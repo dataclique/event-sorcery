@@ -227,21 +227,8 @@ impl Reactor for RebalancingTrigger {
 }
 ```
 
-Use `.on_with_fallback(handler, fallback)` instead of `.on()` when a handler
-needs a recovery path. If the primary handler returns `Err(error)`, the fallback
-receives `(error, id, event)` and can reprocess the event from the errored state
-(e.g., force-applying a snapshot that the normal path rejected):
-
-```rust
-.on_with_fallback(
-    |id, event| async move { self.on_snapshot(event).await },
-    |error, id, event| async move {
-        self.on_snapshot_recovery(error, event).await
-    },
-)
-```
-
-Wire reactors via `Unwired` + `StoreBuilder::wire()`.
+Wire reactors via `StoreBuilder::with()`; clone the same `Arc` into each builder
+when a reactor depends on multiple entities.
 
 ## Services Pattern
 
