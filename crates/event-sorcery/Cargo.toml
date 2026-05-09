@@ -28,5 +28,9 @@ path = "../../examples/basic_entity/main.rs"
 name = "projection"
 path = "../../examples/projection/main.rs"
 
+[[example]]
+name = "reactor"
+path = "../../examples/reactor/main.rs"
+
 [lints]
 workspace = true
