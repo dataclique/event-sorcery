@@ -12,9 +12,12 @@ use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool};
 
 use sqlite_es::{SqliteAggregateError, insert_serialized_events_batch};
 
+use crate::CompactionPolicy;
 use crate::job_store::{
-    Candidate, CasOutcome, JobRow, JobStore, LeaseRenewal, QueueRow, QueueStatus, Severity,
+    Candidate, CasOutcome, EventBackend, JobRow, JobStore, LeaseRenewal, QueueRow, QueueStatus,
+    Severity,
 };
+use crate::sqlite_event_repository::SqliteEventRepository;
 
 /// The default [`JobStore`]: durable jobs over SQLite.
 ///
@@ -32,6 +35,11 @@ impl SqliteBackend {
     #[must_use]
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// The underlying pool, for the SQLite-bound view reconciliation paths.
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 }
 
@@ -265,5 +273,21 @@ impl JobStore for SqliteBackend {
                 Severity::Fatal
             }
         }
+    }
+}
+
+impl EventBackend for SqliteBackend {
+    type EventRepo = SqliteEventRepository;
+
+    fn event_repo(&self, compaction_policy: CompactionPolicy) -> SqliteEventRepository {
+        SqliteEventRepository::new(self.pool.clone(), compaction_policy)
+    }
+
+    async fn migrate(&self) -> Result<(), SqliteJobError> {
+        sqlx::migrate!("../../migrations")
+            .run(&self.pool)
+            .await
+            .map_err(|error| SqliteJobError::Sql(error.into()))?;
+        Ok(())
     }
 }

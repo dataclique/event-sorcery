@@ -39,7 +39,11 @@ impl From<SqliteEventRepositoryError> for PersistenceError {
     }
 }
 
-pub(crate) struct SqliteEventRepository {
+/// SQLite implementation of the cqrs-es [`PersistedEventRepository`].
+///
+/// Public so it can be the [`crate::EventBackend::EventRepo`] of
+/// [`crate::SqliteBackend`]; consumers obtain it via the backend, not directly.
+pub struct SqliteEventRepository {
     pool: SqlitePool,
     compaction_policy: CompactionPolicy,
     stream_channel_size: usize,

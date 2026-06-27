@@ -43,9 +43,12 @@ a safer, more ergonomic public surface.
   invalidate stale snapshots/views without touching the database by hand.
 - **Don't reinvent persistence.** SQLite-backed event/view repositories live in
   their own crate (`sqlite-es`) so non-event-sorcery consumers can use them too.
-- **Stay backend-pluggable.** Projections take a `ViewBackend` parameter
-  (defaulting to SQLite) so tests can swap in in-memory storage and future
-  callers can add Postgres without touching the projection logic.
+- **Stay backend-pluggable.** Storage is abstracted on both sides. Projections
+  take a `ViewBackend` parameter; the event store and the durable-job worker
+  take an `EventBackend` / `JobStore` parameter. All default to SQLite, so
+  existing call sites are untouched, while tests can swap in alternatives and a
+  future Postgres/MySQL backend plugs in by implementing the traits — not by
+  editing the worker or `Store` logic.
 
 ## Non-goals
 
@@ -151,6 +154,21 @@ A higher-kinded-type emulation that makes `Projection` generic over its storage
 backend without leaking `Lifecycle` into any public bound. The default backend
 is `SqliteViewBackend`. Custom backends plug in alternative storage (in-memory
 for tests, Postgres in the future).
+
+### `JobStore` & `EventBackend`
+
+The write-side equivalent of `ViewBackend`, for the event store and the durable
+jobs. `JobStore` names the operations cqrs-es does not provide — the `job_queue`
+projection, a compare-and-swap event append (conflict surfaced as `CasOutcome`),
+a write-locked claim transaction, lease renewal, and the runnable poll — over
+backend-neutral types. `EventBackend: JobStore` adds the cqrs-es
+event-repository factory. The durable-job worker
+(`EventStoreBackend<Job, JobStore>`) is fully generic over `JobStore`;
+`Store`/`StoreBuilder` are generic over `EventBackend`. The default is
+`SqliteBackend`; a Postgres/MySQL backend implements the two traits (only
+dialect deltas differ). No GAT is needed: the job aggregate is mono-typed and
+the connection/transaction is owned, so plain associated types carry the
+concrete backend types.
 
 ### `StoreBuilder<Entity>`
 

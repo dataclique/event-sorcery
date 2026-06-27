@@ -20,8 +20,7 @@ use tokio::sync::Mutex;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
 use crate::reactor::Reactor;
-use crate::sqlite_event_repository::SqliteEventRepository;
-use crate::{EventSourced, Store};
+use crate::{EventBackend, EventSourced, SqliteBackend, Store};
 
 /// Replay events through EventSourced to reconstruct entity state.
 ///
@@ -145,15 +144,14 @@ pub fn test_store<Entity: EventSourced>(
     pool: sqlx::SqlitePool,
     services: Entity::Services,
 ) -> Store<Entity> {
-    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
-    let event_store =
-        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-            repo,
-            Entity::SNAPSHOT_SIZE,
-        );
+    let backend = SqliteBackend::new(pool);
+    let event_store = PersistedEventStore::new_snapshot_store(
+        backend.event_repo(Entity::COMPACTION_POLICY),
+        Entity::SNAPSHOT_SIZE,
+    );
     #[allow(clippy::disallowed_methods)]
     let cqrs = CqrsFramework::new(event_store, vec![], services);
-    Store::new(cqrs, pool)
+    Store::new(cqrs, &backend)
 }
 
 /// Test wrapper for [`Reactor`] implementations that hides

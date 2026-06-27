@@ -119,15 +119,15 @@ pub use job::{Job, JobQueue, JobStoreError, Label};
 pub use job_backend::{Backoff, Clock, EventStoreBackend, JobWorkerConfig};
 pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{
-    BackendError, Candidate, CasOutcome, JobRow, JobStore, LeaseRenewal, QueueRow, QueueStatus,
-    Severity,
+    BackendError, Candidate, CasOutcome, EventBackend, JobRow, JobStore, LeaseRenewal, QueueRow,
+    QueueStatus, Severity,
 };
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::Reactor;
 pub use schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry};
-use sqlite_event_repository::SqliteEventRepository;
+pub use sqlite_event_repository::SqliteEventRepository;
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, replay, test_store,
@@ -135,8 +135,10 @@ pub use testing::{
 pub use view_backend::{SqliteViewBackend, ViewBackend};
 pub use wire::StoreBuilder;
 
-pub(crate) type SqliteCqrs<Entity> =
-    CqrsFramework<Lifecycle<Entity>, PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>>;
+pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
+    Lifecycle<Entity>,
+    PersistedEventStore<<Backend as EventBackend>::EventRepo, Lifecycle<Entity>>,
+>;
 
 /// Whether old events may be deleted after they are captured in a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,20 +319,22 @@ pub trait EventSourced:
 /// startup. The builder handles CQRS framework construction,
 /// query wiring, and schema reconciliation, returning a
 /// ready-to-use `Store`.
-pub struct Store<Entity: EventSourced> {
-    cqrs: SqliteCqrs<Entity>,
-    event_store: PersistedEventStore<SqliteEventRepository, Lifecycle<Entity>>,
+pub struct Store<Entity: EventSourced, Backend: EventBackend = SqliteBackend> {
+    cqrs: EsCqrs<Entity, Backend>,
+    event_store: PersistedEventStore<Backend::EventRepo, Lifecycle<Entity>>,
 }
 
-impl<Entity: EventSourced> Store<Entity> {
-    /// Wrap an existing `SqliteCqrs` framework.
+impl<Entity: EventSourced, Backend: EventBackend> Store<Entity, Backend> {
+    /// Wrap an existing CQRS framework built over `backend`.
     ///
     /// Prefer using `StoreBuilder::build()` which handles wiring
     /// and reconciliation. This constructor exists for cases
     /// where direct construction is needed (e.g., tests).
-    pub(crate) fn new(cqrs: SqliteCqrs<Entity>, pool: SqlitePool) -> Self {
-        let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
-        let event_store = PersistedEventStore::new_snapshot_store(repo, Entity::SNAPSHOT_SIZE);
+    pub(crate) fn new(cqrs: EsCqrs<Entity, Backend>, backend: &Backend) -> Self {
+        let event_store = PersistedEventStore::new_snapshot_store(
+            backend.event_repo(Entity::COMPACTION_POLICY),
+            Entity::SNAPSHOT_SIZE,
+        );
         Self { cqrs, event_store }
     }
 
@@ -363,7 +367,10 @@ impl<Entity: EventSourced> Store<Entity> {
 
         Ok(context.aggregate.into_result()?)
     }
+}
 
+/// SQLite-specific [`Store`] helpers.
+impl<Entity: EventSourced> Store<Entity, SqliteBackend> {
     /// Reconstruct an entity's state from events without needing
     /// a full `Store` (no services or CQRS framework required).
     ///

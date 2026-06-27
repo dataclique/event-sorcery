@@ -12,7 +12,9 @@
 use std::future::Future;
 use std::ops::DerefMut;
 
-use cqrs_es::persist::SerializedEvent;
+use cqrs_es::persist::{PersistedEventRepository, SerializedEvent};
+
+use crate::CompactionPolicy;
 
 /// Outcome of a compare-and-swap event append.
 ///
@@ -196,6 +198,28 @@ pub trait JobStore: Clone + Send + Sync + 'static {
 
     /// Map a backend error to a neutral [`Severity`].
     fn classify(error: &Self::Error) -> Severity;
+}
+
+/// A complete event-sorcery backend: a [`JobStore`] that also supplies the
+/// cqrs-es event repository the core `Store` wraps.
+///
+/// The supertrait edge ties the two together so the `job_queue` the worker polls
+/// and the events the enqueue flush appends agree on one backend and schema. The
+/// core obtains its repository ONLY via [`event_repo`](Self::event_repo) -- a
+/// consumer hands the core a backend, never a bare repository, so a non-flushing
+/// repository (one that would silently drop the atomic-enqueue guarantee) cannot
+/// be injected.
+pub trait EventBackend: JobStore {
+    /// The cqrs-es event repository for this backend. Its `persist` MUST flush
+    /// buffered jobs in the same transaction that commits the events.
+    type EventRepo: PersistedEventRepository + Send + Sync + 'static;
+
+    /// Builds the flush-aware event repository for `compaction_policy`.
+    fn event_repo(&self, compaction_policy: CompactionPolicy) -> Self::EventRepo;
+
+    /// Applies this backend's canonical events + snapshots + `job_queue` schema,
+    /// so a consumer migrates with one call regardless of dialect.
+    fn migrate(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// apalis-facing worker error: a backend store error, or a job that cannot be
