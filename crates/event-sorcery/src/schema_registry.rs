@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use tracing::{debug, info};
 
 use crate::CompactionPolicy;
+use crate::job::JobQueue;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::{DomainEvent, EventSourced, Nil};
 
@@ -75,7 +76,7 @@ impl EventSourced for SchemaRegistry {
     type Event = SchemaRegistryEvent;
     type Command = SchemaRegistryCommand;
     type Error = Never;
-    type Services = ();
+    type Jobs = Nil;
     type Materialized = Nil;
 
     const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
@@ -98,7 +99,7 @@ impl EventSourced for SchemaRegistry {
 
     async fn initialize(
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         Ok(vec![SchemaRegistryEvent::VersionUpdated { name, version }])
@@ -107,7 +108,7 @@ impl EventSourced for SchemaRegistry {
     async fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        _jobs: &JobQueue<Self::Jobs>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         if self.version_of(&name) == Some(version) {
@@ -495,7 +496,7 @@ mod tests {
         type Event = CompactableEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "CompactableWidget";
@@ -513,7 +514,7 @@ mod tests {
 
         async fn initialize(
             _command: Self::Command,
-            _services: &Self::Services,
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<Self::Event>, Never> {
             Ok(vec![CompactableEvent::Created])
         }
@@ -521,7 +522,7 @@ mod tests {
         async fn transition(
             &self,
             _command: Self::Command,
-            _services: &Self::Services,
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<Self::Event>, Never> {
             Ok(vec![])
         }
