@@ -387,7 +387,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::JobQueue;
+    use crate::Decision;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Alpha {
@@ -437,19 +437,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize(
-            (): (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<AlphaEvent>, AlphaError> {
-            Ok(vec![AlphaEvent::Born])
+        async fn initialize((): ()) -> Result<Decision<Self>, AlphaError> {
+            Ok(Decision::Events(vec![AlphaEvent::Born]))
         }
 
-        async fn transition(
-            &self,
-            (): (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<AlphaEvent>, AlphaError> {
-            Ok(vec![])
+        async fn transition(&self, (): ()) -> Result<Decision<Self>, AlphaError> {
+            Ok(Decision::Events(vec![]))
         }
     }
 
@@ -499,19 +492,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize(
-            (): (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<BetaEvent>, BetaError> {
-            Ok(vec![BetaEvent::Spawned])
+        async fn initialize((): ()) -> Result<Decision<Self>, BetaError> {
+            Ok(Decision::Events(vec![BetaEvent::Spawned]))
         }
 
-        async fn transition(
-            &self,
-            (): (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<BetaEvent>, BetaError> {
-            Ok(vec![])
+        async fn transition(&self, (): ()) -> Result<Decision<Self>, BetaError> {
+            Ok(Decision::Events(vec![]))
         }
     }
 

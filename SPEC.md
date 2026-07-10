@@ -104,10 +104,13 @@ It splits behavior across two pairs:
   `transition` handles a command against existing state. The split prevents
   accidentally reading "current state" while bootstrapping.
 
-Command handlers are pure `(state, command) -> events` plus enqueues: they
-receive a `JobQueue<Self::Jobs>` and may push declared jobs, but perform no side
-effects themselves. Pushed jobs flush in the same transaction that commits the
-events (see [ADR-0001](adrs/0001-jobs-replace-services.md)).
+Command handlers are pure: they return a `Decision` -- either domain events, or
+exactly one job dispatch -- and perform no side effects themselves. A dispatch
+is enacted by the framework: it emits the `Dispatched` intent event and enqueues
+the job in the same transaction, and only its delivery path can construct the
+settled `Confirmed`/`Failed` verdicts. An accomplished-fact event cannot ride
+along with a merely-enqueued effect (see
+[ADR-0009](adrs/0009-handlers-return-events-or-one-job-dispatch.md)).
 
 ### `Lifecycle` adapter
 
@@ -179,47 +182,63 @@ implements the one trait (only dialect deltas differ). See
 
 ### Durable jobs
 
-Side effects run as durable, at-least-once jobs instead of inline in command
-handlers. A job is a serializable value implementing the `Job` trait (`Input`
-dependency bundle, `Output`, `Error`, a `perform` method). Jobs are themselves
-an `EventSourced` aggregate (`aggregate_type = "job"`): enqueue, claim, retry,
-defer, and terminal outcomes are ordinary events, committed exactly-once, with
-the runnable set materialized in the `job_queue` projection.
+Side effects run as durable, at-least-once worker jobs -- never inline in
+command handlers. Jobs are themselves an `EventSourced` aggregate
+(`aggregate_type = "job"`): enqueue, claim, retry, defer, and terminal outcomes
+are ordinary events, committed exactly-once, with the runnable set materialized
+in the `job_queue` projection. Two job traits exist:
 
-- **Enqueue** is transactional from a command handler (`JobQueue::push` flushes
-  with the entity's events) or standalone via `JobRuntime::enqueue` (its own
-  transaction; see [ADR-0007](adrs/0007-reactor-side-job-enqueue.md)).
+- **`Job`** -- a job an entity kicks off, with an `Origin` entity and
+  `submit`/`reconcile` execution (see "Entity-dispatched jobs" below). This is
+  the only kind a command handler can start.
+- **`StandaloneJob`** -- origin-less background work (`perform`), enqueued
+  directly on `JobRuntime::enqueue` by reactors, pollers, job chains, and
+  startup recovery (its own transaction; see
+  [ADR-0007](adrs/0007-reactor-side-job-enqueue.md)).
+
+Shared machinery for both:
+
 - **Execution** happens in supervised apalis workers
   (`build_supervised_worker!`): claim with a lease, renew while running, fenced
   ack on completion. Exhausted retries or claim budgets dead-letter the job;
   terminal rows are retained.
+- **Failure classification** is explicit at every return site:
+  `JobFailure::Transient` retries with backoff, `JobFailure::Terminal`
+  dead-letters immediately (`DeadReason::Rejected`); there is deliberately no
+  `From` impl, so `?` cannot silently classify.
 - **Defer** (`JobOutcome::Defer`) reschedules without counting an attempt, for
   polling on an external outcome that is not ready yet.
 - **`JobContext`** — every execution receives the job's id and the durable
   attempt number, so external-boundary idempotency keys can derive from stable
   framework identity.
 
-### Durable operations
+### Entity-dispatched jobs
 
-The lifecycle of a fallible external operation _on an entity_ — request it, run
-it durably, feed the outcome back into entity state — is a library primitive,
-not consumer plumbing (see
-[ADR-0008](adrs/0008-entity-scoped-durable-operations.md)):
+The lifecycle of a fallible external action _on an entity_ -- kick it off, run
+it durably, deliver the verdict back into entity state -- is the handler
+contract itself, not opt-in plumbing (see
+[ADR-0008](adrs/0008-entity-scoped-durable-operations.md) and
+[ADR-0009](adrs/0009-handlers-return-events-or-one-job-dispatch.md)):
 
-- **`Operation<J>`** is a library-owned state machine
-  (`Idle -> Requested -> Confirmed(Output) | Failed(Error)`) embedded in entity
-  state, with `OperationEvent<J>` / `OperationCommand<J>` wrappers the consumer
-  nests in their own event/command enums. Requesting an operation enqueues its
-  job in the same transaction that commits the `Requested` event, so there is no
-  intent/call crash window. The state guard — ignore an outcome that already
-  landed, refuse a second request while one is in flight — lives in the library
-  machine.
-- **Outcome feed-back.** An operation-driving job declares its origin entity;
-  the framework maps the job result to the corresponding `OperationCommand` and
-  delivers it to the origin **before** acking the job as succeeded. Failed
-  delivery means no ack and redelivery; duplicates are absorbed by the state
-  guard. Dead-lettered jobs deliver `Failed`, so an entity never dangles
-  in-flight.
+- **`Decision`.** Handlers return either domain events or exactly one
+  `JobDispatch`, obtained from `DispatchedJob::dispatch(job)` -- the only path
+  to an enqueue from a handler. The framework emits the `Dispatched` event
+  (which carries the job value: the intent IS the job) and enqueues in the same
+  transaction, so there is no intent/call crash window and no free-form event
+  can accompany the enqueue.
+- **`DispatchedJob<J>`** is the library-owned machine embedded in entity state
+  (`Idle -> InFlight -> Confirmed(Settled) | Failed(SettledFailure)`), with
+  `DispatchEvent<J>` wrappers nested in the entity's event enum. The state guard
+  -- absorb a duplicate verdict, refuse an overlapping dispatch -- lives in the
+  machine. Settled verdicts are SEALED: only the framework's delivery path
+  constructs them, so `Confirmed` in entity state is a proof the job settled,
+  not a claim.
+- **Verdict delivery.** The framework maps the job result to a `DispatchOutcome`
+  and delivers it to the origin (through `OriginPort`, implemented by `Store`
+  when the origin's command enum absorbs it via `From`) **before** acking the
+  job. Failed delivery defers (never counts an attempt); duplicates are absorbed
+  by the guard; dead-lettered jobs deliver `Failed`, so an entity never dangles
+  in flight.
 - **Submit/reconcile routing.** Whether an execution is the first try or a
   follow-up is a safety invariant for financial operations, so the framework
   routes it: the first claim runs `submit`; every later claim runs `reconcile`,
@@ -228,7 +247,7 @@ not consumer plumbing (see
   (defers and polls again). The routing is driven by the durable claim count on
   the job aggregate, which over-approximates submissions in the safe direction:
   an execution can never be routed to `submit` while a prior submission might
-  exist. Terminal `Confirmed`/`Failed` events carry the attempt count.
+  exist. Settled verdicts carry the attempt count.
 
 ### `StoreBuilder<Entity>`
 
@@ -244,11 +263,12 @@ projection becomes a type error, not silent data staleness.
 2. `Store` looks up the aggregate, loads its `Lifecycle`, applies any relevant
    snapshot, replays uncached events.
 3. `Lifecycle::handle` routes to `EventSourced::initialize` (no state) or
-   `EventSourced::transition` (has state) and produces events; the handler may
-   push durable jobs onto its `JobQueue`.
+   `EventSourced::transition` (has state), which return a `Decision`. For
+   `Decision::Dispatch`, the framework emits the `Dispatched` event and buffers
+   the enqueue itself.
 4. `cqrs-es::CqrsFramework` persists events with monotonic sequence numbers; the
-   repository flushes any pushed jobs (their `Enqueued` events and `job_queue`
-   seed rows) in the same SQL transaction.
+   repository flushes any buffered dispatches (their `Enqueued` events and
+   `job_queue` seed rows) in the same SQL transaction.
 5. Reactors registered on this aggregate are notified.
 
 ### Read path

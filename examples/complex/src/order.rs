@@ -1,8 +1,9 @@
-//! `Order` aggregate: a placed/filled/cancelled state machine, no
-//! materialized view. Reads go through `Store::load` (replay from events).
-//! Placing an order enqueues a durable [`SendOrderConfirmation`] job -- the
-//! handler stays a pure `(state, command) -> events` function and the side
-//! effect (confirming the order to the customer) runs in a supervised worker.
+//! `Order` aggregate: placing an order KICKS OFF a durable
+//! [`SendOrderConfirmation`] job (ADR-0009). The `Dispatched` intent commits
+//! atomically with the enqueue, the order shows `PendingConfirmation`, and
+//! only the worker's delivered verdict moves it to `Placed` -- the handler
+//! cannot claim the confirmation happened. `Fill`/`Cancel` are pure domain
+//! events on a placed order.
 //!
 //! Orders hit a short-lived terminal state (filled or cancelled), so the
 //! aggregate opts into `CompactionPolicy::CompactAfterSnapshot`. Once a
@@ -20,12 +21,13 @@ use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
 use event_sorcery::{
-    CompactionPolicy, EventSourced, Job, JobContext, JobFailure, JobOutcome, JobQueue, Label, Nil,
+    CompactionPolicy, Decision, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob,
+    EventSourced, Job, JobContext, JobFailure, JobOutcome, Label, Never, Nil, Reconciliation,
 };
 
 use crate::inventory::Sku;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OrderId(pub u64);
 
 impl Display for OrderId {
@@ -54,31 +56,48 @@ pub enum ParseOrderIdError {
     NotNumeric(#[from] std::num::ParseIntError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Order {
     pub item: Sku,
     pub quantity: u32,
     pub status: OrderStatus,
+    pub confirmation: DispatchedJob<SendOrderConfirmation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderStatus {
+    /// The confirmation job is in flight; the order is not yet placed.
+    PendingConfirmation,
     Placed,
     Filled,
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OrderEvent {
-    Placed { item: Sku, quantity: u32 },
+    Confirmation(DispatchEvent<SendOrderConfirmation>),
     Filled,
     Cancelled,
+}
+
+impl From<DispatchEvent<SendOrderConfirmation>> for OrderEvent {
+    fn from(event: DispatchEvent<SendOrderConfirmation>) -> Self {
+        Self::Confirmation(event)
+    }
 }
 
 impl DomainEvent for OrderEvent {
     fn event_type(&self) -> String {
         match self {
-            Self::Placed { .. } => "OrderEvent::Placed".to_string(),
+            Self::Confirmation(DispatchEvent::Dispatched { .. }) => {
+                "OrderEvent::Placed".to_string()
+            }
+            Self::Confirmation(DispatchEvent::Confirmed(_)) => {
+                "OrderEvent::ConfirmationSent".to_string()
+            }
+            Self::Confirmation(DispatchEvent::Failed(_)) => {
+                "OrderEvent::ConfirmationFailed".to_string()
+            }
             Self::Filled => "OrderEvent::Filled".to_string(),
             Self::Cancelled => "OrderEvent::Cancelled".to_string(),
         }
@@ -91,9 +110,17 @@ impl DomainEvent for OrderEvent {
 
 #[derive(Debug, Clone)]
 pub enum OrderCommand {
-    Place { item: Sku, quantity: u32 },
+    Place { order: OrderId, item: Sku, quantity: u32 },
     Fill,
     Cancel,
+    /// Delivered by the framework when the confirmation job settles.
+    Confirmation(DispatchOutcome<SendOrderConfirmation>),
+}
+
+impl From<DispatchOutcome<SendOrderConfirmation>> for OrderCommand {
+    fn from(outcome: DispatchOutcome<SendOrderConfirmation>) -> Self {
+        Self::Confirmation(outcome)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -102,31 +129,34 @@ pub enum OrderError {
     AlreadyPlaced,
     #[error("order has not been placed")]
     NotPlaced,
+    #[error("order is not confirmed yet")]
+    NotConfirmed,
     #[error("order is no longer open")]
     NotOpen,
+    #[error(transparent)]
+    Confirmation(#[from] DispatchRefused),
 }
 
-/// Durable side effect dispatched when an order is placed: confirm it to the
-/// customer.
-///
-/// The handler enqueues this on the typed [`JobQueue`]; a supervised worker runs
-/// it later, exactly once per placement, atomically with the `Placed` event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The job a `Place` command kicks off: confirm the order to the customer.
+/// The job carries the full intent, so the `Dispatched` event durably records
+/// the order and `originate` derives the entity state from it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendOrderConfirmation {
+    pub order: OrderId,
     pub item: Sku,
     pub quantity: u32,
 }
 
-/// Dependency bundle the worker injects into [`SendOrderConfirmation::perform`].
-/// A real app would hold an email/SMS client; here it just prints the
-/// confirmation it would have sent.
+/// Dependency bundle the worker injects (alongside the origin store, via
+/// `JobInput`). A real app would hold an email/SMS client; here it prints.
 #[derive(Clone, Default)]
 pub struct Confirmer;
 
 impl Job for SendOrderConfirmation {
     type Input = Confirmer;
     type Output = ();
-    type Error = std::convert::Infallible;
+    type Error = Never;
+    type Origin = Order;
 
     const WORKER_NAME: &'static str = "send-order-confirmation";
     const KIND: &'static str = "send-order-confirmation";
@@ -135,16 +165,30 @@ impl Job for SendOrderConfirmation {
         Label::new(format!("send-order-confirmation:{}", self.item))
     }
 
-    async fn perform(
+    fn origin_id(&self) -> OrderId {
+        self.order
+    }
+
+    async fn submit(
         &self,
         _ctx: &JobContext,
         _input: &Confirmer,
-    ) -> Result<JobOutcome<()>, JobFailure<Self::Error>> {
+    ) -> Result<JobOutcome<()>, JobFailure<Never>> {
         println!(
             "  [worker] sent confirmation for {} x{}",
             self.item, self.quantity
         );
         Ok(JobOutcome::Done(()))
+    }
+
+    async fn reconcile(
+        &self,
+        _ctx: &JobContext,
+        _input: &Confirmer,
+    ) -> Result<Reconciliation<()>, JobFailure<Never>> {
+        // A duplicate confirmation email is tolerable; treat an unknown fate
+        // as settled.
+        Ok(Reconciliation::Settled(()))
     }
 }
 
@@ -159,24 +203,47 @@ impl EventSourced for Order {
 
     const AGGREGATE_TYPE: &'static str = "Order";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
     const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
     const SNAPSHOT_SIZE: usize = 1;
 
     fn originate(event: &OrderEvent) -> Option<Self> {
         match event {
-            OrderEvent::Placed { item, quantity } => Some(Self {
-                item: item.clone(),
-                quantity: *quantity,
-                status: OrderStatus::Placed,
-            }),
-            OrderEvent::Filled | OrderEvent::Cancelled => None,
+            // The intent IS the job: the order is born from the dispatched
+            // confirmation, carrying item and quantity.
+            OrderEvent::Confirmation(dispatch_event @ DispatchEvent::Dispatched { job, .. }) => {
+                let confirmation = DispatchedJob::Idle.evolve(dispatch_event).ok()?;
+                Some(Self {
+                    item: job.item.clone(),
+                    quantity: job.quantity,
+                    status: OrderStatus::PendingConfirmation,
+                    confirmation,
+                })
+            }
+            OrderEvent::Confirmation(DispatchEvent::Confirmed(_) | DispatchEvent::Failed(_))
+            | OrderEvent::Filled
+            | OrderEvent::Cancelled => None,
         }
     }
 
     fn evolve(entity: &Self, event: &OrderEvent) -> Result<Option<Self>, OrderError> {
         match event {
-            OrderEvent::Placed { .. } => Ok(None),
+            OrderEvent::Confirmation(dispatch_event) => {
+                let Ok(confirmation) = entity.confirmation.evolve(dispatch_event) else {
+                    return Ok(None);
+                };
+                let status = match dispatch_event {
+                    DispatchEvent::Dispatched { .. } => OrderStatus::PendingConfirmation,
+                    DispatchEvent::Confirmed(_) => OrderStatus::Placed,
+                    // `Never` fails: the arm exists for exhaustiveness.
+                    DispatchEvent::Failed(_) => OrderStatus::PendingConfirmation,
+                };
+                Ok(Some(Self {
+                    status,
+                    confirmation,
+                    ..entity.clone()
+                }))
+            }
             OrderEvent::Filled => Ok(Some(Self {
                 status: OrderStatus::Filled,
                 ..entity.clone()
@@ -188,46 +255,53 @@ impl EventSourced for Order {
         }
     }
 
-    async fn initialize(
-        command: OrderCommand,
-        jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<OrderEvent>, OrderError> {
+    async fn initialize(command: OrderCommand) -> Result<Decision<Self>, OrderError> {
         match command {
-            OrderCommand::Place { item, quantity } => {
-                // Enqueue the confirmation side effect; it flushes atomically
-                // with the Placed event and runs in a supervised worker.
-                jobs.push(SendOrderConfirmation {
-                    item: item.clone(),
+            // Placing IS kicking off the confirmation job; the framework
+            // commits the `Dispatched` intent and the enqueue together.
+            OrderCommand::Place {
+                order,
+                item,
+                quantity,
+            } => Ok(Decision::Dispatch(DispatchedJob::Idle.dispatch(
+                SendOrderConfirmation {
+                    order,
+                    item,
                     quantity,
-                });
-                Ok(vec![OrderEvent::Placed { item, quantity }])
+                },
+            )?)),
+            OrderCommand::Fill | OrderCommand::Cancel | OrderCommand::Confirmation(_) => {
+                Err(OrderError::NotPlaced)
             }
-            OrderCommand::Fill | OrderCommand::Cancel => Err(OrderError::NotPlaced),
         }
     }
 
-    async fn transition(
-        &self,
-        command: OrderCommand,
-        _jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<OrderEvent>, OrderError> {
+    async fn transition(&self, command: OrderCommand) -> Result<Decision<Self>, OrderError> {
         match command {
             OrderCommand::Place { .. } => Err(OrderError::AlreadyPlaced),
             OrderCommand::Fill => match self.status {
-                OrderStatus::Placed => Ok(vec![OrderEvent::Filled]),
+                OrderStatus::PendingConfirmation => Err(OrderError::NotConfirmed),
+                OrderStatus::Placed => Ok(Decision::Events(vec![OrderEvent::Filled])),
                 OrderStatus::Filled | OrderStatus::Cancelled => Err(OrderError::NotOpen),
             },
             OrderCommand::Cancel => match self.status {
-                OrderStatus::Placed => Ok(vec![OrderEvent::Cancelled]),
+                OrderStatus::PendingConfirmation => Err(OrderError::NotConfirmed),
+                OrderStatus::Placed => Ok(Decision::Events(vec![OrderEvent::Cancelled])),
                 OrderStatus::Filled | OrderStatus::Cancelled => Err(OrderError::NotOpen),
             },
+            OrderCommand::Confirmation(outcome) => {
+                let events = self.confirmation.settle(outcome)?;
+                Ok(Decision::Events(
+                    events.into_iter().map(OrderEvent::Confirmation).collect(),
+                ))
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use event_sorcery::TestHarness;
+    use event_sorcery::{JobId, Settled, TestHarness};
 
     use super::*;
 
@@ -235,28 +309,61 @@ mod tests {
         Sku("widgets".to_string())
     }
 
+    fn placed(order: OrderId, job_id: JobId, quantity: u32) -> Vec<OrderEvent> {
+        vec![
+            OrderEvent::Confirmation(DispatchEvent::Dispatched {
+                job_id,
+                job: SendOrderConfirmation {
+                    order,
+                    item: widgets(),
+                    quantity,
+                },
+            }),
+            OrderEvent::Confirmation(DispatchEvent::Confirmed(Settled::simulated(
+                job_id,
+                (),
+                1,
+            ))),
+        ]
+    }
+
     #[tokio::test]
-    async fn fill_after_place_emits_filled_event() {
+    async fn fill_after_confirmed_place_emits_filled_event() {
         TestHarness::<Order>::new()
-            .given(vec![OrderEvent::Placed {
-                item: widgets(),
-                quantity: 3,
-            }])
+            .given(placed(OrderId(1), JobId::new(), 3))
             .when(OrderCommand::Fill)
             .await
             .then_expect_events(&[OrderEvent::Filled]);
     }
 
     #[tokio::test]
-    async fn cancel_filled_order_returns_not_open() {
+    async fn fill_before_the_confirmation_settles_is_refused() {
+        let job_id = JobId::new();
         let error = TestHarness::<Order>::new()
-            .given(vec![
-                OrderEvent::Placed {
+            .given(vec![OrderEvent::Confirmation(DispatchEvent::Dispatched {
+                job_id,
+                job: SendOrderConfirmation {
+                    order: OrderId(1),
                     item: widgets(),
-                    quantity: 1,
+                    quantity: 3,
                 },
-                OrderEvent::Filled,
-            ])
+            })])
+            .when(OrderCommand::Fill)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            event_sorcery::LifecycleError::Apply(OrderError::NotConfirmed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_filled_order_returns_not_open() {
+        let mut history = placed(OrderId(1), JobId::new(), 1);
+        history.push(OrderEvent::Filled);
+        let error = TestHarness::<Order>::new()
+            .given(history)
             .when(OrderCommand::Cancel)
             .await
             .then_expect_error();

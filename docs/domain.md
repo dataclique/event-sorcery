@@ -126,39 +126,51 @@ trigger view rebuilds.
 
 ### Job
 
-A durable, retryable unit of side-effecting work (`Job`). Command handlers stay
-pure `(state, command) -> events` and enqueue jobs via the typed
-`JobQueue<Self::Jobs>` they receive; the entity declares the job types it may
-dispatch as `EventSourced::Jobs` (a `JobList`, built with the `jobs!` macro, or
-`Nil`). Jobs flush in the same transaction that commits the events, and a
-supervised worker claims and runs each one. There is no service-injection into
-handlers -- inputs a handler needs are carried on the command; side effects are
-jobs.
+A durable, retryable unit of work an ENTITY kicks off for a worker (`Job`,
+ADR-0009). It has an `Origin` entity and carries everything the round trip needs
+(including the origin's id via `origin_id()`). The entity declares the job types
+it may dispatch as `EventSourced::Jobs` (a `JobList`, built with the `jobs!`
+macro, or `Nil`). There is no service-injection into handlers -- inputs a
+handler needs are carried on the command; side effects are jobs.
 
-Every execution receives a `JobContext` carrying the job's `JobId` (a ULID,
-stable across retries -- the root for external idempotency keys) and the durable
-attempt count. Failures state their retry class explicitly at the return site:
-`JobFailure::Transient` retries with backoff, `JobFailure::Terminal`
-dead-letters immediately (`DeadReason::Rejected`). There is deliberately no
-`From` impl for `JobFailure`, so `?` cannot silently classify a failure.
+A `Job` implements `submit`/`reconcile`, not `perform`: the framework routes the
+FIRST execution to `submit` and every later one to `reconcile`, which must
+determine the earlier attempt's fate and return a `Reconciliation` verdict
+(`Settled` / `NotSubmitted` / `Indeterminate`). Every execution receives a
+`JobContext` carrying the job's `JobId` (a ULID, stable across retries -- the
+root for external idempotency keys) and the durable attempt count. Failures
+state their retry class explicitly at the return site: `JobFailure::Transient`
+retries with backoff, `JobFailure::Terminal` dead-letters immediately
+(`DeadReason::Rejected`). There is deliberately no `From` impl for `JobFailure`,
+so `?` cannot silently classify a failure.
 
-### Operation
+### Standalone job
 
-The durable lifecycle of one fallible external action _on an entity_ (ADR-0008).
-The entity embeds an `Operation<J>` field
-(`Idle -> Requested -> Confirmed | Failed`) and nests `OperationEvent<J>` /
-`OperationCommand<J>` in its own enums; the machine owns the state guard (refuse
-overlapping requests, absorb duplicate outcome delivery). Requesting enqueues
-the driving job in the same transaction that commits `Requested`.
+Origin-less background work (`StandaloneJob`, ADR-0007): reactors, pollers, job
+chains, and startup recovery enqueue these directly on `JobRuntime::enqueue` --
+there is no command commit to ride and no entity waiting on the verdict.
+Implements `perform`. Every `Job` is also a `StandaloneJob` via the framework's
+blanket impl (that is how the worker runs it); consumers only write
+`StandaloneJob` impls for genuinely origin-less work.
 
-The driving job implements `OperationJob` instead of `Job::perform`: the
-framework routes the FIRST execution to `submit` and every later one to
-`reconcile`, which must determine the earlier attempt's fate and return a
-`Reconciliation` verdict (`Settled` / `NotSubmitted` / `Indeterminate`). A
-settled outcome is delivered to the `Origin` entity through an `OriginPort`
-(implemented by `Store` when the origin's command enum absorbs
-`OperationCommand<J>` via `From`) BEFORE the job acks; failed delivery defers
-rather than counting an attempt.
+### Decision / dispatch
+
+What a command handler returns (`Decision`, ADR-0009): either domain events, or
+exactly one `JobDispatch` -- the wiring-proven kick-off of a job, obtained from
+`DispatchedJob::dispatch(job)`. This is the whole durability contract: the
+framework (never the handler) emits the `Dispatched` event (which carries the
+job value -- the intent IS the job) and enqueues in the same transaction.
+
+The entity embeds a `DispatchedJob<J>` field
+(`Idle -> InFlight -> Confirmed | Failed`) and nests `DispatchEvent<J>` in its
+event enum; the machine owns the state guard (refuse overlapping dispatches,
+absorb duplicate verdict delivery). Settled verdicts (`Settled` /
+`SettledFailure`, arriving as an opaque `DispatchOutcome` command) are SEALED --
+only the framework's delivery path constructs them, so `Confirmed` in entity
+state proves the job settled. Delivery goes through an `OriginPort` (implemented
+by `Store` when the origin's command enum absorbs `DispatchOutcome<J>` via
+`From`) BEFORE the job acks; failed delivery defers rather than counting an
+attempt.
 
 ### Lifecycle
 

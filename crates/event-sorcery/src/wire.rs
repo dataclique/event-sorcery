@@ -112,7 +112,8 @@ fn es_cqrs<Entity: EventSourced, Backend: EventBackend>(
         backend.event_repo(Entity::COMPACTION_POLICY),
         Entity::SNAPSHOT_SIZE,
     );
-    // `Lifecycle`'s cqrs-es services are unit -- handlers use the typed JobQueue.
+    // `Lifecycle`'s cqrs-es services are unit -- handlers return a `Decision`
+    // instead of calling out through injected services.
     #[allow(clippy::disallowed_methods)]
     CqrsFramework::new(store, queries, ())
 }
@@ -215,7 +216,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::JobQueue;
+    use crate::Decision;
     use crate::dependency::EntityList;
     use crate::deps;
     use crate::lifecycle::{Lifecycle, Never};
@@ -273,19 +274,12 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<EventA>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<EventA>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
     }
 
@@ -310,19 +304,12 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<EventB>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<EventB>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
     }
 
@@ -445,19 +432,12 @@ mod tests {
             }
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<TallyEvent>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<TallyEvent>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
     }
 

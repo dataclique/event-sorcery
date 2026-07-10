@@ -84,12 +84,12 @@
 //! to cqrs-es.
 
 pub(crate) mod dependency;
+mod dispatch;
 mod job;
 mod job_backend;
 mod job_sqlite;
 mod job_store;
 mod lifecycle;
-mod operation;
 mod projection;
 mod reactor;
 mod schema_registry;
@@ -116,9 +116,13 @@ use std::str::FromStr;
 pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
+pub use dispatch::{
+    Contains, Decision, DispatchEvent, DispatchFailure, DispatchOutcome, DispatchRefused,
+    DispatchReplay, DispatchedJob, Here, Job, JobDispatch, JobInput, JobList, OriginDeliveryError,
+    OriginPort, Reconciliation, Settled, SettledFailure, There,
+};
 pub use job::{
-    Contains, DeadReason, Here, Job, JobContext, JobFailure, JobId, JobList, JobOutcome, JobQueue,
-    JobStoreError, Label, There,
+    DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,
 };
 pub use job_backend::{
     Backoff, Clock, EventStoreBackend, JobEnqueueError, JobRuntime, JobWorkerConfig, run_job,
@@ -127,10 +131,6 @@ pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
-pub use operation::{
-    Operation, OperationCommand, OperationEvent, OperationFailure, OperationInput, OperationJob,
-    OperationRefused, OperationReplay, OriginDeliveryError, OriginPort, Reconciliation,
-};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::Reactor;
 pub use schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry};
@@ -184,11 +184,11 @@ pub enum CompactionPolicy {
 /// - `Error`: Domain-specific errors from command handling or
 ///   event application (e.g., arithmetic overflow). For
 ///   entities with infallible operations, use [`Never`].
-/// - `Jobs`: Type-level list of the [`Job`] types this entity's
-///   handlers may enqueue (`jobs![SendEmail, ChargeCard]`, or
-///   [`Nil`] for none). Handlers receive a [`JobQueue<Self::Jobs>`](JobQueue)
-///   and can only push declared jobs -- side effects run as durable
-///   jobs flushed in the same transaction that commits the events.
+/// - `Jobs`: Type-level list of the [`Job`] types this entity may
+///   dispatch (`jobs![ChargeCard, SendReceipt]`, or [`Nil`] for
+///   none). Handlers kick a job off by returning
+///   [`Decision::Dispatch`]; the framework enqueues it in the same
+///   transaction that commits the `Dispatched` event.
 ///
 /// # Constants
 ///
@@ -239,14 +239,15 @@ pub trait EventSourced:
     /// Domain error type returned by command handlers and event
     /// application.
     type Error: DomainError;
-    /// Type-level list of the [`Job`] types this entity's command
-    /// handlers may enqueue.
+    /// Type-level list of the [`Job`] types this entity may dispatch.
     ///
-    /// Write it with the [`jobs!`] macro (`jobs![SendEmail, ChargeCard]`),
-    /// or [`Nil`] for an entity that dispatches no jobs. Handlers receive a
-    /// [`JobQueue<Self::Jobs>`](JobQueue) and can only push jobs declared
-    /// here -- enqueuing an undeclared job is a compile error. The framework
-    /// flushes pushed jobs in the same transaction that commits the events.
+    /// Write it with the [`jobs!`] macro (`jobs![ChargeCard, SendReceipt]`),
+    /// or [`Nil`] for an entity that dispatches no jobs. A handler kicks a
+    /// job off by returning [`Decision::Dispatch`], and
+    /// [`DispatchedJob::dispatch`] compile-checks that the job is declared
+    /// here -- dispatching an undeclared job is a compile error. The
+    /// framework enqueues the job in the same transaction that commits the
+    /// `Dispatched` event.
     type Jobs: JobList;
     /// Whether this entity has a materialized view.
     ///
@@ -301,24 +302,19 @@ pub trait EventSourced:
 
     /// Handle a command when the entity doesn't exist yet.
     ///
-    /// No `&self` -- impossible to accidentally reference
-    /// existing state during creation. Enqueue side effects via `jobs`.
-    async fn initialize(
-        command: Self::Command,
-        jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<Self::Event>, Self::Error>;
+    /// No `&self` -- impossible to accidentally reference existing state
+    /// during creation. Returns a [`Decision`]: pure domain events, or
+    /// exactly one job dispatch (via [`DispatchedJob::dispatch`]) whose
+    /// `Dispatched` event and enqueue the framework commits together.
+    async fn initialize(command: Self::Command) -> Result<Decision<Self>, Self::Error>;
 
     /// Handle a command against existing state.
     ///
-    /// `&self` is the domain type directly, not `Lifecycle`.
-    /// The handler only deals with live state; lifecycle routing
-    /// is handled by the blanket `Aggregate` impl. Enqueue side effects via
-    /// `jobs`; the handler stays pure `(state, command) -> events` + enqueues.
-    async fn transition(
-        &self,
-        command: Self::Command,
-        jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<Self::Event>, Self::Error>;
+    /// `&self` is the domain type directly, not `Lifecycle`. The handler
+    /// only deals with live state; lifecycle routing is handled by the
+    /// blanket `Aggregate` impl. Returns a [`Decision`]: pure domain events,
+    /// or exactly one job dispatch.
+    async fn transition(&self, command: Self::Command) -> Result<Decision<Self>, Self::Error>;
 }
 
 /// Type-safe command dispatch for an event-sourced entity.
@@ -374,7 +370,7 @@ impl<Entity: EventSourced, Backend: EventBackend> Store<Entity, Backend> {
         id: &Entity::Id,
         command: Entity::Command,
     ) -> Result<(), SendError<Entity>> {
-        // Open a pending-job scope so any `JobQueue::push` the handler makes is
+        // Open a pending-job scope so the job a `Decision::Dispatch` carries is
         // drained by the repository's flush in the same commit transaction.
         job::with_pending_scope(self.cqrs.execute(&id.to_string(), command)).await
     }
@@ -819,24 +815,23 @@ mod tests {
             }
         }
 
-        async fn initialize(
-            command: WidgetCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<WidgetEvent>, WidgetError> {
+        async fn initialize(command: WidgetCommand) -> Result<Decision<Self>, WidgetError> {
             match command {
-                WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
-                WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+                WidgetCommand::Create { name } => {
+                    Ok(Decision::Events(vec![WidgetEvent::Created { name }]))
+                }
+                WidgetCommand::Rename { name } => {
+                    Ok(Decision::Events(vec![WidgetEvent::Renamed { name }]))
+                }
             }
         }
 
-        async fn transition(
-            &self,
-            command: WidgetCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<WidgetEvent>, WidgetError> {
+        async fn transition(&self, command: WidgetCommand) -> Result<Decision<Self>, WidgetError> {
             match command {
-                WidgetCommand::Create { .. } => Ok(vec![]),
-                WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+                WidgetCommand::Create { .. } => Ok(Decision::Events(vec![])),
+                WidgetCommand::Rename { name } => {
+                    Ok(Decision::Events(vec![WidgetEvent::Renamed { name }]))
+                }
             }
         }
     }
@@ -1017,24 +1012,20 @@ mod tests {
                 }
             }
 
-            async fn initialize(
-                command: TallyCommand,
-                _jobs: &JobQueue<Self::Jobs>,
-            ) -> Result<Vec<TallyEvent>, WidgetError> {
+            async fn initialize(command: TallyCommand) -> Result<Decision<Self>, WidgetError> {
                 match command {
-                    TallyCommand::Start => Ok(vec![TallyEvent::Started]),
-                    TallyCommand::Increment => Ok(vec![TallyEvent::Incremented]),
+                    TallyCommand::Start => Ok(Decision::Events(vec![TallyEvent::Started])),
+                    TallyCommand::Increment => Ok(Decision::Events(vec![TallyEvent::Incremented])),
                 }
             }
 
             async fn transition(
                 &self,
                 command: TallyCommand,
-                _jobs: &JobQueue<Self::Jobs>,
-            ) -> Result<Vec<TallyEvent>, WidgetError> {
+            ) -> Result<Decision<Self>, WidgetError> {
                 match command {
-                    TallyCommand::Start => Ok(vec![]),
-                    TallyCommand::Increment => Ok(vec![TallyEvent::Incremented]),
+                    TallyCommand::Start => Ok(Decision::Events(vec![])),
+                    TallyCommand::Increment => Ok(Decision::Events(vec![TallyEvent::Incremented])),
                 }
             }
         }
@@ -1109,24 +1100,26 @@ mod tests {
                 }
             }
 
-            async fn initialize(
-                command: WidgetCommand,
-                _jobs: &JobQueue<Self::Jobs>,
-            ) -> Result<Vec<WidgetEvent>, WidgetError> {
+            async fn initialize(command: WidgetCommand) -> Result<Decision<Self>, WidgetError> {
                 match command {
-                    WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
-                    WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+                    WidgetCommand::Create { name } => {
+                        Ok(Decision::Events(vec![WidgetEvent::Created { name }]))
+                    }
+                    WidgetCommand::Rename { name } => {
+                        Ok(Decision::Events(vec![WidgetEvent::Renamed { name }]))
+                    }
                 }
             }
 
             async fn transition(
                 &self,
                 command: WidgetCommand,
-                _jobs: &JobQueue<Self::Jobs>,
-            ) -> Result<Vec<WidgetEvent>, WidgetError> {
+            ) -> Result<Decision<Self>, WidgetError> {
                 match command {
-                    WidgetCommand::Create { .. } => Ok(vec![]),
-                    WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+                    WidgetCommand::Create { .. } => Ok(Decision::Events(vec![])),
+                    WidgetCommand::Rename { name } => {
+                        Ok(Decision::Events(vec![WidgetEvent::Renamed { name }]))
+                    }
                 }
             }
         }

@@ -31,9 +31,8 @@ use std::collections::BTreeMap;
 use tracing::{debug, info};
 
 use crate::CompactionPolicy;
-use crate::job::JobQueue;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::{DomainEvent, EventSourced, Nil};
+use crate::{Decision, DomainEvent, EventSourced, Nil};
 
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";
@@ -97,24 +96,21 @@ impl EventSourced for SchemaRegistry {
         Ok(Some(new_state))
     }
 
-    async fn initialize(
-        command: Self::Command,
-        _jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+    async fn initialize(command: Self::Command) -> Result<Decision<Self>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
-        Ok(vec![SchemaRegistryEvent::VersionUpdated { name, version }])
+        Ok(Decision::Events(vec![
+            SchemaRegistryEvent::VersionUpdated { name, version },
+        ]))
     }
 
-    async fn transition(
-        &self,
-        command: Self::Command,
-        _jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+    async fn transition(&self, command: Self::Command) -> Result<Decision<Self>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         if self.version_of(&name) == Some(version) {
-            Ok(vec![])
+            Ok(Decision::Events(vec![]))
         } else {
-            Ok(vec![SchemaRegistryEvent::VersionUpdated { name, version }])
+            Ok(Decision::Events(vec![
+                SchemaRegistryEvent::VersionUpdated { name, version },
+            ]))
         }
     }
 }
@@ -512,19 +508,12 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(
-            _command: Self::Command,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<Self::Event>, Never> {
-            Ok(vec![CompactableEvent::Created])
+        async fn initialize(_command: Self::Command) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![CompactableEvent::Created]))
         }
 
-        async fn transition(
-            &self,
-            _command: Self::Command,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<Self::Event>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: Self::Command) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
     }
 

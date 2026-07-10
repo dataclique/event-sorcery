@@ -652,7 +652,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
-    use crate::JobQueue;
+    use crate::Decision;
     use crate::Nil;
     use crate::lifecycle::Never;
 
@@ -696,19 +696,12 @@ mod tests {
             Ok(Some(entity.clone()))
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<TestEvent>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<TestEvent>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
     }
 
@@ -1098,19 +1091,12 @@ mod tests {
             }
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
+            Ok(Decision::Events(vec![]))
         }
     }
 

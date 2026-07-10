@@ -17,10 +17,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::EventSourced;
 use crate::dependency::HasEntity;
-use crate::job::JobQueue;
+use crate::dispatch::JobDispatch;
 use crate::reactor::Reactor;
+use crate::{Decision, EventSourced};
 
 /// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
 ///
@@ -136,8 +136,8 @@ where
     type Command = Entity::Command;
     type Event = Entity::Event;
     type Error = LifecycleError<Entity>;
-    // Handlers receive a typed `JobQueue`, not cqrs-es services, so the
-    // framework-level services are unit; `handle` builds the queue itself.
+    // Handlers return a `Decision` (events or one job dispatch), never call
+    // out through injected services, so the framework-level services are unit.
     type Services = ();
 
     const TYPE: &'static str = Entity::AGGREGATE_TYPE;
@@ -148,13 +148,9 @@ where
         _services: &Self::Services,
         sink: &EventSink<Self>,
     ) -> Result<(), Self::Error> {
-        // Handlers enqueue side-effect jobs onto this typed queue; the queue
-        // buffers into the per-command scope `Store::send` opened, and the event
-        // repository drains it in the same transaction that commits the events.
-        let jobs = JobQueue::<Entity::Jobs>::default();
-        let events = match &*self {
-            Self::Uninitialized => Entity::initialize(command, &jobs).await,
-            Self::Live(entity) => entity.transition(command, &jobs).await,
+        let decision = match &*self {
+            Self::Uninitialized => Entity::initialize(command).await,
+            Self::Live(entity) => entity.transition(command).await,
             Self::Failed { error, .. } => {
                 warn!(
                     target: "cqrs",
@@ -174,6 +170,19 @@ where
             );
         })
         .map_err(LifecycleError::Apply)?;
+
+        // A dispatch is the framework's to enact: buffer the enqueue onto the
+        // per-command scope `Store::send` opened (the event repository drains
+        // it in the same transaction that commits the events) and emit the
+        // machine-built `Dispatched` event. The handler never touches either.
+        let events = match decision {
+            Decision::Events(events) => events,
+            Decision::Dispatch(dispatch) => {
+                let JobDispatch { event, pending } = dispatch;
+                crate::job::buffer(pending);
+                vec![event]
+            }
+        };
 
         if events.is_empty() {
             return Ok(());
@@ -430,31 +439,31 @@ mod tests {
             }
         }
 
-        async fn initialize(
-            command: CounterCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, CounterError> {
+        async fn initialize(command: CounterCommand) -> Result<Decision<Self>, CounterError> {
             use CounterCommand::*;
             match command {
-                Create { initial } => Ok(vec![CounterEvent::Created { initial }]),
-                Increment => Ok(vec![CounterEvent::Incremented]),
+                Create { initial } => Ok(Decision::Events(vec![CounterEvent::Created { initial }])),
+                Increment => Ok(Decision::Events(vec![CounterEvent::Incremented])),
                 Fail => Err(CounterError),
-                BrokenBatch => Ok(vec![CounterEvent::Incremented, CounterEvent::Incremented]),
+                BrokenBatch => Ok(Decision::Events(vec![
+                    CounterEvent::Incremented,
+                    CounterEvent::Incremented,
+                ])),
             }
         }
 
         async fn transition(
             &self,
             command: CounterCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, CounterError> {
+        ) -> Result<Decision<Self>, CounterError> {
             match command {
-                CounterCommand::Create { .. } => Ok(vec![]),
-                CounterCommand::Increment => Ok(vec![CounterEvent::Incremented]),
+                CounterCommand::Create { .. } => Ok(Decision::Events(vec![])),
+                CounterCommand::Increment => Ok(Decision::Events(vec![CounterEvent::Incremented])),
                 CounterCommand::Fail => Err(CounterError),
-                CounterCommand::BrokenBatch => {
-                    Ok(vec![CounterEvent::Invalid, CounterEvent::Incremented])
-                }
+                CounterCommand::BrokenBatch => Ok(Decision::Events(vec![
+                    CounterEvent::Invalid,
+                    CounterEvent::Incremented,
+                ])),
             }
         }
     }

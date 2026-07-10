@@ -76,12 +76,14 @@ mod tests {
             .send(
                 &order,
                 OrderCommand::Place {
+                    order,
                     item: widgets(),
                     quantity: 1,
                 },
             )
             .await
             .unwrap();
+        settle_confirmation(&store, order).await;
         store.send(&order, OrderCommand::Fill).await.unwrap();
 
         let entries = log.entries().await;
@@ -89,6 +91,7 @@ mod tests {
             entries,
             vec![
                 "O-0007: OrderEvent::Placed".to_string(),
+                "O-0007: OrderEvent::ConfirmationSent".to_string(),
                 "O-0007: OrderEvent::Filled".to_string(),
             ]
         );
@@ -111,12 +114,14 @@ mod tests {
             .send(
                 &order,
                 OrderCommand::Place {
+                    order,
                     item: widgets(),
                     quantity: 3,
                 },
             )
             .await
             .unwrap();
+        settle_confirmation(&store, order).await;
         store.send(&order, OrderCommand::Fill).await.unwrap();
 
         let captured = spy.events().await;
@@ -124,6 +129,31 @@ mod tests {
             .iter()
             .map(|(_, event)| event.event_type())
             .collect();
-        assert_eq!(kinds, vec!["OrderEvent::Placed", "OrderEvent::Filled"]);
+        assert_eq!(
+            kinds,
+            vec![
+                "OrderEvent::Placed",
+                "OrderEvent::ConfirmationSent",
+                "OrderEvent::Filled"
+            ]
+        );
+    }
+
+    /// Simulate the framework delivering the confirmation verdict so `Fill`
+    /// is allowed (the worker path is exercised in `main` and store tests).
+    async fn settle_confirmation(store: &event_sorcery::Store<Order>, order: OrderId) {
+        let placed = store.load(&order).await.unwrap().unwrap();
+        let event_sorcery::DispatchedJob::InFlight { job_id } = placed.confirmation else {
+            panic!("expected the confirmation in flight");
+        };
+        store
+            .send(
+                &order,
+                OrderCommand::Confirmation(
+                    event_sorcery::DispatchOutcome::simulated_confirmed(job_id, (), 1),
+                ),
+            )
+            .await
+            .unwrap();
     }
 }
