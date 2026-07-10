@@ -128,8 +128,8 @@ pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseR
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use operation::{
-    Operation, OperationCommand, OperationEvent, OperationFailure, OperationJob, OperationRefused,
-    OperationReplay, Reconciliation,
+    Operation, OperationCommand, OperationEvent, OperationFailure, OperationInput, OperationJob,
+    OperationRefused, OperationReplay, OriginDeliveryError, OriginPort, Reconciliation,
 };
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::Reactor;

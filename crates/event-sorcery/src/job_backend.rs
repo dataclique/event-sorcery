@@ -192,7 +192,11 @@ impl<J: Job, Backend: EventBackend> EventStoreBackend<J, Backend> {
 /// Decodes a won claim into an apalis task, or `None` if the stored args no
 /// longer deserialize into `J` or the view id is not a valid [`JobId`] (a
 /// poison row the worker skips).
-fn build_task<J: Job>(view_id: String, won: WonClaim) -> Option<Task<J, JobContext, String>> {
+fn build_task<J: Job>(
+    view_id: String,
+    won: WonClaim,
+    max_attempts: u32,
+) -> Option<Task<J, JobContext, String>> {
     let job_id: JobId = match view_id.parse() {
         Ok(job_id) => job_id,
         Err(error) => {
@@ -214,6 +218,7 @@ fn build_task<J: Job>(view_id: String, won: WonClaim) -> Option<Task<J, JobConte
             claim_seq: won.claim_seq,
             claim_id: won.claim_id,
             attempt: won.attempt,
+            max_attempts,
         },
     );
     task.parts.task_id = Some(TaskId::new(view_id));
@@ -296,7 +301,9 @@ impl<J: Job, Backend: EventBackend> ApalisBackend for EventStoreBackend<J, Backe
             for job_id in candidates {
                 match backend.claim_one(&job_id, now_ms).await {
                     Ok(ClaimOutcome::Won(won)) => {
-                        if let Some(task) = build_task::<J>(job_id, won) {
+                        if let Some(task) =
+                            build_task::<J>(job_id, won, backend.config.max_attempts)
+                        {
                             return Some((Ok(Some(task)), backend));
                         }
                     }
@@ -597,7 +604,7 @@ fn ack_plan<J: Job>(result: &Result<JobOutcome<J::Output>, BoxDynError>) -> AckP
     }
 }
 
-fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {
@@ -946,7 +953,7 @@ mod tests {
         let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
             panic!("expected to win the claim");
         };
-        let task = build_task::<TestJob>(job_id.to_string(), won).expect("payload decodes");
+        let task = build_task::<TestJob>(job_id.to_string(), won, 5).expect("payload decodes");
 
         // The context the handler extracts carries the claimed job's durable
         // identity: the stable job id and a zero attempt on the first run.
@@ -969,7 +976,8 @@ mod tests {
         let ClaimOutcome::Won(rewon) = claim(&backend, &job_id, "w2", retry_ms, 50).await else {
             panic!("expected to win the retry claim");
         };
-        let retry_task = build_task::<TestJob>(job_id.to_string(), rewon).expect("payload decodes");
+        let retry_task =
+            build_task::<TestJob>(job_id.to_string(), rewon, 5).expect("payload decodes");
         let retry_ctx = JobContext::from_request(&retry_task).await.unwrap();
         assert_eq!(retry_ctx.job_id(), job_id);
         assert_eq!(retry_ctx.attempt(), 1);
@@ -1045,6 +1053,7 @@ mod tests {
             claim_seq: won.claim_seq,
             claim_id: won.claim_id,
             attempt: won.attempt,
+            max_attempts: 5,
         };
 
         // A terminal failure on the FIRST attempt (max_attempts = 5) must kill
@@ -1175,6 +1184,7 @@ mod tests {
             claim_seq: won.claim_seq,
             claim_id: won.claim_id,
             attempt: won.attempt,
+            max_attempts: 5,
         };
 
         ack(

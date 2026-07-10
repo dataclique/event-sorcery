@@ -124,6 +124,10 @@ pub struct JobContext {
     pub(crate) claim_id: ClaimId,
     /// Recorded failures so far (0 on first run), from the fold.
     pub(crate) attempt: u32,
+    /// The worker's retry budget ([`crate::JobWorkerConfig::max_attempts`]),
+    /// captured at claim time; 0 when unknown (a context built outside a
+    /// worker).
+    pub(crate) max_attempts: u32,
 }
 
 impl JobContext {
@@ -152,6 +156,13 @@ impl JobContext {
     pub fn is_first_execution(&self) -> bool {
         const FIRST_CLAIM_SEQ: i64 = 2;
         self.claim_seq == FIRST_CLAIM_SEQ
+    }
+
+    /// Whether a failure recorded for this run would exhaust the retry budget,
+    /// so the worker dead-letters instead of rescheduling. `false` when the
+    /// budget is unknown (a context built outside a worker).
+    pub fn is_final_attempt(&self) -> bool {
+        self.max_attempts > 0 && self.attempt + 1 >= self.max_attempts
     }
 }
 

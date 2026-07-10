@@ -15,16 +15,21 @@
 //! [`reconcile`](OperationJob::reconcile), so a follow-up can never blindly
 //! resubmit a call whose fate is unknown.
 
+use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
+use tracing::{error, warn};
 
-use crate::EventSourced;
 use crate::job::{
     Contains, DeadReason, Job, JobContext, JobFailure, JobId, JobList, JobOutcome, JobQueue, Label,
 };
+use crate::job_backend::error_chain;
+use crate::job_store::EventBackend;
+use crate::{EventSourced, Store};
 
 /// A durable job that drives one entity-scoped operation (ADR-0008).
 ///
@@ -119,16 +124,87 @@ pub enum Reconciliation<Output> {
     Indeterminate(Duration),
 }
 
+/// How settled outcomes reach the origin entity.
+///
+/// Object-safe so the worker input stays backend-agnostic; [`Store`]
+/// implements it whenever the origin's command enum absorbs
+/// [`OperationCommand<J>`] via `From`.
+#[async_trait]
+pub trait OriginPort<J: OperationJob>: Send + Sync {
+    /// Deliver a settled outcome as a command on the origin entity.
+    async fn deliver(
+        &self,
+        id: &<J::Origin as EventSourced>::Id,
+        command: OperationCommand<J>,
+    ) -> Result<(), OriginDeliveryError>;
+}
+
+/// Delivering a settled outcome to the origin entity failed. The worker defers
+/// and retries -- delivery failures never count as operation attempts, because
+/// the operation itself already settled.
+#[derive(Debug, thiserror::Error)]
+#[error("outcome delivery to the origin entity failed")]
+pub struct OriginDeliveryError(#[source] Box<dyn std::error::Error + Send + Sync>);
+
+#[async_trait]
+impl<J, Backend> OriginPort<J> for Store<J::Origin, Backend>
+where
+    J: OperationJob,
+    Backend: EventBackend,
+    <J::Origin as EventSourced>::Command: From<OperationCommand<J>>,
+    <J::Origin as EventSourced>::Event: Clone + Debug + Serialize + DeserializeOwned + Send + Sync,
+{
+    async fn deliver(
+        &self,
+        id: &<J::Origin as EventSourced>::Id,
+        command: OperationCommand<J>,
+    ) -> Result<(), OriginDeliveryError> {
+        self.send(id, command.into())
+            .await
+            .map_err(|send_error| OriginDeliveryError(Box::new(send_error)))
+    }
+}
+
+/// Worker-side dependency bundle for an [`OperationJob`]: the consumer's input
+/// plus the port outcomes are delivered through.
+///
+/// Register it as the job's input in `build_supervised_worker!`:
+/// `PlaceHedge => OperationInput::new(hedge_deps, order_store.clone())`.
+pub struct OperationInput<J: OperationJob> {
+    input: J::Input,
+    origin: Arc<dyn OriginPort<J>>,
+}
+
+impl<J: OperationJob> OperationInput<J> {
+    /// Bundles the job's dependencies with the origin entity's delivery port
+    /// (usually the origin's `Arc<Store>`).
+    pub fn new<Port: OriginPort<J> + 'static>(input: J::Input, origin: Arc<Port>) -> Self {
+        Self {
+            input,
+            origin: origin as Arc<dyn OriginPort<J>>,
+        }
+    }
+}
+
+/// How long the worker snoozes before retrying a failed outcome delivery.
+/// Delivery retries ride [`JobOutcome::Defer`], so they never count attempts.
+const DELIVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Every [`OperationJob`] is a [`Job`] whose execution is the submit/reconcile
-/// routing (ADR-0008): the first execution runs
-/// [`submit`](OperationJob::submit); every later one runs
-/// [`reconcile`](OperationJob::reconcile) first and only re-submits on an
-/// explicit [`Reconciliation::NotSubmitted`]. This is what lets an operation
-/// job ride the whole durable-job machinery (typed enqueue, claims, leases,
-/// retry, defer, dead-letter) without implementing `perform`.
+/// routing plus outcome feed-back (ADR-0008).
+///
+/// The first execution runs [`submit`](OperationJob::submit); every later one
+/// runs [`reconcile`](OperationJob::reconcile) first and only re-submits on an
+/// explicit [`Reconciliation::NotSubmitted`]. A settled outcome is delivered to
+/// the origin entity BEFORE the job acks: failed delivery defers the job (no
+/// attempt counted -- the operation itself settled), so the verdict is
+/// re-derived and re-delivered until the origin accepts it, and duplicates are
+/// absorbed by the [`Operation`] state guard. A transient failure that exhausts
+/// the retry budget best-effort delivers `Failed(DeadLettered)` before the
+/// worker dead-letters, so the origin does not dangle in flight.
 impl<J: OperationJob> Job for J {
-    type Input = J::Input;
-    type Output = J::Output;
+    type Input = OperationInput<J>;
+    type Output = ();
     type Error = J::Error;
 
     const WORKER_NAME: &'static str = <J as OperationJob>::WORKER_NAME;
@@ -141,15 +217,81 @@ impl<J: OperationJob> Job for J {
     async fn perform(
         &self,
         ctx: &JobContext,
-        input: &Self::Input,
-    ) -> Result<JobOutcome<Self::Output>, JobFailure<Self::Error>> {
-        if ctx.is_first_execution() {
-            return self.submit(ctx, input).await;
-        }
-        match self.reconcile(ctx, input).await? {
-            Reconciliation::Settled(output) => Ok(JobOutcome::Done(output)),
-            Reconciliation::Indeterminate(delay) => Ok(JobOutcome::Defer(delay)),
-            Reconciliation::NotSubmitted => self.submit(ctx, input).await,
+        wrapped: &OperationInput<J>,
+    ) -> Result<JobOutcome<()>, JobFailure<J::Error>> {
+        let outcome = if ctx.is_first_execution() {
+            self.submit(ctx, &wrapped.input).await
+        } else {
+            match self.reconcile(ctx, &wrapped.input).await {
+                Ok(Reconciliation::Settled(output)) => Ok(JobOutcome::Done(output)),
+                Ok(Reconciliation::Indeterminate(delay)) => return Ok(JobOutcome::Defer(delay)),
+                Ok(Reconciliation::NotSubmitted) => self.submit(ctx, &wrapped.input).await,
+                Err(failure) => Err(failure),
+            }
+        };
+
+        let attempts = ctx.attempt() + 1;
+        match outcome {
+            Ok(JobOutcome::Done(output)) => {
+                let confirm = OperationCommand::Confirm {
+                    job_id: ctx.job_id(),
+                    output,
+                    attempts,
+                };
+                match wrapped.origin.deliver(&self.origin_id(), confirm).await {
+                    Ok(()) => Ok(JobOutcome::Done(())),
+                    Err(delivery_error) => {
+                        warn!(
+                            target: "cqrs", ?delivery_error, job_id = %ctx.job_id(),
+                            "confirmed operation outcome could not be delivered; deferring"
+                        );
+                        Ok(JobOutcome::Defer(DELIVERY_RETRY_DELAY))
+                    }
+                }
+            }
+            Ok(JobOutcome::Defer(delay)) => Ok(JobOutcome::Defer(delay)),
+            Err(JobFailure::Terminal(domain_error)) => {
+                let fail = OperationCommand::Fail {
+                    job_id: ctx.job_id(),
+                    failure: OperationFailure::Rejected(domain_error.clone()),
+                    attempts,
+                };
+                match wrapped.origin.deliver(&self.origin_id(), fail).await {
+                    Ok(()) => Err(JobFailure::Terminal(domain_error)),
+                    Err(delivery_error) => {
+                        warn!(
+                            target: "cqrs", ?delivery_error, job_id = %ctx.job_id(),
+                            "terminal operation outcome could not be delivered; deferring"
+                        );
+                        Ok(JobOutcome::Defer(DELIVERY_RETRY_DELAY))
+                    }
+                }
+            }
+            Err(JobFailure::Transient(domain_error)) => {
+                if ctx.is_final_attempt() {
+                    // The worker will dead-letter this job; tell the origin so
+                    // its operation does not dangle in flight. Best effort: a
+                    // failed delivery here is logged loudly for the operator.
+                    let fail = OperationCommand::Fail {
+                        job_id: ctx.job_id(),
+                        failure: OperationFailure::DeadLettered {
+                            reason: DeadReason::RetriesExhausted,
+                            detail: error_chain(&domain_error),
+                        },
+                        attempts,
+                    };
+                    if let Err(delivery_error) =
+                        wrapped.origin.deliver(&self.origin_id(), fail).await
+                    {
+                        error!(
+                            target: "cqrs", ?delivery_error, job_id = %ctx.job_id(),
+                            "OPERATION DANGLING: job dead-letters but the origin \
+                             entity could not be told; operator intervention needed"
+                        );
+                    }
+                }
+                Err(JobFailure::Transient(domain_error))
+            }
         }
     }
 }
@@ -727,15 +869,23 @@ mod tests {
         Indeterminate,
     }
 
-    /// Records which methods ran (via its `Input`) and reconciles with a
-    /// configured verdict, so routing is observable.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    enum ProbeSubmit {
+        Succeed,
+        RejectTerminal,
+        FailTransient,
+    }
+
+    /// Records which methods ran (via its `Input`), submits and reconciles with
+    /// configured behavior, so routing and delivery are observable.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct ProbeJob {
+        submit: ProbeSubmit,
         verdict: ProbeVerdict,
     }
 
     impl OperationJob for ProbeJob {
-        type Input = std::sync::Mutex<Vec<&'static str>>;
+        type Input = Arc<std::sync::Mutex<Vec<&'static str>>>;
         type Output = String;
         type Error = OrderRejected;
         type Origin = Desk;
@@ -757,7 +907,15 @@ mod tests {
             input: &Self::Input,
         ) -> Result<JobOutcome<String>, JobFailure<OrderRejected>> {
             input.lock().unwrap().push("submit");
-            Ok(JobOutcome::Done("submitted".to_string()))
+            match self.submit {
+                ProbeSubmit::Succeed => Ok(JobOutcome::Done("submitted".to_string())),
+                ProbeSubmit::RejectTerminal => Err(JobFailure::Terminal(OrderRejected {
+                    reason: "no funds".to_string(),
+                })),
+                ProbeSubmit::FailTransient => Err(JobFailure::Transient(OrderRejected {
+                    reason: "timeout".to_string(),
+                })),
+            }
         }
 
         async fn reconcile(
@@ -776,6 +934,45 @@ mod tests {
         }
     }
 
+    /// Test [`OriginPort`]: records deliveries, optionally failing them.
+    #[derive(Default)]
+    struct RecordingPort {
+        delivered: std::sync::Mutex<Vec<(u64, OperationCommand<ProbeJob>)>>,
+        unavailable: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl OriginPort<ProbeJob> for RecordingPort {
+        async fn deliver(
+            &self,
+            id: &u64,
+            command: OperationCommand<ProbeJob>,
+        ) -> Result<(), OriginDeliveryError> {
+            if self.unavailable.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(OriginDeliveryError("origin unavailable".into()));
+            }
+            self.delivered.lock().unwrap().push((*id, command));
+            Ok(())
+        }
+    }
+
+    struct ProbeRun {
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        port: Arc<RecordingPort>,
+        input: OperationInput<ProbeJob>,
+    }
+
+    fn probe_run() -> ProbeRun {
+        let calls = Arc::new(std::sync::Mutex::new(vec![]));
+        let port = Arc::new(RecordingPort::default());
+        let input = OperationInput::new(calls.clone(), port.clone());
+        ProbeRun { calls, port, input }
+    }
+
+    fn probe(submit: ProbeSubmit, verdict: ProbeVerdict) -> ProbeJob {
+        ProbeJob { submit, verdict }
+    }
+
     fn ctx_with_claim_seq(claim_seq: i64) -> JobContext {
         JobContext {
             claim_seq,
@@ -784,63 +981,156 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_execution_routes_to_submit() {
-        let calls = std::sync::Mutex::new(vec![]);
-        let job = ProbeJob {
-            verdict: ProbeVerdict::Settled,
-        };
+    async fn first_execution_routes_to_submit_and_delivers_confirm() {
+        let run = probe_run();
+        let job = probe(ProbeSubmit::Succeed, ProbeVerdict::Settled);
+        let ctx = ctx_with_claim_seq(2);
 
-        let outcome = Job::perform(&job, &ctx_with_claim_seq(2), &calls)
-            .await
-            .unwrap();
+        let outcome = Job::perform(&job, &ctx, &run.input).await.unwrap();
 
-        assert_eq!(*calls.lock().unwrap(), ["submit"]);
-        assert!(matches!(outcome, JobOutcome::Done(output) if output == "submitted"));
+        assert_eq!(*run.calls.lock().unwrap(), ["submit"]);
+        assert!(matches!(outcome, JobOutcome::Done(())));
+        assert_eq!(
+            *run.port.delivered.lock().unwrap(),
+            vec![(
+                1,
+                OperationCommand::Confirm {
+                    job_id: ctx.job_id(),
+                    output: "submitted".to_string(),
+                    attempts: 1,
+                }
+            )]
+        );
     }
 
     #[tokio::test]
-    async fn later_execution_routes_to_reconcile() {
-        let calls = std::sync::Mutex::new(vec![]);
-        let job = ProbeJob {
-            verdict: ProbeVerdict::Settled,
-        };
+    async fn later_execution_routes_to_reconcile_and_delivers_its_verdict() {
+        let run = probe_run();
+        let job = probe(ProbeSubmit::Succeed, ProbeVerdict::Settled);
 
-        let outcome = Job::perform(&job, &ctx_with_claim_seq(3), &calls)
+        let outcome = Job::perform(&job, &ctx_with_claim_seq(3), &run.input)
             .await
             .unwrap();
 
-        assert_eq!(*calls.lock().unwrap(), ["reconcile"]);
-        assert!(matches!(outcome, JobOutcome::Done(output) if output == "reconciled"));
+        assert_eq!(*run.calls.lock().unwrap(), ["reconcile"]);
+        assert!(matches!(outcome, JobOutcome::Done(())));
+        assert!(matches!(
+            run.port.delivered.lock().unwrap().as_slice(),
+            [(1, OperationCommand::Confirm { output, .. })] if output == "reconciled"
+        ));
     }
 
     #[tokio::test]
     async fn reconcile_not_submitted_authorizes_a_resubmit() {
-        let calls = std::sync::Mutex::new(vec![]);
-        let job = ProbeJob {
-            verdict: ProbeVerdict::NotSubmitted,
-        };
+        let run = probe_run();
+        let job = probe(ProbeSubmit::Succeed, ProbeVerdict::NotSubmitted);
 
-        let outcome = Job::perform(&job, &ctx_with_claim_seq(4), &calls)
+        let outcome = Job::perform(&job, &ctx_with_claim_seq(4), &run.input)
             .await
             .unwrap();
 
-        assert_eq!(*calls.lock().unwrap(), ["reconcile", "submit"]);
-        assert!(matches!(outcome, JobOutcome::Done(output) if output == "submitted"));
+        assert_eq!(*run.calls.lock().unwrap(), ["reconcile", "submit"]);
+        assert!(matches!(outcome, JobOutcome::Done(())));
     }
 
     #[tokio::test]
-    async fn reconcile_indeterminate_defers_without_submitting() {
-        let calls = std::sync::Mutex::new(vec![]);
-        let job = ProbeJob {
-            verdict: ProbeVerdict::Indeterminate,
-        };
+    async fn reconcile_indeterminate_defers_without_submitting_or_delivering() {
+        let run = probe_run();
+        let job = probe(ProbeSubmit::Succeed, ProbeVerdict::Indeterminate);
 
-        let outcome = Job::perform(&job, &ctx_with_claim_seq(3), &calls)
+        let outcome = Job::perform(&job, &ctx_with_claim_seq(3), &run.input)
             .await
             .unwrap();
 
-        assert_eq!(*calls.lock().unwrap(), ["reconcile"]);
+        assert_eq!(*run.calls.lock().unwrap(), ["reconcile"]);
         assert!(matches!(outcome, JobOutcome::Defer(_)));
+        assert!(run.port.delivered.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_delivers_fail_before_dead_lettering() {
+        let run = probe_run();
+        let job = probe(ProbeSubmit::RejectTerminal, ProbeVerdict::Settled);
+        let ctx = ctx_with_claim_seq(2);
+
+        let failure = Job::perform(&job, &ctx, &run.input).await.unwrap_err();
+
+        assert!(matches!(failure, JobFailure::Terminal(_)));
+        assert_eq!(
+            *run.port.delivered.lock().unwrap(),
+            vec![(
+                1,
+                OperationCommand::Fail {
+                    job_id: ctx.job_id(),
+                    failure: OperationFailure::Rejected(OrderRejected {
+                        reason: "no funds".to_string(),
+                    }),
+                    attempts: 1,
+                }
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_defers_instead_of_counting_an_attempt() {
+        let run = probe_run();
+        run.port
+            .unavailable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let job = probe(ProbeSubmit::Succeed, ProbeVerdict::Settled);
+
+        let outcome = Job::perform(&job, &ctx_with_claim_seq(2), &run.input)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, JobOutcome::Defer(_)));
+    }
+
+    #[tokio::test]
+    async fn final_transient_attempt_delivers_the_dead_letter_verdict() {
+        let run = probe_run();
+        let job = probe(ProbeSubmit::FailTransient, ProbeVerdict::NotSubmitted);
+        let ctx = JobContext {
+            claim_seq: 9,
+            attempt: 4,
+            max_attempts: 5,
+            ..JobContext::default()
+        };
+
+        let failure = Job::perform(&job, &ctx, &run.input).await.unwrap_err();
+
+        assert!(matches!(failure, JobFailure::Transient(_)));
+        assert!(matches!(
+            run.port.delivered.lock().unwrap().as_slice(),
+            [(
+                1,
+                OperationCommand::Fail {
+                    failure: OperationFailure::DeadLettered {
+                        reason: DeadReason::RetriesExhausted,
+                        ..
+                    },
+                    attempts: 5,
+                    ..
+                }
+            )]
+        ));
+    }
+
+    #[tokio::test]
+    async fn nonfinal_transient_attempt_delivers_nothing() {
+        let run = probe_run();
+        let job = probe(ProbeSubmit::FailTransient, ProbeVerdict::NotSubmitted);
+        let ctx = JobContext {
+            claim_seq: 9,
+            attempt: 1,
+            max_attempts: 5,
+            ..JobContext::default()
+        };
+
+        let failure = Job::perform(&job, &ctx, &run.input).await.unwrap_err();
+
+        assert!(matches!(failure, JobFailure::Transient(_)));
+        assert!(run.port.delivered.lock().unwrap().is_empty());
     }
 
     #[test]
