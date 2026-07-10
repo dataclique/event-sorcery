@@ -326,6 +326,7 @@ where
                 envelope.payload.clone(),
             );
 
+            // WIP: RAI-1317 -- wrap react() in retry-on-busy (SQLITE_BUSY / BUSY_SNAPSHOT).
             if let Err(error) = self.reactor.react(injected).await {
                 error!(
                     target: "cqrs",
