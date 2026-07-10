@@ -89,7 +89,7 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
 /// Stable across every retry and re-claim of the job, so it is the correct
 /// root for external-boundary idempotency keys. Converted to a string only at
 /// the storage boundary (the job's aggregate id and `job_queue` view id).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobId(Ulid);
 
 impl JobId {
@@ -138,6 +138,20 @@ impl JobContext {
     /// `n` after `n` failed attempts. Deferred runs do not advance it.
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    /// Whether this run is the job's FIRST execution ever -- no earlier run can
+    /// have reached an external system.
+    ///
+    /// Derived from the durable event stream: the first claim is always the
+    /// event after `Enqueued`, and every later run (retry, defer, lease-expired
+    /// reclaim) claims at a higher sequence because the first `Claimed` event is
+    /// permanent. This over-approximates submissions in the safe direction: a
+    /// crash after the claim but before the external call still reports `false`
+    /// on the next run.
+    pub fn is_first_execution(&self) -> bool {
+        const FIRST_CLAIM_SEQ: i64 = 2;
+        self.claim_seq == FIRST_CLAIM_SEQ
     }
 }
 
@@ -227,7 +241,7 @@ impl ClaimId {
 
 /// Why a job was dead-lettered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum DeadReason {
+pub enum DeadReason {
     /// Every retry attempt failed.
     RetriesExhausted,
     /// The job failed with [`JobFailure::Terminal`] -- a definitive rejection
@@ -743,6 +757,7 @@ pub(crate) fn pending_seed_payload(request: &EnqueueRequest) -> Result<String, J
 
 /// A job buffered by a handler, awaiting flush at the next commit.
 struct PendingPush {
+    job_id: JobId,
     job: Box<dyn ErasedJob>,
     delay: Option<Duration>,
 }
@@ -831,29 +846,37 @@ impl<Jobs: JobList> Default for JobQueue<Jobs> {
 
 impl<Jobs: JobList> JobQueue<Jobs> {
     /// Enqueues a job (which must be declared in `Jobs`) to run as soon as the
-    /// triggering events commit.
-    pub fn push<J, Index>(&self, job: J)
+    /// triggering events commit. Returns the new job's [`JobId`], minted here so
+    /// the handler can record it in the events it emits (correlation, audit,
+    /// idempotency-key derivation).
+    pub fn push<J, Index>(&self, job: J) -> JobId
     where
         J: Job,
         Jobs: Contains<J, Index>,
     {
+        let job_id = JobId::new();
         buffer(PendingPush {
+            job_id,
             job: Box::new(job),
             delay: None,
         });
+        job_id
     }
 
     /// Enqueues a job (which must be declared in `Jobs`) to run no sooner than
-    /// `delay` after the events commit.
-    pub fn push_with_delay<J, Index>(&self, job: J, delay: Duration)
+    /// `delay` after the events commit. Returns the new job's [`JobId`].
+    pub fn push_with_delay<J, Index>(&self, job: J, delay: Duration) -> JobId
     where
         J: Job,
         Jobs: Contains<J, Index>,
     {
+        let job_id = JobId::new();
         buffer(PendingPush {
+            job_id,
             job: Box::new(job),
             delay: Some(delay),
         });
+        job_id
     }
 }
 
@@ -888,9 +911,9 @@ fn buffer(push: PendingPush) {
     }
 }
 
-/// Drains the per-command pending-job buffer into [`EnqueueRequest`]s (each with
-/// a fresh ULID id and a resolved `run_at`). A no-op when no buffer scope is
-/// active or it is empty.
+/// Drains the per-command pending-job buffer into [`EnqueueRequest`]s (each
+/// keeping the [`JobId`] minted at push time, with a resolved `run_at`). A no-op
+/// when no buffer scope is active or it is empty.
 pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
     let pending = PENDING_JOBS
         .try_with(|buffer| buffer.borrow_mut().drain(..).collect::<Vec<_>>())
@@ -900,7 +923,7 @@ pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
         .into_iter()
         .map(|push| {
             Ok(EnqueueRequest {
-                job_id: JobId::new(),
+                job_id: push.job_id,
                 kind: push.job.kind(),
                 payload: push.job.encode()?,
                 run_at_ms: resolve_run_at_ms(push.delay)?,

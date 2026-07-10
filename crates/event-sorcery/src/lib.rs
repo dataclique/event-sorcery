@@ -89,6 +89,7 @@ mod job_backend;
 mod job_sqlite;
 mod job_store;
 mod lifecycle;
+mod operation;
 mod projection;
 mod reactor;
 mod schema_registry;
@@ -116,7 +117,7 @@ pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 pub use job::{
-    Contains, Here, Job, JobContext, JobFailure, JobId, JobList, JobOutcome, JobQueue,
+    Contains, DeadReason, Here, Job, JobContext, JobFailure, JobId, JobList, JobOutcome, JobQueue,
     JobStoreError, Label, There,
 };
 pub use job_backend::{
@@ -126,6 +127,10 @@ pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
+pub use operation::{
+    Operation, OperationCommand, OperationEvent, OperationFailure, OperationJob, OperationRefused,
+    OperationReplay, Reconciliation,
+};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::Reactor;
 pub use schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry};
