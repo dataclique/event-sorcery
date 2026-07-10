@@ -20,7 +20,7 @@ use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
 use event_sorcery::{
-    CompactionPolicy, EventSourced, Job, JobContext, JobOutcome, JobQueue, Label, Nil,
+    CompactionPolicy, EventSourced, Job, JobContext, JobFailure, JobOutcome, JobQueue, Label, Nil,
 };
 
 use crate::inventory::Sku;
@@ -139,7 +139,7 @@ impl Job for SendOrderConfirmation {
         &self,
         _ctx: &JobContext,
         _input: &Confirmer,
-    ) -> Result<JobOutcome<()>, Self::Error> {
+    ) -> Result<JobOutcome<()>, JobFailure<Self::Error>> {
         println!(
             "  [worker] sent confirmation for {} x{}",
             self.item, self.quantity

@@ -39,8 +39,9 @@ use tracing::{error, warn};
 use sqlite_es::{Cmp, Order, Predicate, Term, Value};
 
 use crate::job::{
-    DeadReason, Job, JobCommand, JobContext, JobError, JobId, JobOutcome, JobState, JobStoreError,
-    WonClaim, WorkerId, enqueue_request, enqueued_event, pending_seed_payload, plan_claim,
+    DeadReason, Job, JobCommand, JobContext, JobError, JobFailure, JobId, JobOutcome, JobState,
+    JobStoreError, WonClaim, WorkerId, enqueue_request, enqueued_event, pending_seed_payload,
+    plan_claim,
 };
 use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
@@ -228,7 +229,7 @@ pub async fn run_job<J: Job>(
     job: J,
     ctx: JobContext,
     input: Data<Arc<J::Input>>,
-) -> Result<JobOutcome<J::Output>, J::Error> {
+) -> Result<JobOutcome<J::Output>, JobFailure<J::Error>> {
     job.perform(&ctx, &input).await
 }
 
@@ -551,11 +552,7 @@ where
                     )
                     .into()),
                 };
-            let plan = match &result {
-                Ok(JobOutcome::Done(_)) => AckPlan::Succeeded,
-                Ok(JobOutcome::Defer(delay)) => AckPlan::Deferred(*delay),
-                Err(error) => AckPlan::Failed(error_chain(&**error)),
-            };
+            let plan = ack_plan::<J>(&result);
 
             if lost.load(Ordering::Relaxed) {
                 warn!(target: "cqrs", job_id = %ctx.job_id, "lease lost during execution; re-claimer owns the outcome");
@@ -578,8 +575,26 @@ enum AckPlan {
     Succeeded,
     /// Deferred (success): re-run after the delay -> `Reschedule`, no attempt.
     Deferred(Duration),
-    /// Failed with this error chain -> `RetrySchedule` or `Kill`.
+    /// Failed transiently with this error chain -> `RetrySchedule` or `Kill`.
     Failed(String),
+    /// Failed terminally ([`JobFailure::Terminal`]) -> immediate `Kill`, no
+    /// retries.
+    Rejected(String),
+}
+
+/// Maps an execution result to its ack, recovering the [`JobFailure`]
+/// classification from the type-erased tower error. An error that is not a
+/// `JobFailure` (the execution timeout, middleware failures) is treated as
+/// transient: only an explicit `Terminal` return skips the retry budget.
+fn ack_plan<J: Job>(result: &Result<JobOutcome<J::Output>, BoxDynError>) -> AckPlan {
+    match result {
+        Ok(JobOutcome::Done(_)) => AckPlan::Succeeded,
+        Ok(JobOutcome::Defer(delay)) => AckPlan::Deferred(*delay),
+        Err(error) => match error.downcast_ref::<JobFailure<J::Error>>() {
+            Some(JobFailure::Terminal(_)) => AckPlan::Rejected(error_chain(&**error)),
+            Some(JobFailure::Transient(_)) | None => AckPlan::Failed(error_chain(&**error)),
+        },
+    }
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -694,6 +709,13 @@ fn ack_command(
                 run_at: clock.now() + lease_delta(delay),
             };
         }
+        AckPlan::Rejected(error_text) => {
+            return JobCommand::Kill {
+                claim_id: ctx.claim_id.clone(),
+                reason: DeadReason::Rejected,
+                error: error_text,
+            };
+        }
         AckPlan::Failed(error_text) => error_text,
     };
     let failed = ctx.attempt + 1;
@@ -806,7 +828,7 @@ mod tests {
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<JobOutcome<()>, std::convert::Infallible> {
+        ) -> Result<JobOutcome<()>, JobFailure<std::convert::Infallible>> {
             Ok(JobOutcome::Done(()))
         }
     }
@@ -951,6 +973,105 @@ mod tests {
         let retry_ctx = JobContext::from_request(&retry_task).await.unwrap();
         assert_eq!(retry_ctx.job_id(), job_id);
         assert_eq!(retry_ctx.attempt(), 1);
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("external system said no")]
+    struct TestPerformError;
+
+    #[derive(Serialize, Deserialize)]
+    struct FallibleJob;
+
+    impl Job for FallibleJob {
+        type Input = ();
+        type Output = ();
+        type Error = TestPerformError;
+
+        const WORKER_NAME: &'static str = "fallible-worker";
+        const KIND: &'static str = "fallible-job";
+
+        fn label(&self) -> Label {
+            Label::new("fallible")
+        }
+
+        async fn perform(
+            &self,
+            _ctx: &JobContext,
+            _input: &(),
+        ) -> Result<JobOutcome<()>, JobFailure<TestPerformError>> {
+            Err(JobFailure::Terminal(TestPerformError))
+        }
+    }
+
+    #[test]
+    fn ack_plan_maps_failure_classification() {
+        let terminal: Result<JobOutcome<()>, BoxDynError> =
+            Err(Box::new(JobFailure::Terminal(TestPerformError)));
+        assert!(matches!(
+            ack_plan::<FallibleJob>(&terminal),
+            AckPlan::Rejected(_)
+        ));
+
+        let transient: Result<JobOutcome<()>, BoxDynError> =
+            Err(Box::new(JobFailure::Transient(TestPerformError)));
+        assert!(matches!(
+            ack_plan::<FallibleJob>(&transient),
+            AckPlan::Failed(_)
+        ));
+
+        // An error that carries no classification (the execution timeout, a
+        // middleware failure) must default to the retry path, never to an
+        // immediate dead-letter.
+        let unclassified: Result<JobOutcome<()>, BoxDynError> = Err("execution timed out".into());
+        assert!(matches!(
+            ack_plan::<FallibleJob>(&unclassified),
+            AckPlan::Failed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_dead_letters_without_retries() {
+        let pool = one_db_pool().await;
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let backend = SqliteBackend::new(pool.clone());
+        let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
+        let now_ms = Utc::now().timestamp_millis() + 1_000;
+
+        let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
+            panic!("expected to win the claim");
+        };
+        let ctx = JobContext {
+            job_id,
+            claim_seq: won.claim_seq,
+            claim_id: won.claim_id,
+            attempt: won.attempt,
+        };
+
+        // A terminal failure on the FIRST attempt (max_attempts = 5) must kill
+        // the job immediately instead of scheduling a retry.
+        ack(
+            &runtime.jobs,
+            &JobWorkerConfig::default(),
+            &Clock::system(),
+            &ctx,
+            AckPlan::Rejected("external system said no".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobDead"]
+        );
+        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("dead"));
+
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM job_queue WHERE view_id = ?1")
+                .bind(job_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(state["Live"]["Dead"]["reason"], "Rejected");
     }
 
     #[tokio::test]

@@ -52,7 +52,7 @@ plumbing.
 ## Decision
 
 Absorb the skeleton into event-sorcery as **entity-scoped durable operations**,
-four composable additions:
+five composable additions:
 
 1. **`Operation<J>` — a library-owned state machine embedded in entity state.**
    `Operation<J: Job>` models
@@ -109,6 +109,24 @@ four composable additions:
    made structural). The terminal `Confirmed`/`Failed` feedback events carry the
    attempt count, so the entity's audit trail records how many tries the
    operation took without the entity tracking it live.
+
+5. **Explicit Transient/Terminal failure classification at the return site.** A
+   failed execution is either worth retrying (timeout, rate limit, connection
+   loss) or a definitive rejection retrying can never fix (validation failure,
+   insufficient funds, permanently rejected order) — and the framework must be
+   told which, explicitly, at every failure return:
+   `perform`/`submit`/`reconcile` fail with
+   `JobFailure::Transient(error) | JobFailure::Terminal(error)`, and
+   `JobFailure` deliberately has NO `From<Error>` impl, so `?` cannot silently
+   classify a failure. Silent conversion ergonomics are exactly how unexpected
+   retries (or missing ones) happen. The worker maps `Transient` to today's
+   backoff/retry path (dead-lettering as `RetriesExhausted` when attempts run
+   out) and `Terminal` to an immediate dead-letter (`DeadReason::Rejected`, no
+   retries) — and, with the feed-back weld, immediate `Failed` delivery to the
+   origin entity. Classification carried by the error type (a `retryability()`
+   method) was rejected: it restores silent `?` flow, and the same error can
+   then be classified only one way globally when the right treatment can differ
+   by call site.
 
 Multi-leg sequencing (bridge leg B starts when leg A confirms) deliberately
 stays consumer code — that ordering _is_ the domain. Each leg becomes one

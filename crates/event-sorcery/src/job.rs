@@ -69,8 +69,9 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     ///
     /// Return [`JobOutcome::Done`] when finished, or [`JobOutcome::Defer`] to
     /// re-run later without counting an attempt (a poll-while-pending or
-    /// external-wait snooze). An `Err` is a failure that counts an attempt and is
-    /// retried/dead-lettered per the worker config.
+    /// external-wait snooze). Failures state their retry class explicitly at
+    /// the return site: [`JobFailure::Transient`] counts an attempt and is
+    /// retried with backoff; [`JobFailure::Terminal`] dead-letters immediately.
     ///
     /// `ctx` carries the job's durable identity: derive external-boundary
     /// idempotency keys from [`JobContext::job_id`] (never from the attempt
@@ -80,7 +81,7 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
         &self,
         ctx: &JobContext,
         input: &Self::Input,
-    ) -> impl Future<Output = Result<JobOutcome<Self::Output>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<JobOutcome<Self::Output>, JobFailure<Self::Error>>> + Send;
 }
 
 /// Identity of a durable job -- a ULID minted at enqueue time.
@@ -152,6 +153,28 @@ pub enum JobOutcome<Output> {
     Defer(Duration),
 }
 
+/// How a failed [`Job::perform`] must be treated -- chosen explicitly at every
+/// failure return (ADR-0008).
+///
+/// There is deliberately NO `From<Error>` impl: `?` cannot silently classify a
+/// failure, because silent conversion ergonomics are exactly how unexpected
+/// retries (or missing ones) happen. Wrap the error at the return site --
+/// `Err(JobFailure::Transient(error))` / `Err(JobFailure::Terminal(error))` --
+/// so every failure site states its retry class.
+#[derive(Debug, thiserror::Error)]
+pub enum JobFailure<PerformError> {
+    /// Worth retrying (timeout, rate limit, connection loss): the worker
+    /// reschedules with backoff, counting an attempt, and dead-letters as
+    /// `RetriesExhausted` once attempts run out.
+    #[error("transient job failure")]
+    Transient(#[source] PerformError),
+    /// A definitive rejection that retrying can never fix (validation failure,
+    /// insufficient funds, permanently rejected order): the worker dead-letters
+    /// immediately -- no retries.
+    #[error("terminal job failure")]
+    Terminal(#[source] PerformError),
+}
+
 /// Human-readable identifier for a job instance, used in logs.
 #[derive(Debug, Clone)]
 pub struct Label(String);
@@ -207,6 +230,9 @@ impl ClaimId {
 pub(crate) enum DeadReason {
     /// Every retry attempt failed.
     RetriesExhausted,
+    /// The job failed with [`JobFailure::Terminal`] -- a definitive rejection
+    /// retrying can never fix, dead-lettered on first occurrence.
+    Rejected,
     /// The stored payload no longer deserializes into the job type.
     Undecodable,
     /// The job was claimed too many times without recording an outcome
@@ -943,7 +969,7 @@ mod tests {
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<JobOutcome<()>, Infallible> {
+        ) -> Result<JobOutcome<()>, JobFailure<Infallible>> {
             Ok(JobOutcome::Done(()))
         }
     }
