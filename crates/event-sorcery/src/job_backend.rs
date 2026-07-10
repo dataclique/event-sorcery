@@ -9,6 +9,7 @@
 //!
 //! Deployment is single-process, multiple in-process workers, one database.
 
+use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,7 @@ use apalis_core::error::BoxDynError;
 use apalis_core::task::Task;
 use apalis_core::task::data::Data;
 use apalis_core::task::task_id::TaskId;
+use apalis_core::task_fn::FromRequest;
 use apalis_core::worker::context::WorkerContext;
 use chrono::{DateTime, TimeDelta, Utc};
 use cqrs_es::AggregateError;
@@ -37,8 +39,9 @@ use tracing::{error, warn};
 use sqlite_es::{Cmp, Order, Predicate, Term, Value};
 
 use crate::job::{
-    ClaimId, DeadReason, Job, JobCommand, JobError, JobOutcome, JobState, JobStoreError, WonClaim,
-    WorkerId, enqueue_request, enqueued_event, pending_seed_payload, plan_claim,
+    DeadReason, Job, JobCommand, JobContext, JobError, JobFailure, JobId, JobOutcome, JobState,
+    JobStoreError, WonClaim, WorkerId, enqueue_request, enqueued_event, pending_seed_payload,
+    plan_claim,
 };
 use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
@@ -77,7 +80,7 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
     /// events. Use that for command-born jobs; use this for everything else. A
     /// standalone enqueue is its own transaction -- NOT atomic with whatever event
     /// or poll prompted it (that has already committed).
-    pub async fn enqueue<J: Job>(&self, job: J) -> Result<String, JobEnqueueError<Backend::Error>> {
+    pub async fn enqueue<J: Job>(&self, job: J) -> Result<JobId, JobEnqueueError<Backend::Error>> {
         self.enqueue_resolved(job, None).await
     }
 
@@ -87,7 +90,7 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
         &self,
         job: J,
         delay: std::time::Duration,
-    ) -> Result<String, JobEnqueueError<Backend::Error>> {
+    ) -> Result<JobId, JobEnqueueError<Backend::Error>> {
         self.enqueue_resolved(job, Some(delay)).await
     }
 
@@ -97,7 +100,7 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
         &self,
         job: J,
         delay: Option<std::time::Duration>,
-    ) -> Result<String, JobEnqueueError<Backend::Error>> {
+    ) -> Result<JobId, JobEnqueueError<Backend::Error>> {
         let request = enqueue_request(&job, delay)?;
         let event = enqueued_event(&request)?;
         let payload = pending_seed_payload(&request)?;
@@ -187,25 +190,33 @@ impl<J: Job, Backend: EventBackend> EventStoreBackend<J, Backend> {
 }
 
 /// Decodes a won claim into an apalis task, or `None` if the stored args no
-/// longer deserialize into `J` (a poison payload the worker skips).
-fn build_task<J: Job>(job_id: String, won: WonClaim) -> Option<Task<J, JobContext, String>> {
+/// longer deserialize into `J` or the view id is not a valid [`JobId`] (a
+/// poison row the worker skips).
+fn build_task<J: Job>(view_id: String, won: WonClaim) -> Option<Task<J, JobContext, String>> {
+    let job_id: JobId = match view_id.parse() {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            error!(target: "cqrs", ?error, view_id, "claimed job has a malformed id; skipping");
+            return None;
+        }
+    };
     let job: J = match serde_json::from_value(won.args) {
         Ok(job) => job,
         Err(error) => {
-            error!(target: "cqrs", ?error, job_id, "claimed job failed to decode; skipping");
+            error!(target: "cqrs", ?error, %job_id, "claimed job failed to decode; skipping");
             return None;
         }
     };
     let mut task = Task::new_with_ctx(
         job,
         JobContext {
-            job_id: job_id.clone(),
+            job_id,
             claim_seq: won.claim_seq,
             claim_id: won.claim_id,
             attempt: won.attempt,
         },
     );
-    task.parts.task_id = Some(TaskId::new(job_id));
+    task.parts.task_id = Some(TaskId::new(view_id));
     Some(task)
 }
 
@@ -216,9 +227,20 @@ fn build_task<J: Job>(job_id: String, won: WonClaim) -> Option<Task<J, JobContex
 /// [`build_supervised_worker!`](crate::build_supervised_worker).
 pub async fn run_job<J: Job>(
     job: J,
+    ctx: JobContext,
     input: Data<Arc<J::Input>>,
-) -> Result<JobOutcome<J::Output>, J::Error> {
-    job.perform(&input).await
+) -> Result<JobOutcome<J::Output>, JobFailure<J::Error>> {
+    job.perform(&ctx, &input).await
+}
+
+/// Extracts the claim-time [`JobContext`] into the task handler, so `perform`
+/// receives the job's durable identity alongside its input.
+impl<Args: Sync> FromRequest<Task<Args, Self, String>> for JobContext {
+    type Error = Infallible;
+
+    async fn from_request(task: &Task<Args, Self, String>) -> Result<Self, Infallible> {
+        Ok(task.parts.ctx.clone())
+    }
 }
 
 impl<J: Job, Backend: EventBackend> ApalisBackend for EventStoreBackend<J, Backend> {
@@ -392,18 +414,6 @@ impl std::fmt::Debug for Clock {
     }
 }
 
-/// Per-task context captured at claim time; the ack reads it from `parts.ctx`.
-#[derive(Clone, Default)]
-pub struct JobContext {
-    job_id: String,
-    /// Sequence of the `Claimed` event this worker appended; the renew keys on it.
-    claim_seq: i64,
-    /// Identity of the claim that produced this run; the ack fences on it.
-    claim_id: ClaimId,
-    /// Recorded failures so far (0 on first run), from the fold.
-    attempt: u32,
-}
-
 fn poll_predicate(kind: &str, now_ms: i64) -> Predicate {
     let kind_eq = || Term {
         column: "kind".to_string(),
@@ -542,11 +552,7 @@ where
                     )
                     .into()),
                 };
-            let plan = match &result {
-                Ok(JobOutcome::Done(_)) => AckPlan::Succeeded,
-                Ok(JobOutcome::Defer(delay)) => AckPlan::Deferred(*delay),
-                Err(error) => AckPlan::Failed(error_chain(&**error)),
-            };
+            let plan = ack_plan::<J>(&result);
 
             if lost.load(Ordering::Relaxed) {
                 warn!(target: "cqrs", job_id = %ctx.job_id, "lease lost during execution; re-claimer owns the outcome");
@@ -569,8 +575,26 @@ enum AckPlan {
     Succeeded,
     /// Deferred (success): re-run after the delay -> `Reschedule`, no attempt.
     Deferred(Duration),
-    /// Failed with this error chain -> `RetrySchedule` or `Kill`.
+    /// Failed transiently with this error chain -> `RetrySchedule` or `Kill`.
     Failed(String),
+    /// Failed terminally ([`JobFailure::Terminal`]) -> immediate `Kill`, no
+    /// retries.
+    Rejected(String),
+}
+
+/// Maps an execution result to its ack, recovering the [`JobFailure`]
+/// classification from the type-erased tower error. An error that is not a
+/// `JobFailure` (the execution timeout, middleware failures) is treated as
+/// transient: only an explicit `Terminal` return skips the retry budget.
+fn ack_plan<J: Job>(result: &Result<JobOutcome<J::Output>, BoxDynError>) -> AckPlan {
+    match result {
+        Ok(JobOutcome::Done(_)) => AckPlan::Succeeded,
+        Ok(JobOutcome::Defer(delay)) => AckPlan::Deferred(*delay),
+        Err(error) => match error.downcast_ref::<JobFailure<J::Error>>() {
+            Some(JobFailure::Terminal(_)) => AckPlan::Rejected(error_chain(&**error)),
+            Some(JobFailure::Transient(_)) | None => AckPlan::Failed(error_chain(&**error)),
+        },
+    }
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
@@ -601,7 +625,7 @@ async fn renew_loop<Backend: EventBackend>(
             () = cancel.cancelled() => break,
             () = sleep(config.renew_interval) => {
                 let new_lease = clock.now() + lease_delta(config.lease_duration);
-                match backend.renew(&ctx.job_id, ctx.claim_seq, new_lease.timestamp_millis()).await {
+                match backend.renew(&ctx.job_id.to_string(), ctx.claim_seq, new_lease.timestamp_millis()).await {
                     Ok(LeaseRenewal::Lost) => {
                         error!(target: "cqrs", job_id = %ctx.job_id, claim_seq = ctx.claim_seq, "lease lost; stopping renewal");
                         lost.store(true, Ordering::Relaxed);
@@ -683,6 +707,13 @@ fn ack_command(
             return JobCommand::Reschedule {
                 claim_id: ctx.claim_id.clone(),
                 run_at: clock.now() + lease_delta(delay),
+            };
+        }
+        AckPlan::Rejected(error_text) => {
+            return JobCommand::Kill {
+                claim_id: ctx.claim_id.clone(),
+                reason: DeadReason::Rejected,
+                error: error_text,
             };
         }
         AckPlan::Failed(error_text) => error_text,
@@ -769,7 +800,6 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use sqlx::SqlitePool;
     use sqlx::sqlite::SqlitePoolOptions;
-    use ulid::Ulid;
 
     use sqlite_es::insert_serialized_events_batch;
 
@@ -794,7 +824,11 @@ mod tests {
             Label::new(format!("test:{}", self.n))
         }
 
-        async fn perform(&self, _input: &()) -> Result<JobOutcome<()>, std::convert::Infallible> {
+        async fn perform(
+            &self,
+            _ctx: &JobContext,
+            _input: &(),
+        ) -> Result<JobOutcome<()>, JobFailure<std::convert::Infallible>> {
             Ok(JobOutcome::Done(()))
         }
     }
@@ -818,9 +852,9 @@ mod tests {
 
     /// Seeds a job exactly as the enqueue flush does: the `Enqueued` event at
     /// sequence 1 plus the seed `job_queue` row (version 1, pending, no lease).
-    async fn enqueue(pool: &SqlitePool, run_at_ms: i64) -> String {
+    async fn enqueue(pool: &SqlitePool, run_at_ms: i64) -> JobId {
         let request = EnqueueRequest {
-            job_id: Ulid::new().to_string(),
+            job_id: JobId::new(),
             kind: JobKind::new(TestJob::KIND),
             payload: serde_json::to_value(TestJob { n: 1 }).unwrap(),
             run_at_ms,
@@ -834,7 +868,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO job_queue (view_id, version, payload, lease_until) VALUES (?1, 1, ?2, NULL)",
         )
-        .bind(&request.job_id)
+        .bind(request.job_id.to_string())
         .bind(&payload)
         .execute(&mut *connection)
         .await
@@ -844,34 +878,35 @@ mod tests {
 
     async fn claim(
         backend: &SqliteBackend,
-        job_id: &str,
+        job_id: &JobId,
         worker: &str,
         now_ms: i64,
         max_claims: u32,
     ) -> ClaimOutcome<WonClaim> {
         let worker = WorkerId::new(worker);
+        let view_id = job_id.to_string();
         backend
-            .claim(job_id, |read| {
-                plan_claim(job_id, read, &worker, now_ms, 30_000, max_claims)
+            .claim(&view_id, |read| {
+                plan_claim(&view_id, read, &worker, now_ms, 30_000, max_claims)
             })
             .await
             .unwrap()
     }
 
-    async fn event_types(pool: &SqlitePool, job_id: &str) -> Vec<String> {
+    async fn event_types(pool: &SqlitePool, job_id: &JobId) -> Vec<String> {
         sqlx::query_scalar::<_, String>(
             "SELECT event_type FROM events WHERE aggregate_type = 'job' AND aggregate_id = ?1 \
              ORDER BY sequence",
         )
-        .bind(job_id)
+        .bind(job_id.to_string())
         .fetch_all(pool)
         .await
         .unwrap()
     }
 
-    async fn queue_status(pool: &SqlitePool, job_id: &str) -> Option<String> {
+    async fn queue_status(pool: &SqlitePool, job_id: &JobId) -> Option<String> {
         sqlx::query_scalar::<_, Option<String>>("SELECT status FROM job_queue WHERE view_id = ?1")
-            .bind(job_id)
+            .bind(job_id.to_string())
             .fetch_optional(pool)
             .await
             .unwrap()
@@ -898,6 +933,145 @@ mod tests {
             queue_status(&pool, &job_id).await.as_deref(),
             Some("claimed")
         );
+    }
+
+    #[tokio::test]
+    async fn perform_receives_the_claimed_jobs_identity() {
+        let pool = one_db_pool().await;
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let backend = SqliteBackend::new(pool.clone());
+        let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
+        let now_ms = Utc::now().timestamp_millis() + 1_000;
+
+        let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
+            panic!("expected to win the claim");
+        };
+        let task = build_task::<TestJob>(job_id.to_string(), won).expect("payload decodes");
+
+        // The context the handler extracts carries the claimed job's durable
+        // identity: the stable job id and a zero attempt on the first run.
+        let ctx = JobContext::from_request(&task).await.unwrap();
+        assert_eq!(ctx.job_id(), job_id);
+        assert_eq!(ctx.attempt(), 0);
+
+        // A failed attempt bumps the durable attempt count, and the re-claimed
+        // task's context reports it.
+        ack(
+            &runtime.jobs,
+            &JobWorkerConfig::default(),
+            &Clock::system(),
+            &ctx,
+            AckPlan::Failed("boom".to_string()),
+        )
+        .await;
+
+        let retry_ms = now_ms + 3_600_000;
+        let ClaimOutcome::Won(rewon) = claim(&backend, &job_id, "w2", retry_ms, 50).await else {
+            panic!("expected to win the retry claim");
+        };
+        let retry_task = build_task::<TestJob>(job_id.to_string(), rewon).expect("payload decodes");
+        let retry_ctx = JobContext::from_request(&retry_task).await.unwrap();
+        assert_eq!(retry_ctx.job_id(), job_id);
+        assert_eq!(retry_ctx.attempt(), 1);
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("external system said no")]
+    struct TestPerformError;
+
+    #[derive(Serialize, Deserialize)]
+    struct FallibleJob;
+
+    impl Job for FallibleJob {
+        type Input = ();
+        type Output = ();
+        type Error = TestPerformError;
+
+        const WORKER_NAME: &'static str = "fallible-worker";
+        const KIND: &'static str = "fallible-job";
+
+        fn label(&self) -> Label {
+            Label::new("fallible")
+        }
+
+        async fn perform(
+            &self,
+            _ctx: &JobContext,
+            _input: &(),
+        ) -> Result<JobOutcome<()>, JobFailure<TestPerformError>> {
+            Err(JobFailure::Terminal(TestPerformError))
+        }
+    }
+
+    #[test]
+    fn ack_plan_maps_failure_classification() {
+        let terminal: Result<JobOutcome<()>, BoxDynError> =
+            Err(Box::new(JobFailure::Terminal(TestPerformError)));
+        assert!(matches!(
+            ack_plan::<FallibleJob>(&terminal),
+            AckPlan::Rejected(_)
+        ));
+
+        let transient: Result<JobOutcome<()>, BoxDynError> =
+            Err(Box::new(JobFailure::Transient(TestPerformError)));
+        assert!(matches!(
+            ack_plan::<FallibleJob>(&transient),
+            AckPlan::Failed(_)
+        ));
+
+        // An error that carries no classification (the execution timeout, a
+        // middleware failure) must default to the retry path, never to an
+        // immediate dead-letter.
+        let unclassified: Result<JobOutcome<()>, BoxDynError> = Err("execution timed out".into());
+        assert!(matches!(
+            ack_plan::<FallibleJob>(&unclassified),
+            AckPlan::Failed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_dead_letters_without_retries() {
+        let pool = one_db_pool().await;
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let backend = SqliteBackend::new(pool.clone());
+        let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
+        let now_ms = Utc::now().timestamp_millis() + 1_000;
+
+        let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
+            panic!("expected to win the claim");
+        };
+        let ctx = JobContext {
+            job_id,
+            claim_seq: won.claim_seq,
+            claim_id: won.claim_id,
+            attempt: won.attempt,
+        };
+
+        // A terminal failure on the FIRST attempt (max_attempts = 5) must kill
+        // the job immediately instead of scheduling a retry.
+        ack(
+            &runtime.jobs,
+            &JobWorkerConfig::default(),
+            &Clock::system(),
+            &ctx,
+            AckPlan::Rejected("external system said no".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobDead"]
+        );
+        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("dead"));
+
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM job_queue WHERE view_id = ?1")
+                .bind(job_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(state["Live"]["Dead"]["reason"], "Rejected");
     }
 
     #[tokio::test]
@@ -962,7 +1136,7 @@ mod tests {
         let backend = SqliteBackend::new(pool.clone());
 
         let request = EnqueueRequest {
-            job_id: Ulid::new().to_string(),
+            job_id: JobId::new(),
             kind: JobKind::new(TestJob::KIND),
             payload: serde_json::to_value(TestJob { n: 1 }).unwrap(),
             run_at_ms: 1000,
@@ -980,7 +1154,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            crate::job_sqlite::SqliteJobError::DuplicateEnqueue { job_id } if job_id == request.job_id
+            crate::job_sqlite::SqliteJobError::DuplicateEnqueue { job_id } if job_id == request.job_id.to_string()
         ));
     }
 
@@ -997,7 +1171,7 @@ mod tests {
             panic!("expected to win the claim");
         };
         let ctx = JobContext {
-            job_id: job_id.clone(),
+            job_id,
             claim_seq: won.claim_seq,
             claim_id: won.claim_id,
             attempt: won.attempt,
@@ -1025,7 +1199,7 @@ mod tests {
         // The claim budget reset to 0 so a poller may defer indefinitely.
         let payload: String =
             sqlx::query_scalar("SELECT payload FROM job_queue WHERE view_id = ?1")
-                .bind(&job_id)
+                .bind(job_id.to_string())
                 .fetch_one(&pool)
                 .await
                 .unwrap();

@@ -168,7 +168,7 @@ impl SqliteEventRepository {
                 "INSERT INTO job_queue (view_id, version, payload, lease_until) \
                  VALUES (?1, 1, ?2, NULL)",
             )
-            .bind(&request.job_id)
+            .bind(request.job_id.to_string())
             .bind(&payload)
             .execute(&mut *tx)
             .await?;
