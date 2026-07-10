@@ -385,7 +385,7 @@ pub enum OperationFailure<DomainError> {
 
 /// A command the operation's state guard refused. Map into the entity's domain
 /// error with `#[from]`.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum OperationRefused {
     /// A `Request` arrived while a driving job is already in flight.
     #[error("operation already in flight")]
@@ -540,7 +540,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use crate::job::{JobFailure, JobOutcome, take_pending, with_pending_scope};
-    use crate::{Never, Nil, jobs};
+    use crate::{Nil, jobs};
 
     use super::*;
 
@@ -556,12 +556,33 @@ mod tests {
         reason: String,
     }
 
+    /// Reference embedded-operation entity: one `Operation<PlaceOrder>` field,
+    /// events/commands/errors delegating to the machine.
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-    struct Desk;
+    struct Desk {
+        order: Operation<PlaceOrder>,
+    }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     enum DeskEvent {
         Order(OperationEvent<PlaceOrder>),
+    }
+
+    #[derive(Debug, Clone)]
+    enum DeskCommand {
+        Order(OperationCommand<PlaceOrder>),
+    }
+
+    impl From<OperationCommand<PlaceOrder>> for DeskCommand {
+        fn from(command: OperationCommand<PlaceOrder>) -> Self {
+            Self::Order(command)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+    enum DeskError {
+        #[error(transparent)]
+        Order(#[from] OperationRefused),
     }
 
     impl cqrs_es::DomainEvent for DeskEvent {
@@ -578,8 +599,8 @@ mod tests {
     impl EventSourced for Desk {
         type Id = u64;
         type Event = DeskEvent;
-        type Command = ();
-        type Error = Never;
+        type Command = DeskCommand;
+        type Error = DeskError;
         type Jobs = jobs![PlaceOrder];
         type Materialized = Nil;
 
@@ -587,27 +608,38 @@ mod tests {
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
 
-        fn originate(_event: &DeskEvent) -> Option<Self> {
-            Some(Self)
+        fn originate(event: &DeskEvent) -> Option<Self> {
+            let DeskEvent::Order(operation_event) = event;
+            let order = Operation::Idle.evolve(operation_event).ok()?;
+            Some(Self { order })
         }
 
-        fn evolve(_entity: &Self, _event: &DeskEvent) -> Result<Option<Self>, Never> {
-            Ok(Some(Self))
+        fn evolve(entity: &Self, event: &DeskEvent) -> Result<Option<Self>, DeskError> {
+            let DeskEvent::Order(operation_event) = event;
+            Ok(entity
+                .order
+                .evolve(operation_event)
+                .ok()
+                .map(|order| Self { order }))
         }
 
         async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<DeskEvent>, Never> {
-            Ok(vec![])
+            command: DeskCommand,
+            jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<DeskEvent>, DeskError> {
+            let DeskCommand::Order(operation_command) = command;
+            let events = Operation::Idle.transition(operation_command, jobs)?;
+            Ok(events.into_iter().map(DeskEvent::Order).collect())
         }
 
         async fn transition(
             &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<DeskEvent>, Never> {
-            Ok(vec![])
+            command: DeskCommand,
+            jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<DeskEvent>, DeskError> {
+            let DeskCommand::Order(operation_command) = command;
+            let events = self.order.transition(operation_command, jobs)?;
+            Ok(events.into_iter().map(DeskEvent::Order).collect())
         }
     }
 
@@ -1131,6 +1163,95 @@ mod tests {
 
         assert!(matches!(failure, JobFailure::Transient(_)));
         assert!(run.port.delivered.lock().unwrap().is_empty());
+    }
+
+    /// End to end over a real store: request through `Store::send` (Requested
+    /// event + job enqueued in one commit), claim like the worker does, run the
+    /// routed execution with the store itself as the origin port, and watch the
+    /// entity settle -- with the guard refusing overlap and absorbing duplicate
+    /// delivery along the way.
+    #[tokio::test]
+    async fn requested_operation_settles_through_a_real_store() {
+        use crate::job::{WorkerId, plan_claim};
+        use crate::job_store::ClaimOutcome;
+        use crate::{AggregateError, LifecycleError, SqliteBackend, StoreBuilder};
+
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        let desk_store = StoreBuilder::<Desk>::new(pool.clone())
+            .build()
+            .await
+            .unwrap();
+
+        desk_store
+            .send(&7, DeskCommand::Order(OperationCommand::Request(place())))
+            .await
+            .unwrap();
+        let desk = desk_store.load(&7).await.unwrap().unwrap();
+        let Operation::Requested { job_id } = desk.order else {
+            panic!("expected the operation in flight, got {:?}", desk.order);
+        };
+
+        // The guard refuses an overlapping request through the full stack.
+        let refused = desk_store
+            .send(&7, DeskCommand::Order(OperationCommand::Request(place())))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            AggregateError::UserError(LifecycleError::Apply(DeskError::Order(
+                OperationRefused::InFlight
+            )))
+        ));
+
+        // Claim exactly as the worker poll does and run the routed execution
+        // with the real store as the origin port.
+        let backend = SqliteBackend::new(pool.clone());
+        let view_id = job_id.to_string();
+        let worker = WorkerId::new("test-worker");
+        let now_ms = chrono::Utc::now().timestamp_millis() + 1_000;
+        let outcome = backend
+            .claim(&view_id, |read| {
+                plan_claim(&view_id, read, &worker, now_ms, 30_000, 50)
+            })
+            .await
+            .unwrap();
+        let ClaimOutcome::Won(won) = outcome else {
+            panic!("expected to win the claim");
+        };
+        let job: PlaceOrder = serde_json::from_value(won.args.clone()).unwrap();
+        let ctx = JobContext {
+            job_id,
+            claim_seq: won.claim_seq,
+            claim_id: won.claim_id,
+            attempt: won.attempt,
+            max_attempts: 5,
+        };
+        let input = OperationInput::new((), desk_store.clone());
+
+        let done = Job::perform(&job, &ctx, &input).await.unwrap();
+        assert!(matches!(done, JobOutcome::Done(())));
+
+        let settled = Operation::Confirmed {
+            job_id,
+            output: "filled".to_string(),
+            attempts: 1,
+        };
+        assert_eq!(desk_store.load(&7).await.unwrap().unwrap().order, settled);
+
+        // An at-least-once redelivery of the same verdict is absorbed.
+        desk_store
+            .send(
+                &7,
+                DeskCommand::Order(OperationCommand::Confirm {
+                    job_id,
+                    output: "filled".to_string(),
+                    attempts: 1,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(desk_store.load(&7).await.unwrap().unwrap().order, settled);
     }
 
     #[test]
