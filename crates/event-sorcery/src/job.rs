@@ -71,10 +71,73 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
     /// re-run later without counting an attempt (a poll-while-pending or
     /// external-wait snooze). An `Err` is a failure that counts an attempt and is
     /// retried/dead-lettered per the worker config.
+    ///
+    /// `ctx` carries the job's durable identity: derive external-boundary
+    /// idempotency keys from [`JobContext::job_id`] (never from the attempt
+    /// number, which changes across retries) so every retry presents the same
+    /// key and the external system deduplicates.
     fn perform(
         &self,
+        ctx: &JobContext,
         input: &Self::Input,
     ) -> impl Future<Output = Result<JobOutcome<Self::Output>, Self::Error>> + Send;
+}
+
+/// Identity of a durable job -- a ULID minted at enqueue time.
+///
+/// Stable across every retry and re-claim of the job, so it is the correct
+/// root for external-boundary idempotency keys. Converted to a string only at
+/// the storage boundary (the job's aggregate id and `job_queue` view id).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct JobId(Ulid);
+
+impl JobId {
+    pub(crate) fn new() -> Self {
+        Self(Ulid::new())
+    }
+}
+
+impl std::fmt::Display for JobId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(ulid) = self;
+        std::fmt::Display::fmt(ulid, formatter)
+    }
+}
+
+impl std::str::FromStr for JobId {
+    type Err = ulid::DecodeError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        raw.parse().map(Self)
+    }
+}
+
+/// Durable execution context a worker hands to [`Job::perform`], captured at
+/// claim time; the ack reads it from the task's `parts.ctx`.
+#[derive(Clone, Default)]
+pub struct JobContext {
+    pub(crate) job_id: JobId,
+    /// Sequence of the `Claimed` event this worker appended; the renew keys on it.
+    pub(crate) claim_seq: i64,
+    /// Identity of the claim that produced this run; the ack fences on it.
+    pub(crate) claim_id: ClaimId,
+    /// Recorded failures so far (0 on first run), from the fold.
+    pub(crate) attempt: u32,
+}
+
+impl JobContext {
+    /// Stable identifier of the job being executed -- the same across every
+    /// retry and re-claim of this job, so it is the correct root for
+    /// external-boundary idempotency keys.
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    /// Durably recorded failures before this run: `0` on the first execution,
+    /// `n` after `n` failed attempts. Deferred runs do not advance it.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
 }
 
 /// What a [`Job::perform`] reports back to the worker (ADR-0007).
@@ -312,7 +375,7 @@ pub(crate) enum JobError {
 
 #[async_trait]
 impl EventSourced for JobState {
-    type Id = String;
+    type Id = JobId;
     type Event = JobEvent;
     type Command = JobCommand;
     type Error = JobError;
@@ -478,7 +541,7 @@ pub(crate) struct WonClaim {
 /// buffer and flushed by the event repository in the commit transaction.
 pub(crate) struct EnqueueRequest {
     /// The new job's id (a fresh ULID).
-    pub(crate) job_id: String,
+    pub(crate) job_id: JobId,
     /// The job kind.
     pub(crate) kind: JobKind,
     /// The job arguments.
@@ -635,7 +698,7 @@ pub(crate) fn enqueued_event(request: &EnqueueRequest) -> Result<SerializedEvent
         payload: request.payload.clone(),
         run_at: from_millis(request.run_at_ms),
     }
-    .serialized(&request.job_id, 1)?)
+    .serialized(&request.job_id.to_string(), 1)?)
 }
 
 /// Builds the seed `job_queue` projection payload (version 1) for an enqueue:
@@ -811,7 +874,7 @@ pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
         .into_iter()
         .map(|push| {
             Ok(EnqueueRequest {
-                job_id: Ulid::new().to_string(),
+                job_id: JobId::new(),
                 kind: push.job.kind(),
                 payload: push.job.encode()?,
                 run_at_ms: resolve_run_at_ms(push.delay)?,
@@ -828,7 +891,7 @@ pub(crate) fn enqueue_request<J: Job>(
     delay: Option<Duration>,
 ) -> Result<EnqueueRequest, JobStoreError> {
     Ok(EnqueueRequest {
-        job_id: Ulid::new().to_string(),
+        job_id: JobId::new(),
         kind: JobKind::new(J::KIND),
         payload: serde_json::to_value(job)?,
         run_at_ms: resolve_run_at_ms(delay)?,
@@ -876,7 +939,11 @@ mod tests {
             }
         }
 
-        async fn perform(&self, _input: &()) -> Result<JobOutcome<()>, Infallible> {
+        async fn perform(
+            &self,
+            _ctx: &JobContext,
+            _input: &(),
+        ) -> Result<JobOutcome<()>, Infallible> {
             Ok(JobOutcome::Done(()))
         }
     }
