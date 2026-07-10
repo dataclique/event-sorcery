@@ -135,6 +135,31 @@ supervised worker claims and runs each one. There is no service-injection into
 handlers -- inputs a handler needs are carried on the command; side effects are
 jobs.
 
+Every execution receives a `JobContext` carrying the job's `JobId` (a ULID,
+stable across retries -- the root for external idempotency keys) and the durable
+attempt count. Failures state their retry class explicitly at the return site:
+`JobFailure::Transient` retries with backoff, `JobFailure::Terminal`
+dead-letters immediately (`DeadReason::Rejected`). There is deliberately no
+`From` impl for `JobFailure`, so `?` cannot silently classify a failure.
+
+### Operation
+
+The durable lifecycle of one fallible external action _on an entity_ (ADR-0008).
+The entity embeds an `Operation<J>` field
+(`Idle -> Requested -> Confirmed | Failed`) and nests `OperationEvent<J>` /
+`OperationCommand<J>` in its own enums; the machine owns the state guard (refuse
+overlapping requests, absorb duplicate outcome delivery). Requesting enqueues
+the driving job in the same transaction that commits `Requested`.
+
+The driving job implements `OperationJob` instead of `Job::perform`: the
+framework routes the FIRST execution to `submit` and every later one to
+`reconcile`, which must determine the earlier attempt's fate and return a
+`Reconciliation` verdict (`Settled` / `NotSubmitted` / `Indeterminate`). A
+settled outcome is delivered to the `Origin` entity through an `OriginPort`
+(implemented by `Store` when the origin's command enum absorbs
+`OperationCommand<J>` via `From`) BEFORE the job acks; failed delivery defers
+rather than counting an attempt.
+
 ### Lifecycle
 
 The `pub(crate)` enum that wraps `EventSourced` so it satisfies

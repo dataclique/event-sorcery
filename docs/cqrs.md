@@ -291,7 +291,11 @@ only non-determinism is what the command carries in.
 
 A `Job` is one self-contained side effect. Its `Input` associated type is the
 dependency bundle a worker injects into `perform` (e.g. an email client); `KIND`
-routes the job to the worker that runs it:
+routes the job to the worker that runs it. `perform` receives a `JobContext`
+(the stable `JobId` plus the durable attempt count -- derive external
+idempotency keys from the id, never the attempt) and classifies every failure
+explicitly: `JobFailure::Transient` retries with backoff, `JobFailure::Terminal`
+dead-letters immediately.
 
 ```rust
 #[derive(Serialize, Deserialize)]
@@ -302,7 +306,7 @@ struct NotifyClosed {
 impl Job for NotifyClosed {
     type Input = Notifier;  // injected by the worker
     type Output = ();
-    type Error = std::convert::Infallible;
+    type Error = NotifyError;
 
     const WORKER_NAME: &'static str = "notify-closed";
     const KIND: &'static str = "notify-closed";
@@ -311,13 +315,35 @@ impl Job for NotifyClosed {
         Label::new(format!("notify-closed:{}", self.subject))
     }
 
-    async fn perform(&self, input: &Notifier) -> Result<(), Self::Error> {
-        input.email_customer(&self.subject).await  // the actual side effect
+    async fn perform(
+        &self,
+        ctx: &JobContext,
+        input: &Notifier,
+    ) -> Result<JobOutcome<()>, JobFailure<Self::Error>> {
+        input
+            .email_customer(ctx.job_id(), &self.subject)  // the actual side effect
+            .await
+            .map(JobOutcome::Done)
+            .map_err(JobFailure::Transient)  // a timeout is worth retrying
     }
 }
 ```
 
 See **Running Jobs** below for wiring the worker that drains the queue.
+
+### Durable Operations
+
+When the side effect is an _operation whose outcome must land back in entity
+state_ (place an order, submit a transfer), skip hand-writing the
+requested/confirmed/failed plumbing: embed an `Operation<J>` field in the
+entity, nest `OperationEvent<J>` / `OperationCommand<J>` in its enums, and
+implement `OperationJob` (with `submit`/`reconcile` instead of `perform`) on the
+driving job. The framework enqueues the job transactionally with the `Requested`
+event, routes retries to `reconcile` so a follow-up never blindly resubmits, and
+delivers the settled outcome back to the entity before the job acks. Register
+the worker input as `OperationInput::new(deps, origin_store.clone())`. See
+ADR-0008 and the `operation` module docs; the `Desk` entity in `operation.rs`'s
+tests is a compact reference implementation.
 
 ## Schema Versioning
 

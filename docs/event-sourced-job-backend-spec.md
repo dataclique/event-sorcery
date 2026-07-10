@@ -190,12 +190,13 @@ spawned renewal must run during a CPU-heavy `perform`; CPU-bound work uses
 
 ## 12. Consumer idempotency contract (first-class)
 
-Exactly-once _effect_ needs consumer cooperation. Inject `job_id` into `perform`
-as the external idempotency key. **Key on `job_id` ALONE, never
-`job_id+attempt`** (the latter fails to dedup the crash-after-effect duplicate).
-The external boundary must be success-equivalent under that key: a re-issue of
-an already-succeeded op must replay success, not error. The in-library
-fenced-ack alarm is monitoring, not the safeguard.
+Exactly-once _effect_ needs consumer cooperation. `perform` receives a
+`JobContext`; derive the external idempotency key from `JobContext::job_id`.
+**Key on the job id ALONE, never `job_id+attempt`** (the latter fails to dedup
+the crash-after-effect duplicate). The external boundary must be
+success-equivalent under that key: a re-issue of an already-succeeded op must
+replay success, not error. The in-library fenced-ack alarm is monitoring, not
+the safeguard.
 
 ## 13. Residual risks (accepted / documented)
 
