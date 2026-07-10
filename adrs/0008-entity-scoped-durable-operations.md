@@ -2,10 +2,9 @@
 
 ## Status
 
-Proposed.
+Accepted.
 
-Date: 2026-07-10. No tracker issue yet; a GitHub issue is warranted once the
-direction is approved.
+Date: 2026-07-10.
 
 ## Context
 
@@ -53,7 +52,7 @@ plumbing.
 ## Decision
 
 Absorb the skeleton into event-sorcery as **entity-scoped durable operations**,
-three composable additions:
+four composable additions:
 
 1. **`Operation<J>` — a library-owned state machine embedded in entity state.**
    `Operation<J: Job>` models
@@ -82,10 +81,34 @@ three composable additions:
    startup poll) is already the re-driver, and the operation state machine is
    its durable ledger.
 
-3. **`JobContext` exposed to `perform`.** `perform` receives the job id and
-   attempt number, so consumers can derive external-boundary idempotency keys
-   (broker `client_order_id`, transfer reference) from stable framework identity
-   instead of threading their own.
+3. **Submit/reconcile split — a retry is routed to a different method.** This
+   library is used for financial operations, where whether this is the first try
+   or a follow-up changes what is safe to do: a follow-up must never blindly
+   resubmit, because the dangerous window is "the call reached the external
+   system but the outcome never committed". So an operation-driving job does not
+   implement a single `perform`. The framework calls `submit(input, ctx)` only
+   on the job's first claim; any later claim (retry after an error,
+   lease-expired reclaim, crash mid-call) is routed to `reconcile(input, ctx)`,
+   which must determine the fate of the earlier attempt — typically by querying
+   the external system with the operation's idempotency key — and return a typed
+   verdict: `Settled(outcome)` (the earlier attempt landed or definitively
+   failed; feed it back), `NotSubmitted` (provably never reached the external
+   system; the framework authorizes `submit` again), or `Indeterminate` (cannot
+   tell yet; maps onto the existing `JobOutcome::Defer`, which correctly counts
+   no attempt — polling for the fate of a submission is not a new business
+   attempt). The claim counter that drives the routing is already exactly-once
+   (claims are events on the job aggregate) and over-approximates submissions in
+   the safe direction: it is impossible to be routed to `submit` while a prior
+   submission might exist. Jobs without an `Origin` keep the plain `perform`.
+
+4. **`JobContext` and stable idempotency keys.** Both `submit` and `reconcile`
+   receive the job id and attempt number. External-boundary idempotency keys
+   (broker `client_order_id`, transfer reference) must derive from the job id
+   only — never the attempt — so every retry presents the same key and the
+   external system dedupes (the `client_order_id_for_placement` reuse pattern,
+   made structural). The terminal `Confirmed`/`Failed` feedback events carry the
+   attempt count, so the entity's audit trail records how many tries the
+   operation took without the entity tracking it live.
 
 Multi-leg sequencing (bridge leg B starts when leg A confirms) deliberately
 stays consumer code — that ordering _is_ the domain. Each leg becomes one
@@ -126,6 +149,31 @@ stays consumer code — that ordering _is_ the domain. Each leg becomes one
 - Rejected because: it fixes the smaller half of the problem and leaves the
   error-prone half untouched.
 
+### Track the attempt count inside the entity's `Operation` state machine
+
+- Pros: the entity event log would show retries directly; no need to consult the
+  job stream for attempt history.
+- Cons: the job aggregate already records every claim/retry/reschedule
+  exactly-once as events; a second durable counter on the entity can disagree
+  with it, and contradictory duplicated state is exactly what this library's
+  type-modeling rules forbid.
+- Rejected because: the job stream is the operational ledger and the entity
+  stream is the domain ledger. The entity gets the attempt count where it is
+  domain-relevant — stamped on the terminal `Confirmed`/`Failed` events — and
+  the per-attempt history stays on the job stream.
+
+### Advisory attempt number only (expose `ctx.attempt`, keep one `perform`)
+
+- Pros: smallest API change; consumers who care can branch on the attempt number
+  themselves.
+- Cons: nothing forces the check-before-resubmit discipline; a consumer who
+  forgets the branch double-places a trade on the first lease expiry.
+  `st0x.liquidity` ADR-0014 documents precisely this class of incident with
+  hand-rolled guards.
+- Rejected because: for money movement, first-try-vs-follow-up is a safety
+  invariant, not a hint — it belongs in the method routing where the type system
+  enforces it, not in a field the consumer may ignore.
+
 ### Status quo: keep the pattern in consumer code
 
 - Pros: zero library work; maximum consumer freedom.
@@ -141,10 +189,11 @@ stays consumer code — that ordering _is_ the domain. Each leg becomes one
 - Consumer entities keep plumbing _variants_ in their enums, but each is one
   library-typed wrapper line instead of a hand-built triad; handlers shrink to
   domain decisions plus `Operation` delegation.
-- `Job` grows origin/outcome associated items; `perform` gains a `JobContext`
-  parameter. This is a breaking change for existing `Job` impls (the two
-  examples and any early consumers) — acceptable pre-1.0, and jobs without an
-  origin can stay outcome-less via a default.
+- Operation-driving jobs implement `submit`/`reconcile` instead of `perform`,
+  and `perform`/`submit`/`reconcile` gain a `JobContext` parameter. This is a
+  breaking change for existing `Job` impls (the two examples and any early
+  consumers) — acceptable pre-1.0, and jobs without an origin can stay
+  outcome-less via a default.
 - Delivery-before-ack makes entity command execution part of the job success
   path; a persistently failing origin entity will hold its job in retry. That is
   the correct failure mode (fail-stop, visible), consistent with ADR-0007's
