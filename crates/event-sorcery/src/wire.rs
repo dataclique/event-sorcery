@@ -46,8 +46,7 @@ use crate::lifecycle::{Lifecycle, ReactorBridge};
 use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
-use crate::sqlite_event_repository::SqliteEventRepository;
-use crate::{CompactionPolicy, EventSourced, SqliteCqrs, Store};
+use crate::{CompactionPolicy, EsCqrs, EventBackend, EventSourced, SqliteBackend, Store};
 
 /// Builder for a single CQRS framework.
 ///
@@ -59,18 +58,28 @@ use crate::{CompactionPolicy, EventSourced, SqliteCqrs, Store};
 ///
 /// Register reactors via [`.with()`](Self::with), then call
 /// [`.build()`](Self::build) to construct the framework.
-pub struct StoreBuilder<Entity: EventSourced, Materialized = <Entity as EventSourced>::Materialized>
-{
-    pool: SqlitePool,
+pub struct StoreBuilder<
+    Entity: EventSourced,
+    Backend: EventBackend = SqliteBackend,
+    Materialized = <Entity as EventSourced>::Materialized,
+> {
+    backend: Backend,
     queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
     _materialized: std::marker::PhantomData<Materialized>,
 }
 
-impl<Entity: EventSourced> StoreBuilder<Entity> {
-    /// Creates a new builder for the given entity type.
+impl<Entity: EventSourced> StoreBuilder<Entity, SqliteBackend> {
+    /// Creates a new builder backed by SQLite over `pool`.
     pub fn new(pool: SqlitePool) -> Self {
+        Self::with_backend(SqliteBackend::new(pool))
+    }
+}
+
+impl<Entity: EventSourced, Backend: EventBackend> StoreBuilder<Entity, Backend> {
+    /// Creates a new builder over an arbitrary [`EventBackend`].
+    pub fn with_backend(backend: Backend) -> Self {
         Self {
-            pool,
+            backend,
             queries: vec![],
             _materialized: std::marker::PhantomData,
         }
@@ -95,23 +104,23 @@ impl<Entity: EventSourced> StoreBuilder<Entity> {
     }
 }
 
-fn sqlite_snapshot_cqrs<Entity: EventSourced>(
-    pool: SqlitePool,
+fn es_cqrs<Entity: EventSourced, Backend: EventBackend>(
+    backend: &Backend,
     queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
-    services: Entity::Services,
-) -> SqliteCqrs<Entity> {
-    let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
-    let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-        repo,
+) -> EsCqrs<Entity, Backend> {
+    let store = PersistedEventStore::new_snapshot_store(
+        backend.event_repo(Entity::COMPACTION_POLICY),
         Entity::SNAPSHOT_SIZE,
     );
+    // `Lifecycle`'s cqrs-es services are unit -- handlers use the typed JobQueue.
     #[allow(clippy::disallowed_methods)]
-    CqrsFramework::new(store, queries, services)
+    CqrsFramework::new(store, queries, ())
 }
 
 /// Projected entities: auto-creates and wires a [`Projection`],
 /// returning `(Arc<Store>, Arc<Projection>)`.
-impl<Entity: EventSourced<Materialized = Table> + 'static> StoreBuilder<Entity, Table>
+impl<Entity: EventSourced<Materialized = Table> + 'static>
+    StoreBuilder<Entity, SqliteBackend, Table>
 where
     Entity::Id: Clone,
     Entity::Event: Clone,
@@ -119,7 +128,6 @@ where
 {
     pub async fn build(
         mut self,
-        services: Entity::Services,
     ) -> Result<(Arc<Store<Entity>>, Arc<Projection<Entity>>), ReconcileError> {
         // Projected entities must retain all events so that
         // `catch_up`/`rebuild_all` can replay the full history.
@@ -134,10 +142,11 @@ where
             );
         }
 
-        let reconciler = Reconciler::new(self.pool.clone());
+        let pool = self.backend.pool().clone();
+        let reconciler = Reconciler::new(pool.clone());
         let reconciliation = reconciler.reconcile::<Entity>().await?;
 
-        let projection = Arc::new(Projection::sqlite(self.pool.clone()));
+        let projection = Arc::new(Projection::sqlite(pool.clone()));
 
         // A schema version change can leave stored view payloads in an
         // incompatible format. `catch_up` only revisits views that are behind
@@ -173,26 +182,29 @@ where
             reactor: projection.clone(),
         }));
 
-        let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries, services);
-        Ok((Arc::new(Store::new(cqrs, self.pool)), projection))
+        let Self {
+            backend, queries, ..
+        } = self;
+        let cqrs = es_cqrs(&backend, queries);
+        Ok((Arc::new(Store::new(cqrs, &backend)), projection))
     }
 }
 
 /// Non-projected entities: returns just `Store`.
-impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, Nil> {
-    pub async fn build(
-        self,
-        services: Entity::Services,
-    ) -> Result<Arc<Store<Entity>>, ReconcileError> {
+impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, SqliteBackend, Nil> {
+    pub async fn build(self) -> Result<Arc<Store<Entity>>, ReconcileError> {
         // A non-projected entity has no views to rebuild, so the reconciliation
         // outcome does not change recovery; reconcile still clears stale
         // snapshots and record_version marks the version handled.
-        let reconciler = Reconciler::new(self.pool.clone());
+        let reconciler = Reconciler::new(self.backend.pool().clone());
         let _ = reconciler.reconcile::<Entity>().await?;
         reconciler.record_version::<Entity>().await?;
 
-        let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries, services);
-        Ok(Arc::new(Store::new(cqrs, self.pool)))
+        let Self {
+            backend, queries, ..
+        } = self;
+        let cqrs = es_cqrs(&backend, queries);
+        Ok(Arc::new(Store::new(cqrs, &backend)))
     }
 }
 
@@ -203,6 +215,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::JobQueue;
     use crate::dependency::EntityList;
     use crate::deps;
     use crate::lifecycle::{Lifecycle, Never};
@@ -245,7 +258,7 @@ mod tests {
         type Event = EventA;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "AggregateA";
@@ -260,11 +273,18 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<EventA>, Never> {
+        async fn initialize(
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<EventA>, Never> {
             Ok(vec![])
         }
 
-        async fn transition(&self, _command: (), _services: &()) -> Result<Vec<EventA>, Never> {
+        async fn transition(
+            &self,
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<EventA>, Never> {
             Ok(vec![])
         }
     }
@@ -275,7 +295,7 @@ mod tests {
         type Event = EventB;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "AggregateB";
@@ -290,11 +310,18 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<EventB>, Never> {
+        async fn initialize(
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<EventB>, Never> {
             Ok(vec![])
         }
 
-        async fn transition(&self, _command: (), _services: &()) -> Result<Vec<EventB>, Never> {
+        async fn transition(
+            &self,
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<EventB>, Never> {
             Ok(vec![])
         }
     }
@@ -344,7 +371,7 @@ mod tests {
 
         let _store = StoreBuilder::<AggregateA>::new(pool.clone())
             .with(Arc::new(SingleEntityReactor))
-            .build(())
+            .build()
             .await
             .unwrap();
     }
@@ -360,13 +387,13 @@ mod tests {
         let _store_a = StoreBuilder::<AggregateA>::new(pool.clone())
             .with(multi.clone())
             .with(single)
-            .build(())
+            .build()
             .await
             .unwrap();
 
         let _store_b = StoreBuilder::<AggregateB>::new(pool.clone())
             .with(multi)
-            .build(())
+            .build()
             .await
             .unwrap();
     }
@@ -397,7 +424,7 @@ mod tests {
         type Event = TallyEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Table;
 
         const AGGREGATE_TYPE: &'static str = "Tally";
@@ -418,11 +445,18 @@ mod tests {
             }
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<TallyEvent>, Never> {
+        async fn initialize(
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<TallyEvent>, Never> {
             Ok(vec![])
         }
 
-        async fn transition(&self, _command: (), _services: &()) -> Result<Vec<TallyEvent>, Never> {
+        async fn transition(
+            &self,
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<TallyEvent>, Never> {
             Ok(vec![])
         }
     }
@@ -470,7 +504,7 @@ mod tests {
             .unwrap();
 
         let (_store, _projection) = StoreBuilder::<Tally>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 
@@ -544,7 +578,7 @@ mod tests {
             .unwrap();
 
         let (_store, _projection) = StoreBuilder::<Tally>::new(pool.clone())
-            .build(())
+            .build()
             .await
             .unwrap();
 

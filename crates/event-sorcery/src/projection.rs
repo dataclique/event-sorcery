@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
-use sqlite_es::SqliteViewRepository;
+use sqlite_es::{IndexedView, Order, Predicate, SqliteViewRepository};
 use sqlx::AssertSqlSafe;
 use sqlx::SqlitePool;
 use sqlx::sqlite::Sqlite;
@@ -484,6 +484,19 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
             Err(error) => Err(error)?,
         }
     }
+
+    /// Find the `view_id`s whose view columns satisfy `predicate`, ordered and
+    /// capped at `limit`. Delegates to the view repository's indexed scan -- the
+    /// one query the load-by-id repository cannot express (e.g. polling a job
+    /// queue for runnable rows).
+    pub async fn find(
+        &self,
+        predicate: &Predicate,
+        order: Option<&Order>,
+        limit: i64,
+    ) -> Result<Vec<String>, ProjectionError<Entity>> {
+        Ok(self.repo.find(predicate, order, limit).await?)
+    }
 }
 
 impl<Entity: EventSourced, Backend: ViewBackend> Clone for Projection<Entity, Backend> {
@@ -639,6 +652,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
+    use crate::JobQueue;
     use crate::Nil;
     use crate::lifecycle::Never;
 
@@ -665,7 +679,7 @@ mod tests {
         type Event = TestEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Nil;
 
         const AGGREGATE_TYPE: &'static str = "TestEntity";
@@ -682,11 +696,18 @@ mod tests {
             Ok(Some(entity.clone()))
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<TestEvent>, Never> {
+        async fn initialize(
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<TestEvent>, Never> {
             Ok(vec![])
         }
 
-        async fn transition(&self, _command: (), _services: &()) -> Result<Vec<TestEvent>, Never> {
+        async fn transition(
+            &self,
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<TestEvent>, Never> {
             Ok(vec![])
         }
     }
@@ -748,6 +769,23 @@ mod tests {
                 .await
                 .insert(context.view_instance_id, view);
             Ok(())
+        }
+    }
+
+    impl<View, Agg> IndexedView<View, Agg> for InMemoryRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg> + Clone,
+        Agg: cqrs_es::Aggregate,
+    {
+        // The in-memory double has no indexed columns; `find` behavior is
+        // covered against `SqliteViewRepository`. Tests here poll via `load`.
+        async fn find(
+            &self,
+            _predicate: &Predicate,
+            _order: Option<&Order>,
+            _limit: i64,
+        ) -> Result<Vec<String>, PersistenceError> {
+            Ok(vec![])
         }
     }
 
@@ -850,6 +888,21 @@ mod tests {
                 .insert(context.view_instance_id, (view, new_version));
 
             Ok(())
+        }
+    }
+
+    impl<View, Agg> IndexedView<View, Agg> for ConflictingRepo<View, Agg>
+    where
+        View: cqrs_es::View<Agg> + Clone,
+        Agg: cqrs_es::Aggregate,
+    {
+        async fn find(
+            &self,
+            _predicate: &Predicate,
+            _order: Option<&Order>,
+            _limit: i64,
+        ) -> Result<Vec<String>, PersistenceError> {
+            Ok(vec![])
         }
     }
 
@@ -1022,7 +1075,7 @@ mod tests {
         type Event = CounterEvent;
         type Command = ();
         type Error = Never;
-        type Services = ();
+        type Jobs = Nil;
         type Materialized = Table;
 
         const AGGREGATE_TYPE: &'static str = "Counter";
@@ -1045,14 +1098,17 @@ mod tests {
             }
         }
 
-        async fn initialize(_command: (), _services: &()) -> Result<Vec<CounterEvent>, Never> {
+        async fn initialize(
+            _command: (),
+            _jobs: &JobQueue<Self::Jobs>,
+        ) -> Result<Vec<CounterEvent>, Never> {
             Ok(vec![])
         }
 
         async fn transition(
             &self,
             _command: (),
-            _services: &(),
+            _jobs: &JobQueue<Self::Jobs>,
         ) -> Result<Vec<CounterEvent>, Never> {
             Ok(vec![])
         }

@@ -21,6 +21,8 @@ enum SqliteEventRepositoryError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Integer(#[from] std::num::TryFromIntError),
+    #[error(transparent)]
+    JobFlush(#[from] crate::job::JobStoreError),
 }
 
 impl From<SqliteEventRepositoryError> for PersistenceError {
@@ -32,11 +34,16 @@ impl From<SqliteEventRepositoryError> for PersistenceError {
             Sql(source) => Self::ConnectionError(Box::new(source)),
             Json(source) => Self::DeserializationError(Box::new(source)),
             Integer(source) => Self::UnknownError(Box::new(source)),
+            JobFlush(source) => Self::UnknownError(Box::new(source)),
         }
     }
 }
 
-pub(crate) struct SqliteEventRepository {
+/// SQLite implementation of the cqrs-es [`PersistedEventRepository`].
+///
+/// Public so it can be the [`crate::EventBackend::EventRepo`] of
+/// [`crate::SqliteBackend`]; consumers obtain it via the backend, not directly.
+pub struct SqliteEventRepository {
     pool: SqlitePool,
     compaction_policy: CompactionPolicy,
     stream_channel_size: usize,
@@ -138,6 +145,31 @@ impl SqliteEventRepository {
             .bind(last_sequence)
             .bind(snapshot_version)
             .bind(aggregate)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Drain any jobs the command buffered: append each as an Enqueued event
+        // AND seed its job_queue projection row (version 1), both in this
+        // transaction, so a job becomes durable and pollable iff the triggering
+        // events commit.
+        for request in crate::job::take_pending()? {
+            let event = crate::job::enqueued_event(&request)?;
+            sqlite_es::insert_serialized_events_batch(
+                &mut tx,
+                "events",
+                std::slice::from_ref(&event),
+            )
+            .await
+            .map_err(map_sqlite_aggregate_error)?;
+
+            let payload = crate::job::pending_seed_payload(&request)?;
+            sqlx::query(
+                "INSERT INTO job_queue (view_id, version, payload, lease_until) \
+                 VALUES (?1, 1, ?2, NULL)",
+            )
+            .bind(&request.job_id)
+            .bind(&payload)
             .execute(&mut *tx)
             .await?;
         }
