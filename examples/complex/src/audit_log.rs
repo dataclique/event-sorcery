@@ -149,7 +149,7 @@ mod tests {
         store
             .send(
                 &order,
-                OrderCommand::Confirmation(event_sorcery::DispatchOutcome::simulated_confirmed(
+                OrderCommand::Settle(event_sorcery::DispatchOutcome::simulated_confirmed(
                     job_id,
                     (),
                     1,

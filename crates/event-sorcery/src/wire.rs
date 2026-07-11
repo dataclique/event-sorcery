@@ -256,15 +256,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for AggregateA {
         type Id = String;
-        type Event = EventA;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = EventA;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "AggregateA";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "AggregateA";
 
         fn originate(_event: &EventA) -> Option<Self> {
             Some(Self)
@@ -286,15 +286,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for AggregateB {
         type Id = String;
-        type Event = EventB;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = EventB;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "AggregateB";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "AggregateB";
 
         fn originate(_event: &EventB) -> Option<Self> {
             Some(Self)
@@ -408,15 +408,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Tally {
         type Id = String;
-        type Event = TallyEvent;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = TallyEvent;
         type Materialized = Table;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Tally";
         const PROJECTION: Table = Table("tally_view");
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Tally";
 
         fn originate(event: &TallyEvent) -> Option<Self> {
             match event {

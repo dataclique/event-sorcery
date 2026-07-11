@@ -72,15 +72,15 @@ pub enum SchemaRegistryCommand {
 #[async_trait]
 impl EventSourced for SchemaRegistry {
     type Id = String;
-    type Event = SchemaRegistryEvent;
-    type Command = SchemaRegistryCommand;
     type Error = Never;
-    type Jobs = Nil;
+    type Command = SchemaRegistryCommand;
+    type Event = SchemaRegistryEvent;
     type Materialized = Nil;
+    type Jobs = Nil;
 
-    const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
+    const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
 
     fn originate(event: &Self::Event) -> Option<Self> {
         let SchemaRegistryEvent::VersionUpdated { name, version } = event;
@@ -491,15 +491,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for CompactableWidget {
         type Id = String;
-        type Event = CompactableEvent;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = CompactableEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "CompactableWidget";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 2;
+        const AGGREGATE_TYPE: &'static str = "CompactableWidget";
         const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
 
         fn originate(_event: &Self::Event) -> Option<Self> {

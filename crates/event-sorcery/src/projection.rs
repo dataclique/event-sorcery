@@ -676,15 +676,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for TestEntity {
         type Id = String;
-        type Event = TestEvent;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = TestEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "TestEntity";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "TestEntity";
 
         fn originate(_event: &TestEvent) -> Option<Self> {
             Some(Self {
@@ -1065,15 +1065,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Counter {
         type Id = String;
-        type Event = CounterEvent;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = CounterEvent;
         type Materialized = Table;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Counter";
         const PROJECTION: Table = Table("counter_view");
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Counter";
 
         fn originate(event: &CounterEvent) -> Option<Self> {
             match event {

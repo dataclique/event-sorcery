@@ -164,20 +164,24 @@ through `Effect::Dispatch`.
 
 What a command handler returns (`Effect`, ADR-0009): either domain events, or
 exactly one `JobDispatch` -- the wiring-proven kick-off of a job, obtained from
-`DispatchedJob::dispatch(job)`. This is the whole durability contract: the
-framework (never the handler) emits the `Dispatched` event (which carries the
-job value -- the intent IS the job) and enqueues in the same transaction.
+the state guard `DispatchedJob::dispatch(job)` in `transition`, or from the
+infallible `Effect::kickoff(job)` in `initialize` (no dispatch state exists
+yet). This is the whole durability contract: the framework (never the handler)
+emits the `Dispatched` event (which carries the job value -- the intent IS the
+job) and enqueues in the same transaction.
 
 The entity embeds a `DispatchedJob<J>` field
 (`Idle -> InFlight -> Confirmed | Failed`) and nests `DispatchEvent<J>` in its
-event enum; the machine owns the state guard (refuse overlapping dispatches,
-absorb duplicate verdict delivery). Settled verdicts (`Settled` /
-`SettledFailure`, arriving as an opaque `DispatchOutcome` command) are SEALED --
-only the framework's delivery path constructs them, so `Confirmed` in entity
-state proves the job settled. Delivery goes through an `OriginPort` (implemented
-by `Store` when the origin's command enum absorbs `DispatchOutcome<J>` via
-`From`) BEFORE the job acks; failed delivery defers rather than counting an
-attempt.
+event enum (conventionally a `Dispatch` variant, with the settling
+`DispatchOutcome<J>` command conventionally named `Settle`); the machine owns
+the state guard (refuse overlapping dispatches, absorb duplicate verdict
+delivery), and `DispatchedJob::originate(event)` folds the first dispatch event
+in the entity's `originate`. Settled verdicts (`Settled` / `SettledFailure`,
+arriving as an opaque `DispatchOutcome` command) are SEALED -- only the
+framework's delivery path constructs them, so `Confirmed` in entity state proves
+the job settled. Delivery goes through an `OriginPort` (implemented by `Store`
+when the origin's command enum absorbs `DispatchOutcome<J>` via `From`) BEFORE
+the job acks; failed delivery defers rather than counting an attempt.
 
 ### Lifecycle
 

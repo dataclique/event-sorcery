@@ -72,15 +72,15 @@ pub enum MyEntityCommand {
 #[async_trait]
 impl EventSourced for MyEntity {
     type Id = MyEntityId;       // strongly-typed, Display + FromStr
-    type Event = MyEntityEvent;
-    type Command = MyEntityCommand;
     type Error = Never;         // or a thiserror type
-    type Jobs = Nil;            // or jobs![SendEmail, ChargeCard]
+    type Command = MyEntityCommand;
+    type Event = MyEntityEvent;
     type Materialized = Table;  // Table for projected, Nil for non-projected
+    type Jobs = Nil;            // or jobs![SendEmail, ChargeCard]
 
-    const AGGREGATE_TYPE: &'static str = "MyEntity";
     const PROJECTION: Table = Table("my_entity_view");
     const SCHEMA_VERSION: u64 = 1;
+    const AGGREGATE_TYPE: &'static str = "MyEntity";
 
     // Event-side: reconstruct state from events
     fn originate(event: &Self::Event) -> Option<Self> { /* ... */ }
@@ -285,8 +285,8 @@ type Jobs = jobs![NotifyClosed];  // or Nil for an entity that dispatches nothin
 
 Embed a `DispatchedJob<J>` field in the entity
 (`Idle -> InFlight -> Confirmed | Failed`), nest `DispatchEvent<J>` in the event
-enum and `DispatchOutcome<J>` in the command enum (with `From` impls), and
-delegate:
+enum (conventionally a `Dispatch` variant) and `DispatchOutcome<J>` in the
+command enum (conventionally `Settle`), both with `From` impls, and delegate:
 
 ```rust
 async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self::Error> {
@@ -297,15 +297,19 @@ async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self:
             subject: self.subject.clone(),
         })?)),
         // The framework delivers the sealed verdict; settle folds it in.
-        MyCommand::Notify(outcome) => {
+        MyCommand::Settle(outcome) => {
             let events = self.notify.settle(outcome)?;
-            Ok(Effect::Events(events.into_iter().map(MyEvent::Notify).collect()))
+            Ok(Effect::Events(events.into_iter().map(MyEvent::Dispatch).collect()))
         }
         // Pure domain facts stay plain events.
         MyCommand::AwaitCustomer => Ok(Effect::Events(vec![MyEvent::AwaitingCustomer])),
     }
 }
 ```
+
+From an `initialize` handler there is no dispatch state to guard, so kick off
+with the infallible `Effect::kickoff(job)`; in `originate`, fold the first
+`Dispatched` event with `DispatchedJob::originate(event)`.
 
 The dispatch compile-checks that the job is declared in `Jobs`, that its
 `Origin` is this entity, and that the event enum absorbs `DispatchEvent<J>` --

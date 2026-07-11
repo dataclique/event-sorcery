@@ -80,30 +80,36 @@ pub enum InventoryError {
 #[async_trait]
 impl EventSourced for Inventory {
     type Id = Sku;
-    type Event = InventoryEvent;
-    type Command = InventoryCommand;
     type Error = InventoryError;
-    type Jobs = Nil;
+    type Command = InventoryCommand;
+    type Event = InventoryEvent;
     type Materialized = Table;
+    type Jobs = Nil;
 
-    const AGGREGATE_TYPE: &'static str = "Inventory";
     const PROJECTION: Table = Table("inventory_view");
     const SCHEMA_VERSION: u64 = 1;
+    const AGGREGATE_TYPE: &'static str = "Inventory";
 
     fn originate(event: &InventoryEvent) -> Option<Self> {
+        use InventoryEvent::{Consumed, Initialized, Restocked};
+
         match event {
-            InventoryEvent::Initialized { item, on_hand } => Some(Self {
+            Initialized { item, on_hand } => Some(Self {
                 item: item.clone(),
                 on_hand: *on_hand,
             }),
-            InventoryEvent::Restocked { .. } | InventoryEvent::Consumed { .. } => None,
+
+            Restocked { .. } | Consumed { .. } => None,
         }
     }
 
     fn evolve(entity: &Self, event: &InventoryEvent) -> Result<Option<Self>, InventoryError> {
+        use InventoryEvent::{Consumed, Initialized, Restocked};
+
         match event {
-            InventoryEvent::Initialized { .. } => Ok(None),
-            InventoryEvent::Restocked { added } => entity
+            Initialized { .. } => Ok(None),
+
+            Restocked { added } => entity
                 .on_hand
                 .checked_add(*added)
                 .map(|on_hand| {
@@ -113,7 +119,8 @@ impl EventSourced for Inventory {
                     })
                 })
                 .ok_or(InventoryError::Overflow),
-            InventoryEvent::Consumed { taken } => entity
+
+            Consumed { taken } => entity
                 .on_hand
                 .checked_sub(*taken)
                 .map(|on_hand| {
@@ -130,37 +137,39 @@ impl EventSourced for Inventory {
     }
 
     async fn initialize(command: InventoryCommand) -> Result<Effect<Self>, InventoryError> {
+        use InventoryCommand::{Consume, Initialize, Restock};
+
         match command {
-            InventoryCommand::Initialize { item, on_hand } => {
-                Ok(Effect::Events(vec![InventoryEvent::Initialized {
-                    item,
-                    on_hand,
-                }]))
-            }
-            InventoryCommand::Restock { .. } | InventoryCommand::Consume { .. } => {
-                Err(InventoryError::NotInitialized)
-            }
+            Initialize { item, on_hand } => Ok(Effect::Events(vec![InventoryEvent::Initialized {
+                item,
+                on_hand,
+            }])),
+
+            Restock { .. } | Consume { .. } => Err(InventoryError::NotInitialized),
         }
     }
 
     async fn transition(&self, command: InventoryCommand) -> Result<Effect<Self>, InventoryError> {
+        use InventoryCommand::{Consume, Initialize, Restock};
+        use InventoryEvent::{Consumed, Restocked};
+
         match command {
-            InventoryCommand::Initialize { .. } => Err(InventoryError::AlreadyInitialized),
-            InventoryCommand::Restock { added } => {
+            Initialize { .. } => Err(InventoryError::AlreadyInitialized),
+
+            Restock { added } => {
                 self.on_hand
                     .checked_add(added)
                     .ok_or(InventoryError::Overflow)?;
-                Ok(Effect::Events(vec![InventoryEvent::Restocked { added }]))
+
+                Ok(Effect::Events(vec![Restocked { added }]))
             }
-            InventoryCommand::Consume { taken } => {
-                if taken > self.on_hand {
-                    return Err(InventoryError::Underflow {
-                        on_hand: self.on_hand,
-                        taken,
-                    });
-                }
-                Ok(Effect::Events(vec![InventoryEvent::Consumed { taken }]))
-            }
+
+            Consume { taken } if taken > self.on_hand => Err(InventoryError::Underflow {
+                on_hand: self.on_hand,
+                taken,
+            }),
+
+            Consume { taken } => Ok(Effect::Events(vec![Consumed { taken }])),
         }
     }
 }

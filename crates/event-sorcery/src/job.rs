@@ -434,15 +434,15 @@ pub(crate) enum JobError {
 #[async_trait]
 impl EventSourced for JobState {
     type Id = JobId;
-    type Event = JobEvent;
-    type Command = JobCommand;
     type Error = JobError;
-    type Jobs = Nil;
+    type Command = JobCommand;
+    type Event = JobEvent;
     type Materialized = Table;
+    type Jobs = Nil;
 
-    const AGGREGATE_TYPE: &'static str = JOB_AGGREGATE_TYPE;
     const PROJECTION: Table = Table("job_queue");
     const SCHEMA_VERSION: u64 = 1;
+    const AGGREGATE_TYPE: &'static str = JOB_AGGREGATE_TYPE;
     const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
     fn originate(event: &JobEvent) -> Option<Self> {

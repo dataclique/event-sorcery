@@ -134,10 +134,54 @@ pub enum Reconciliation<Output> {
 pub enum Effect<Entity: EventSourced> {
     /// Pure domain facts; nothing external was requested.
     Events(Vec<Entity::Event>),
-    /// One durable job dispatch, obtained from [`DispatchedJob::dispatch`].
-    /// The framework emits the wrapped `Dispatched` event and enqueues the
-    /// job in the same transaction.
+    /// One durable job dispatch, obtained from [`DispatchedJob::dispatch`]
+    /// (or [`Effect::kickoff`] when the entity has no state yet). The
+    /// framework emits the wrapped `Dispatched` event and enqueues the job
+    /// in the same transaction.
     Dispatch(JobDispatch<Entity>),
+}
+
+impl<Entity: EventSourced> Effect<Entity> {
+    /// Kick off `job` from a handler with no prior dispatch to guard --
+    /// an `initialize` handler, where the entity does not exist yet. The
+    /// [`Idle`](DispatchedJob::Idle) machine cannot refuse, so this form is
+    /// infallible; from `transition`, dispatch through the entity's state
+    /// (`self.field.dispatch(job)?`) so an in-flight or confirmed job
+    /// refuses the overlap.
+    ///
+    /// Carries the same wiring proof as [`DispatchedJob::dispatch`]: the
+    /// job's origin is this entity, the entity's event enum absorbs
+    /// [`DispatchEvent<J>`], and the job is declared in the entity's
+    /// [`jobs!`](crate::jobs) list.
+    pub fn kickoff<J, Index>(job: J) -> Self
+    where
+        J: Job<Origin = Entity>,
+        Entity::Event: From<DispatchEvent<J>>,
+        Entity::Jobs: Contains<J, Index>,
+    {
+        Self::Dispatch(kick(job))
+    }
+}
+
+/// The unguarded kick-off construction shared by [`Effect::kickoff`] and the
+/// state-guarded [`DispatchedJob::dispatch`].
+fn kick<J: Job>(job: J) -> JobDispatch<J::Origin>
+where
+    <J::Origin as EventSourced>::Event: From<DispatchEvent<J>>,
+{
+    let job_id = JobId::new();
+    let event = DispatchEvent::Dispatched {
+        job_id,
+        job: job.clone(),
+    };
+    JobDispatch {
+        event: event.into(),
+        pending: PendingPush {
+            job_id,
+            job: Box::new(job),
+            delay: None,
+        },
+    }
 }
 
 /// A wiring-proven job kick-off.
@@ -358,21 +402,7 @@ impl<J: Job> DispatchedJob<J> {
         <J::Origin as EventSourced>::Jobs: Contains<J, Index>,
     {
         match self {
-            Self::Idle | Self::Failed(_) => {
-                let job_id = JobId::new();
-                let event = DispatchEvent::Dispatched {
-                    job_id,
-                    job: job.clone(),
-                };
-                Ok(JobDispatch {
-                    event: event.into(),
-                    pending: PendingPush {
-                        job_id,
-                        job: Box::new(job),
-                        delay: None,
-                    },
-                })
-            }
+            Self::Idle | Self::Failed(_) => Ok(kick(job)),
             Self::InFlight { .. } => Err(DispatchRefused::InFlight),
             Self::Confirmed(_) => Err(DispatchRefused::AlreadyConfirmed),
         }
@@ -424,8 +454,16 @@ impl<J: Job> DispatchedJob<J> {
         }
     }
 
+    /// Folds the FIRST [`DispatchEvent`] of a fresh entity into a machine.
+    /// Call from the entity's `originate` -- it mirrors
+    /// [`EventSourced::originate`] the way [`evolve`](Self::evolve) mirrors
+    /// [`EventSourced::evolve`].
+    pub fn originate(event: &DispatchEvent<J>) -> Result<Self, DispatchReplay> {
+        Self::Idle.evolve(event)
+    }
+
     /// Folds a [`DispatchEvent`] into the next state. Call from the entity's
-    /// `evolve`/`originate`.
+    /// `evolve`.
     pub fn evolve(&self, event: &DispatchEvent<J>) -> Result<Self, DispatchReplay> {
         match (self, event) {
             (Self::Idle | Self::Failed(_), DispatchEvent::Dispatched { job_id, .. }) => {
@@ -745,31 +783,31 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     enum DeskEvent {
-        Order(DispatchEvent<PlaceOrder>),
+        Dispatch(DispatchEvent<PlaceOrder>),
     }
 
     impl From<DispatchEvent<PlaceOrder>> for DeskEvent {
         fn from(event: DispatchEvent<PlaceOrder>) -> Self {
-            Self::Order(event)
+            Self::Dispatch(event)
         }
     }
 
     #[derive(Debug, Clone)]
     enum DeskCommand {
         Place(PlaceOrder),
-        Order(DispatchOutcome<PlaceOrder>),
+        Settle(DispatchOutcome<PlaceOrder>),
     }
 
     impl From<DispatchOutcome<PlaceOrder>> for DeskCommand {
         fn from(outcome: DispatchOutcome<PlaceOrder>) -> Self {
-            Self::Order(outcome)
+            Self::Settle(outcome)
         }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
     enum DeskError {
         #[error(transparent)]
-        Order(#[from] DispatchRefused),
+        Refused(#[from] DispatchRefused),
     }
 
     impl cqrs_es::DomainEvent for DeskEvent {
@@ -785,24 +823,24 @@ mod tests {
     #[async_trait::async_trait]
     impl EventSourced for Desk {
         type Id = u64;
-        type Event = DeskEvent;
-        type Command = DeskCommand;
         type Error = DeskError;
-        type Jobs = jobs![PlaceOrder];
+        type Command = DeskCommand;
+        type Event = DeskEvent;
         type Materialized = Nil;
+        type Jobs = jobs![PlaceOrder];
 
-        const AGGREGATE_TYPE: &'static str = "Desk";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Desk";
 
         fn originate(event: &DeskEvent) -> Option<Self> {
-            let DeskEvent::Order(dispatch_event) = event;
-            let order = DispatchedJob::Idle.evolve(dispatch_event).ok()?;
+            let DeskEvent::Dispatch(dispatch_event) = event;
+            let order = DispatchedJob::originate(dispatch_event).ok()?;
             Some(Self { order })
         }
 
         fn evolve(entity: &Self, event: &DeskEvent) -> Result<Option<Self>, DeskError> {
-            let DeskEvent::Order(dispatch_event) = event;
+            let DeskEvent::Dispatch(dispatch_event) = event;
             Ok(entity
                 .order
                 .evolve(dispatch_event)
@@ -812,18 +850,18 @@ mod tests {
 
         async fn initialize(command: DeskCommand) -> Result<Effect<Self>, DeskError> {
             match command {
-                DeskCommand::Place(job) => Ok(Effect::Dispatch(DispatchedJob::Idle.dispatch(job)?)),
-                DeskCommand::Order(_) => Err(DeskError::Order(DispatchRefused::OutcomeMismatch)),
+                DeskCommand::Place(job) => Ok(Effect::kickoff(job)),
+                DeskCommand::Settle(_) => Err(DeskError::Refused(DispatchRefused::OutcomeMismatch)),
             }
         }
 
         async fn transition(&self, command: DeskCommand) -> Result<Effect<Self>, DeskError> {
             match command {
                 DeskCommand::Place(job) => Ok(Effect::Dispatch(self.order.dispatch(job)?)),
-                DeskCommand::Order(outcome) => {
+                DeskCommand::Settle(outcome) => {
                     let events = self.order.settle(outcome)?;
                     Ok(Effect::Events(
-                        events.into_iter().map(DeskEvent::Order).collect(),
+                        events.into_iter().map(DeskEvent::Dispatch).collect(),
                     ))
                 }
             }
@@ -879,7 +917,7 @@ mod tests {
     fn dispatch_from_idle_pairs_the_event_with_the_enqueue() {
         let dispatch = DispatchedJob::<PlaceOrder>::Idle.dispatch(place()).unwrap();
 
-        let DeskEvent::Order(DispatchEvent::Dispatched { job_id, job }) = &dispatch.event else {
+        let DeskEvent::Dispatch(DispatchEvent::Dispatched { job_id, job }) = &dispatch.event else {
             panic!("expected a Dispatched event");
         };
         assert_eq!(dispatch.pending.job_id, *job_id);
@@ -922,7 +960,7 @@ mod tests {
         let dispatch = state.dispatch(place()).unwrap();
         assert!(matches!(
             dispatch.event,
-            DeskEvent::Order(DispatchEvent::Dispatched { .. })
+            DeskEvent::Dispatch(DispatchEvent::Dispatched { .. })
         ));
     }
 
@@ -1345,7 +1383,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             refused,
-            AggregateError::UserError(LifecycleError::Apply(DeskError::Order(
+            AggregateError::UserError(LifecycleError::Apply(DeskError::Refused(
                 DispatchRefused::InFlight
             )))
         ));
@@ -1389,7 +1427,7 @@ mod tests {
 
         // An at-least-once redelivery of the same verdict is absorbed.
         desk_store
-            .send(&7, DeskCommand::Order(confirmed(job_id)))
+            .send(&7, DeskCommand::Settle(confirmed(job_id)))
             .await
             .unwrap();
         let after = desk_store.load(&7).await.unwrap().unwrap();

@@ -221,11 +221,12 @@ contract itself, not opt-in plumbing (see
 [ADR-0009](adrs/0009-handlers-return-events-or-one-job-dispatch.md)):
 
 - **`Effect`.** Handlers return either domain events or exactly one
-  `JobDispatch`, obtained from `DispatchedJob::dispatch(job)` -- the only path
-  to an enqueue from a handler. The framework emits the `Dispatched` event
-  (which carries the job value: the intent IS the job) and enqueues in the same
-  transaction, so there is no intent/call crash window and no free-form event
-  can accompany the enqueue.
+  `JobDispatch`, obtained from the state guard `DispatchedJob::dispatch(job)`
+  (or the infallible `Effect::kickoff(job)` in `initialize`, where no dispatch
+  state exists yet) -- the only paths to an enqueue from a handler. The
+  framework emits the `Dispatched` event (which carries the job value: the
+  intent IS the job) and enqueues in the same transaction, so there is no
+  intent/call crash window and no free-form event can accompany the enqueue.
 - **`DispatchedJob<J>`** is the library-owned machine embedded in entity state
   (`Idle -> InFlight -> Confirmed(Settled) | Failed(SettledFailure)`), with
   `DispatchEvent<J>` wrappers nested in the entity's event enum. The state guard

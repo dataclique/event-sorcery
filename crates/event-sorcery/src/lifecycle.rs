@@ -416,15 +416,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Counter {
         type Id = String;
-        type Event = CounterEvent;
-        type Command = CounterCommand;
         type Error = CounterError;
-        type Jobs = Nil;
+        type Command = CounterCommand;
+        type Event = CounterEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Counter";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Counter";
 
         fn originate(event: &CounterEvent) -> Option<Self> {
             match event {

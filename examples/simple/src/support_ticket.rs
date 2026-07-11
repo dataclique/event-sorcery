@@ -80,12 +80,12 @@ pub enum SupportTicketEvent {
     AwaitingCustomer {
         at: chrono::DateTime<chrono::Utc>,
     },
-    Notify(DispatchEvent<NotifyClosed>),
+    Dispatch(DispatchEvent<NotifyClosed>),
 }
 
 impl From<DispatchEvent<NotifyClosed>> for SupportTicketEvent {
     fn from(event: DispatchEvent<NotifyClosed>) -> Self {
-        Self::Notify(event)
+        Self::Dispatch(event)
     }
 }
 
@@ -94,11 +94,13 @@ impl DomainEvent for SupportTicketEvent {
         match self {
             Self::Opened { .. } => "SupportTicketEvent::Opened".to_string(),
             Self::AwaitingCustomer { .. } => "SupportTicketEvent::AwaitingCustomer".to_string(),
-            Self::Notify(DispatchEvent::Dispatched { .. }) => {
+            Self::Dispatch(DispatchEvent::Dispatched { .. }) => {
                 "SupportTicketEvent::CloseRequested".to_string()
             }
-            Self::Notify(DispatchEvent::Confirmed(_)) => "SupportTicketEvent::Closed".to_string(),
-            Self::Notify(DispatchEvent::Failed(_)) => "SupportTicketEvent::CloseFailed".to_string(),
+            Self::Dispatch(DispatchEvent::Confirmed(_)) => "SupportTicketEvent::Closed".to_string(),
+            Self::Dispatch(DispatchEvent::Failed(_)) => {
+                "SupportTicketEvent::CloseFailed".to_string()
+            }
         }
     }
 
@@ -123,12 +125,12 @@ pub enum SupportTicketCommand {
         at: chrono::DateTime<chrono::Utc>,
     },
     /// Delivered by the framework when the notify job settles.
-    Notify(DispatchOutcome<NotifyClosed>),
+    Settle(DispatchOutcome<NotifyClosed>),
 }
 
 impl From<DispatchOutcome<NotifyClosed>> for SupportTicketCommand {
     fn from(outcome: DispatchOutcome<NotifyClosed>) -> Self {
-        Self::Notify(outcome)
+        Self::Settle(outcome)
     }
 }
 
@@ -141,7 +143,7 @@ pub enum SupportTicketError {
     #[error("ticket is already closed or closing")]
     AlreadyClosed,
     #[error(transparent)]
-    Notify(#[from] DispatchRefused),
+    Refused(#[from] DispatchRefused),
 }
 
 /// The job a `Close` command kicks off: notify the customer. The job carries
@@ -230,15 +232,15 @@ impl StandaloneJob for SweepStaleTickets {
 #[async_trait]
 impl EventSourced for SupportTicket {
     type Id = TicketId;
-    type Event = SupportTicketEvent;
-    type Command = SupportTicketCommand;
     type Error = SupportTicketError;
-    type Jobs = event_sorcery::jobs![NotifyClosed];
+    type Command = SupportTicketCommand;
+    type Event = SupportTicketEvent;
     type Materialized = Table;
+    type Jobs = event_sorcery::jobs![NotifyClosed];
 
-    const AGGREGATE_TYPE: &'static str = "SupportTicket";
     const PROJECTION: Table = Table("support_ticket_view");
     const SCHEMA_VERSION: u64 = 2;
+    const AGGREGATE_TYPE: &'static str = "SupportTicket";
 
     fn originate(event: &SupportTicketEvent) -> Option<Self> {
         match event {
@@ -253,7 +255,7 @@ impl EventSourced for SupportTicket {
                 last_updated_at: *at,
                 notify: DispatchedJob::Idle,
             }),
-            SupportTicketEvent::AwaitingCustomer { .. } | SupportTicketEvent::Notify(_) => None,
+            SupportTicketEvent::AwaitingCustomer { .. } | SupportTicketEvent::Dispatch(_) => None,
         }
     }
 
@@ -268,7 +270,7 @@ impl EventSourced for SupportTicket {
                 last_updated_at: *at,
                 ..entity.clone()
             })),
-            SupportTicketEvent::Notify(dispatch_event) => {
+            SupportTicketEvent::Dispatch(dispatch_event) => {
                 let Ok(notify) = entity.notify.evolve(dispatch_event) else {
                     return Ok(None);
                 };
@@ -304,7 +306,7 @@ impl EventSourced for SupportTicket {
             }])),
             SupportTicketCommand::AwaitCustomer { .. }
             | SupportTicketCommand::Close { .. }
-            | SupportTicketCommand::Notify(_) => Err(SupportTicketError::NotOpen),
+            | SupportTicketCommand::Settle(_) => Err(SupportTicketError::NotOpen),
         }
     }
 
@@ -335,10 +337,13 @@ impl EventSourced for SupportTicket {
                     })?))
                 }
             },
-            SupportTicketCommand::Notify(outcome) => {
+            SupportTicketCommand::Settle(outcome) => {
                 let events = self.notify.settle(outcome)?;
                 Ok(Effect::Events(
-                    events.into_iter().map(SupportTicketEvent::Notify).collect(),
+                    events
+                        .into_iter()
+                        .map(SupportTicketEvent::Dispatch)
+                        .collect(),
                 ))
             }
         }
@@ -370,7 +375,7 @@ mod tests {
     }
 
     fn dispatched(ticket: TicketId, job_id: JobId) -> SupportTicketEvent {
-        SupportTicketEvent::Notify(DispatchEvent::Dispatched {
+        SupportTicketEvent::Dispatch(DispatchEvent::Dispatched {
             job_id,
             job: NotifyClosed {
                 ticket,
@@ -393,7 +398,7 @@ mod tests {
         // The only event a close can produce is the framework-built intent.
         assert!(matches!(
             events.as_slice(),
-            [SupportTicketEvent::Notify(DispatchEvent::Dispatched { job, .. })]
+            [SupportTicketEvent::Dispatch(DispatchEvent::Dispatched { job, .. })]
                 if job.subject == "printer on fire" && job.ticket == TicketId(1)
         ));
     }
@@ -429,7 +434,11 @@ mod tests {
         let settled: SupportTicket = replay([
             opened(TicketId(1)),
             dispatched(TicketId(1), job_id),
-            SupportTicketEvent::Notify(DispatchEvent::Confirmed(Settled::simulated(job_id, (), 1))),
+            SupportTicketEvent::Dispatch(DispatchEvent::Confirmed(Settled::simulated(
+                job_id,
+                (),
+                1,
+            ))),
         ])
         .unwrap()
         .unwrap();
@@ -492,7 +501,7 @@ mod tests {
         store
             .send(
                 &id,
-                SupportTicketCommand::Notify(DispatchOutcome::simulated_confirmed(job_id, (), 1)),
+                SupportTicketCommand::Settle(DispatchOutcome::simulated_confirmed(job_id, (), 1)),
             )
             .await
             .unwrap();

@@ -415,15 +415,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Alpha {
         type Id = String;
-        type Event = AlphaEvent;
-        type Command = ();
         type Error = AlphaError;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = AlphaEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Alpha";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Alpha";
 
         fn originate(event: &AlphaEvent) -> Option<Self> {
             match event {
@@ -472,15 +472,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Beta {
         type Id = String;
-        type Event = BetaEvent;
-        type Command = ();
         type Error = BetaError;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = BetaEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Beta";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Beta";
 
         fn originate(event: &BetaEvent) -> Option<Self> {
             match event {
