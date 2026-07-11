@@ -122,6 +122,7 @@ pub use dispatch::{
     Contains, DeliveryPolicy, DispatchEvent, DispatchFailure, DispatchOutcome, DispatchRefused,
     DispatchReplay, DispatchedJob, Effect, Fx, Here, Job, JobDispatch, JobInput, JobList,
     OriginDeliveryError, OriginPort, Reconciliation, Settled, SettledFailure, There, fx,
+    uneventful,
 };
 pub use job::{
     DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,
@@ -830,7 +831,7 @@ mod tests {
 
         async fn transition(&self, command: WidgetCommand) -> Result<Effect<Self>, WidgetError> {
             match command {
-                WidgetCommand::Create { .. } => Ok(Effect::Events(vec![])),
+                WidgetCommand::Create { .. } => uneventful(),
                 WidgetCommand::Rename { name } => {
                     Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
                 }
@@ -1023,7 +1024,7 @@ mod tests {
 
             async fn transition(&self, command: TallyCommand) -> Result<Effect<Self>, WidgetError> {
                 match command {
-                    TallyCommand::Start => Ok(Effect::Events(vec![])),
+                    TallyCommand::Start => uneventful(),
                     TallyCommand::Increment => Ok(Effect::Events(vec![TallyEvent::Incremented])),
                 }
             }
@@ -1115,7 +1116,7 @@ mod tests {
                 command: WidgetCommand,
             ) -> Result<Effect<Self>, WidgetError> {
                 match command {
-                    WidgetCommand::Create { .. } => Ok(Effect::Events(vec![])),
+                    WidgetCommand::Create { .. } => uneventful(),
                     WidgetCommand::Rename { name } => {
                         Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
                     }

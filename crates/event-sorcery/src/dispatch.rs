@@ -187,6 +187,15 @@ where
     value.produce()
 }
 
+/// The no-op handler outcome: accept the command, record nothing.
+///
+/// The empty counterpart of [`fx`] -- a bare `fx(vec![])` cannot infer its
+/// element type (an empty event list and an empty settlement list are
+/// indistinguishable), so the empty outcome gets its own name.
+pub fn uneventful<Entity: EventSourced>() -> Result<Effect<Entity>, Entity::Error> {
+    Ok(Effect::Events(vec![]))
+}
+
 /// A value a command handler can return as its entire outcome.
 ///
 /// Domain events, a job kick-off, a guarded [`JobDispatch`], or the entity's

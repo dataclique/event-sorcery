@@ -129,6 +129,7 @@ sections below.
 | `Nil`                  | Empty type-level list (no projection / jobs) |
 | `Effect<Entity>`       | Handler result: events, or one job dispatch  |
 | `fx(value)`            | Wraps events/job/dispatch/error into result  |
+| `uneventful()`         | No-op outcome: accept command, no events     |
 | `Job`                  | Entity-kicked job (submit/reconcile)         |
 | `StandaloneJob`        | Origin-less worker job (perform)             |
 | `DispatchedJob<J>`     | Entity-embedded state of a kicked-off job    |
@@ -315,7 +316,9 @@ async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self:
 `Job` (the infallible kick-off for `initialize`, where there is no dispatch
 state to guard), or the entity's domain error (which becomes the `Err` arm). In
 `originate`, fold the first `Dispatched` event with
-`DispatchedJob::originate(event)`.
+`DispatchedJob::originate(event)`. The empty outcome has its own name:
+`uneventful()` accepts the command and records nothing (a bare `fx(vec![])`
+cannot infer its element type).
 
 The dispatch compile-checks that the job is declared in `Jobs`, that its
 `Origin` is this entity, and that the event enum absorbs `DispatchEvent<J>` --

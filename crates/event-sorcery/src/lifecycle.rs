@@ -369,7 +369,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::{EventSourced, Nil};
+    use crate::{EventSourced, Nil, uneventful};
 
     /// Test entity: a simple counter with controllable error behavior.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,7 +459,7 @@ mod tests {
 
         async fn transition(&self, command: CounterCommand) -> Result<Effect<Self>, CounterError> {
             match command {
-                CounterCommand::Create { .. } => Ok(Effect::Events(vec![])),
+                CounterCommand::Create { .. } => uneventful(),
                 CounterCommand::Increment => Ok(Effect::Events(vec![CounterEvent::Incremented])),
                 CounterCommand::Fail => Err(CounterError),
                 CounterCommand::BrokenBatch => Ok(Effect::Events(vec![

@@ -32,7 +32,7 @@ use tracing::{debug, info};
 
 use crate::CompactionPolicy;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::{DomainEvent, Effect, EventSourced, Nil};
+use crate::{DomainEvent, Effect, EventSourced, Nil, uneventful};
 
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";
@@ -107,7 +107,7 @@ impl EventSourced for SchemaRegistry {
     async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         if self.version_of(&name) == Some(version) {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         } else {
             Ok(Effect::Events(vec![SchemaRegistryEvent::VersionUpdated {
                 name,
@@ -515,7 +515,7 @@ mod tests {
         }
 
         async fn transition(&self, _command: Self::Command) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
     }
 

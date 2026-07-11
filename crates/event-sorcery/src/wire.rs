@@ -216,10 +216,10 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::Effect;
     use crate::dependency::EntityList;
     use crate::deps;
     use crate::lifecycle::{Lifecycle, Never};
+    use crate::{Effect, uneventful};
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
     struct AggregateA;
@@ -275,11 +275,11 @@ mod tests {
         }
 
         async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
 
         async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
     }
 
@@ -305,11 +305,11 @@ mod tests {
         }
 
         async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
 
         async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
     }
 
@@ -433,11 +433,11 @@ mod tests {
         }
 
         async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
 
         async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
     }
 

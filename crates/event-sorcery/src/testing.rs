@@ -402,7 +402,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::{Effect, Nil};
+    use crate::{Effect, Nil, uneventful};
 
     // Required for ReactorHarness::receive to resolve HasEntity<Counter>.
     crate::register_entities!(Counter);
@@ -489,13 +489,13 @@ mod tests {
                 CounterCommand::Create { initial } => {
                     Ok(Effect::Events(vec![CounterEvent::Created { initial }]))
                 }
-                CounterCommand::Increment => Ok(Effect::Events(vec![])),
+                CounterCommand::Increment => uneventful(),
             }
         }
 
         async fn transition(&self, command: CounterCommand) -> Result<Effect<Self>, CounterError> {
             match command {
-                CounterCommand::Create { .. } => Ok(Effect::Events(vec![])),
+                CounterCommand::Create { .. } => uneventful(),
                 CounterCommand::Increment => Ok(Effect::Events(vec![CounterEvent::Incremented])),
             }
         }

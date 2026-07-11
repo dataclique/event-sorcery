@@ -387,7 +387,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::Effect;
+    use crate::{Effect, uneventful};
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Alpha {
@@ -442,7 +442,7 @@ mod tests {
         }
 
         async fn transition(&self, (): ()) -> Result<Effect<Self>, AlphaError> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
     }
 
@@ -497,7 +497,7 @@ mod tests {
         }
 
         async fn transition(&self, (): ()) -> Result<Effect<Self>, BetaError> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
     }
 

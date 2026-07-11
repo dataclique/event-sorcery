@@ -546,7 +546,7 @@ impl EventSourced for JobState {
     async fn initialize(_command: JobCommand) -> Result<crate::Effect<Self>, JobError> {
         // Jobs are born from the enqueue flush (a raw `Enqueued` append), never a
         // command. An ack of a vanished job is a harmless no-op.
-        Ok(crate::Effect::Events(vec![]))
+        crate::dispatch::uneventful()
     }
 
     async fn transition(&self, command: JobCommand) -> Result<crate::Effect<Self>, JobError> {

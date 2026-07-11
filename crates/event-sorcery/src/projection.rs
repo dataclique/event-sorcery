@@ -652,9 +652,9 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
-    use crate::Effect;
     use crate::Nil;
     use crate::lifecycle::Never;
+    use crate::{Effect, uneventful};
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct TestEntity {
@@ -697,11 +697,11 @@ mod tests {
         }
 
         async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
 
         async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
     }
 
@@ -1092,11 +1092,11 @@ mod tests {
         }
 
         async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
 
         async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![]))
+            uneventful()
         }
     }
 
