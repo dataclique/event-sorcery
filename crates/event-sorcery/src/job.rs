@@ -543,13 +543,13 @@ impl EventSourced for JobState {
         Ok(Some(next))
     }
 
-    async fn initialize(_command: JobCommand) -> Result<crate::Decision<Self>, JobError> {
+    async fn initialize(_command: JobCommand) -> Result<crate::Effect<Self>, JobError> {
         // Jobs are born from the enqueue flush (a raw `Enqueued` append), never a
         // command. An ack of a vanished job is a harmless no-op.
-        Ok(crate::Decision::Events(vec![]))
+        Ok(crate::Effect::Events(vec![]))
     }
 
-    async fn transition(&self, command: JobCommand) -> Result<crate::Decision<Self>, JobError> {
+    async fn transition(&self, command: JobCommand) -> Result<crate::Effect<Self>, JobError> {
         let Self::Claimed { claim_id: held, .. } = self else {
             return Err(JobError::Fenced);
         };
@@ -571,7 +571,7 @@ impl EventSourced for JobState {
             JobCommand::Reschedule { run_at, .. } => JobEvent::Rescheduled { run_at },
             JobCommand::Kill { reason, error, .. } => JobEvent::Dead { reason, error },
         };
-        Ok(crate::Decision::Events(vec![event]))
+        Ok(crate::Effect::Events(vec![event]))
     }
 }
 
@@ -800,7 +800,7 @@ tokio::task_local! {
 }
 
 /// Runs `command_execution` with a fresh pending-job scope active, so the
-/// framework's [`buffer`] of a [`crate::Decision::Dispatch`] lands where the
+/// framework's [`buffer`] of a [`crate::Effect::Dispatch`] lands where the
 /// repository's flush ([`take_pending`]) will drain it -- in the same
 /// transaction that commits the events.
 pub(crate) async fn with_pending_scope<Output>(
@@ -960,7 +960,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let crate::Decision::Events(events) = owned else {
+        let crate::Effect::Events(events) = owned else {
             panic!("expected events");
         };
         assert_eq!(events, vec![JobEvent::Succeeded]);

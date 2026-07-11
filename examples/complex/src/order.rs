@@ -21,7 +21,7 @@ use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
 use event_sorcery::{
-    CompactionPolicy, Decision, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob,
+    CompactionPolicy, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect,
     EventSourced, Job, JobContext, JobFailure, JobOutcome, Label, Never, Nil, Reconciliation,
 };
 
@@ -110,7 +110,11 @@ impl DomainEvent for OrderEvent {
 
 #[derive(Debug, Clone)]
 pub enum OrderCommand {
-    Place { order: OrderId, item: Sku, quantity: u32 },
+    Place {
+        order: OrderId,
+        item: Sku,
+        quantity: u32,
+    },
     Fill,
     Cancel,
     /// Delivered by the framework when the confirmation job settles.
@@ -140,7 +144,7 @@ pub enum OrderError {
 /// The job a `Place` command kicks off: confirm the order to the customer.
 /// The job carries the full intent, so the `Dispatched` event durably records
 /// the order and `originate` derives the entity state from it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendOrderConfirmation {
     pub order: OrderId,
     pub item: Sku,
@@ -195,17 +199,17 @@ impl Job for SendOrderConfirmation {
 #[async_trait]
 impl EventSourced for Order {
     type Id = OrderId;
-    type Event = OrderEvent;
-    type Command = OrderCommand;
     type Error = OrderError;
+    type Command = OrderCommand;
+    type Event = OrderEvent;
     type Jobs = event_sorcery::jobs![SendOrderConfirmation];
     type Materialized = Nil;
 
-    const AGGREGATE_TYPE: &'static str = "Order";
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 2;
-    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
     const SNAPSHOT_SIZE: usize = 1;
+    const AGGREGATE_TYPE: &'static str = "Order";
+    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
 
     fn originate(event: &OrderEvent) -> Option<Self> {
         match event {
@@ -233,13 +237,15 @@ impl EventSourced for Order {
                     return Ok(None);
                 };
                 let status = match dispatch_event {
-                    DispatchEvent::Dispatched { .. } => OrderStatus::PendingConfirmation,
                     DispatchEvent::Confirmed(_) => OrderStatus::Placed,
-                    // Unreachable while `SendOrderConfirmation::Error = Never`.
-                    // If that error type ever becomes real, this arm leaves the
-                    // order stuck in PendingConfirmation -- add a failed status
-                    // (or allow cancellation from here) at the same time.
-                    DispatchEvent::Failed(_) => OrderStatus::PendingConfirmation,
+                    // The `Failed` arm is unreachable while
+                    // `SendOrderConfirmation::Error = Never`. If that error type
+                    // ever becomes real, this leaves the order stuck in
+                    // PendingConfirmation -- add a failed status (or allow
+                    // cancellation from here) at the same time.
+                    DispatchEvent::Dispatched { .. } | DispatchEvent::Failed(_) => {
+                        OrderStatus::PendingConfirmation
+                    }
                 };
                 Ok(Some(Self {
                     status,
@@ -258,7 +264,7 @@ impl EventSourced for Order {
         }
     }
 
-    async fn initialize(command: OrderCommand) -> Result<Decision<Self>, OrderError> {
+    async fn initialize(command: OrderCommand) -> Result<Effect<Self>, OrderError> {
         match command {
             // Placing IS kicking off the confirmation job; the framework
             // commits the `Dispatched` intent and the enqueue together.
@@ -266,7 +272,7 @@ impl EventSourced for Order {
                 order,
                 item,
                 quantity,
-            } => Ok(Decision::Dispatch(DispatchedJob::Idle.dispatch(
+            } => Ok(Effect::Dispatch(DispatchedJob::Idle.dispatch(
                 SendOrderConfirmation {
                     order,
                     item,
@@ -279,22 +285,22 @@ impl EventSourced for Order {
         }
     }
 
-    async fn transition(&self, command: OrderCommand) -> Result<Decision<Self>, OrderError> {
+    async fn transition(&self, command: OrderCommand) -> Result<Effect<Self>, OrderError> {
         match command {
             OrderCommand::Place { .. } => Err(OrderError::AlreadyPlaced),
             OrderCommand::Fill => match self.status {
                 OrderStatus::PendingConfirmation => Err(OrderError::NotConfirmed),
-                OrderStatus::Placed => Ok(Decision::Events(vec![OrderEvent::Filled])),
+                OrderStatus::Placed => Ok(Effect::Events(vec![OrderEvent::Filled])),
                 OrderStatus::Filled | OrderStatus::Cancelled => Err(OrderError::NotOpen),
             },
             OrderCommand::Cancel => match self.status {
                 OrderStatus::PendingConfirmation => Err(OrderError::NotConfirmed),
-                OrderStatus::Placed => Ok(Decision::Events(vec![OrderEvent::Cancelled])),
+                OrderStatus::Placed => Ok(Effect::Events(vec![OrderEvent::Cancelled])),
                 OrderStatus::Filled | OrderStatus::Cancelled => Err(OrderError::NotOpen),
             },
             OrderCommand::Confirmation(outcome) => {
                 let events = self.confirmation.settle(outcome)?;
-                Ok(Decision::Events(
+                Ok(Effect::Events(
                     events.into_iter().map(OrderEvent::Confirmation).collect(),
                 ))
             }
@@ -322,11 +328,7 @@ mod tests {
                     quantity,
                 },
             }),
-            OrderEvent::Confirmation(DispatchEvent::Confirmed(Settled::simulated(
-                job_id,
-                (),
-                1,
-            ))),
+            OrderEvent::Confirmation(DispatchEvent::Confirmed(Settled::simulated(job_id, (), 1))),
         ]
     }
 

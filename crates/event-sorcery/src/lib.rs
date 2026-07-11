@@ -117,8 +117,8 @@ pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 pub use dispatch::{
-    Contains, Decision, DeliveryPolicy, DispatchEvent, DispatchFailure, DispatchOutcome,
-    DispatchRefused, DispatchReplay, DispatchedJob, Here, Job, JobDispatch, JobInput, JobList,
+    Contains, DeliveryPolicy, DispatchEvent, DispatchFailure, DispatchOutcome, DispatchRefused,
+    DispatchReplay, DispatchedJob, Effect, Here, Job, JobDispatch, JobInput, JobList,
     OriginDeliveryError, OriginPort, Reconciliation, Settled, SettledFailure, There,
 };
 pub use job::{
@@ -187,7 +187,7 @@ pub enum CompactionPolicy {
 /// - `Jobs`: Type-level list of the [`Job`] types this entity may
 ///   dispatch (`jobs![ChargeCard, SendReceipt]`, or [`Nil`] for
 ///   none). Handlers kick a job off by returning
-///   [`Decision::Dispatch`]; the framework enqueues it in the same
+///   [`Effect::Dispatch`]; the framework enqueues it in the same
 ///   transaction that commits the `Dispatched` event.
 ///
 /// # Constants
@@ -243,7 +243,7 @@ pub trait EventSourced:
     ///
     /// Write it with the [`jobs!`] macro (`jobs![ChargeCard, SendReceipt]`),
     /// or [`Nil`] for an entity that dispatches no jobs. A handler kicks a
-    /// job off by returning [`Decision::Dispatch`], and
+    /// job off by returning [`Effect::Dispatch`], and
     /// [`DispatchedJob::dispatch`] compile-checks that the job is declared
     /// here -- dispatching an undeclared job is a compile error. The
     /// framework enqueues the job in the same transaction that commits the
@@ -303,18 +303,18 @@ pub trait EventSourced:
     /// Handle a command when the entity doesn't exist yet.
     ///
     /// No `&self` -- impossible to accidentally reference existing state
-    /// during creation. Returns a [`Decision`]: pure domain events, or
+    /// during creation. Returns an [`Effect`]: pure domain events, or
     /// exactly one job dispatch (via [`DispatchedJob::dispatch`]) whose
     /// `Dispatched` event and enqueue the framework commits together.
-    async fn initialize(command: Self::Command) -> Result<Decision<Self>, Self::Error>;
+    async fn initialize(command: Self::Command) -> Result<Effect<Self>, Self::Error>;
 
     /// Handle a command against existing state.
     ///
     /// `&self` is the domain type directly, not `Lifecycle`. The handler
     /// only deals with live state; lifecycle routing is handled by the
-    /// blanket `Aggregate` impl. Returns a [`Decision`]: pure domain events,
+    /// blanket `Aggregate` impl. Returns an [`Effect`]: pure domain events,
     /// or exactly one job dispatch.
-    async fn transition(&self, command: Self::Command) -> Result<Decision<Self>, Self::Error>;
+    async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self::Error>;
 }
 
 /// Type-safe command dispatch for an event-sourced entity.
@@ -370,7 +370,7 @@ impl<Entity: EventSourced, Backend: EventBackend> Store<Entity, Backend> {
         id: &Entity::Id,
         command: Entity::Command,
     ) -> Result<(), SendError<Entity>> {
-        // Open a pending-job scope so the job a `Decision::Dispatch` carries is
+        // Open a pending-job scope so the job an `Effect::Dispatch` carries is
         // drained by the repository's flush in the same commit transaction.
         job::with_pending_scope(self.cqrs.execute(&id.to_string(), command)).await
     }
@@ -815,22 +815,22 @@ mod tests {
             }
         }
 
-        async fn initialize(command: WidgetCommand) -> Result<Decision<Self>, WidgetError> {
+        async fn initialize(command: WidgetCommand) -> Result<Effect<Self>, WidgetError> {
             match command {
                 WidgetCommand::Create { name } => {
-                    Ok(Decision::Events(vec![WidgetEvent::Created { name }]))
+                    Ok(Effect::Events(vec![WidgetEvent::Created { name }]))
                 }
                 WidgetCommand::Rename { name } => {
-                    Ok(Decision::Events(vec![WidgetEvent::Renamed { name }]))
+                    Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
                 }
             }
         }
 
-        async fn transition(&self, command: WidgetCommand) -> Result<Decision<Self>, WidgetError> {
+        async fn transition(&self, command: WidgetCommand) -> Result<Effect<Self>, WidgetError> {
             match command {
-                WidgetCommand::Create { .. } => Ok(Decision::Events(vec![])),
+                WidgetCommand::Create { .. } => Ok(Effect::Events(vec![])),
                 WidgetCommand::Rename { name } => {
-                    Ok(Decision::Events(vec![WidgetEvent::Renamed { name }]))
+                    Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
                 }
             }
         }
@@ -1012,20 +1012,17 @@ mod tests {
                 }
             }
 
-            async fn initialize(command: TallyCommand) -> Result<Decision<Self>, WidgetError> {
+            async fn initialize(command: TallyCommand) -> Result<Effect<Self>, WidgetError> {
                 match command {
-                    TallyCommand::Start => Ok(Decision::Events(vec![TallyEvent::Started])),
-                    TallyCommand::Increment => Ok(Decision::Events(vec![TallyEvent::Incremented])),
+                    TallyCommand::Start => Ok(Effect::Events(vec![TallyEvent::Started])),
+                    TallyCommand::Increment => Ok(Effect::Events(vec![TallyEvent::Incremented])),
                 }
             }
 
-            async fn transition(
-                &self,
-                command: TallyCommand,
-            ) -> Result<Decision<Self>, WidgetError> {
+            async fn transition(&self, command: TallyCommand) -> Result<Effect<Self>, WidgetError> {
                 match command {
-                    TallyCommand::Start => Ok(Decision::Events(vec![])),
-                    TallyCommand::Increment => Ok(Decision::Events(vec![TallyEvent::Incremented])),
+                    TallyCommand::Start => Ok(Effect::Events(vec![])),
+                    TallyCommand::Increment => Ok(Effect::Events(vec![TallyEvent::Incremented])),
                 }
             }
         }
@@ -1100,13 +1097,13 @@ mod tests {
                 }
             }
 
-            async fn initialize(command: WidgetCommand) -> Result<Decision<Self>, WidgetError> {
+            async fn initialize(command: WidgetCommand) -> Result<Effect<Self>, WidgetError> {
                 match command {
                     WidgetCommand::Create { name } => {
-                        Ok(Decision::Events(vec![WidgetEvent::Created { name }]))
+                        Ok(Effect::Events(vec![WidgetEvent::Created { name }]))
                     }
                     WidgetCommand::Rename { name } => {
-                        Ok(Decision::Events(vec![WidgetEvent::Renamed { name }]))
+                        Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
                     }
                 }
             }
@@ -1114,11 +1111,11 @@ mod tests {
             async fn transition(
                 &self,
                 command: WidgetCommand,
-            ) -> Result<Decision<Self>, WidgetError> {
+            ) -> Result<Effect<Self>, WidgetError> {
                 match command {
-                    WidgetCommand::Create { .. } => Ok(Decision::Events(vec![])),
+                    WidgetCommand::Create { .. } => Ok(Effect::Events(vec![])),
                     WidgetCommand::Rename { name } => {
-                        Ok(Decision::Events(vec![WidgetEvent::Renamed { name }]))
+                        Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
                     }
                 }
             }

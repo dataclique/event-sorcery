@@ -112,7 +112,7 @@ fn es_cqrs<Entity: EventSourced, Backend: EventBackend>(
         backend.event_repo(Entity::COMPACTION_POLICY),
         Entity::SNAPSHOT_SIZE,
     );
-    // `Lifecycle`'s cqrs-es services are unit -- handlers return a `Decision`
+    // `Lifecycle`'s cqrs-es services are unit -- handlers return an `Effect`
     // instead of calling out through injected services.
     #[allow(clippy::disallowed_methods)]
     CqrsFramework::new(store, queries, ())
@@ -216,7 +216,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::Decision;
+    use crate::Effect;
     use crate::dependency::EntityList;
     use crate::deps;
     use crate::lifecycle::{Lifecycle, Never};
@@ -274,12 +274,12 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
 
-        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
     }
 
@@ -304,12 +304,12 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
 
-        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
     }
 
@@ -432,12 +432,12 @@ mod tests {
             }
         }
 
-        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
 
-        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
     }
 

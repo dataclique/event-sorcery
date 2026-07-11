@@ -387,7 +387,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::Decision;
+    use crate::Effect;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Alpha {
@@ -437,12 +437,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize((): ()) -> Result<Decision<Self>, AlphaError> {
-            Ok(Decision::Events(vec![AlphaEvent::Born]))
+        async fn initialize((): ()) -> Result<Effect<Self>, AlphaError> {
+            Ok(Effect::Events(vec![AlphaEvent::Born]))
         }
 
-        async fn transition(&self, (): ()) -> Result<Decision<Self>, AlphaError> {
-            Ok(Decision::Events(vec![]))
+        async fn transition(&self, (): ()) -> Result<Effect<Self>, AlphaError> {
+            Ok(Effect::Events(vec![]))
         }
     }
 
@@ -492,12 +492,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize((): ()) -> Result<Decision<Self>, BetaError> {
-            Ok(Decision::Events(vec![BetaEvent::Spawned]))
+        async fn initialize((): ()) -> Result<Effect<Self>, BetaError> {
+            Ok(Effect::Events(vec![BetaEvent::Spawned]))
         }
 
-        async fn transition(&self, (): ()) -> Result<Decision<Self>, BetaError> {
-            Ok(Decision::Events(vec![]))
+        async fn transition(&self, (): ()) -> Result<Effect<Self>, BetaError> {
+            Ok(Effect::Events(vec![]))
         }
     }
 

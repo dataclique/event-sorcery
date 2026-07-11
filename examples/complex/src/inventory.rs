@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use event_sorcery::{Decision, EventSourced, Nil, Table};
+use event_sorcery::{Effect, EventSourced, Nil, Table};
 
 /// Stock-keeping unit. Used both as `Inventory::Id` and as the foreign-key
 /// payload on `Order::item`, so the two entities share an identifier currency.
@@ -129,25 +129,28 @@ impl EventSourced for Inventory {
         }
     }
 
-    async fn initialize(command: InventoryCommand) -> Result<Decision<Self>, InventoryError> {
+    async fn initialize(command: InventoryCommand) -> Result<Effect<Self>, InventoryError> {
         match command {
-            InventoryCommand::Initialize { item, on_hand } => Ok(Decision::Events(vec![
-                InventoryEvent::Initialized { item, on_hand },
-            ])),
+            InventoryCommand::Initialize { item, on_hand } => {
+                Ok(Effect::Events(vec![InventoryEvent::Initialized {
+                    item,
+                    on_hand,
+                }]))
+            }
             InventoryCommand::Restock { .. } | InventoryCommand::Consume { .. } => {
                 Err(InventoryError::NotInitialized)
             }
         }
     }
 
-    async fn transition(&self, command: InventoryCommand) -> Result<Decision<Self>, InventoryError> {
+    async fn transition(&self, command: InventoryCommand) -> Result<Effect<Self>, InventoryError> {
         match command {
             InventoryCommand::Initialize { .. } => Err(InventoryError::AlreadyInitialized),
             InventoryCommand::Restock { added } => {
                 self.on_hand
                     .checked_add(added)
                     .ok_or(InventoryError::Overflow)?;
-                Ok(Decision::Events(vec![InventoryEvent::Restocked { added }]))
+                Ok(Effect::Events(vec![InventoryEvent::Restocked { added }]))
             }
             InventoryCommand::Consume { taken } => {
                 if taken > self.on_hand {
@@ -156,7 +159,7 @@ impl EventSourced for Inventory {
                         taken,
                     });
                 }
-                Ok(Decision::Events(vec![InventoryEvent::Consumed { taken }]))
+                Ok(Effect::Events(vec![InventoryEvent::Consumed { taken }]))
             }
         }
     }

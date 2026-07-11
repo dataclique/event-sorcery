@@ -158,11 +158,11 @@ blanket impl makes it type-check, but a standalone enqueue skips the
 `Dispatched` event, so the origin's `DispatchedJob` field stays `Idle` and the
 eventual verdict delivery is refused permanently (`DispatchRefused`, surfaced as
 a `VERDICT REFUSED` operator alert). Entity-kicked jobs are dispatched only
-through `Decision::Dispatch`.
+through `Effect::Dispatch`.
 
-### Decision / dispatch
+### Effect / dispatch
 
-What a command handler returns (`Decision`, ADR-0009): either domain events, or
+What a command handler returns (`Effect`, ADR-0009): either domain events, or
 exactly one `JobDispatch` -- the wiring-proven kick-off of a job, obtained from
 `DispatchedJob::dispatch(job)`. This is the whole durability contract: the
 framework (never the handler) emits the `Dispatched` event (which carries the

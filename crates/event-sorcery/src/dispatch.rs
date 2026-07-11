@@ -2,7 +2,7 @@
 //!
 //! A command is the operation being performed; if it needs the outside world,
 //! it kicks off a **job** for a worker. The coupling is enforced by the
-//! handler signature: `initialize`/`transition` return a [`Decision`] -- either
+//! handler signature: `initialize`/`transition` return an [`Effect`] -- either
 //! domain events, or exactly one [`JobDispatch`]. The framework (never the
 //! handler) emits the `Dispatched` event and enqueues the job in the same
 //! transaction, and only the framework's delivery path can construct the
@@ -131,7 +131,7 @@ pub enum Reconciliation<Output> {
 /// from a handler, and a dispatch carries no free-form events -- the framework
 /// emits the `Dispatched` intent record itself, so an accomplished-fact event
 /// cannot ride along with a merely-enqueued effect.
-pub enum Decision<Entity: EventSourced> {
+pub enum Effect<Entity: EventSourced> {
     /// Pure domain facts; nothing external was requested.
     Events(Vec<Entity::Event>),
     /// One durable job dispatch, obtained from [`DispatchedJob::dispatch`].
@@ -144,7 +144,7 @@ pub enum Decision<Entity: EventSourced> {
 ///
 /// Holds the wrapped `Dispatched` event plus the pending enqueue, produced
 /// only by [`DispatchedJob::dispatch`]. Opaque -- handlers return it inside
-/// [`Decision::Dispatch`]; the framework takes it apart.
+/// [`Effect::Dispatch`]; the framework takes it apart.
 pub struct JobDispatch<Entity: EventSourced> {
     pub(crate) event: Entity::Event,
     pub(crate) pending: PendingPush,
@@ -345,7 +345,7 @@ pub struct DispatchReplay;
 
 impl<J: Job> DispatchedJob<J> {
     /// Kick off `job`: the guarded, wiring-proven construction of a
-    /// [`JobDispatch`] to return inside [`Decision::Dispatch`].
+    /// [`JobDispatch`] to return inside [`Effect::Dispatch`].
     ///
     /// Refuses while a job is in flight or after a confirmation; a failed
     /// dispatch may be retried with a fresh job. The bounds prove at the
@@ -380,7 +380,7 @@ impl<J: Job> DispatchedJob<J> {
 
     /// Folds a delivered [`DispatchOutcome`] into the events it justifies.
     /// Call from the entity's `transition` handler and return them as
-    /// [`Decision::Events`].
+    /// [`Effect::Events`].
     ///
     /// Duplicate delivery (the at-least-once ack path re-delivering a settled
     /// verdict) is absorbed: it produces no events and no error.
@@ -720,7 +720,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use crate::job::take_pending;
-    use crate::{Decision, Nil};
+    use crate::{Effect, Nil};
 
     use super::*;
 
@@ -810,21 +810,19 @@ mod tests {
                 .map(|order| Self { order }))
         }
 
-        async fn initialize(command: DeskCommand) -> Result<Decision<Self>, DeskError> {
+        async fn initialize(command: DeskCommand) -> Result<Effect<Self>, DeskError> {
             match command {
-                DeskCommand::Place(job) => {
-                    Ok(Decision::Dispatch(DispatchedJob::Idle.dispatch(job)?))
-                }
+                DeskCommand::Place(job) => Ok(Effect::Dispatch(DispatchedJob::Idle.dispatch(job)?)),
                 DeskCommand::Order(_) => Err(DeskError::Order(DispatchRefused::OutcomeMismatch)),
             }
         }
 
-        async fn transition(&self, command: DeskCommand) -> Result<Decision<Self>, DeskError> {
+        async fn transition(&self, command: DeskCommand) -> Result<Effect<Self>, DeskError> {
             match command {
-                DeskCommand::Place(job) => Ok(Decision::Dispatch(self.order.dispatch(job)?)),
+                DeskCommand::Place(job) => Ok(Effect::Dispatch(self.order.dispatch(job)?)),
                 DeskCommand::Order(outcome) => {
                     let events = self.order.settle(outcome)?;
-                    Ok(Decision::Events(
+                    Ok(Effect::Events(
                         events.into_iter().map(DeskEvent::Order).collect(),
                     ))
                 }

@@ -32,7 +32,7 @@ use tracing::{debug, info};
 
 use crate::CompactionPolicy;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::{Decision, DomainEvent, EventSourced, Nil};
+use crate::{DomainEvent, Effect, EventSourced, Nil};
 
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";
@@ -96,21 +96,23 @@ impl EventSourced for SchemaRegistry {
         Ok(Some(new_state))
     }
 
-    async fn initialize(command: Self::Command) -> Result<Decision<Self>, Self::Error> {
+    async fn initialize(command: Self::Command) -> Result<Effect<Self>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
-        Ok(Decision::Events(vec![
-            SchemaRegistryEvent::VersionUpdated { name, version },
-        ]))
+        Ok(Effect::Events(vec![SchemaRegistryEvent::VersionUpdated {
+            name,
+            version,
+        }]))
     }
 
-    async fn transition(&self, command: Self::Command) -> Result<Decision<Self>, Self::Error> {
+    async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         if self.version_of(&name) == Some(version) {
-            Ok(Decision::Events(vec![]))
+            Ok(Effect::Events(vec![]))
         } else {
-            Ok(Decision::Events(vec![
-                SchemaRegistryEvent::VersionUpdated { name, version },
-            ]))
+            Ok(Effect::Events(vec![SchemaRegistryEvent::VersionUpdated {
+                name,
+                version,
+            }]))
         }
     }
 }
@@ -508,12 +510,12 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(_command: Self::Command) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![CompactableEvent::Created]))
+        async fn initialize(_command: Self::Command) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![CompactableEvent::Created]))
         }
 
-        async fn transition(&self, _command: Self::Command) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn transition(&self, _command: Self::Command) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
     }
 

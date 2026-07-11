@@ -20,7 +20,7 @@ use tracing::{error, warn};
 use crate::dependency::HasEntity;
 use crate::dispatch::JobDispatch;
 use crate::reactor::Reactor;
-use crate::{Decision, EventSourced};
+use crate::{Effect, EventSourced};
 
 /// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
 ///
@@ -105,7 +105,7 @@ pub enum LifecycleError<Entity: EventSourced> {
     },
     #[error(transparent)]
     Apply(Entity::Error),
-    /// A `Decision::Dispatch` could not be buffered onto the command scope (a
+    /// An `Effect::Dispatch` could not be buffered onto the command scope (a
     /// framework bug); the command fails so the `Dispatched` event is never
     /// committed without its enqueue.
     #[error(transparent)]
@@ -141,7 +141,7 @@ where
     type Command = Entity::Command;
     type Event = Entity::Event;
     type Error = LifecycleError<Entity>;
-    // Handlers return a `Decision` (events or one job dispatch), never call
+    // Handlers return an `Effect` (events or one job dispatch), never call
     // out through injected services, so the framework-level services are unit.
     type Services = ();
 
@@ -181,8 +181,8 @@ where
         // it in the same transaction that commits the events) and emit the
         // machine-built `Dispatched` event. The handler never touches either.
         let events = match decision {
-            Decision::Events(events) => events,
-            Decision::Dispatch(dispatch) => {
+            Effect::Events(events) => events,
+            Effect::Dispatch(dispatch) => {
                 let JobDispatch { event, pending } = dispatch;
                 crate::job::buffer(pending)?;
                 vec![event]
@@ -444,28 +444,25 @@ mod tests {
             }
         }
 
-        async fn initialize(command: CounterCommand) -> Result<Decision<Self>, CounterError> {
+        async fn initialize(command: CounterCommand) -> Result<Effect<Self>, CounterError> {
             use CounterCommand::*;
             match command {
-                Create { initial } => Ok(Decision::Events(vec![CounterEvent::Created { initial }])),
-                Increment => Ok(Decision::Events(vec![CounterEvent::Incremented])),
+                Create { initial } => Ok(Effect::Events(vec![CounterEvent::Created { initial }])),
+                Increment => Ok(Effect::Events(vec![CounterEvent::Incremented])),
                 Fail => Err(CounterError),
-                BrokenBatch => Ok(Decision::Events(vec![
+                BrokenBatch => Ok(Effect::Events(vec![
                     CounterEvent::Incremented,
                     CounterEvent::Incremented,
                 ])),
             }
         }
 
-        async fn transition(
-            &self,
-            command: CounterCommand,
-        ) -> Result<Decision<Self>, CounterError> {
+        async fn transition(&self, command: CounterCommand) -> Result<Effect<Self>, CounterError> {
             match command {
-                CounterCommand::Create { .. } => Ok(Decision::Events(vec![])),
-                CounterCommand::Increment => Ok(Decision::Events(vec![CounterEvent::Incremented])),
+                CounterCommand::Create { .. } => Ok(Effect::Events(vec![])),
+                CounterCommand::Increment => Ok(Effect::Events(vec![CounterEvent::Incremented])),
                 CounterCommand::Fail => Err(CounterError),
-                CounterCommand::BrokenBatch => Ok(Decision::Events(vec![
+                CounterCommand::BrokenBatch => Ok(Effect::Events(vec![
                     CounterEvent::Invalid,
                     CounterEvent::Incremented,
                 ])),

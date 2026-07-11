@@ -76,7 +76,7 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
     /// the reactor / poller / job-chain / startup enqueue path -- there is no
     /// command commit for the job to ride. Returns the new job's id.
     ///
-    /// Contrast the handler-side [`Decision::Dispatch`](crate::Decision), where
+    /// Contrast the handler-side [`Effect::Dispatch`](crate::Effect), where
     /// the framework enqueues atomically with the `Dispatched` event. Use that
     /// for entity-kicked jobs; use this for everything else. A standalone
     /// enqueue is its own transaction -- NOT atomic with whatever event or poll

@@ -652,7 +652,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
-    use crate::Decision;
+    use crate::Effect;
     use crate::Nil;
     use crate::lifecycle::Never;
 
@@ -696,12 +696,12 @@ mod tests {
             Ok(Some(entity.clone()))
         }
 
-        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
 
-        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
     }
 
@@ -1091,12 +1091,12 @@ mod tests {
             }
         }
 
-        async fn initialize(_command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
 
-        async fn transition(&self, _command: ()) -> Result<Decision<Self>, Never> {
-            Ok(Decision::Events(vec![]))
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![]))
         }
     }
 

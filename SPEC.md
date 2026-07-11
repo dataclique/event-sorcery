@@ -104,7 +104,7 @@ It splits behavior across two pairs:
   `transition` handles a command against existing state. The split prevents
   accidentally reading "current state" while bootstrapping.
 
-Command handlers are pure: they return a `Decision` -- either domain events, or
+Command handlers are pure: they return an `Effect` -- either domain events, or
 exactly one job dispatch -- and perform no side effects themselves. A dispatch
 is enacted by the framework: it emits the `Dispatched` intent event and enqueues
 the job in the same transaction, and only its delivery path can construct the
@@ -220,7 +220,7 @@ contract itself, not opt-in plumbing (see
 [ADR-0008](adrs/0008-entity-scoped-durable-operations.md) and
 [ADR-0009](adrs/0009-handlers-return-events-or-one-job-dispatch.md)):
 
-- **`Decision`.** Handlers return either domain events or exactly one
+- **`Effect`.** Handlers return either domain events or exactly one
   `JobDispatch`, obtained from `DispatchedJob::dispatch(job)` -- the only path
   to an enqueue from a handler. The framework emits the `Dispatched` event
   (which carries the job value: the intent IS the job) and enqueues in the same
@@ -266,8 +266,8 @@ projection becomes a type error, not silent data staleness.
 2. `Store` looks up the aggregate, loads its `Lifecycle`, applies any relevant
    snapshot, replays uncached events.
 3. `Lifecycle::handle` routes to `EventSourced::initialize` (no state) or
-   `EventSourced::transition` (has state), which return a `Decision`. For
-   `Decision::Dispatch`, the framework emits the `Dispatched` event and buffers
+   `EventSourced::transition` (has state), which return an `Effect`. For
+   `Effect::Dispatch`, the framework emits the `Dispatched` event and buffers
    the enqueue itself.
 4. `cqrs-es::CqrsFramework` persists events with monotonic sequence numbers; the
    repository flushes any buffered dispatches (their `Enqueued` events and

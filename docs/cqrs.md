@@ -89,16 +89,16 @@ impl EventSourced for MyEntity {
 
     // Command-side: decide -- domain events, or one job dispatch
     async fn initialize(command: Self::Command)
-        -> Result<Decision<Self>, Self::Error> { /* ... */ }
+        -> Result<Effect<Self>, Self::Error> { /* ... */ }
     async fn transition(&self, command: Self::Command)
-        -> Result<Decision<Self>, Self::Error> { /* ... */ }
+        -> Result<Effect<Self>, Self::Error> { /* ... */ }
 }
 ```
 
 `Jobs` is the type-level list of `Job`s the entity may dispatch -- written with
 the `jobs!` macro (`jobs![ChargeCard, SendReceipt]`), or `Nil` for none. A
 handler kicks a job off by returning
-`Decision::Dispatch(self.field.dispatch(job)?)`; the framework emits the
+`Effect::Dispatch(self.field.dispatch(job)?)`; the framework emits the
 `Dispatched` event and enqueues in the same transaction, and only its delivery
 path can settle the dispatch. See the **Jobs Pattern** and **Running Jobs**
 sections below.
@@ -127,13 +127,13 @@ sections below.
 | `DomainEvent`          | Trait for event serialization (from cqrs-es) |
 | `Table`                | Newtype for projection table name            |
 | `Nil`                  | Empty type-level list (no projection / jobs) |
-| `Decision<Entity>`     | Handler result: events, or one job dispatch  |
+| `Effect<Entity>`       | Handler result: events, or one job dispatch  |
 | `Job`                  | Entity-kicked job (submit/reconcile)         |
 | `StandaloneJob`        | Origin-less worker job (perform)             |
 | `DispatchedJob<J>`     | Entity-embedded state of a kicked-off job    |
 | `DispatchEvent<J>`     | Dispatch lifecycle facts on the entity       |
 | `DispatchOutcome<J>`   | Sealed verdict delivered by the framework    |
-| `JobDispatch<Entity>`  | Opaque kick-off returned in a `Decision`     |
+| `JobDispatch<Entity>`  | Opaque kick-off returned in an `Effect`      |
 | `Settled<Output>`      | Sealed success payload (output + attempts)   |
 | `SettledFailure<E>`    | Sealed failure payload (reason + attempts)   |
 | `DispatchRefused`      | Guard refusal (in-flight, mismatch)          |
@@ -271,7 +271,7 @@ Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 Command handlers stay pure. A command is the operation being performed; if it
 needs the outside world (send an email, charge a card, call a chain), it KICKS
 OFF a durable `Job` for a worker -- and the handler signature enforces it
-(ADR-0009): a handler returns a `Decision`, either domain events or exactly one
+(ADR-0009): a handler returns an `Effect`, either domain events or exactly one
 job dispatch. The framework emits the `Dispatched` event (carrying the job value
 -- the intent IS the job) and enqueues in the **same transaction**, so there is
 no crash window between intent and job, and no accomplished-fact event can
@@ -289,20 +289,20 @@ enum and `DispatchOutcome<J>` in the command enum (with `From` impls), and
 delegate:
 
 ```rust
-async fn transition(&self, command: Self::Command) -> Result<Decision<Self>, Self::Error> {
+async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self::Error> {
     match command {
         // Kick off the job; the machine's guard refuses while one is in flight.
-        MyCommand::Close => Ok(Decision::Dispatch(self.notify.dispatch(NotifyClosed {
+        MyCommand::Close => Ok(Effect::Dispatch(self.notify.dispatch(NotifyClosed {
             ticket: self.ticket,
             subject: self.subject.clone(),
         })?)),
         // The framework delivers the sealed verdict; settle folds it in.
         MyCommand::Notify(outcome) => {
             let events = self.notify.settle(outcome)?;
-            Ok(Decision::Events(events.into_iter().map(MyEvent::Notify).collect()))
+            Ok(Effect::Events(events.into_iter().map(MyEvent::Notify).collect()))
         }
         // Pure domain facts stay plain events.
-        MyCommand::AwaitCustomer => Ok(Decision::Events(vec![MyEvent::AwaitingCustomer])),
+        MyCommand::AwaitCustomer => Ok(Effect::Events(vec![MyEvent::AwaitingCustomer])),
     }
 }
 ```

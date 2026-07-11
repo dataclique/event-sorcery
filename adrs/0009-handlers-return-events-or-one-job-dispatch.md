@@ -50,11 +50,11 @@ events, or exactly one job dispatch.**
 
 ```rust
 async fn initialize(command: Self::Command)
-    -> Result<Decision<Self>, Self::Error>;
+    -> Result<Effect<Self>, Self::Error>;
 async fn transition(&self, command: Self::Command)
-    -> Result<Decision<Self>, Self::Error>;
+    -> Result<Effect<Self>, Self::Error>;
 
-pub enum Decision<Entity: EventSourced> {
+pub enum Effect<Entity: EventSourced> {
     /// Pure domain facts. No side effects were requested; nothing to enforce.
     Events(Vec<Entity::Event>),
     /// One job kicked off for a worker. The framework -- not the handler --
@@ -93,7 +93,7 @@ path) is renamed `StandaloneJob` (`perform`). The embedded machine is
    thereby a _proof_ that the job settled -- not a claim any handler could have
    fabricated.
 
-4. **One command, one dispatch.** `Decision::Dispatch` carries exactly one job.
+4. **One command, one dispatch.** `Effect::Dispatch` carries exactly one job.
    Multi-leg flows are chains: the delivery of one leg's outcome is a command,
    and its handler may dispatch the next leg. This is the st0x.liquidity audit's
    finding restated as a rule -- the sequencing is domain logic, each hop
@@ -118,7 +118,7 @@ path) is renamed `StandaloneJob` (`perform`). The embedded machine is
   not review checklists. If the compiler does not force the migration, the
   contract did not change.
 
-### `Decision::Dispatch { events: Vec<Event>, dispatch: JobDispatch }`
+### `Effect::Dispatch { events: Vec<Event>, dispatch: JobDispatch }`
 
 - Pros: lets a command record additional domain facts alongside the intent.
 - Cons: reopens the hole -- the accompanying events are free-form, so a handler
@@ -147,12 +147,12 @@ path) is renamed `StandaloneJob` (`perform`). The embedded machine is
   transition form is replaced by `dispatch` (guarded construction) and a sealed
   settlement path.
 - `Lifecycle::handle` takes over what `JobQueue`'s task-local scope did:
-  `Decision::Dispatch` is turned into the wrapped `Dispatched` event plus the
+  `Effect::Dispatch` is turned into the wrapped `Dispatched` event plus the
   transactional enqueue inside the framework, where it cannot be forgotten or
   duplicated.
-- Entities whose commands never touch the outside world return
-  `Decision::Events` everywhere and pay one enum wrap per handler -- the full
-  cost of the guarantee for everyone else.
+- Entities whose commands never touch the outside world return `Effect::Events`
+  everywhere and pay one enum wrap per handler -- the full cost of the guarantee
+  for everyone else.
 - SPEC.md's write path, docs/cqrs.md, docs/domain.md, and the ADR-0008 sections
   describing handler-side `JobQueue` pushes must be updated with the new
   contract.

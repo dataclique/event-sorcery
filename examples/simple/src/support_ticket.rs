@@ -17,9 +17,8 @@ use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
 use event_sorcery::{
-    Column, Decision, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob,
-    EventSourced, Job, JobContext, JobFailure, JobOutcome, Label, Never, Reconciliation,
-    StandaloneJob, Table,
+    Column, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect, EventSourced,
+    Job, JobContext, JobFailure, JobOutcome, Label, Never, Reconciliation, StandaloneJob, Table,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -98,12 +97,8 @@ impl DomainEvent for SupportTicketEvent {
             Self::Notify(DispatchEvent::Dispatched { .. }) => {
                 "SupportTicketEvent::CloseRequested".to_string()
             }
-            Self::Notify(DispatchEvent::Confirmed(_)) => {
-                "SupportTicketEvent::Closed".to_string()
-            }
-            Self::Notify(DispatchEvent::Failed(_)) => {
-                "SupportTicketEvent::CloseFailed".to_string()
-            }
+            Self::Notify(DispatchEvent::Confirmed(_)) => "SupportTicketEvent::Closed".to_string(),
+            Self::Notify(DispatchEvent::Failed(_)) => "SupportTicketEvent::CloseFailed".to_string(),
         }
     }
 
@@ -152,7 +147,7 @@ pub enum SupportTicketError {
 /// The job a `Close` command kicks off: notify the customer. The job carries
 /// the full intent (ticket, subject, close timestamp) -- the `Dispatched`
 /// event records it durably, and the fold derives ticket state from it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyClosed {
     pub ticket: TicketId,
     pub subject: String,
@@ -296,15 +291,13 @@ impl EventSourced for SupportTicket {
         }
     }
 
-    async fn initialize(
-        command: SupportTicketCommand,
-    ) -> Result<Decision<Self>, SupportTicketError> {
+    async fn initialize(command: SupportTicketCommand) -> Result<Effect<Self>, SupportTicketError> {
         match command {
             SupportTicketCommand::Open {
                 ticket,
                 subject,
                 at,
-            } => Ok(Decision::Events(vec![SupportTicketEvent::Opened {
+            } => Ok(Effect::Events(vec![SupportTicketEvent::Opened {
                 ticket,
                 subject,
                 at,
@@ -318,14 +311,16 @@ impl EventSourced for SupportTicket {
     async fn transition(
         &self,
         command: SupportTicketCommand,
-    ) -> Result<Decision<Self>, SupportTicketError> {
+    ) -> Result<Effect<Self>, SupportTicketError> {
         match command {
             SupportTicketCommand::Open { .. } => Err(SupportTicketError::AlreadyOpen),
             SupportTicketCommand::AwaitCustomer { at } => match self.status {
                 Status::Closing | Status::Closed => Err(SupportTicketError::AlreadyClosed),
-                Status::Open | Status::Pending => Ok(Decision::Events(vec![
-                    SupportTicketEvent::AwaitingCustomer { at },
-                ])),
+                Status::Open | Status::Pending => {
+                    Ok(Effect::Events(vec![SupportTicketEvent::AwaitingCustomer {
+                        at,
+                    }]))
+                }
             },
             SupportTicketCommand::Close { at } => match self.status {
                 Status::Closing | Status::Closed => Err(SupportTicketError::AlreadyClosed),
@@ -333,7 +328,7 @@ impl EventSourced for SupportTicket {
                 // the `Dispatched` event and enqueues in one transaction; the
                 // ticket only reaches `Closed` when the verdict lands.
                 Status::Open | Status::Pending => {
-                    Ok(Decision::Dispatch(self.notify.dispatch(NotifyClosed {
+                    Ok(Effect::Dispatch(self.notify.dispatch(NotifyClosed {
                         ticket: self.ticket,
                         subject: self.subject.clone(),
                         closed_at: at,
@@ -342,7 +337,7 @@ impl EventSourced for SupportTicket {
             },
             SupportTicketCommand::Notify(outcome) => {
                 let events = self.notify.settle(outcome)?;
-                Ok(Decision::Events(
+                Ok(Effect::Events(
                     events.into_iter().map(SupportTicketEvent::Notify).collect(),
                 ))
             }
@@ -406,7 +401,10 @@ mod tests {
     #[tokio::test]
     async fn closing_twice_is_refused_while_the_job_is_in_flight() {
         let error = TestHarness::<SupportTicket>::new()
-            .given(vec![opened(TicketId(1)), dispatched(TicketId(1), JobId::new())])
+            .given(vec![
+                opened(TicketId(1)),
+                dispatched(TicketId(1), JobId::new()),
+            ])
             .when(SupportTicketCommand::Close {
                 at: fixed_instant(),
             })
@@ -422,19 +420,16 @@ mod tests {
     #[test]
     fn replay_settles_to_closed_only_after_the_verdict() {
         let job_id = JobId::new();
-        let in_flight: SupportTicket = replay([opened(TicketId(1)), dispatched(TicketId(1), job_id)])
-            .unwrap()
-            .unwrap();
+        let in_flight: SupportTicket =
+            replay([opened(TicketId(1)), dispatched(TicketId(1), job_id)])
+                .unwrap()
+                .unwrap();
         assert_eq!(in_flight.status, Status::Closing);
 
         let settled: SupportTicket = replay([
             opened(TicketId(1)),
             dispatched(TicketId(1), job_id),
-            SupportTicketEvent::Notify(DispatchEvent::Confirmed(Settled::simulated(
-                job_id,
-                (),
-                1,
-            ))),
+            SupportTicketEvent::Notify(DispatchEvent::Confirmed(Settled::simulated(job_id, (), 1))),
         ])
         .unwrap()
         .unwrap();
@@ -443,9 +438,10 @@ mod tests {
 
     #[test]
     fn replay_rejects_history_without_genesis_event() {
-        let result: Result<Option<SupportTicket>, _> = replay([SupportTicketEvent::AwaitingCustomer {
-            at: fixed_instant(),
-        }]);
+        let result: Result<Option<SupportTicket>, _> =
+            replay([SupportTicketEvent::AwaitingCustomer {
+                at: fixed_instant(),
+            }]);
         assert!(matches!(
             result,
             Err(event_sorcery::LifecycleError::EventCantOriginate { .. })
@@ -486,7 +482,10 @@ mod tests {
         let closing = store.load(&id).await.unwrap().unwrap();
         assert_eq!(closing.status, Status::Closing);
         let DispatchedJob::InFlight { job_id } = closing.notify else {
-            panic!("expected the notify job in flight, got {:?}", closing.notify);
+            panic!(
+                "expected the notify job in flight, got {:?}",
+                closing.notify
+            );
         };
 
         // Simulate the framework delivering the settled verdict.
