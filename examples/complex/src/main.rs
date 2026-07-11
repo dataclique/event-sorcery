@@ -1,7 +1,8 @@
 //! Multi-entity `event-sorcery` example: an order/inventory domain with
 //! one reactor watching both event streams (alerts) and one reactor
-//! watching `Order` only (audit log). Placing an order also enqueues a
-//! durable `SendOrderConfirmation` job that a supervised worker runs.
+//! watching `Order` only (audit log). Placing an order KICKS OFF a durable
+//! `SendOrderConfirmation` job (ADR-0009): the order is `PendingConfirmation`
+//! until the worker's verdict is delivered back, and only then can it fill.
 //!
 //! Run with: `cargo run --manifest-path examples/complex/Cargo.toml`
 //!
@@ -11,12 +12,13 @@
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 
 use event_sorcery::{
-    Clock, JobRuntime, JobWorkerConfig, StoreBuilder, build_supervised_worker, compact_events,
-    count_aggregates, load_entity,
+    Clock, JobInput, JobRuntime, JobWorkerConfig, StoreBuilder, build_supervised_worker,
+    compact_events, count_aggregates, load_entity,
 };
 
 mod audit_log;
@@ -26,7 +28,7 @@ mod stock_alert;
 
 use audit_log::AuditLog;
 use inventory::{Inventory, InventoryCommand, Sku};
-use order::{Confirmer, Order, OrderCommand, OrderId, SendOrderConfirmation};
+use order::{Confirmer, Order, OrderCommand, OrderId, OrderStatus, SendOrderConfirmation};
 use stock_alert::{LogNotifier, Notifier, StockAlert};
 
 const LOW_WATER: u32 = 2;
@@ -74,28 +76,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .send(&widgets, InventoryCommand::Restock { added: 5 })
         .await?;
 
-    orders
-        .send(
-            &order_one,
-            OrderCommand::Place {
-                item: widgets.clone(),
-                quantity: 3,
-            },
-        )
-        .await?;
+    // Placing kicks off the confirmation job; the orders sit in
+    // PendingConfirmation until the worker's verdicts land.
+    for (id, quantity) in [(order_one, 3), (order_two, 1)] {
+        orders
+            .send(
+                &id,
+                OrderCommand::Place {
+                    order: id,
+                    item: widgets.clone(),
+                    quantity,
+                },
+            )
+            .await?;
+    }
+
+    let runtime = JobRuntime::build(pool.clone()).await?;
+    let config = JobWorkerConfig {
+        poll_interval: Duration::from_millis(25),
+        ..JobWorkerConfig::default()
+    };
+    let monitor = build_supervised_worker!(runtime, config, Clock::system(), {
+        SendOrderConfirmation => JobInput::<SendOrderConfirmation>::new(Confirmer, orders.clone()),
+    });
+    let worker = tokio::spawn(monitor.run());
+
+    println!("running the confirmation worker until both orders settle...");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let one = orders.load(&order_one).await?.ok_or("order one missing")?;
+        let two = orders.load(&order_two).await?.ok_or("order two missing")?;
+        if one.status == OrderStatus::Placed && two.status == OrderStatus::Placed {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err("confirmations did not settle in time".into());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    worker.abort();
+
+    // Only confirmed orders can transition.
     orders.send(&order_one, OrderCommand::Fill).await?;
     inventory
         .send(&widgets, InventoryCommand::Consume { taken: 3 })
-        .await?;
-
-    orders
-        .send(
-            &order_two,
-            OrderCommand::Place {
-                item: widgets.clone(),
-                quantity: 1,
-            },
-        )
         .await?;
     orders.send(&order_two, OrderCommand::Cancel).await?;
 
@@ -144,19 +168,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // reads from the events table.
     let deleted = compact_events::<Order>(&pool).await?;
     println!("compact_events(Order)        = {deleted} events reclaimed");
-
-    // Durable jobs: placing each order enqueued a SendOrderConfirmation job
-    // atomically with its Placed event. Wire a supervised worker over the same
-    // database and run it briefly to drain the queue.
-    let runtime = JobRuntime::build(pool.clone()).await?;
-    let monitor = build_supervised_worker!(
-        runtime,
-        JobWorkerConfig::default(),
-        Clock::system(),
-        { SendOrderConfirmation => Confirmer }
-    );
-    println!("running the job worker briefly to drain the queue...");
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(750), monitor.run()).await;
 
     Ok(())
 }

@@ -402,7 +402,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::{JobQueue, Nil};
+    use crate::{Effect, Nil, uneventful};
 
     // Required for ReactorHarness::receive to resolve HasEntity<Counter>.
     crate::register_entities!(Counter);
@@ -451,15 +451,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Counter {
         type Id = String;
-        type Event = CounterEvent;
-        type Command = CounterCommand;
         type Error = CounterError;
-        type Jobs = Nil;
+        type Command = CounterCommand;
+        type Event = CounterEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Counter";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Counter";
 
         fn originate(event: &CounterEvent) -> Option<Self> {
             use CounterEvent::*;
@@ -484,24 +484,19 @@ mod tests {
             }
         }
 
-        async fn initialize(
-            command: CounterCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, CounterError> {
+        async fn initialize(command: CounterCommand) -> Result<Effect<Self>, CounterError> {
             match command {
-                CounterCommand::Create { initial } => Ok(vec![CounterEvent::Created { initial }]),
-                CounterCommand::Increment => Ok(vec![]),
+                CounterCommand::Create { initial } => {
+                    Ok(Effect::Events(vec![CounterEvent::Created { initial }]))
+                }
+                CounterCommand::Increment => uneventful(),
             }
         }
 
-        async fn transition(
-            &self,
-            command: CounterCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, CounterError> {
+        async fn transition(&self, command: CounterCommand) -> Result<Effect<Self>, CounterError> {
             match command {
-                CounterCommand::Create { .. } => Ok(vec![]),
-                CounterCommand::Increment => Ok(vec![CounterEvent::Incremented]),
+                CounterCommand::Create { .. } => uneventful(),
+                CounterCommand::Increment => Ok(Effect::Events(vec![CounterEvent::Incremented])),
             }
         }
     }

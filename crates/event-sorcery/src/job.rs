@@ -22,12 +22,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::time::Duration;
-use tracing::{error, warn};
+use tracing::error;
 use ulid::Ulid;
 
-use crate::dependency::{Cons, Nil};
+use crate::dependency::Nil;
+use crate::dispatch::DeliveryPolicy;
 use crate::job_store::{ClaimDecision, ClaimRead};
 use crate::lifecycle::Lifecycle;
 use crate::{CompactionPolicy, EventSourced, Table};
@@ -35,20 +35,21 @@ use crate::{CompactionPolicy, EventSourced, Table};
 const JOB_AGGREGATE_TYPE: &str = "job";
 const JOB_EVENT_VERSION: &str = "1.0";
 
-/// A durable, retryable unit of side-effecting work.
+/// A durable, retryable worker job with no origin entity.
 ///
-/// Each implementation is one self-contained side effect; an entity declares the
-/// set of jobs its commands dispatch. The job is appended as an event and
-/// executed by a supervised worker, which calls [`perform`](Job::perform) with
-/// the consumer-owned [`Input`](Job::Input) dependency bundle.
-pub trait Job: Serialize + DeserializeOwned + Send + 'static {
-    /// Dependency bundle injected into [`perform`](Job::perform).
+/// This is the ADR-0007 standalone path: reactors, pollers, job chains, and
+/// startup recovery enqueue these directly on [`crate::JobRuntime`] -- there
+/// is no command commit to ride and no entity waiting on the outcome. A job
+/// an ENTITY kicks off implements [`crate::Job`] instead (submit/reconcile +
+/// verdict delivery) and is dispatched from a command handler.
+pub trait StandaloneJob: Serialize + DeserializeOwned + Send + 'static {
+    /// Dependency bundle injected into [`perform`](StandaloneJob::perform).
     type Input: Send + Sync + 'static;
 
     /// Value produced on successful completion.
     type Output: Send + 'static;
 
-    /// Error returned when [`perform`](Job::perform) fails.
+    /// Error returned when [`perform`](StandaloneJob::perform) fails.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Worker name prefix; the registered worker name is
@@ -89,11 +90,14 @@ pub trait Job: Serialize + DeserializeOwned + Send + 'static {
 /// Stable across every retry and re-claim of the job, so it is the correct
 /// root for external-boundary idempotency keys. Converted to a string only at
 /// the storage boundary (the job's aggregate id and `job_queue` view id).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobId(Ulid);
 
 impl JobId {
-    pub(crate) fn new() -> Self {
+    /// Mints a fresh job id. The framework mints one per dispatch/enqueue;
+    /// public so tests and interop code can fabricate identities.
+    #[must_use]
+    pub fn new() -> Self {
         Self(Ulid::new())
     }
 }
@@ -124,6 +128,13 @@ pub struct JobContext {
     pub(crate) claim_id: ClaimId,
     /// Recorded failures so far (0 on first run), from the fold.
     pub(crate) attempt: u32,
+    /// The worker's retry budget ([`crate::JobWorkerConfig::max_attempts`]),
+    /// captured at claim time; 0 when unknown (a context built outside a
+    /// worker).
+    pub(crate) max_attempts: u32,
+    /// The worker's verdict-delivery deferrals
+    /// ([`crate::JobWorkerConfig::delivery`]), captured at claim time.
+    pub(crate) delivery: DeliveryPolicy,
 }
 
 impl JobContext {
@@ -138,6 +149,27 @@ impl JobContext {
     /// `n` after `n` failed attempts. Deferred runs do not advance it.
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    /// Whether this run is the job's FIRST execution ever -- no earlier run can
+    /// have reached an external system.
+    ///
+    /// Derived from the durable event stream: the first claim is always the
+    /// event after `Enqueued`, and every later run (retry, defer, lease-expired
+    /// reclaim) claims at a higher sequence because the first `Claimed` event is
+    /// permanent. This over-approximates submissions in the safe direction: a
+    /// crash after the claim but before the external call still reports `false`
+    /// on the next run.
+    pub fn is_first_execution(&self) -> bool {
+        const FIRST_CLAIM_SEQ: i64 = 2;
+        self.claim_seq == FIRST_CLAIM_SEQ
+    }
+
+    /// Whether a failure recorded for this run would exhaust the retry budget,
+    /// so the worker dead-letters instead of rescheduling. `false` when the
+    /// budget is unknown (a context built outside a worker).
+    pub fn is_final_attempt(&self) -> bool {
+        self.max_attempts > 0 && self.attempt + 1 >= self.max_attempts
     }
 }
 
@@ -227,7 +259,7 @@ impl ClaimId {
 
 /// Why a job was dead-lettered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum DeadReason {
+pub enum DeadReason {
     /// Every retry attempt failed.
     RetriesExhausted,
     /// The job failed with [`JobFailure::Terminal`] -- a definitive rejection
@@ -402,15 +434,15 @@ pub(crate) enum JobError {
 #[async_trait]
 impl EventSourced for JobState {
     type Id = JobId;
-    type Event = JobEvent;
-    type Command = JobCommand;
     type Error = JobError;
-    type Jobs = Nil;
+    type Command = JobCommand;
+    type Event = JobEvent;
     type Materialized = Table;
+    type Jobs = Nil;
 
-    const AGGREGATE_TYPE: &'static str = JOB_AGGREGATE_TYPE;
     const PROJECTION: Table = Table("job_queue");
     const SCHEMA_VERSION: u64 = 1;
+    const AGGREGATE_TYPE: &'static str = JOB_AGGREGATE_TYPE;
     const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
     fn originate(event: &JobEvent) -> Option<Self> {
@@ -511,20 +543,13 @@ impl EventSourced for JobState {
         Ok(Some(next))
     }
 
-    async fn initialize(
-        _command: JobCommand,
-        _jobs: &JobQueue<Nil>,
-    ) -> Result<Vec<JobEvent>, JobError> {
+    async fn initialize(_command: JobCommand) -> Result<crate::Effect<Self>, JobError> {
         // Jobs are born from the enqueue flush (a raw `Enqueued` append), never a
         // command. An ack of a vanished job is a harmless no-op.
-        Ok(vec![])
+        crate::dispatch::uneventful()
     }
 
-    async fn transition(
-        &self,
-        command: JobCommand,
-        _jobs: &JobQueue<Nil>,
-    ) -> Result<Vec<JobEvent>, JobError> {
+    async fn transition(&self, command: JobCommand) -> Result<crate::Effect<Self>, JobError> {
         let Self::Claimed { claim_id: held, .. } = self else {
             return Err(JobError::Fenced);
         };
@@ -546,7 +571,7 @@ impl EventSourced for JobState {
             JobCommand::Reschedule { run_at, .. } => JobEvent::Rescheduled { run_at },
             JobCommand::Kill { reason, error, .. } => JobEvent::Dead { reason, error },
         };
-        Ok(vec![event])
+        Ok(crate::Effect::Events(vec![event]))
     }
 }
 
@@ -741,119 +766,30 @@ pub(crate) fn pending_seed_payload(request: &EnqueueRequest) -> Result<String, J
     ))?)
 }
 
-/// A job buffered by a handler, awaiting flush at the next commit.
-struct PendingPush {
-    job: Box<dyn ErasedJob>,
-    delay: Option<Duration>,
+/// A dispatched job awaiting flush at the next commit, produced only by
+/// [`crate::DispatchedJob::dispatch`] and buffered only by the framework
+/// (`Lifecycle::handle`).
+pub(crate) struct PendingPush {
+    pub(crate) job_id: JobId,
+    pub(crate) job: Box<dyn ErasedJob>,
+    pub(crate) delay: Option<Duration>,
 }
 
-/// Type erasure over a [`Job`] so a [`JobQueue`] can buffer heterogeneous job
-/// types; the queue needs only the routing kind and the encoded payload.
-trait ErasedJob: Send {
+/// Type erasure over a dispatched [`crate::Job`] so the pending buffer can
+/// hold heterogeneous job types; the flush needs only the routing kind and
+/// the encoded payload.
+pub(crate) trait ErasedJob: Send {
     fn kind(&self) -> JobKind;
     fn encode(&self) -> Result<serde_json::Value, serde_json::Error>;
 }
 
-impl<J: Job> ErasedJob for J {
+impl<J: crate::Job> ErasedJob for J {
     fn kind(&self) -> JobKind {
-        JobKind::new(J::KIND)
+        JobKind::new(<J as crate::Job>::KIND)
     }
 
     fn encode(&self) -> Result<serde_json::Value, serde_json::Error> {
         serde_json::to_value(self)
-    }
-}
-
-/// Type-level list of the [`Job`] types an entity may dispatch.
-///
-/// Built from [`Cons`]/[`Nil`] -- write it with the [`jobs!`](crate::jobs) macro
-/// (`jobs![SendEmail, ChargeCard]`). A [`JobQueue`] over this list compile-checks
-/// that every pushed job is a declared member.
-pub trait JobList {}
-
-impl JobList for Nil {}
-
-impl<Head: Job, Tail: JobList> JobList for Cons<Head, Tail> {}
-
-/// Compile-time proof that job `J` is a member of a [`JobList`].
-///
-/// `Index` is an inferred [`Here`]/[`There`] witness that disambiguates the two
-/// recursive impls so they don't overlap; call sites never name it.
-pub trait Contains<J: Job, Index> {}
-
-/// Membership witness: `J` is the head of the list.
-pub struct Here;
-
-/// Membership witness: `J` is `Index` positions into the tail.
-pub struct There<Index>(PhantomData<Index>);
-
-impl<J: Job, Tail> Contains<J, Here> for Cons<J, Tail> {}
-
-impl<J: Job, Head, Tail, Index> Contains<J, There<Index>> for Cons<Head, Tail> where
-    Tail: Contains<J, Index>
-{
-}
-
-/// Build a type-level [`JobList`] from job types.
-///
-/// `jobs![SendEmail, ChargeCard]` expands to `Cons<SendEmail, Cons<ChargeCard,
-/// Nil>>`; empty `jobs![]` is `Nil`. Use it for
-/// [`EventSourced::Jobs`](crate::EventSourced::Jobs).
-#[macro_export]
-macro_rules! jobs {
-    () => { $crate::Nil };
-    ($head:ty $(, $tail:ty)* $(,)?) => {
-        $crate::Cons<$head, $crate::jobs![$($tail),*]>
-    };
-}
-
-/// Handler-facing handle for enqueuing an entity's [`Job`]s.
-///
-/// Parameterized by the entity's [`JobList`] so [`push`](Self::push)
-/// compile-checks that the job is declared in
-/// [`EventSourced::Jobs`](crate::EventSourced::Jobs).
-///
-/// [`push`](Self::push) / [`push_with_delay`](Self::push_with_delay) are
-/// synchronous and buffer onto the per-command scope that [`Store::send`] opens
-/// around command execution; the event repository drains that scope inside the
-/// commit transaction ([`take_pending`]), so enqueue is atomic with the
-/// triggering events. A push outside a command scope is a programming error (the
-/// handle escaped its handler) and is dropped with a warning.
-///
-/// [`Store::send`]: crate::Store::send
-pub struct JobQueue<Jobs: JobList = Nil>(PhantomData<fn() -> Jobs>);
-
-impl<Jobs: JobList> Default for JobQueue<Jobs> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<Jobs: JobList> JobQueue<Jobs> {
-    /// Enqueues a job (which must be declared in `Jobs`) to run as soon as the
-    /// triggering events commit.
-    pub fn push<J, Index>(&self, job: J)
-    where
-        J: Job,
-        Jobs: Contains<J, Index>,
-    {
-        buffer(PendingPush {
-            job: Box::new(job),
-            delay: None,
-        });
-    }
-
-    /// Enqueues a job (which must be declared in `Jobs`) to run no sooner than
-    /// `delay` after the events commit.
-    pub fn push_with_delay<J, Index>(&self, job: J, delay: Duration)
-    where
-        J: Job,
-        Jobs: Contains<J, Index>,
-    {
-        buffer(PendingPush {
-            job: Box::new(job),
-            delay: Some(delay),
-        });
     }
 }
 
@@ -863,9 +799,10 @@ tokio::task_local! {
     static PENDING_JOBS: RefCell<Vec<PendingPush>>;
 }
 
-/// Runs `command_execution` with a fresh pending-job scope active, so a handler's
-/// [`JobQueue::push`] calls land where the repository's flush ([`take_pending`])
-/// will drain them -- in the same transaction that commits the events.
+/// Runs `command_execution` with a fresh pending-job scope active, so the
+/// framework's [`buffer`] of a [`crate::Effect::Dispatch`] lands where the
+/// repository's flush ([`take_pending`]) will drain it -- in the same
+/// transaction that commits the events.
 pub(crate) async fn with_pending_scope<Output>(
     command_execution: impl Future<Output = Output>,
 ) -> Output {
@@ -874,23 +811,26 @@ pub(crate) async fn with_pending_scope<Output>(
         .await
 }
 
-/// Pushes onto the active pending-job scope, warning if none is active (a push
-/// from outside a command handler, which cannot be flushed atomically).
-fn buffer(push: PendingPush) {
-    if PENDING_JOBS
+/// Buffers a dispatched job onto the active pending scope. Called only by
+/// `Lifecycle::handle` while `Store::send` holds the scope open; an inactive
+/// scope is a framework bug, and the error MUST fail the command so the
+/// `Dispatched` event is never committed without its enqueue.
+pub(crate) fn buffer(push: PendingPush) -> Result<(), DispatchNotBuffered> {
+    PENDING_JOBS
         .try_with(|pending| pending.borrow_mut().push(push))
-        .is_err()
-    {
-        warn!(
-            target: "cqrs",
-            "JobQueue::push called outside a command scope; the job was dropped"
-        );
-    }
+        .map_err(|_| DispatchNotBuffered)
 }
 
-/// Drains the per-command pending-job buffer into [`EnqueueRequest`]s (each with
-/// a fresh ULID id and a resolved `run_at`). A no-op when no buffer scope is
-/// active or it is empty.
+/// A job dispatch could not be buffered because no command scope was active.
+/// Surfacing this fails the command, preserving the ADR-0009 invariant that a
+/// `Dispatched` event and its enqueue commit together or not at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("job dispatch buffered outside a command scope")]
+pub struct DispatchNotBuffered;
+
+/// Drains the per-command pending-job buffer into [`EnqueueRequest`]s (each
+/// keeping the [`JobId`] minted at push time, with a resolved `run_at`). A no-op
+/// when no buffer scope is active or it is empty.
 pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
     let pending = PENDING_JOBS
         .try_with(|buffer| buffer.borrow_mut().drain(..).collect::<Vec<_>>())
@@ -900,7 +840,7 @@ pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
         .into_iter()
         .map(|push| {
             Ok(EnqueueRequest {
-                job_id: JobId::new(),
+                job_id: push.job_id,
                 kind: push.job.kind(),
                 payload: push.job.encode()?,
                 run_at_ms: resolve_run_at_ms(push.delay)?,
@@ -912,7 +852,7 @@ pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
 /// Builds a standalone [`EnqueueRequest`] (fresh ULID, resolved `run_at`) for one
 /// `job` -- the reactor / poller / job-chain enqueue path, without the
 /// command-scope buffer [`take_pending`] drains.
-pub(crate) fn enqueue_request<J: Job>(
+pub(crate) fn enqueue_request<J: StandaloneJob>(
     job: &J,
     delay: Option<Duration>,
 ) -> Result<EnqueueRequest, JobStoreError> {
@@ -950,7 +890,7 @@ mod tests {
         Reminder { address: String },
     }
 
-    impl Job for SendEmail {
+    impl StandaloneJob for SendEmail {
         type Input = ();
         type Output = ();
         type Error = Infallible;
@@ -1004,66 +944,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_within_a_scope_is_taken_by_the_flush() {
-        let taken = with_pending_scope(async {
-            let queue = JobQueue::<crate::jobs![SendEmail]>::default();
-            queue.push(SendEmail::Welcome {
-                address: "a@example.com".to_string(),
-            });
-            queue.push_with_delay(
-                SendEmail::Reminder {
-                    address: "b@example.com".to_string(),
-                },
-                Duration::from_secs(60),
-            );
-            take_pending().unwrap()
-        })
-        .await;
-
-        assert_eq!(taken.len(), 2);
-        assert_eq!(taken[0].kind, JobKind::new("send-email"));
-        assert_eq!(
-            taken[0].payload,
-            serde_json::json!({ "Welcome": { "address": "a@example.com" } })
-        );
-    }
-
-    #[tokio::test]
-    async fn push_outside_a_scope_is_dropped() {
-        let queue = JobQueue::<crate::jobs![SendEmail]>::default();
-        queue.push(SendEmail::Welcome {
-            address: "a@example.com".to_string(),
-        });
-
-        // The earlier push had no scope and was dropped; a fresh scope is empty.
-        let taken = with_pending_scope(async { take_pending().unwrap() }).await;
-        assert!(taken.is_empty());
-    }
-
-    #[tokio::test]
     async fn transition_fences_a_foreign_claim_and_succeeds_for_the_owner() {
         let state = claimed("claim-a", 1);
 
         let fenced = state
-            .transition(
-                JobCommand::Succeed {
-                    claim_id: ClaimId("claim-b".to_string()),
-                },
-                &JobQueue::<Nil>::default(),
-            )
+            .transition(JobCommand::Succeed {
+                claim_id: ClaimId("claim-b".to_string()),
+            })
             .await;
-        assert_eq!(fenced, Err(JobError::Fenced));
+        assert!(matches!(fenced, Err(JobError::Fenced)));
 
         let owned = state
-            .transition(
-                JobCommand::Succeed {
-                    claim_id: ClaimId("claim-a".to_string()),
-                },
-                &JobQueue::<Nil>::default(),
-            )
+            .transition(JobCommand::Succeed {
+                claim_id: ClaimId("claim-a".to_string()),
+            })
             .await
             .unwrap();
-        assert_eq!(owned, vec![JobEvent::Succeeded]);
+        let crate::Effect::Events(events) = owned else {
+            panic!("expected events");
+        };
+        assert_eq!(events, vec![JobEvent::Succeeded]);
     }
 
     #[test]

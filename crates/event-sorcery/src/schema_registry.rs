@@ -31,9 +31,8 @@ use std::collections::BTreeMap;
 use tracing::{debug, info};
 
 use crate::CompactionPolicy;
-use crate::job::JobQueue;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::{DomainEvent, EventSourced, Nil};
+use crate::{DomainEvent, Effect, EventSourced, Nil, uneventful};
 
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";
@@ -73,15 +72,15 @@ pub enum SchemaRegistryCommand {
 #[async_trait]
 impl EventSourced for SchemaRegistry {
     type Id = String;
-    type Event = SchemaRegistryEvent;
-    type Command = SchemaRegistryCommand;
     type Error = Never;
-    type Jobs = Nil;
+    type Command = SchemaRegistryCommand;
+    type Event = SchemaRegistryEvent;
     type Materialized = Nil;
+    type Jobs = Nil;
 
-    const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
+    const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
 
     fn originate(event: &Self::Event) -> Option<Self> {
         let SchemaRegistryEvent::VersionUpdated { name, version } = event;
@@ -97,24 +96,23 @@ impl EventSourced for SchemaRegistry {
         Ok(Some(new_state))
     }
 
-    async fn initialize(
-        command: Self::Command,
-        _jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+    async fn initialize(command: Self::Command) -> Result<Effect<Self>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
-        Ok(vec![SchemaRegistryEvent::VersionUpdated { name, version }])
+        Ok(Effect::Events(vec![SchemaRegistryEvent::VersionUpdated {
+            name,
+            version,
+        }]))
     }
 
-    async fn transition(
-        &self,
-        command: Self::Command,
-        _jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
+    async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self::Error> {
         let SchemaRegistryCommand::Register { name, version } = command;
         if self.version_of(&name) == Some(version) {
-            Ok(vec![])
+            uneventful()
         } else {
-            Ok(vec![SchemaRegistryEvent::VersionUpdated { name, version }])
+            Ok(Effect::Events(vec![SchemaRegistryEvent::VersionUpdated {
+                name,
+                version,
+            }]))
         }
     }
 }
@@ -493,15 +491,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for CompactableWidget {
         type Id = String;
-        type Event = CompactableEvent;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = CompactableEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "CompactableWidget";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 2;
+        const AGGREGATE_TYPE: &'static str = "CompactableWidget";
         const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
 
         fn originate(_event: &Self::Event) -> Option<Self> {
@@ -512,19 +510,12 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(
-            _command: Self::Command,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<Self::Event>, Never> {
-            Ok(vec![CompactableEvent::Created])
+        async fn initialize(_command: Self::Command) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![CompactableEvent::Created]))
         }
 
-        async fn transition(
-            &self,
-            _command: Self::Command,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<Self::Event>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: Self::Command) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
     }
 

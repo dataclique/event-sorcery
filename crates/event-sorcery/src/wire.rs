@@ -112,7 +112,8 @@ fn es_cqrs<Entity: EventSourced, Backend: EventBackend>(
         backend.event_repo(Entity::COMPACTION_POLICY),
         Entity::SNAPSHOT_SIZE,
     );
-    // `Lifecycle`'s cqrs-es services are unit -- handlers use the typed JobQueue.
+    // `Lifecycle`'s cqrs-es services are unit -- handlers return an `Effect`
+    // instead of calling out through injected services.
     #[allow(clippy::disallowed_methods)]
     CqrsFramework::new(store, queries, ())
 }
@@ -215,10 +216,10 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::JobQueue;
     use crate::dependency::EntityList;
     use crate::deps;
     use crate::lifecycle::{Lifecycle, Never};
+    use crate::{Effect, uneventful};
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
     struct AggregateA;
@@ -255,15 +256,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for AggregateA {
         type Id = String;
-        type Event = EventA;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = EventA;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "AggregateA";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "AggregateA";
 
         fn originate(_event: &EventA) -> Option<Self> {
             Some(Self)
@@ -273,34 +274,27 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<EventA>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<EventA>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
     }
 
     #[async_trait]
     impl EventSourced for AggregateB {
         type Id = String;
-        type Event = EventB;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = EventB;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "AggregateB";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "AggregateB";
 
         fn originate(_event: &EventB) -> Option<Self> {
             Some(Self)
@@ -310,19 +304,12 @@ mod tests {
             Ok(Some(Self))
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<EventB>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<EventB>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
     }
 
@@ -421,15 +408,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Tally {
         type Id = String;
-        type Event = TallyEvent;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = TallyEvent;
         type Materialized = Table;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Tally";
         const PROJECTION: Table = Table("tally_view");
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Tally";
 
         fn originate(event: &TallyEvent) -> Option<Self> {
             match event {
@@ -445,19 +432,12 @@ mod tests {
             }
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<TallyEvent>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<TallyEvent>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
     }
 

@@ -72,34 +72,36 @@ pub enum MyEntityCommand {
 #[async_trait]
 impl EventSourced for MyEntity {
     type Id = MyEntityId;       // strongly-typed, Display + FromStr
-    type Event = MyEntityEvent;
-    type Command = MyEntityCommand;
     type Error = Never;         // or a thiserror type
-    type Jobs = Nil;            // or jobs![SendEmail, ChargeCard]
+    type Command = MyEntityCommand;
+    type Event = MyEntityEvent;
     type Materialized = Table;  // Table for projected, Nil for non-projected
+    type Jobs = Nil;            // or jobs![SendEmail, ChargeCard]
 
-    const AGGREGATE_TYPE: &'static str = "MyEntity";
     const PROJECTION: Table = Table("my_entity_view");
     const SCHEMA_VERSION: u64 = 1;
+    const AGGREGATE_TYPE: &'static str = "MyEntity";
 
     // Event-side: reconstruct state from events
     fn originate(event: &Self::Event) -> Option<Self> { /* ... */ }
     fn evolve(entity: &Self, event: &Self::Event)
         -> Result<Option<Self>, Self::Error> { /* ... */ }
 
-    // Command-side: process commands to produce events (and enqueue jobs)
-    async fn initialize(command: Self::Command, jobs: &JobQueue<Self::Jobs>)
-        -> Result<Vec<Self::Event>, Self::Error> { /* ... */ }
-    async fn transition(&self, command: Self::Command, jobs: &JobQueue<Self::Jobs>)
-        -> Result<Vec<Self::Event>, Self::Error> { /* ... */ }
+    // Command-side: decide -- domain events, or one job dispatch
+    async fn initialize(command: Self::Command)
+        -> Result<Effect<Self>, Self::Error> { /* ... */ }
+    async fn transition(&self, command: Self::Command)
+        -> Result<Effect<Self>, Self::Error> { /* ... */ }
 }
 ```
 
-`Jobs` is the type-level list of `Job`s the entity's handlers may enqueue --
-written with the `jobs!` macro (`jobs![SendEmail, ChargeCard]`), or `Nil` for
-none. Handlers get a typed `JobQueue<Self::Jobs>` and can only push declared
-jobs; pushed jobs flush in the same transaction as the events and run later in a
-supervised worker. See the **Jobs Pattern** and **Running Jobs** sections below.
+`Jobs` is the type-level list of `Job`s the entity may dispatch -- written with
+the `jobs!` macro (`jobs![ChargeCard, SendReceipt]`), or `Nil` for none. A
+handler kicks a job off by returning
+`Effect::Dispatch(self.field.dispatch(job)?)`; the framework emits the
+`Dispatched` event and enqueues in the same transaction, and only its delivery
+path can settle the dispatch. See the **Jobs Pattern** and **Running Jobs**
+sections below.
 
 **Method naming conventions:**
 
@@ -125,8 +127,21 @@ supervised worker. See the **Jobs Pattern** and **Running Jobs** sections below.
 | `DomainEvent`          | Trait for event serialization (from cqrs-es) |
 | `Table`                | Newtype for projection table name            |
 | `Nil`                  | Empty type-level list (no projection / jobs) |
-| `Job`                  | Trait for a durable, retryable side effect   |
-| `JobQueue<Jobs>`       | Handler handle for enqueuing declared jobs   |
+| `Effect<Entity>`       | Handler result: events, or one job dispatch  |
+| `fx(value)`            | Wraps events/job/dispatch/error into result  |
+| `uneventful()`         | No-op outcome: accept command, no events     |
+| `Job`                  | Entity-kicked job (submit/reconcile)         |
+| `StandaloneJob`        | Origin-less worker job (perform)             |
+| `DispatchedJob<J>`     | Entity-embedded state of a kicked-off job    |
+| `DispatchEvent<J>`     | Dispatch lifecycle facts on the entity       |
+| `DispatchOutcome<J>`   | Sealed verdict delivered by the framework    |
+| `JobDispatch<Entity>`  | Opaque kick-off returned in an `Effect`      |
+| `Settled<Output>`      | Sealed success payload (output + attempts)   |
+| `SettledFailure<E>`    | Sealed failure payload (reason + attempts)   |
+| `DispatchRefused`      | Guard refusal (in-flight, mismatch)          |
+| `Reconciliation<T>`    | reconcile verdict: settled / not / unknown   |
+| `OriginPort<J>`        | Delivery port for verdicts (impl by `Store`) |
+| `JobInput<J>`          | Worker input: deps + origin delivery port    |
 | `jobs!`                | Macro building the type-level `Job` list     |
 | `JobRuntime`           | Wires the worker-side durable-jobs runtime   |
 
@@ -255,54 +270,78 @@ Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 
 ## Jobs Pattern
 
-Command handlers stay pure `(state, command) -> events`. Side effects (sending
-an email, charging a card, calling a chain) are enqueued as durable `Job`s
-rather than run inline: the handler pushes a job onto its typed `JobQueue`, and
-a supervised worker runs it later. A pushed job is flushed in the **same
-transaction** that commits the triggering events, so the job exists iff its
-events commit -- there is no crash window between a side effect and the event
-meant to record it.
+Command handlers stay pure. A command is the operation being performed; if it
+needs the outside world (send an email, charge a card, call a chain), it KICKS
+OFF a durable `Job` for a worker -- and the handler signature enforces it
+(ADR-0009): a handler returns an `Effect`, either domain events or exactly one
+job dispatch. The framework emits the `Dispatched` event (carrying the job value
+-- the intent IS the job) and enqueues in the **same transaction**, so there is
+no crash window between intent and job, and no accomplished-fact event can
+accompany a merely-enqueued effect.
 
-Declare the jobs an entity may enqueue with the `jobs!` macro:
+Declare the jobs an entity may dispatch with the `jobs!` macro:
 
 ```rust
-type Jobs = jobs![NotifyClosed];  // or Nil for an entity that enqueues nothing
+type Jobs = jobs![NotifyClosed];  // or Nil for an entity that dispatches nothing
 ```
 
-Handlers receive a typed `JobQueue<Self::Jobs>` and enqueue with `push`. The
-queue compile-checks that the job is one of the declared `Jobs` -- pushing an
-undeclared job is a compile error:
+Embed a `DispatchedJob<J>` field in the entity
+(`Idle -> InFlight -> Confirmed | Failed`), nest `DispatchEvent<J>` in the event
+enum (conventionally a `Dispatch` variant) and `DispatchOutcome<J>` in the
+command enum (conventionally `Settle`), both with `From` impls, and delegate:
 
 ```rust
-async fn transition(
-    &self,
-    command: Self::Command,
-    jobs: &JobQueue<Self::Jobs>,
-) -> Result<Vec<Self::Event>, Self::Error> {
-    jobs.push(NotifyClosed { subject: self.subject.clone() });
-    Ok(vec![MyEvent::Closed { /* ... */ }])
+async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self::Error> {
+    use MyCommand::{AwaitCustomer, Close, Settle};
+
+    match command {
+        // Kick off the job; the machine's guard refuses while one is in flight.
+        Close => fx(self.notify.dispatch(NotifyClosed {
+            ticket: self.ticket,
+            subject: self.subject.clone(),
+        })?),
+
+        // The framework delivers the sealed verdict; settle folds it in.
+        Settle(outcome) => fx(self.notify.settle(outcome)?),
+
+        // Pure domain facts stay plain events.
+        AwaitCustomer => fx(MyEvent::AwaitingCustomer),
+    }
 }
 ```
 
-Use `push_with_delay(job, duration)` to defer a job's first run. Inputs a side
-effect used to read from an injected service (e.g. the current time from a
-clock) now travel on the command instead, keeping handlers deterministic: the
-only non-determinism is what the command carries in.
+`fx(value)` wraps whatever a handler arm produces into the full
+`Result<Effect, Error>`: a single event, a `Vec`/array of events, the
+`Vec<DispatchEvent<J>>` that `settle` returns, a guarded `JobDispatch`, a bare
+`Job` (the infallible kick-off for `initialize`, where there is no dispatch
+state to guard), or the entity's domain error (which becomes the `Err` arm). In
+`originate`, fold the first `Dispatched` event with
+`DispatchedJob::originate(event)`. The empty outcome has its own name:
+`uneventful()` accepts the command and records nothing (a bare `fx(vec![])`
+cannot infer its element type).
 
-A `Job` is one self-contained side effect. Its `Input` associated type is the
-dependency bundle a worker injects into `perform` (e.g. an email client); `KIND`
-routes the job to the worker that runs it:
+The dispatch compile-checks that the job is declared in `Jobs`, that its
+`Origin` is this entity, and that the event enum absorbs `DispatchEvent<J>` --
+an unwired job is a compile error. `Confirmed`/`Failed` verdicts are sealed
+(framework-constructed only), so a `Confirmed` dispatch in state _proves_ the
+job settled. Inputs a handler needs (timestamps, ids) travel on the command,
+keeping handlers deterministic.
+
+A `Job` implements `submit`/`reconcile`, never a single `perform`: the framework
+runs `submit` only on the first execution and routes every retry through
+`reconcile`, which looks up the earlier attempt's fate by its idempotency key
+(derive it from `JobContext::job_id`, never the attempt) and returns `Settled` /
+`NotSubmitted` / `Indeterminate`. Failures are classified explicitly at the
+return site: `JobFailure::Transient` retries with backoff,
+`JobFailure::Terminal` dead-letters immediately and settles the origin as
+`Failed(Rejected)`.
 
 ```rust
-#[derive(Serialize, Deserialize)]
-struct NotifyClosed {
-    subject: String,
-}
-
 impl Job for NotifyClosed {
-    type Input = Notifier;  // injected by the worker
+    type Input = Notifier;  // injected by the worker via JobInput
     type Output = ();
-    type Error = std::convert::Infallible;
+    type Error = Never;
+    type Origin = SupportTicket;
 
     const WORKER_NAME: &'static str = "notify-closed";
     const KIND: &'static str = "notify-closed";
@@ -311,13 +350,38 @@ impl Job for NotifyClosed {
         Label::new(format!("notify-closed:{}", self.subject))
     }
 
-    async fn perform(&self, input: &Notifier) -> Result<(), Self::Error> {
-        input.email_customer(&self.subject).await  // the actual side effect
+    fn origin_id(&self) -> TicketId {
+        self.ticket
+    }
+
+    async fn submit(
+        &self,
+        _ctx: &JobContext,
+        input: &Notifier,
+    ) -> Result<JobOutcome<()>, JobFailure<Never>> {
+        input.email_customer(&self.subject).await;
+        Ok(JobOutcome::Done(()))
+    }
+
+    async fn reconcile(
+        &self,
+        _ctx: &JobContext,
+        _input: &Notifier,
+    ) -> Result<Reconciliation<()>, JobFailure<Never>> {
+        Ok(Reconciliation::Settled(()))  // a duplicate email is tolerable
     }
 }
 ```
 
-See **Running Jobs** below for wiring the worker that drains the queue.
+Register the worker input as
+`NotifyClosed => JobInput::<NotifyClosed>::new(Notifier, store.clone())` -- the
+store is the delivery port verdicts come back through. See **Running Jobs**
+below for the worker wiring; the `Desk` entity in `dispatch.rs`'s tests and both
+`examples/` are reference implementations.
+
+Origin-less background work (reactor sweeps, pollers, startup recovery)
+implements `StandaloneJob` (a plain `perform`) and is enqueued directly with
+`JobRuntime::enqueue` (ADR-0007) -- never from a command handler.
 
 ## Schema Versioning
 
@@ -691,10 +755,12 @@ changes.
 
 ## Running Jobs
 
-Enqueuing a job (see **Jobs Pattern** above) only writes a pending row; a worker
-has to drain it. `JobRuntime::build(pool)` wires the durable-jobs runtime over
-the same database, and `build_supervised_worker!` registers one supervised
-worker per job type, mapping each `Job` to the `Input` its `perform` receives:
+Dispatching a job (see **Jobs Pattern** above) only writes a pending row; a
+worker has to drain it. `JobRuntime::build(pool)` wires the durable-jobs runtime
+over the same database, and `build_supervised_worker!` registers one supervised
+worker per job type -- entity-kicked jobs get a `JobInput` (their dependencies
+plus the origin store verdicts are delivered through), standalone jobs get their
+plain input:
 
 ```rust
 let runtime = JobRuntime::build(pool.clone()).await?;
@@ -704,20 +770,22 @@ let monitor = build_supervised_worker!(
     JobWorkerConfig::default(),
     Clock::system(),
     {
-        NotifyClosed => Notifier,
-        ChargeCard   => billing_client.clone(),
+        NotifyClosed => JobInput::<NotifyClosed>::new(Notifier, store.clone()),
+        SweepStaleTickets => (),
     }
 );
 
-monitor.run().await?;  // polls, claims, runs, and acks jobs
+monitor.run().await?;  // polls, claims, runs, delivers, and acks jobs
 ```
 
 Each worker polls the `job_queue` projection for runnable jobs of its `KIND`,
-claims one under a lease, runs `perform`, and durably records the outcome
-(success, retry with backoff, or dead-letter) -- all fenced so a job runs
-exactly once per successful claim. `JobWorkerConfig` tunes poll cadence,
-concurrency, lease duration, retry budget, and backoff; `Clock::system()` is the
-real wall clock (use `Clock::from_fn(..)` to drive lease and retry timing
+claims one under a lease, runs the routed execution (submit/reconcile for
+entity-kicked jobs, `perform` for standalone ones), delivers the verdict, and
+durably records the outcome (success, retry with backoff, or dead-letter) -- all
+fenced so a job runs exactly once per successful claim. `JobWorkerConfig` tunes
+poll cadence, concurrency, lease duration, retry budget, backoff, and the
+verdict-delivery deferrals (`DeliveryPolicy`); `Clock::system()` is the real
+wall clock (use `Clock::from_fn(..)` to drive lease and retry timing
 deterministically in tests).
 
 ## Testing Aggregates

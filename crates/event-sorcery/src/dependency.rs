@@ -387,7 +387,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::JobQueue;
+    use crate::{Effect, uneventful};
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Alpha {
@@ -415,15 +415,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Alpha {
         type Id = String;
-        type Event = AlphaEvent;
-        type Command = ();
         type Error = AlphaError;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = AlphaEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Alpha";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Alpha";
 
         fn originate(event: &AlphaEvent) -> Option<Self> {
             match event {
@@ -437,19 +437,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize(
-            (): (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<AlphaEvent>, AlphaError> {
-            Ok(vec![AlphaEvent::Born])
+        async fn initialize((): ()) -> Result<Effect<Self>, AlphaError> {
+            Ok(Effect::Events(vec![AlphaEvent::Born]))
         }
 
-        async fn transition(
-            &self,
-            (): (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<AlphaEvent>, AlphaError> {
-            Ok(vec![])
+        async fn transition(&self, (): ()) -> Result<Effect<Self>, AlphaError> {
+            uneventful()
         }
     }
 
@@ -479,15 +472,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Beta {
         type Id = String;
-        type Event = BetaEvent;
-        type Command = ();
         type Error = BetaError;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = BetaEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Beta";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Beta";
 
         fn originate(event: &BetaEvent) -> Option<Self> {
             match event {
@@ -499,19 +492,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn initialize(
-            (): (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<BetaEvent>, BetaError> {
-            Ok(vec![BetaEvent::Spawned])
+        async fn initialize((): ()) -> Result<Effect<Self>, BetaError> {
+            Ok(Effect::Events(vec![BetaEvent::Spawned]))
         }
 
-        async fn transition(
-            &self,
-            (): (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<BetaEvent>, BetaError> {
-            Ok(vec![])
+        async fn transition(&self, (): ()) -> Result<Effect<Self>, BetaError> {
+            uneventful()
         }
     }
 

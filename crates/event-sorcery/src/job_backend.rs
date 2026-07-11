@@ -38,10 +38,11 @@ use tracing::{error, warn};
 
 use sqlite_es::{Cmp, Order, Predicate, Term, Value};
 
+use crate::dispatch::DeliveryPolicy;
 use crate::job::{
-    DeadReason, Job, JobCommand, JobContext, JobError, JobFailure, JobId, JobOutcome, JobState,
-    JobStoreError, WonClaim, WorkerId, enqueue_request, enqueued_event, pending_seed_payload,
-    plan_claim,
+    DeadReason, JobCommand, JobContext, JobError, JobFailure, JobId, JobOutcome, JobState,
+    JobStoreError, StandaloneJob, WonClaim, WorkerId, enqueue_request, enqueued_event,
+    pending_seed_payload, plan_claim,
 };
 use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
@@ -75,18 +76,21 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
     /// the reactor / poller / job-chain / startup enqueue path -- there is no
     /// command commit for the job to ride. Returns the new job's id.
     ///
-    /// Contrast the handler-side [`JobQueue::push`](crate::JobQueue::push), which
-    /// buffers into the command's commit so the job is atomic with the triggering
-    /// events. Use that for command-born jobs; use this for everything else. A
-    /// standalone enqueue is its own transaction -- NOT atomic with whatever event
-    /// or poll prompted it (that has already committed).
-    pub async fn enqueue<J: Job>(&self, job: J) -> Result<JobId, JobEnqueueError<Backend::Error>> {
+    /// Contrast the handler-side [`Effect::Dispatch`](crate::Effect), where
+    /// the framework enqueues atomically with the `Dispatched` event. Use that
+    /// for entity-kicked jobs; use this for everything else. A standalone
+    /// enqueue is its own transaction -- NOT atomic with whatever event or poll
+    /// prompted it (that has already committed).
+    pub async fn enqueue<J: StandaloneJob>(
+        &self,
+        job: J,
+    ) -> Result<JobId, JobEnqueueError<Backend::Error>> {
         self.enqueue_resolved(job, None).await
     }
 
     /// Like [`enqueue`](Self::enqueue) but the job becomes runnable only after
     /// `delay` from now -- for self-rescheduling pollers and deferred work.
-    pub async fn enqueue_with_delay<J: Job>(
+    pub async fn enqueue_with_delay<J: StandaloneJob>(
         &self,
         job: J,
         delay: std::time::Duration,
@@ -96,7 +100,7 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
 
     // Takes `job` by value (not `&J`): an owned `Job` is `Send` and so the future
     // is `Send`, whereas a `&J` held across the await would demand `J: Sync`.
-    async fn enqueue_resolved<J: Job>(
+    async fn enqueue_resolved<J: StandaloneJob>(
         &self,
         job: J,
         delay: Option<std::time::Duration>,
@@ -146,7 +150,7 @@ impl JobRuntime<SqliteBackend> {
 
 /// The event-sourced job backend for a single job type `J` over an
 /// [`EventBackend`].
-pub struct EventStoreBackend<J: Job, Backend: EventBackend = SqliteBackend> {
+pub struct EventStoreBackend<J: StandaloneJob, Backend: EventBackend = SqliteBackend> {
     runtime: JobRuntime<Backend>,
     worker_id: WorkerId,
     config: JobWorkerConfig,
@@ -154,7 +158,7 @@ pub struct EventStoreBackend<J: Job, Backend: EventBackend = SqliteBackend> {
     _job: PhantomData<fn() -> J>,
 }
 
-impl<J: Job, Backend: EventBackend> EventStoreBackend<J, Backend> {
+impl<J: StandaloneJob, Backend: EventBackend> EventStoreBackend<J, Backend> {
     /// Builds a worker for job type `J` over `runtime`.
     #[must_use]
     pub fn new(
@@ -192,7 +196,11 @@ impl<J: Job, Backend: EventBackend> EventStoreBackend<J, Backend> {
 /// Decodes a won claim into an apalis task, or `None` if the stored args no
 /// longer deserialize into `J` or the view id is not a valid [`JobId`] (a
 /// poison row the worker skips).
-fn build_task<J: Job>(view_id: String, won: WonClaim) -> Option<Task<J, JobContext, String>> {
+fn build_task<J: StandaloneJob>(
+    view_id: String,
+    won: WonClaim,
+    config: &JobWorkerConfig,
+) -> Option<Task<J, JobContext, String>> {
     let job_id: JobId = match view_id.parse() {
         Ok(job_id) => job_id,
         Err(error) => {
@@ -214,6 +222,8 @@ fn build_task<J: Job>(view_id: String, won: WonClaim) -> Option<Task<J, JobConte
             claim_seq: won.claim_seq,
             claim_id: won.claim_id,
             attempt: won.attempt,
+            max_attempts: config.max_attempts,
+            delivery: config.delivery,
         },
     );
     task.parts.task_id = Some(TaskId::new(view_id));
@@ -225,7 +235,7 @@ fn build_task<J: Job>(view_id: String, won: WonClaim) -> Option<Task<J, JobConte
 /// The worker's middleware (claim, lease renewal, fenced ack) wraps this; the
 /// handler itself only performs the side effect. Used by
 /// [`build_supervised_worker!`](crate::build_supervised_worker).
-pub async fn run_job<J: Job>(
+pub async fn run_job<J: StandaloneJob>(
     job: J,
     ctx: JobContext,
     input: Data<Arc<J::Input>>,
@@ -243,7 +253,7 @@ impl<Args: Sync> FromRequest<Task<Args, Self, String>> for JobContext {
     }
 }
 
-impl<J: Job, Backend: EventBackend> ApalisBackend for EventStoreBackend<J, Backend> {
+impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBackend<J, Backend> {
     type Args = J;
     type IdType = String;
     type Context = JobContext;
@@ -296,7 +306,7 @@ impl<J: Job, Backend: EventBackend> ApalisBackend for EventStoreBackend<J, Backe
             for job_id in candidates {
                 match backend.claim_one(&job_id, now_ms).await {
                     Ok(ClaimOutcome::Won(won)) => {
-                        if let Some(task) = build_task::<J>(job_id, won) {
+                        if let Some(task) = build_task::<J>(job_id, won, &backend.config) {
                             return Some((Ok(Some(task)), backend));
                         }
                     }
@@ -339,6 +349,8 @@ pub struct JobWorkerConfig {
     pub max_claims: u32,
     /// Exponential backoff for retries.
     pub backoff: Backoff,
+    /// Deferrals after a failed verdict delivery to the origin entity.
+    pub delivery: DeliveryPolicy,
 }
 
 impl Default for JobWorkerConfig {
@@ -353,6 +365,7 @@ impl Default for JobWorkerConfig {
             max_attempts: 5,
             max_claims: 50,
             backoff: Backoff::default(),
+            delivery: DeliveryPolicy::default(),
         }
     }
 }
@@ -470,7 +483,7 @@ fn poll_order() -> Order {
 
 /// Layer that wraps the worker's execution service to durably record each job's
 /// outcome and hold its lease for the duration of the run.
-pub struct AckLayer<J: Job, Backend: EventBackend> {
+pub struct AckLayer<J: StandaloneJob, Backend: EventBackend> {
     jobs: Arc<Store<JobState, Backend>>,
     backend: Backend,
     config: JobWorkerConfig,
@@ -478,7 +491,7 @@ pub struct AckLayer<J: Job, Backend: EventBackend> {
     _job: PhantomData<fn() -> J>,
 }
 
-impl<S, J: Job, Backend: EventBackend> Layer<S> for AckLayer<J, Backend> {
+impl<S, J: StandaloneJob, Backend: EventBackend> Layer<S> for AckLayer<J, Backend> {
     type Service = AckService<S, J, Backend>;
 
     fn layer(&self, inner: S) -> Self::Service {
@@ -494,7 +507,7 @@ impl<S, J: Job, Backend: EventBackend> Layer<S> for AckLayer<J, Backend> {
 }
 
 /// See [`AckLayer`].
-pub struct AckService<S, J: Job, Backend: EventBackend> {
+pub struct AckService<S, J: StandaloneJob, Backend: EventBackend> {
     inner: S,
     jobs: Arc<Store<JobState, Backend>>,
     backend: Backend,
@@ -505,7 +518,7 @@ pub struct AckService<S, J: Job, Backend: EventBackend> {
 
 impl<S, J, Backend> Service<Task<J, JobContext, String>> for AckService<S, J, Backend>
 where
-    J: Job,
+    J: StandaloneJob,
     Backend: EventBackend,
     S: Service<Task<J, JobContext, String>, Response = JobOutcome<J::Output>>,
     S::Error: Into<BoxDynError> + Send + Sync + 'static,
@@ -586,7 +599,7 @@ enum AckPlan {
 /// classification from the type-erased tower error. An error that is not a
 /// `JobFailure` (the execution timeout, middleware failures) is treated as
 /// transient: only an explicit `Terminal` return skips the retry budget.
-fn ack_plan<J: Job>(result: &Result<JobOutcome<J::Output>, BoxDynError>) -> AckPlan {
+fn ack_plan<J: StandaloneJob>(result: &Result<JobOutcome<J::Output>, BoxDynError>) -> AckPlan {
     match result {
         Ok(JobOutcome::Done(_)) => AckPlan::Succeeded,
         Ok(JobOutcome::Defer(delay)) => AckPlan::Deferred(*delay),
@@ -597,7 +610,7 @@ fn ack_plan<J: Job>(result: &Result<JobOutcome<J::Output>, BoxDynError>) -> AckP
     }
 }
 
-fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {
@@ -775,7 +788,7 @@ macro_rules! build_supervised_worker {
                 monitor.register(move |index| {
                     let name = ::std::format!(
                         "{}-{}",
-                        <$job as $crate::Job>::WORKER_NAME,
+                        <$job as $crate::StandaloneJob>::WORKER_NAME,
                         index
                     );
                     let backend = $crate::EventStoreBackend::<$job>::new(
@@ -812,7 +825,7 @@ mod tests {
         n: u32,
     }
 
-    impl Job for TestJob {
+    impl StandaloneJob for TestJob {
         type Input = ();
         type Output = ();
         type Error = std::convert::Infallible;
@@ -946,7 +959,8 @@ mod tests {
         let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
             panic!("expected to win the claim");
         };
-        let task = build_task::<TestJob>(job_id.to_string(), won).expect("payload decodes");
+        let task = build_task::<TestJob>(job_id.to_string(), won, &JobWorkerConfig::default())
+            .expect("payload decodes");
 
         // The context the handler extracts carries the claimed job's durable
         // identity: the stable job id and a zero attempt on the first run.
@@ -969,7 +983,9 @@ mod tests {
         let ClaimOutcome::Won(rewon) = claim(&backend, &job_id, "w2", retry_ms, 50).await else {
             panic!("expected to win the retry claim");
         };
-        let retry_task = build_task::<TestJob>(job_id.to_string(), rewon).expect("payload decodes");
+        let retry_task =
+            build_task::<TestJob>(job_id.to_string(), rewon, &JobWorkerConfig::default())
+                .expect("payload decodes");
         let retry_ctx = JobContext::from_request(&retry_task).await.unwrap();
         assert_eq!(retry_ctx.job_id(), job_id);
         assert_eq!(retry_ctx.attempt(), 1);
@@ -982,7 +998,7 @@ mod tests {
     #[derive(Serialize, Deserialize)]
     struct FallibleJob;
 
-    impl Job for FallibleJob {
+    impl StandaloneJob for FallibleJob {
         type Input = ();
         type Output = ();
         type Error = TestPerformError;
@@ -1045,6 +1061,8 @@ mod tests {
             claim_seq: won.claim_seq,
             claim_id: won.claim_id,
             attempt: won.attempt,
+            max_attempts: 5,
+            ..JobContext::default()
         };
 
         // A terminal failure on the FIRST attempt (max_attempts = 5) must kill
@@ -1175,6 +1193,8 @@ mod tests {
             claim_seq: won.claim_seq,
             claim_id: won.claim_id,
             attempt: won.attempt,
+            max_attempts: 5,
+            ..JobContext::default()
         };
 
         ack(

@@ -84,6 +84,7 @@
 //! to cqrs-es.
 
 pub(crate) mod dependency;
+mod dispatch;
 mod job;
 mod job_backend;
 mod job_sqlite;
@@ -115,9 +116,16 @@ use std::str::FromStr;
 pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
+#[doc(hidden)]
+pub use dispatch::fx_marker;
+pub use dispatch::{
+    Contains, DeliveryPolicy, DispatchEvent, DispatchFailure, DispatchOutcome, DispatchRefused,
+    DispatchReplay, DispatchedJob, Effect, Fx, Here, Job, JobDispatch, JobInput, JobList,
+    OriginDeliveryError, OriginPort, Reconciliation, Settled, SettledFailure, There, fx,
+    uneventful,
+};
 pub use job::{
-    Contains, Here, Job, JobContext, JobFailure, JobId, JobList, JobOutcome, JobQueue,
-    JobStoreError, Label, There,
+    DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,
 };
 pub use job_backend::{
     Backoff, Clock, EventStoreBackend, JobEnqueueError, JobRuntime, JobWorkerConfig, run_job,
@@ -171,28 +179,28 @@ pub enum CompactionPolicy {
 /// - `Id`: The strongly-typed aggregate identifier. Prevents
 ///   mixing up IDs between different entity types at compile
 ///   time. Converted to string at the cqrs-es boundary only.
-/// - `Event`: Domain events that drive state changes. Must be
-///   `Eq` so lifecycle error states can carry typed events.
-/// - `Command`: Instructions that produce events. A single
-///   command type is used for both initialization and
-///   transitions -- the lifecycle routes based on state.
 /// - `Error`: Domain-specific errors from command handling or
 ///   event application (e.g., arithmetic overflow). For
 ///   entities with infallible operations, use [`Never`].
-/// - `Jobs`: Type-level list of the [`Job`] types this entity's
-///   handlers may enqueue (`jobs![SendEmail, ChargeCard]`, or
-///   [`Nil`] for none). Handlers receive a [`JobQueue<Self::Jobs>`](JobQueue)
-///   and can only push declared jobs -- side effects run as durable
-///   jobs flushed in the same transaction that commits the events.
+/// - `Command`: Instructions that produce events. A single
+///   command type is used for both initialization and
+///   transitions -- the lifecycle routes based on state.
+/// - `Event`: Domain events that drive state changes. Must be
+///   `Eq` so lifecycle error states can carry typed events.
+/// - `Jobs`: Type-level list of the [`Job`] types this entity may
+///   dispatch (`jobs![ChargeCard, SendReceipt]`, or [`Nil`] for
+///   none). Handlers kick a job off by returning
+///   [`Effect::Dispatch`]; the framework enqueues it in the same
+///   transaction that commits the `Dispatched` event.
 ///
 /// # Constants
 ///
-/// - `AGGREGATE_TYPE`: Stable identifier for the event store.
-///   Must not change after events are persisted.
 /// - `SCHEMA_VERSION`: Bump when the entity's state, event, or
 ///   view schema changes. On startup, the wiring infrastructure
 ///   detects version mismatches and automatically clears stale
 ///   snapshots and replays views.
+/// - `AGGREGATE_TYPE`: Stable identifier for the event store.
+///   Must not change after events are persisted.
 ///
 /// # Event-side methods
 ///
@@ -227,22 +235,13 @@ pub trait EventSourced:
 {
     /// Aggregate identity type, used as the key in the event store.
     type Id: Debug + Display + FromStr + Clone + Send + Sync;
-    /// Domain event type emitted by commands and applied during replay.
-    type Event: DomainEvent;
-    /// Command type that drives state transitions.
-    type Command: Send + Sync;
     /// Domain error type returned by command handlers and event
     /// application.
     type Error: DomainError;
-    /// Type-level list of the [`Job`] types this entity's command
-    /// handlers may enqueue.
-    ///
-    /// Write it with the [`jobs!`] macro (`jobs![SendEmail, ChargeCard]`),
-    /// or [`Nil`] for an entity that dispatches no jobs. Handlers receive a
-    /// [`JobQueue<Self::Jobs>`](JobQueue) and can only push jobs declared
-    /// here -- enqueuing an undeclared job is a compile error. The framework
-    /// flushes pushed jobs in the same transaction that commits the events.
-    type Jobs: JobList;
+    /// Command type that drives state transitions.
+    type Command: Send + Sync;
+    /// Domain event type emitted by commands and applied during replay.
+    type Event: DomainEvent;
     /// Whether this entity has a materialized view.
     ///
     /// Set to `Table` with `PROJECTION = Table("view_name")` for
@@ -253,21 +252,22 @@ pub trait EventSourced:
     /// `Table` entities return `(Store, Projection)`, `Nil` entities
     /// return just `Store`.
     type Materialized;
+    /// Type-level list of the [`Job`] types this entity may dispatch.
+    ///
+    /// Write it with the [`jobs!`] macro (`jobs![ChargeCard, SendReceipt]`),
+    /// or [`Nil`] for an entity that dispatches no jobs. A handler kicks a
+    /// job off by returning [`Effect::Dispatch`], and
+    /// [`DispatchedJob::dispatch`] compile-checks that the job is declared
+    /// here -- dispatching an undeclared job is a compile error. The
+    /// framework enqueues the job in the same transaction that commits the
+    /// `Dispatched` event.
+    type Jobs: JobList;
 
-    /// Unique string identifying this aggregate type in the event
-    /// store. Must be stable across deployments.
-    const AGGREGATE_TYPE: &'static str;
     /// Projection table name (for `Table` entities) or `Nil`.
     const PROJECTION: Self::Materialized;
     /// Schema version for migration reconciliation. Bump when the
     /// event schema changes.
     const SCHEMA_VERSION: u64;
-    /// Event retention policy for this entity.
-    ///
-    /// Financial audit aggregates must use the default
-    /// [`CompactionPolicy::Retain`]. Only observational aggregates
-    /// whose old events have no audit value should opt into compaction.
-    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
     /// How many commands between automatic snapshots.
     ///
     /// A snapshot of `1` means every command triggers a snapshot
@@ -276,6 +276,15 @@ pub trait EventSourced:
     /// aggregates with low event counts per instance benefit from a
     /// larger value (e.g., 10-50) to reduce write amplification.
     const SNAPSHOT_SIZE: usize = 10;
+    /// Unique string identifying this aggregate type in the event
+    /// store. Must be stable across deployments.
+    const AGGREGATE_TYPE: &'static str;
+    /// Event retention policy for this entity.
+    ///
+    /// Financial audit aggregates must use the default
+    /// [`CompactionPolicy::Retain`]. Only observational aggregates
+    /// whose old events have no audit value should opt into compaction.
+    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
     /// Create initial state from a genesis event.
     ///
@@ -296,24 +305,19 @@ pub trait EventSourced:
 
     /// Handle a command when the entity doesn't exist yet.
     ///
-    /// No `&self` -- impossible to accidentally reference
-    /// existing state during creation. Enqueue side effects via `jobs`.
-    async fn initialize(
-        command: Self::Command,
-        jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<Self::Event>, Self::Error>;
+    /// No `&self` -- impossible to accidentally reference existing state
+    /// during creation. Returns an [`Effect`]: pure domain events, or
+    /// exactly one job dispatch (via [`DispatchedJob::dispatch`]) whose
+    /// `Dispatched` event and enqueue the framework commits together.
+    async fn initialize(command: Self::Command) -> Result<Effect<Self>, Self::Error>;
 
     /// Handle a command against existing state.
     ///
-    /// `&self` is the domain type directly, not `Lifecycle`.
-    /// The handler only deals with live state; lifecycle routing
-    /// is handled by the blanket `Aggregate` impl. Enqueue side effects via
-    /// `jobs`; the handler stays pure `(state, command) -> events` + enqueues.
-    async fn transition(
-        &self,
-        command: Self::Command,
-        jobs: &JobQueue<Self::Jobs>,
-    ) -> Result<Vec<Self::Event>, Self::Error>;
+    /// `&self` is the domain type directly, not `Lifecycle`. The handler
+    /// only deals with live state; lifecycle routing is handled by the
+    /// blanket `Aggregate` impl. Returns an [`Effect`]: pure domain events,
+    /// or exactly one job dispatch.
+    async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self::Error>;
 }
 
 /// Type-safe command dispatch for an event-sourced entity.
@@ -369,7 +373,7 @@ impl<Entity: EventSourced, Backend: EventBackend> Store<Entity, Backend> {
         id: &Entity::Id,
         command: Entity::Command,
     ) -> Result<(), SendError<Entity>> {
-        // Open a pending-job scope so any `JobQueue::push` the handler makes is
+        // Open a pending-job scope so the job an `Effect::Dispatch` carries is
         // drained by the repository's flush in the same commit transaction.
         job::with_pending_scope(self.cqrs.execute(&id.to_string(), command)).await
     }
@@ -788,17 +792,17 @@ mod tests {
     #[async_trait]
     impl EventSourced for Widget {
         type Id = NumericId;
-        type Event = WidgetEvent;
-        type Command = WidgetCommand;
         type Error = WidgetError;
-        type Jobs = Nil;
+        type Command = WidgetCommand;
+        type Event = WidgetEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Widget";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
-        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
         const SNAPSHOT_SIZE: usize = 1;
+        const AGGREGATE_TYPE: &'static str = "Widget";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
 
         fn originate(event: &WidgetEvent) -> Option<Self> {
             match event {
@@ -814,24 +818,23 @@ mod tests {
             }
         }
 
-        async fn initialize(
-            command: WidgetCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<WidgetEvent>, WidgetError> {
+        async fn initialize(command: WidgetCommand) -> Result<Effect<Self>, WidgetError> {
             match command {
-                WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
-                WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+                WidgetCommand::Create { name } => {
+                    Ok(Effect::Events(vec![WidgetEvent::Created { name }]))
+                }
+                WidgetCommand::Rename { name } => {
+                    Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
+                }
             }
         }
 
-        async fn transition(
-            &self,
-            command: WidgetCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<WidgetEvent>, WidgetError> {
+        async fn transition(&self, command: WidgetCommand) -> Result<Effect<Self>, WidgetError> {
             match command {
-                WidgetCommand::Create { .. } => Ok(vec![]),
-                WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+                WidgetCommand::Create { .. } => uneventful(),
+                WidgetCommand::Rename { name } => {
+                    Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
+                }
             }
         }
     }
@@ -985,16 +988,16 @@ mod tests {
         #[async_trait]
         impl EventSourced for Tally {
             type Id = NumericId;
-            type Event = TallyEvent;
-            type Command = TallyCommand;
             type Error = WidgetError;
-            type Jobs = Nil;
+            type Command = TallyCommand;
+            type Event = TallyEvent;
             type Materialized = Nil;
+            type Jobs = Nil;
 
-            const AGGREGATE_TYPE: &'static str = "Tally";
             const PROJECTION: Nil = Nil;
             const SCHEMA_VERSION: u64 = 1;
             const SNAPSHOT_SIZE: usize = 1;
+            const AGGREGATE_TYPE: &'static str = "Tally";
 
             fn originate(event: &TallyEvent) -> Option<Self> {
                 match event {
@@ -1012,24 +1015,17 @@ mod tests {
                 }
             }
 
-            async fn initialize(
-                command: TallyCommand,
-                _jobs: &JobQueue<Self::Jobs>,
-            ) -> Result<Vec<TallyEvent>, WidgetError> {
+            async fn initialize(command: TallyCommand) -> Result<Effect<Self>, WidgetError> {
                 match command {
-                    TallyCommand::Start => Ok(vec![TallyEvent::Started]),
-                    TallyCommand::Increment => Ok(vec![TallyEvent::Incremented]),
+                    TallyCommand::Start => Ok(Effect::Events(vec![TallyEvent::Started])),
+                    TallyCommand::Increment => Ok(Effect::Events(vec![TallyEvent::Incremented])),
                 }
             }
 
-            async fn transition(
-                &self,
-                command: TallyCommand,
-                _jobs: &JobQueue<Self::Jobs>,
-            ) -> Result<Vec<TallyEvent>, WidgetError> {
+            async fn transition(&self, command: TallyCommand) -> Result<Effect<Self>, WidgetError> {
                 match command {
-                    TallyCommand::Start => Ok(vec![]),
-                    TallyCommand::Increment => Ok(vec![TallyEvent::Incremented]),
+                    TallyCommand::Start => uneventful(),
+                    TallyCommand::Increment => Ok(Effect::Events(vec![TallyEvent::Incremented])),
                 }
             }
         }
@@ -1080,15 +1076,15 @@ mod tests {
         #[async_trait]
         impl EventSourced for RetainedWidget {
             type Id = NumericId;
-            type Event = WidgetEvent;
-            type Command = WidgetCommand;
             type Error = WidgetError;
-            type Jobs = Nil;
+            type Command = WidgetCommand;
+            type Event = WidgetEvent;
             type Materialized = Nil;
+            type Jobs = Nil;
 
-            const AGGREGATE_TYPE: &'static str = "RetainedWidget";
             const PROJECTION: Nil = Nil;
             const SCHEMA_VERSION: u64 = 1;
+            const AGGREGATE_TYPE: &'static str = "RetainedWidget";
 
             fn originate(event: &WidgetEvent) -> Option<Self> {
                 match event {
@@ -1104,24 +1100,26 @@ mod tests {
                 }
             }
 
-            async fn initialize(
-                command: WidgetCommand,
-                _jobs: &JobQueue<Self::Jobs>,
-            ) -> Result<Vec<WidgetEvent>, WidgetError> {
+            async fn initialize(command: WidgetCommand) -> Result<Effect<Self>, WidgetError> {
                 match command {
-                    WidgetCommand::Create { name } => Ok(vec![WidgetEvent::Created { name }]),
-                    WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+                    WidgetCommand::Create { name } => {
+                        Ok(Effect::Events(vec![WidgetEvent::Created { name }]))
+                    }
+                    WidgetCommand::Rename { name } => {
+                        Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
+                    }
                 }
             }
 
             async fn transition(
                 &self,
                 command: WidgetCommand,
-                _jobs: &JobQueue<Self::Jobs>,
-            ) -> Result<Vec<WidgetEvent>, WidgetError> {
+            ) -> Result<Effect<Self>, WidgetError> {
                 match command {
-                    WidgetCommand::Create { .. } => Ok(vec![]),
-                    WidgetCommand::Rename { name } => Ok(vec![WidgetEvent::Renamed { name }]),
+                    WidgetCommand::Create { .. } => uneventful(),
+                    WidgetCommand::Rename { name } => {
+                        Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
+                    }
                 }
             }
         }

@@ -652,9 +652,9 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
-    use crate::JobQueue;
     use crate::Nil;
     use crate::lifecycle::Never;
+    use crate::{Effect, uneventful};
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct TestEntity {
@@ -676,15 +676,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for TestEntity {
         type Id = String;
-        type Event = TestEvent;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = TestEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "TestEntity";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "TestEntity";
 
         fn originate(_event: &TestEvent) -> Option<Self> {
             Some(Self {
@@ -696,19 +696,12 @@ mod tests {
             Ok(Some(entity.clone()))
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<TestEvent>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<TestEvent>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
     }
 
@@ -1072,15 +1065,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Counter {
         type Id = String;
-        type Event = CounterEvent;
-        type Command = ();
         type Error = Never;
-        type Jobs = Nil;
+        type Command = ();
+        type Event = CounterEvent;
         type Materialized = Table;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Counter";
         const PROJECTION: Table = Table("counter_view");
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Counter";
 
         fn originate(event: &CounterEvent) -> Option<Self> {
             match event {
@@ -1098,19 +1091,12 @@ mod tests {
             }
         }
 
-        async fn initialize(
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, Never> {
-            Ok(vec![])
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
 
-        async fn transition(
-            &self,
-            _command: (),
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, Never> {
-            Ok(vec![])
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            uneventful()
         }
     }
 

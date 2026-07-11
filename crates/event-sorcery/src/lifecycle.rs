@@ -17,10 +17,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::EventSourced;
 use crate::dependency::HasEntity;
-use crate::job::JobQueue;
+use crate::dispatch::JobDispatch;
 use crate::reactor::Reactor;
+use crate::{Effect, EventSourced};
 
 /// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
 ///
@@ -105,6 +105,11 @@ pub enum LifecycleError<Entity: EventSourced> {
     },
     #[error(transparent)]
     Apply(Entity::Error),
+    /// An `Effect::Dispatch` could not be buffered onto the command scope (a
+    /// framework bug); the command fails so the `Dispatched` event is never
+    /// committed without its enqueue.
+    #[error(transparent)]
+    DispatchNotBuffered(#[from] crate::job::DispatchNotBuffered),
 }
 
 /// Uninhabited error type for entities with infallible
@@ -136,8 +141,8 @@ where
     type Command = Entity::Command;
     type Event = Entity::Event;
     type Error = LifecycleError<Entity>;
-    // Handlers receive a typed `JobQueue`, not cqrs-es services, so the
-    // framework-level services are unit; `handle` builds the queue itself.
+    // Handlers return an `Effect` (events or one job dispatch), never call
+    // out through injected services, so the framework-level services are unit.
     type Services = ();
 
     const TYPE: &'static str = Entity::AGGREGATE_TYPE;
@@ -148,13 +153,9 @@ where
         _services: &Self::Services,
         sink: &EventSink<Self>,
     ) -> Result<(), Self::Error> {
-        // Handlers enqueue side-effect jobs onto this typed queue; the queue
-        // buffers into the per-command scope `Store::send` opened, and the event
-        // repository drains it in the same transaction that commits the events.
-        let jobs = JobQueue::<Entity::Jobs>::default();
-        let events = match &*self {
-            Self::Uninitialized => Entity::initialize(command, &jobs).await,
-            Self::Live(entity) => entity.transition(command, &jobs).await,
+        let decision = match &*self {
+            Self::Uninitialized => Entity::initialize(command).await,
+            Self::Live(entity) => entity.transition(command).await,
             Self::Failed { error, .. } => {
                 warn!(
                     target: "cqrs",
@@ -174,6 +175,19 @@ where
             );
         })
         .map_err(LifecycleError::Apply)?;
+
+        // A dispatch is the framework's to enact: buffer the enqueue onto the
+        // per-command scope `Store::send` opened (the event repository drains
+        // it in the same transaction that commits the events) and emit the
+        // machine-built `Dispatched` event. The handler never touches either.
+        let events = match decision {
+            Effect::Events(events) => events,
+            Effect::Dispatch(dispatch) => {
+                let JobDispatch { event, pending } = dispatch;
+                crate::job::buffer(pending)?;
+                vec![event]
+            }
+        };
 
         if events.is_empty() {
             return Ok(());
@@ -355,7 +369,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::{EventSourced, Nil};
+    use crate::{EventSourced, Nil, uneventful};
 
     /// Test entity: a simple counter with controllable error behavior.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,15 +416,15 @@ mod tests {
     #[async_trait]
     impl EventSourced for Counter {
         type Id = String;
-        type Event = CounterEvent;
-        type Command = CounterCommand;
         type Error = CounterError;
-        type Jobs = Nil;
+        type Command = CounterCommand;
+        type Event = CounterEvent;
         type Materialized = Nil;
+        type Jobs = Nil;
 
-        const AGGREGATE_TYPE: &'static str = "Counter";
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const AGGREGATE_TYPE: &'static str = "Counter";
 
         fn originate(event: &CounterEvent) -> Option<Self> {
             match event {
@@ -430,31 +444,28 @@ mod tests {
             }
         }
 
-        async fn initialize(
-            command: CounterCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, CounterError> {
+        async fn initialize(command: CounterCommand) -> Result<Effect<Self>, CounterError> {
             use CounterCommand::*;
             match command {
-                Create { initial } => Ok(vec![CounterEvent::Created { initial }]),
-                Increment => Ok(vec![CounterEvent::Incremented]),
+                Create { initial } => Ok(Effect::Events(vec![CounterEvent::Created { initial }])),
+                Increment => Ok(Effect::Events(vec![CounterEvent::Incremented])),
                 Fail => Err(CounterError),
-                BrokenBatch => Ok(vec![CounterEvent::Incremented, CounterEvent::Incremented]),
+                BrokenBatch => Ok(Effect::Events(vec![
+                    CounterEvent::Incremented,
+                    CounterEvent::Incremented,
+                ])),
             }
         }
 
-        async fn transition(
-            &self,
-            command: CounterCommand,
-            _jobs: &JobQueue<Self::Jobs>,
-        ) -> Result<Vec<CounterEvent>, CounterError> {
+        async fn transition(&self, command: CounterCommand) -> Result<Effect<Self>, CounterError> {
             match command {
-                CounterCommand::Create { .. } => Ok(vec![]),
-                CounterCommand::Increment => Ok(vec![CounterEvent::Incremented]),
+                CounterCommand::Create { .. } => uneventful(),
+                CounterCommand::Increment => Ok(Effect::Events(vec![CounterEvent::Incremented])),
                 CounterCommand::Fail => Err(CounterError),
-                CounterCommand::BrokenBatch => {
-                    Ok(vec![CounterEvent::Invalid, CounterEvent::Incremented])
-                }
+                CounterCommand::BrokenBatch => Ok(Effect::Events(vec![
+                    CounterEvent::Invalid,
+                    CounterEvent::Incremented,
+                ])),
             }
         }
     }
