@@ -119,8 +119,8 @@ Retry with exponential backoff on optimistic-lock conflicts is
 `Projection::react`'s own internal behavior, not a property of reactors in
 general -- a bespoke reactor opts into an equivalent retry for transient SQLite
 busy errors via `RetryOnBusy`/`IdempotentReactor` or `retry_with_backoff` (see
-[docs/cqrs.md](cqrs.md#reactors)); one that does neither still silently drops
-its update on a busy error.
+[docs/cqrs.md](cqrs.md#reactors)); one that does neither swallows a busy error
+without retry, leaving its write outcome unknown.
 
 ### Schema Version
 

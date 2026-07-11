@@ -298,10 +298,10 @@ pub fn is_retryable_sqlite_busy(error: &(dyn std::error::Error + 'static)) -> bo
 /// underlying lock conflict, so match the whole family rather than enumerating
 /// each extended code by hand.
 fn is_busy_extended_code(code: Option<&str>) -> bool {
-    matches!(
-        code.map(str::parse::<i32>),
-        Some(Ok(extended_code)) if extended_code & 0xFF == 5
-    )
+    match code.map(str::parse::<i32>) {
+        Some(Ok(extended_code)) => extended_code & 0xFF == 5,
+        Some(Err(_)) | None => false,
+    }
 }
 
 #[cfg(test)]

@@ -274,8 +274,10 @@ Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 retry. `Projection` gets its own retry-with-backoff for free (see
 `Projection::react`), covering both optimistic-lock conflicts and transient
 SQLite busy errors, but a bespoke `Reactor` does not: under SQLite WAL
-contention, a `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` failure silently drops the
-reactor's update unless it opts in.
+contention, a `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` failure is swallowed without
+retry and the write outcome is unknown -- an atomic `react()` lost its update,
+while one that committed earlier non-transactional work is left partially
+applied -- unless the reactor opts in.
 
 Opt in by wrapping the reactor in `RetryOnBusy` and implementing the
 `IdempotentReactor` marker trait, which declares that `react()` performs solely
@@ -304,9 +306,9 @@ already-committed statement. A conforming `react()` must be atomic as a whole --
 a single statement, a single transaction, or written so replaying it is safe
 (upserts, not bare inserts).
 
-A reactor that does neither still silently drops its update on a busy error,
-exactly as before this exists -- opting in is a per-reactor decision, not a
-blanket fix.
+A reactor that does neither still swallows a busy error without retry, leaving
+its write outcome unknown, exactly as before this exists -- opting in is a
+per-reactor decision, not a blanket fix.
 
 **Latency tradeoff:** `CqrsFramework::execute_with_metadata` awaits every
 registered reactor's `dispatch()` synchronously before returning to the command
