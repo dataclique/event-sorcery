@@ -852,10 +852,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("connect");
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("migrate");
+        sqlite_es::MIGRATOR.run(&pool).await.expect("migrate");
         pool
     }
 

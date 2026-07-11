@@ -1495,7 +1495,7 @@ mod tests {
         use crate::{AggregateError, LifecycleError, SqliteBackend, StoreBuilder};
 
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
         let desk_store = StoreBuilder::<Desk>::new(pool.clone())
             .build()
             .await

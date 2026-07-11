@@ -225,7 +225,7 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let pool = ok(SqlitePool::connect(":memory:").await);
-    ok(sqlx::migrate!("../../migrations").run(&pool).await);
+    ok(sqlite_es::MIGRATOR.run(&pool).await);
     let store = ok(StoreBuilder::<BenchEntity>::new(pool.clone()).build().await);
     let jobs = ok(JobRuntime::build(pool).await);
     Fixture {

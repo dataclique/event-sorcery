@@ -49,6 +49,17 @@ mod sql_query;
 pub mod testing;
 mod view_repository;
 
+/// The canonical event-store schema (events, snapshots, job queue,
+/// schema registry), embedded at compile time from this crate's
+/// `migrations/` directory.
+///
+/// Run it against an application database with
+/// `MIGRATOR.run(&pool)`. Consumers that manage their own migration
+/// history instead copy the `.sql` files from this crate's
+/// `migrations/` directory into their application's and never edit
+/// them afterwards.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 pub use cqrs::{SqliteCqrs, sqlite_cqrs};
 pub use cqrs_es::persist::ViewContext;
 pub use event_repository::{

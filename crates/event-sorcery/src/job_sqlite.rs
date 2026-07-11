@@ -71,7 +71,7 @@ impl EventBackend for SqliteBackend {
     }
 
     async fn migrate(&self) -> Result<(), SqliteJobError> {
-        sqlx::migrate!("../../migrations")
+        sqlite_es::MIGRATOR
             .run(&self.pool)
             .await
             .map_err(|error| SqliteJobError::Sql(error.into()))?;
