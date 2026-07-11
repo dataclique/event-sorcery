@@ -1168,6 +1168,28 @@ mod tests {
         assert!(inspected.is_empty());
     }
 
+    /// A `Dispatched` event must never commit without its enqueue: handling a
+    /// dispatching command outside the per-command pending scope (a framework
+    /// bug) fails the command instead of committing a dangling intent.
+    #[tokio::test]
+    async fn dispatch_outside_a_pending_scope_fails_the_command() {
+        use cqrs_es::Aggregate;
+        use cqrs_es::event_sink::EventSink;
+
+        use crate::lifecycle::{Lifecycle, LifecycleError};
+
+        let mut lifecycle = Lifecycle::<Desk>::default();
+        let sink = EventSink::default();
+
+        let error = lifecycle
+            .handle(DeskCommand::Place(place()), &(), &sink)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, LifecycleError::DispatchNotBuffered(_)));
+        assert_eq!(sink.collect().await, vec![]);
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     enum ProbeVerdict {
         Settled,
