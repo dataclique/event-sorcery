@@ -770,9 +770,10 @@ claims one under a lease, runs the routed execution (submit/reconcile for
 entity-kicked jobs, `perform` for standalone ones), delivers the verdict, and
 durably records the outcome (success, retry with backoff, or dead-letter) -- all
 fenced so a job runs exactly once per successful claim. `JobWorkerConfig` tunes
-poll cadence, concurrency, lease duration, retry budget, and backoff;
-`Clock::system()` is the real wall clock (use `Clock::from_fn(..)` to drive
-lease and retry timing deterministically in tests).
+poll cadence, concurrency, lease duration, retry budget, backoff, and the
+verdict-delivery deferrals (`DeliveryPolicy`); `Clock::system()` is the real
+wall clock (use `Clock::from_fn(..)` to drive lease and retry timing
+deterministically in tests).
 
 ## Testing Aggregates
 

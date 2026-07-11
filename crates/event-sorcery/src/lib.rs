@@ -117,9 +117,9 @@ pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
 pub use dispatch::{
-    Contains, Decision, DispatchEvent, DispatchFailure, DispatchOutcome, DispatchRefused,
-    DispatchReplay, DispatchedJob, Here, Job, JobDispatch, JobInput, JobList, OriginDeliveryError,
-    OriginPort, Reconciliation, Settled, SettledFailure, There,
+    Contains, Decision, DeliveryPolicy, DispatchEvent, DispatchFailure, DispatchOutcome,
+    DispatchRefused, DispatchReplay, DispatchedJob, Here, Job, JobDispatch, JobInput, JobList,
+    OriginDeliveryError, OriginPort, Reconciliation, Settled, SettledFailure, There,
 };
 pub use job::{
     DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,

@@ -27,6 +27,7 @@ use tracing::error;
 use ulid::Ulid;
 
 use crate::dependency::Nil;
+use crate::dispatch::DeliveryPolicy;
 use crate::job_store::{ClaimDecision, ClaimRead};
 use crate::lifecycle::Lifecycle;
 use crate::{CompactionPolicy, EventSourced, Table};
@@ -131,6 +132,9 @@ pub struct JobContext {
     /// captured at claim time; 0 when unknown (a context built outside a
     /// worker).
     pub(crate) max_attempts: u32,
+    /// The worker's verdict-delivery deferrals
+    /// ([`crate::JobWorkerConfig::delivery`]), captured at claim time.
+    pub(crate) delivery: DeliveryPolicy,
 }
 
 impl JobContext {

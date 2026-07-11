@@ -533,24 +533,38 @@ impl<J: Job> JobInput<J> {
     }
 }
 
-/// How long the worker snoozes before retrying a transport-failed verdict
-/// delivery. Delivery retries ride [`JobOutcome::Defer`], so they never count
-/// attempts.
-const DELIVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// How long a worker defers after a failed verdict delivery, per failure
+/// class. Set on [`JobWorkerConfig`](crate::JobWorkerConfig); deferrals ride
+/// [`JobOutcome::Defer`], so they never count attempts.
+#[derive(Clone, Copy, Debug)]
+pub struct DeliveryPolicy {
+    /// Snooze before retrying a transport-failed delivery (database
+    /// contention, connection loss) -- retrying is expected to succeed.
+    pub retry_delay: Duration,
+    /// Backoff after the origin REFUSED a verdict -- a wiring/correlation bug
+    /// retries cannot fix, kept slow and loud rather than hot-looping while
+    /// the operator investigates.
+    pub refused_backoff: Duration,
+}
 
-/// How long the worker backs off after the origin REFUSED a verdict -- a
-/// wiring/correlation bug retries cannot fix, kept slow and loud rather than
-/// hot-looping while the operator investigates.
-const REFUSED_BACKOFF_DELAY: Duration = Duration::from_secs(300);
+impl Default for DeliveryPolicy {
+    fn default() -> Self {
+        Self {
+            retry_delay: Duration::from_secs(5),
+            refused_backoff: Duration::from_secs(300),
+        }
+    }
+}
 
-fn delivery_deferral(job_id: JobId, delivery_error: &OriginDeliveryError) -> Duration {
+fn delivery_deferral(ctx: &JobContext, delivery_error: &OriginDeliveryError) -> Duration {
+    let job_id = ctx.job_id();
     match delivery_error {
         OriginDeliveryError::Transport(_) => {
             warn!(
                 target: "cqrs", ?delivery_error, %job_id,
                 "settled verdict could not be delivered; deferring"
             );
-            DELIVERY_RETRY_DELAY
+            ctx.delivery.retry_delay
         }
         OriginDeliveryError::Refused(_) => {
             error!(
@@ -558,7 +572,7 @@ fn delivery_deferral(job_id: JobId, delivery_error: &OriginDeliveryError) -> Dur
                 "VERDICT REFUSED: the origin entity rejected a settled verdict; \
                  backing off -- operator intervention needed"
             );
-            REFUSED_BACKOFF_DELAY
+            ctx.delivery.refused_backoff
         }
     }
 }
@@ -609,10 +623,9 @@ impl<J: Job> StandaloneJob for J {
                 let confirm = DispatchOutcome::confirmed(ctx.job_id(), output, attempts);
                 match wrapped.origin.deliver(&self.origin_id(), confirm).await {
                     Ok(()) => Ok(JobOutcome::Done(())),
-                    Err(delivery_error) => Ok(JobOutcome::Defer(delivery_deferral(
-                        ctx.job_id(),
-                        &delivery_error,
-                    ))),
+                    Err(delivery_error) => {
+                        Ok(JobOutcome::Defer(delivery_deferral(ctx, &delivery_error)))
+                    }
                 }
             }
             Ok(JobOutcome::Defer(delay)) => Ok(JobOutcome::Defer(delay)),
@@ -624,10 +637,9 @@ impl<J: Job> StandaloneJob for J {
                 );
                 match wrapped.origin.deliver(&self.origin_id(), fail).await {
                     Ok(()) => Err(JobFailure::Terminal(domain_error)),
-                    Err(delivery_error) => Ok(JobOutcome::Defer(delivery_deferral(
-                        ctx.job_id(),
-                        &delivery_error,
-                    ))),
+                    Err(delivery_error) => {
+                        Ok(JobOutcome::Defer(delivery_deferral(ctx, &delivery_error)))
+                    }
                 }
             }
             Err(JobFailure::Transient(domain_error)) => {
@@ -1218,12 +1230,43 @@ mod tests {
             .unavailable
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let job = probe(ProbeSubmit::Succeed, ProbeVerdict::Settled);
+        let retry_delay = Duration::from_millis(750);
+        let ctx = JobContext {
+            claim_seq: 2,
+            delivery: DeliveryPolicy {
+                retry_delay,
+                ..DeliveryPolicy::default()
+            },
+            ..JobContext::default()
+        };
 
-        let outcome = StandaloneJob::perform(&job, &ctx_with_claim_seq(2), &run.input)
+        let outcome = StandaloneJob::perform(&job, &ctx, &run.input)
             .await
             .unwrap();
 
-        assert!(matches!(outcome, JobOutcome::Defer(_)));
+        assert!(matches!(outcome, JobOutcome::Defer(delay) if delay == retry_delay));
+    }
+
+    #[test]
+    fn delivery_deferral_uses_the_configured_delays() {
+        let retry_delay = Duration::from_millis(250);
+        let refused_backoff = Duration::from_secs(60);
+        let ctx = JobContext {
+            delivery: DeliveryPolicy {
+                retry_delay,
+                refused_backoff,
+            },
+            ..JobContext::default()
+        };
+
+        assert_eq!(
+            delivery_deferral(&ctx, &OriginDeliveryError::Transport("down".into())),
+            retry_delay
+        );
+        assert_eq!(
+            delivery_deferral(&ctx, &OriginDeliveryError::Refused("mismatch".into())),
+            refused_backoff
+        );
     }
 
     #[tokio::test]
@@ -1331,6 +1374,7 @@ mod tests {
             claim_id: won.claim_id,
             attempt: won.attempt,
             max_attempts: 5,
+            ..JobContext::default()
         };
         let input = JobInput::new((), desk_store.clone());
 

@@ -38,6 +38,7 @@ use tracing::{error, warn};
 
 use sqlite_es::{Cmp, Order, Predicate, Term, Value};
 
+use crate::dispatch::DeliveryPolicy;
 use crate::job::{
     DeadReason, JobCommand, JobContext, JobError, JobFailure, JobId, JobOutcome, JobState,
     JobStoreError, StandaloneJob, WonClaim, WorkerId, enqueue_request, enqueued_event,
@@ -198,7 +199,7 @@ impl<J: StandaloneJob, Backend: EventBackend> EventStoreBackend<J, Backend> {
 fn build_task<J: StandaloneJob>(
     view_id: String,
     won: WonClaim,
-    max_attempts: u32,
+    config: &JobWorkerConfig,
 ) -> Option<Task<J, JobContext, String>> {
     let job_id: JobId = match view_id.parse() {
         Ok(job_id) => job_id,
@@ -221,7 +222,8 @@ fn build_task<J: StandaloneJob>(
             claim_seq: won.claim_seq,
             claim_id: won.claim_id,
             attempt: won.attempt,
-            max_attempts,
+            max_attempts: config.max_attempts,
+            delivery: config.delivery,
         },
     );
     task.parts.task_id = Some(TaskId::new(view_id));
@@ -304,9 +306,7 @@ impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBacken
             for job_id in candidates {
                 match backend.claim_one(&job_id, now_ms).await {
                     Ok(ClaimOutcome::Won(won)) => {
-                        if let Some(task) =
-                            build_task::<J>(job_id, won, backend.config.max_attempts)
-                        {
+                        if let Some(task) = build_task::<J>(job_id, won, &backend.config) {
                             return Some((Ok(Some(task)), backend));
                         }
                     }
@@ -349,6 +349,8 @@ pub struct JobWorkerConfig {
     pub max_claims: u32,
     /// Exponential backoff for retries.
     pub backoff: Backoff,
+    /// Deferrals after a failed verdict delivery to the origin entity.
+    pub delivery: DeliveryPolicy,
 }
 
 impl Default for JobWorkerConfig {
@@ -363,6 +365,7 @@ impl Default for JobWorkerConfig {
             max_attempts: 5,
             max_claims: 50,
             backoff: Backoff::default(),
+            delivery: DeliveryPolicy::default(),
         }
     }
 }
@@ -956,7 +959,8 @@ mod tests {
         let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
             panic!("expected to win the claim");
         };
-        let task = build_task::<TestJob>(job_id.to_string(), won, 5).expect("payload decodes");
+        let task = build_task::<TestJob>(job_id.to_string(), won, &JobWorkerConfig::default())
+            .expect("payload decodes");
 
         // The context the handler extracts carries the claimed job's durable
         // identity: the stable job id and a zero attempt on the first run.
@@ -980,7 +984,8 @@ mod tests {
             panic!("expected to win the retry claim");
         };
         let retry_task =
-            build_task::<TestJob>(job_id.to_string(), rewon, 5).expect("payload decodes");
+            build_task::<TestJob>(job_id.to_string(), rewon, &JobWorkerConfig::default())
+                .expect("payload decodes");
         let retry_ctx = JobContext::from_request(&retry_task).await.unwrap();
         assert_eq!(retry_ctx.job_id(), job_id);
         assert_eq!(retry_ctx.attempt(), 1);
@@ -1057,6 +1062,7 @@ mod tests {
             claim_id: won.claim_id,
             attempt: won.attempt,
             max_attempts: 5,
+            ..JobContext::default()
         };
 
         // A terminal failure on the FIRST attempt (max_attempts = 5) must kill
@@ -1188,6 +1194,7 @@ mod tests {
             claim_id: won.claim_id,
             attempt: won.attempt,
             max_attempts: 5,
+            ..JobContext::default()
         };
 
         ack(
