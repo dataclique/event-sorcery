@@ -268,6 +268,62 @@ receives `(error, id, event)` and can reprocess the event from the errored state
 
 Wire reactors via `Unwired` + `StoreBuilder::wire()`.
 
+### Retrying on transient SQLite busy errors
+
+`ReactorBridge::dispatch` logs and swallows any `react()` error -- it does not
+retry. `Projection` gets its own retry-with-backoff for free (see
+`Projection::react`), covering both optimistic-lock conflicts and transient
+SQLite busy errors, but a bespoke `Reactor` does not: under SQLite WAL
+contention, a `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` failure is swallowed without
+retry and the write outcome is unknown -- an atomic `react()` lost its update,
+while one that committed earlier non-transactional work is left partially
+applied -- unless the reactor opts in.
+
+Opt in by wrapping the reactor in `RetryOnBusy` and implementing the
+`IdempotentReactor` marker trait, which declares that `react()` performs solely
+SQLite writes with no side effect (HTTP/RPC call, `Store::send` to another
+aggregate, message-queue publish) that would double-fire on retry:
+
+```rust
+impl IdempotentReactor for MyReactor {}
+
+let store = StoreBuilder::<MyEntity>::new(pool)
+    .with(Arc::new(RetryOnBusy { inner: my_reactor }))
+    // ...
+```
+
+Only implement `IdempotentReactor` for reactors that are provably pure DB writes
+end-to-end -- a reactor that orchestrates across aggregates (like
+`RebalancingTrigger` above) must not, unless the downstream command handler is
+independently confirmed idempotent under re-invocation. For a reactor whose
+`react()` has side effects before its write, call `retry_with_backoff` and
+`is_retryable_sqlite_busy` directly around just the write instead, leaving the
+earlier side effects outside the retry boundary and outside `IdempotentReactor`
+entirely. A `react()` that issues two or more separate, non-transactional SQLite
+statements is unsafe to mark too: if the first commits and a later one hits
+`SQLITE_BUSY`, the retry replays the whole `react()`, re-running the
+already-committed statement. A conforming `react()` must be atomic as a whole --
+a single statement, a single transaction, or written so replaying it is safe
+(upserts, not bare inserts).
+
+A reactor that does neither still swallows a busy error without retry, leaving
+its write outcome unknown, exactly as before this exists -- opting in is a
+per-reactor decision, not a blanket fix.
+
+**Latency tradeoff:** `CqrsFramework::execute_with_metadata` awaits every
+registered reactor's `dispatch()` synchronously before returning to the command
+caller, once per event, so a `RetryOnBusy`-wrapped reactor can block that caller
+for up to the full retry budget (~4.3s, see `RETRY_MAX_ATTEMPTS`/
+`RETRY_BASE_DELAY_MS`/`RETRY_MAX_DELAY_MS`) _per reacted event_ whenever a
+busy/busy-snapshot conflict occurs -- including conflicts caused by an unrelated
+writer committing anywhere in the same database file, not just writes to the
+aggregate the command touched. A single command that emits multiple events
+dispatches the reactor once per event, so the worst-case block for that command
+is the retry budget multiplied by the event count, not a flat ~4.3s. Callers
+with tight request timeouts need a budget larger than the retry schedule. This
+is a real behavioral tradeoff (latency vs. lost updates), not just an
+idempotency question -- weigh it before wrapping a reactor in `RetryOnBusy`.
+
 ## Jobs Pattern
 
 Command handlers stay pure. A command is the operation being performed; if it
