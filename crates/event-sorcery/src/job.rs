@@ -809,18 +809,20 @@ pub(crate) async fn with_pending_scope<Output>(
 
 /// Buffers a dispatched job onto the active pending scope. Called only by
 /// `Lifecycle::handle` while `Store::send` holds the scope open; an inactive
-/// scope is a framework bug, logged loudly.
-pub(crate) fn buffer(push: PendingPush) {
-    if PENDING_JOBS
+/// scope is a framework bug, and the error MUST fail the command so the
+/// `Dispatched` event is never committed without its enqueue.
+pub(crate) fn buffer(push: PendingPush) -> Result<(), DispatchNotBuffered> {
+    PENDING_JOBS
         .try_with(|pending| pending.borrow_mut().push(push))
-        .is_err()
-    {
-        error!(
-            target: "cqrs",
-            "job dispatch buffered outside a command scope; the job was dropped"
-        );
-    }
+        .map_err(|_| DispatchNotBuffered)
 }
+
+/// A job dispatch could not be buffered because no command scope was active.
+/// Surfacing this fails the command, preserving the ADR-0009 invariant that a
+/// `Dispatched` event and its enqueue commit together or not at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("job dispatch buffered outside a command scope")]
+pub struct DispatchNotBuffered;
 
 /// Drains the per-command pending-job buffer into [`EnqueueRequest`]s (each
 /// keeping the [`JobId`] minted at push time, with a resolved `run_at`). A no-op

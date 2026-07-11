@@ -235,7 +235,10 @@ impl EventSourced for Order {
                 let status = match dispatch_event {
                     DispatchEvent::Dispatched { .. } => OrderStatus::PendingConfirmation,
                     DispatchEvent::Confirmed(_) => OrderStatus::Placed,
-                    // `Never` fails: the arm exists for exhaustiveness.
+                    // Unreachable while `SendOrderConfirmation::Error = Never`.
+                    // If that error type ever becomes real, this arm leaves the
+                    // order stuck in PendingConfirmation -- add a failed status
+                    // (or allow cancellation from here) at the same time.
                     DispatchEvent::Failed(_) => OrderStatus::PendingConfirmation,
                 };
                 Ok(Some(Self {
@@ -334,6 +337,27 @@ mod tests {
             .when(OrderCommand::Fill)
             .await
             .then_expect_events(&[OrderEvent::Filled]);
+    }
+
+    #[tokio::test]
+    async fn confirmation_verdict_transitions_pending_to_placed() {
+        let job_id = JobId::new();
+        TestHarness::<Order>::new()
+            .given(vec![OrderEvent::Confirmation(DispatchEvent::Dispatched {
+                job_id,
+                job: SendOrderConfirmation {
+                    order: OrderId(1),
+                    item: widgets(),
+                    quantity: 3,
+                },
+            })])
+            .when(OrderCommand::Confirmation(
+                event_sorcery::DispatchOutcome::simulated_confirmed(job_id, (), 1),
+            ))
+            .await
+            .then_expect_events(&[OrderEvent::Confirmation(DispatchEvent::Confirmed(
+                Settled::simulated(job_id, (), 1),
+            ))]);
     }
 
     #[tokio::test]

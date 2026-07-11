@@ -1,4 +1,4 @@
-# ADR-0009: Handlers return events or one operation -- durability enforced by the signature
+# ADR-0009: Handlers return events or one job dispatch -- durability enforced by the signature
 
 ## Status
 

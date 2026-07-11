@@ -153,6 +153,13 @@ Implements `perform`. Every `Job` is also a `StandaloneJob` via the framework's
 blanket impl (that is how the worker runs it); consumers only write
 `StandaloneJob` impls for genuinely origin-less work.
 
+**Never pass a `Job` (an entity-kicked job) to `JobRuntime::enqueue`.** The
+blanket impl makes it type-check, but a standalone enqueue skips the
+`Dispatched` event, so the origin's `DispatchedJob` field stays `Idle` and the
+eventual verdict delivery is refused permanently (`DispatchRefused`, surfaced as
+a `VERDICT REFUSED` operator alert). Entity-kicked jobs are dispatched only
+through `Decision::Dispatch`.
+
 ### Decision / dispatch
 
 What a command handler returns (`Decision`, ADR-0009): either domain events, or

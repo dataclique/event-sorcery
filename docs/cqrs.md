@@ -133,6 +133,12 @@ sections below.
 | `DispatchedJob<J>`     | Entity-embedded state of a kicked-off job    |
 | `DispatchEvent<J>`     | Dispatch lifecycle facts on the entity       |
 | `DispatchOutcome<J>`   | Sealed verdict delivered by the framework    |
+| `JobDispatch<Entity>`  | Opaque kick-off returned in a `Decision`     |
+| `Settled<Output>`      | Sealed success payload (output + attempts)   |
+| `SettledFailure<E>`    | Sealed failure payload (reason + attempts)   |
+| `DispatchRefused`      | Guard refusal (in-flight, mismatch)          |
+| `Reconciliation<T>`    | reconcile verdict: settled / not / unknown   |
+| `OriginPort<J>`        | Delivery port for verdicts (impl by `Store`) |
 | `JobInput<J>`          | Worker input: deps + origin delivery port    |
 | `jobs!`                | Macro building the type-level `Job` list     |
 | `JobRuntime`           | Wires the worker-side durable-jobs runtime   |

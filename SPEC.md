@@ -237,8 +237,11 @@ contract itself, not opt-in plumbing (see
   and delivers it to the origin (through `OriginPort`, implemented by `Store`
   when the origin's command enum absorbs it via `From`) **before** acking the
   job. Failed delivery defers (never counts an attempt); duplicates are absorbed
-  by the guard; dead-lettered jobs deliver `Failed`, so an entity never dangles
-  in flight.
+  by the guard; execution-time dead letters (a terminal rejection or an
+  exhausted retry budget) deliver `Failed` first, so those never leave the
+  entity dangling in flight. Known gap: a claim-budget `Abandoned` dead letter
+  fires before any execution and cannot deliver -- the ADR-0007 item-4
+  terminal-failure hook is the planned fix.
 - **Submit/reconcile routing.** Whether an execution is the first try or a
   follow-up is a safety invariant for financial operations, so the framework
   routes it: the first claim runs `submit`; every later claim runs `reconcile`,

@@ -10,10 +10,11 @@ Event-sourcing primitives in Rust. A thin, opinionated layer on top of
   Standalone — usable wherever you'd plug in a `cqrs-es` backend.
 - **[`crates/event-sorcery`](crates/event-sorcery)** — higher-level ergonomics
   on top of `sqlite-es`: the `EventSourced` trait, `Lifecycle` adapter, typed
-  `Store`, projections, schema registry, reactor, durable jobs, and
-  entity-scoped durable operations (request/confirm/fail lifecycles with
-  submit/reconcile retry safety and outcome feed-back; see
-  [ADR-0008](adrs/0008-entity-scoped-durable-operations.md)).
+  `Store`, projections, schema registry, reactor, and durable job dispatch
+  enforced by the handler signature (dispatch/confirm/fail lifecycles with
+  submit/reconcile retry safety and outcome feedback; see
+  [ADR-0008](adrs/0008-entity-scoped-durable-operations.md) and
+  [ADR-0009](adrs/0009-handlers-return-events-or-one-job-dispatch.md)).
 
 `event-sorcery` is the recommended entry point. Use `sqlite-es` directly only if
 you need lower-level control.

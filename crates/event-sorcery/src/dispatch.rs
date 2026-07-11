@@ -470,8 +470,18 @@ pub trait OriginPort<J: Job>: Send + Sync {
 /// defers and retries -- delivery failures never count as job attempts,
 /// because the job itself already settled.
 #[derive(Debug, thiserror::Error)]
-#[error("verdict delivery to the origin entity failed")]
-pub struct OriginDeliveryError(#[source] Box<dyn std::error::Error + Send + Sync>);
+pub enum OriginDeliveryError {
+    /// The origin could not be reached or written (database contention,
+    /// connection loss). Retrying the delivery is expected to succeed.
+    #[error("verdict delivery to the origin entity failed")]
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The origin's domain logic refused the verdict (a [`DispatchRefused`]
+    /// mapped into its error type) -- a wiring or correlation bug that no
+    /// retry can fix. The worker backs off on a long delay and logs for the
+    /// operator instead of hot-looping.
+    #[error("the origin entity refused the delivered verdict")]
+    Refused(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
 
 #[async_trait]
 impl<J, Backend> OriginPort<J> for Store<J::Origin, Backend>
@@ -488,7 +498,17 @@ where
     ) -> Result<(), OriginDeliveryError> {
         self.send(id, outcome.into())
             .await
-            .map_err(|send_error| OriginDeliveryError(Box::new(send_error)))
+            .map_err(|send_error| match send_error {
+                crate::AggregateError::UserError(_) => {
+                    OriginDeliveryError::Refused(Box::new(send_error))
+                }
+                crate::AggregateError::AggregateConflict
+                | crate::AggregateError::DatabaseConnectionError(_)
+                | crate::AggregateError::DeserializationError(_)
+                | crate::AggregateError::UnexpectedError(_) => {
+                    OriginDeliveryError::Transport(Box::new(send_error))
+                }
+            })
     }
 }
 
@@ -513,9 +533,35 @@ impl<J: Job> JobInput<J> {
     }
 }
 
-/// How long the worker snoozes before retrying a failed verdict delivery.
-/// Delivery retries ride [`JobOutcome::Defer`], so they never count attempts.
+/// How long the worker snoozes before retrying a transport-failed verdict
+/// delivery. Delivery retries ride [`JobOutcome::Defer`], so they never count
+/// attempts.
 const DELIVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// How long the worker backs off after the origin REFUSED a verdict -- a
+/// wiring/correlation bug retries cannot fix, kept slow and loud rather than
+/// hot-looping while the operator investigates.
+const REFUSED_BACKOFF_DELAY: Duration = Duration::from_secs(300);
+
+fn delivery_deferral(job_id: JobId, delivery_error: &OriginDeliveryError) -> Duration {
+    match delivery_error {
+        OriginDeliveryError::Transport(_) => {
+            warn!(
+                target: "cqrs", ?delivery_error, %job_id,
+                "settled verdict could not be delivered; deferring"
+            );
+            DELIVERY_RETRY_DELAY
+        }
+        OriginDeliveryError::Refused(_) => {
+            error!(
+                target: "cqrs", ?delivery_error, %job_id,
+                "VERDICT REFUSED: the origin entity rejected a settled verdict; \
+                 backing off -- operator intervention needed"
+            );
+            REFUSED_BACKOFF_DELAY
+        }
+    }
+}
 
 /// Every [`Job`] is a [`StandaloneJob`] whose execution is the
 /// submit/reconcile routing plus verdict delivery (ADR-0008/0009).
@@ -563,13 +609,10 @@ impl<J: Job> StandaloneJob for J {
                 let confirm = DispatchOutcome::confirmed(ctx.job_id(), output, attempts);
                 match wrapped.origin.deliver(&self.origin_id(), confirm).await {
                     Ok(()) => Ok(JobOutcome::Done(())),
-                    Err(delivery_error) => {
-                        warn!(
-                            target: "cqrs", ?delivery_error, job_id = %ctx.job_id(),
-                            "confirmed job verdict could not be delivered; deferring"
-                        );
-                        Ok(JobOutcome::Defer(DELIVERY_RETRY_DELAY))
-                    }
+                    Err(delivery_error) => Ok(JobOutcome::Defer(delivery_deferral(
+                        ctx.job_id(),
+                        &delivery_error,
+                    ))),
                 }
             }
             Ok(JobOutcome::Defer(delay)) => Ok(JobOutcome::Defer(delay)),
@@ -581,13 +624,10 @@ impl<J: Job> StandaloneJob for J {
                 );
                 match wrapped.origin.deliver(&self.origin_id(), fail).await {
                     Ok(()) => Err(JobFailure::Terminal(domain_error)),
-                    Err(delivery_error) => {
-                        warn!(
-                            target: "cqrs", ?delivery_error, job_id = %ctx.job_id(),
-                            "terminal job verdict could not be delivered; deferring"
-                        );
-                        Ok(JobOutcome::Defer(DELIVERY_RETRY_DELAY))
-                    }
+                    Err(delivery_error) => Ok(JobOutcome::Defer(delivery_deferral(
+                        ctx.job_id(),
+                        &delivery_error,
+                    ))),
                 }
             }
             Err(JobFailure::Transient(domain_error)) => {
@@ -1055,7 +1095,7 @@ mod tests {
             outcome: DispatchOutcome<ProbeJob>,
         ) -> Result<(), OriginDeliveryError> {
             if self.unavailable.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(OriginDeliveryError("origin unavailable".into()));
+                return Err(OriginDeliveryError::Transport("origin unavailable".into()));
             }
             self.delivered.lock().unwrap().push((*id, outcome));
             Ok(())

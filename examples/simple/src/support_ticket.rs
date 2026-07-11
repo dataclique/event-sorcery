@@ -280,7 +280,10 @@ impl EventSourced for SupportTicket {
                 let (status, last_updated_at) = match dispatch_event {
                     DispatchEvent::Dispatched { job, .. } => (Status::Closing, job.closed_at),
                     DispatchEvent::Confirmed(_) => (Status::Closed, entity.last_updated_at),
-                    // `Never` fails: the arm exists for exhaustiveness.
+                    // Unreachable while `NotifyClosed::Error = Never`. If that
+                    // error type ever becomes real, this arm leaves the ticket
+                    // stuck in Closing -- add a failed/reopened status at the
+                    // same time.
                     DispatchEvent::Failed(_) => (Status::Closing, entity.last_updated_at),
                 };
                 Ok(Some(Self {

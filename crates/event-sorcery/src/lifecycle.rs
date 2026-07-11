@@ -105,6 +105,11 @@ pub enum LifecycleError<Entity: EventSourced> {
     },
     #[error(transparent)]
     Apply(Entity::Error),
+    /// A `Decision::Dispatch` could not be buffered onto the command scope (a
+    /// framework bug); the command fails so the `Dispatched` event is never
+    /// committed without its enqueue.
+    #[error(transparent)]
+    DispatchNotBuffered(#[from] crate::job::DispatchNotBuffered),
 }
 
 /// Uninhabited error type for entities with infallible
@@ -179,7 +184,7 @@ where
             Decision::Events(events) => events,
             Decision::Dispatch(dispatch) => {
                 let JobDispatch { event, pending } = dispatch;
-                crate::job::buffer(pending);
+                crate::job::buffer(pending)?;
                 vec![event]
             }
         };
