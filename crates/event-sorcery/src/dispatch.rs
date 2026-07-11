@@ -163,6 +163,113 @@ impl<Entity: EventSourced> Effect<Entity> {
     }
 }
 
+/// Wraps a handler-outcome value into the full handler result, so every match
+/// arm reads uniformly regardless of what it returns:
+///
+/// ```ignore
+/// match command {
+///     Initialize { .. } => fx(InventoryError::AlreadyInitialized),
+///     Restock { added } => fx(Restocked { added }),
+///     Place { .. } => fx(SendOrderConfirmation { .. }),          // kick-off
+///     Settle(outcome) => fx(self.confirmation.settle(outcome)?), // events
+/// }
+/// ```
+///
+/// Accepts anything implementing [`Fx`]: a single event, a `Vec`/array of
+/// events, a [`Job`] (the infallible [`Effect::kickoff`] -- initialize-side),
+/// a guarded [`JobDispatch`], or the entity's domain error (which becomes the
+/// `Err` arm).
+pub fn fx<Entity, Marker, Value>(value: Value) -> Result<Effect<Entity>, Entity::Error>
+where
+    Entity: EventSourced,
+    Value: Fx<Entity, Marker>,
+{
+    value.produce()
+}
+
+/// A value a command handler can return as its entire outcome.
+///
+/// Domain events, a job kick-off, a guarded [`JobDispatch`], or the entity's
+/// domain error -- wrapped by [`fx`] into the handler's
+/// `Result<Effect, Error>`. `Marker` exists only to keep the blanket impls
+/// coherent; the compiler infers it at every [`fx`] call and consumers never
+/// name it.
+pub trait Fx<Entity: EventSourced, Marker> {
+    /// The handler result this value stands for.
+    fn produce(self) -> Result<Effect<Entity>, Entity::Error>;
+}
+
+/// Inference markers for the [`Fx`] blanket impls; never named by consumers.
+#[doc(hidden)]
+pub mod fx_marker {
+    use std::marker::PhantomData;
+
+    pub struct Event;
+    pub struct Events;
+    pub struct Kickoff<Index>(PhantomData<Index>);
+    pub struct Settlement<Index>(PhantomData<Index>);
+    pub struct Guarded;
+    pub struct Failure;
+}
+
+impl<Entity, Ev> Fx<Entity, fx_marker::Event> for Ev
+where
+    Entity: EventSourced<Event = Ev>,
+{
+    fn produce(self) -> Result<Effect<Entity>, Entity::Error> {
+        Ok(Effect::Events(vec![self]))
+    }
+}
+
+impl<Entity: EventSourced> Fx<Entity, fx_marker::Events> for Vec<Entity::Event> {
+    fn produce(self) -> Result<Effect<Entity>, Entity::Error> {
+        Ok(Effect::Events(self))
+    }
+}
+
+impl<Entity: EventSourced, const N: usize> Fx<Entity, fx_marker::Events> for [Entity::Event; N] {
+    fn produce(self) -> Result<Effect<Entity>, Entity::Error> {
+        Ok(Effect::Events(self.into()))
+    }
+}
+
+impl<J, Index> Fx<J::Origin, fx_marker::Settlement<Index>> for Vec<DispatchEvent<J>>
+where
+    J: Job,
+    <J::Origin as EventSourced>::Event: From<DispatchEvent<J>>,
+    <J::Origin as EventSourced>::Jobs: Contains<J, Index>,
+{
+    fn produce(self) -> Result<Effect<J::Origin>, <J::Origin as EventSourced>::Error> {
+        Ok(Effect::Events(self.into_iter().map(Into::into).collect()))
+    }
+}
+
+impl<J, Index> Fx<J::Origin, fx_marker::Kickoff<Index>> for J
+where
+    J: Job,
+    <J::Origin as EventSourced>::Event: From<DispatchEvent<J>>,
+    <J::Origin as EventSourced>::Jobs: Contains<J, Index>,
+{
+    fn produce(self) -> Result<Effect<J::Origin>, <J::Origin as EventSourced>::Error> {
+        Ok(Effect::kickoff(self))
+    }
+}
+
+impl<Entity: EventSourced> Fx<Entity, fx_marker::Guarded> for JobDispatch<Entity> {
+    fn produce(self) -> Result<Effect<Entity>, Entity::Error> {
+        Ok(Effect::Dispatch(self))
+    }
+}
+
+impl<Entity, Error> Fx<Entity, fx_marker::Failure> for Error
+where
+    Entity: EventSourced<Error = Error>,
+{
+    fn produce(self) -> Result<Effect<Entity>, Error> {
+        Err(self)
+    }
+}
+
 /// The unguarded kick-off construction shared by [`Effect::kickoff`] and the
 /// state-guarded [`DispatchedJob::dispatch`].
 fn kick<J: Job>(job: J) -> JobDispatch<J::Origin>
@@ -850,20 +957,15 @@ mod tests {
 
         async fn initialize(command: DeskCommand) -> Result<Effect<Self>, DeskError> {
             match command {
-                DeskCommand::Place(job) => Ok(Effect::kickoff(job)),
-                DeskCommand::Settle(_) => Err(DeskError::Refused(DispatchRefused::OutcomeMismatch)),
+                DeskCommand::Place(job) => fx(job),
+                DeskCommand::Settle(_) => fx(DeskError::Refused(DispatchRefused::OutcomeMismatch)),
             }
         }
 
         async fn transition(&self, command: DeskCommand) -> Result<Effect<Self>, DeskError> {
             match command {
-                DeskCommand::Place(job) => Ok(Effect::Dispatch(self.order.dispatch(job)?)),
-                DeskCommand::Settle(outcome) => {
-                    let events = self.order.settle(outcome)?;
-                    Ok(Effect::Events(
-                        events.into_iter().map(DeskEvent::Dispatch).collect(),
-                    ))
-                }
+                DeskCommand::Place(job) => fx(self.order.dispatch(job)?),
+                DeskCommand::Settle(outcome) => fx(self.order.settle(outcome)?),
             }
         }
     }

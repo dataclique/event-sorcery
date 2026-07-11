@@ -170,6 +170,11 @@ yet). This is the whole durability contract: the framework (never the handler)
 emits the `Dispatched` event (which carries the job value -- the intent IS the
 job) and enqueues in the same transaction.
 
+Handler arms return through `fx(value)`, which wraps any outcome -- a single
+event, a collection of events, `settle`'s `Vec<DispatchEvent<J>>`, a bare `Job`
+(the initialize-side kick-off), a guarded `JobDispatch`, or the domain error --
+into the full `Result<Effect, Error>`.
+
 The entity embeds a `DispatchedJob<J>` field
 (`Idle -> InFlight -> Confirmed | Failed`) and nests `DispatchEvent<J>` in its
 event enum (conventionally a `Dispatch` variant, with the settling

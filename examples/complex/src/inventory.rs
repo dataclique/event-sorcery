@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use event_sorcery::{Effect, EventSourced, Nil, Table};
+use event_sorcery::{Effect, EventSourced, Nil, Table, fx};
 
 /// Stock-keeping unit. Used both as `Inventory::Id` and as the foreign-key
 /// payload on `Order::item`, so the two entities share an identifier currency.
@@ -140,12 +140,9 @@ impl EventSourced for Inventory {
         use InventoryCommand::{Consume, Initialize, Restock};
 
         match command {
-            Initialize { item, on_hand } => Ok(Effect::Events(vec![InventoryEvent::Initialized {
-                item,
-                on_hand,
-            }])),
+            Initialize { item, on_hand } => fx(InventoryEvent::Initialized { item, on_hand }),
 
-            Restock { .. } | Consume { .. } => Err(InventoryError::NotInitialized),
+            Restock { .. } | Consume { .. } => fx(InventoryError::NotInitialized),
         }
     }
 
@@ -154,22 +151,22 @@ impl EventSourced for Inventory {
         use InventoryEvent::{Consumed, Restocked};
 
         match command {
-            Initialize { .. } => Err(InventoryError::AlreadyInitialized),
+            Initialize { .. } => fx(InventoryError::AlreadyInitialized),
 
             Restock { added } => {
                 self.on_hand
                     .checked_add(added)
                     .ok_or(InventoryError::Overflow)?;
 
-                Ok(Effect::Events(vec![Restocked { added }]))
+                fx(Restocked { added })
             }
 
-            Consume { taken } if taken > self.on_hand => Err(InventoryError::Underflow {
+            Consume { taken } if taken > self.on_hand => fx(InventoryError::Underflow {
                 on_hand: self.on_hand,
                 taken,
             }),
 
-            Consume { taken } => Ok(Effect::Events(vec![Consumed { taken }])),
+            Consume { taken } => fx(Consumed { taken }),
         }
     }
 }

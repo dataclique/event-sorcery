@@ -128,6 +128,7 @@ sections below.
 | `Table`                | Newtype for projection table name            |
 | `Nil`                  | Empty type-level list (no projection / jobs) |
 | `Effect<Entity>`       | Handler result: events, or one job dispatch  |
+| `fx(value)`            | Wraps events/job/dispatch/error into result  |
 | `Job`                  | Entity-kicked job (submit/reconcile)         |
 | `StandaloneJob`        | Origin-less worker job (perform)             |
 | `DispatchedJob<J>`     | Entity-embedded state of a kicked-off job    |
@@ -290,26 +291,31 @@ command enum (conventionally `Settle`), both with `From` impls, and delegate:
 
 ```rust
 async fn transition(&self, command: Self::Command) -> Result<Effect<Self>, Self::Error> {
+    use MyCommand::{AwaitCustomer, Close, Settle};
+
     match command {
         // Kick off the job; the machine's guard refuses while one is in flight.
-        MyCommand::Close => Ok(Effect::Dispatch(self.notify.dispatch(NotifyClosed {
+        Close => fx(self.notify.dispatch(NotifyClosed {
             ticket: self.ticket,
             subject: self.subject.clone(),
-        })?)),
+        })?),
+
         // The framework delivers the sealed verdict; settle folds it in.
-        MyCommand::Settle(outcome) => {
-            let events = self.notify.settle(outcome)?;
-            Ok(Effect::Events(events.into_iter().map(MyEvent::Dispatch).collect()))
-        }
+        Settle(outcome) => fx(self.notify.settle(outcome)?),
+
         // Pure domain facts stay plain events.
-        MyCommand::AwaitCustomer => Ok(Effect::Events(vec![MyEvent::AwaitingCustomer])),
+        AwaitCustomer => fx(MyEvent::AwaitingCustomer),
     }
 }
 ```
 
-From an `initialize` handler there is no dispatch state to guard, so kick off
-with the infallible `Effect::kickoff(job)`; in `originate`, fold the first
-`Dispatched` event with `DispatchedJob::originate(event)`.
+`fx(value)` wraps whatever a handler arm produces into the full
+`Result<Effect, Error>`: a single event, a `Vec`/array of events, the
+`Vec<DispatchEvent<J>>` that `settle` returns, a guarded `JobDispatch`, a bare
+`Job` (the infallible kick-off for `initialize`, where there is no dispatch
+state to guard), or the entity's domain error (which becomes the `Err` arm). In
+`originate`, fold the first `Dispatched` event with
+`DispatchedJob::originate(event)`.
 
 The dispatch compile-checks that the job is declared in `Jobs`, that its
 `Origin` is this entity, and that the event enum absorbs `DispatchEvent<J>` --

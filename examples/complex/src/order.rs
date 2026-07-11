@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use event_sorcery::{
     CompactionPolicy, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect,
-    EventSourced, Job, JobContext, JobFailure, JobOutcome, Label, Never, Nil, Reconciliation,
+    EventSourced, Job, JobContext, JobFailure, JobOutcome, Label, Never, Nil, Reconciliation, fx,
 };
 
 use crate::inventory::Sku;
@@ -210,10 +210,12 @@ impl EventSourced for Order {
     const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
 
     fn originate(event: &OrderEvent) -> Option<Self> {
+        use OrderEvent::{Cancelled, Dispatch, Filled};
+
         match event {
             // The intent IS the job: the order is born from the dispatched
             // confirmation, carrying item and quantity.
-            OrderEvent::Dispatch(dispatch_event @ DispatchEvent::Dispatched { job, .. }) => {
+            Dispatch(dispatch_event @ DispatchEvent::Dispatched { job, .. }) => {
                 let confirmation = DispatchedJob::originate(dispatch_event).ok()?;
                 Some(Self {
                     item: job.item.clone(),
@@ -222,15 +224,18 @@ impl EventSourced for Order {
                     confirmation,
                 })
             }
-            OrderEvent::Dispatch(DispatchEvent::Confirmed(_) | DispatchEvent::Failed(_))
-            | OrderEvent::Filled
-            | OrderEvent::Cancelled => None,
+
+            Dispatch(DispatchEvent::Confirmed(_) | DispatchEvent::Failed(_))
+            | Filled
+            | Cancelled => None,
         }
     }
 
     fn evolve(entity: &Self, event: &OrderEvent) -> Result<Option<Self>, OrderError> {
+        use OrderEvent::{Cancelled, Dispatch, Filled};
+
         match event {
-            OrderEvent::Dispatch(dispatch_event) => {
+            Dispatch(dispatch_event) => {
                 let Ok(confirmation) = entity.confirmation.evolve(dispatch_event) else {
                     return Ok(None);
                 };
@@ -251,11 +256,13 @@ impl EventSourced for Order {
                     ..entity.clone()
                 }))
             }
-            OrderEvent::Filled => Ok(Some(Self {
+
+            Filled => Ok(Some(Self {
                 status: OrderStatus::Filled,
                 ..entity.clone()
             })),
-            OrderEvent::Cancelled => Ok(Some(Self {
+
+            Cancelled => Ok(Some(Self {
                 status: OrderStatus::Cancelled,
                 ..entity.clone()
             })),
@@ -272,13 +279,13 @@ impl EventSourced for Order {
                 order,
                 item,
                 quantity,
-            } => Ok(Effect::kickoff(SendOrderConfirmation {
+            } => fx(SendOrderConfirmation {
                 order,
                 item,
                 quantity,
-            })),
+            }),
 
-            Fill | Cancel | Settle(_) => Err(OrderError::NotPlaced),
+            Fill | Cancel | Settle(_) => fx(OrderError::NotPlaced),
         }
     }
 
@@ -288,23 +295,21 @@ impl EventSourced for Order {
         use OrderEvent::{Cancelled, Filled};
 
         match command {
-            Place { .. } => Err(OrderError::AlreadyPlaced),
+            Place { .. } => fx(OrderError::AlreadyPlaced),
+
             Fill => match self.status {
-                OrderStatus::PendingConfirmation => Err(NotConfirmed),
-                OrderStatus::Placed => Ok(Effect::Events(vec![Filled])),
-                OrderStatus::Filled | OrderStatus::Cancelled => Err(NotOpen),
+                OrderStatus::PendingConfirmation => fx(NotConfirmed),
+                OrderStatus::Placed => fx(Filled),
+                OrderStatus::Filled | OrderStatus::Cancelled => fx(NotOpen),
             },
+
             Cancel => match self.status {
-                OrderStatus::PendingConfirmation => Err(NotConfirmed),
-                OrderStatus::Placed => Ok(Effect::Events(vec![Cancelled])),
-                OrderStatus::Filled | OrderStatus::Cancelled => Err(NotOpen),
+                OrderStatus::PendingConfirmation => fx(NotConfirmed),
+                OrderStatus::Placed => fx(Cancelled),
+                OrderStatus::Filled | OrderStatus::Cancelled => fx(NotOpen),
             },
-            Settle(outcome) => {
-                let events = self.confirmation.settle(outcome)?;
-                Ok(Effect::Events(
-                    events.into_iter().map(OrderEvent::Dispatch).collect(),
-                ))
-            }
+
+            Settle(outcome) => fx(self.confirmation.settle(outcome)?),
         }
     }
 }

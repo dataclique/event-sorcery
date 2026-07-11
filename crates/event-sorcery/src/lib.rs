@@ -116,10 +116,12 @@ use std::str::FromStr;
 pub use dependency::Cons;
 pub use dependency::Nil;
 pub use dependency::{Dependent, EntityList, Fold, HasEntity, OneOf};
+#[doc(hidden)]
+pub use dispatch::fx_marker;
 pub use dispatch::{
     Contains, DeliveryPolicy, DispatchEvent, DispatchFailure, DispatchOutcome, DispatchRefused,
-    DispatchReplay, DispatchedJob, Effect, Here, Job, JobDispatch, JobInput, JobList,
-    OriginDeliveryError, OriginPort, Reconciliation, Settled, SettledFailure, There,
+    DispatchReplay, DispatchedJob, Effect, Fx, Here, Job, JobDispatch, JobInput, JobList,
+    OriginDeliveryError, OriginPort, Reconciliation, Settled, SettledFailure, There, fx,
 };
 pub use job::{
     DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,

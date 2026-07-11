@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use event_sorcery::{
     Column, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect, EventSourced,
     Job, JobContext, JobFailure, JobOutcome, Label, Never, Reconciliation, StandaloneJob, Table,
+    fx,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -243,8 +244,10 @@ impl EventSourced for SupportTicket {
     const AGGREGATE_TYPE: &'static str = "SupportTicket";
 
     fn originate(event: &SupportTicketEvent) -> Option<Self> {
+        use SupportTicketEvent::{AwaitingCustomer, Dispatch, Opened};
+
         match event {
-            SupportTicketEvent::Opened {
+            Opened {
                 ticket,
                 subject,
                 at,
@@ -255,7 +258,8 @@ impl EventSourced for SupportTicket {
                 last_updated_at: *at,
                 notify: DispatchedJob::Idle,
             }),
-            SupportTicketEvent::AwaitingCustomer { .. } | SupportTicketEvent::Dispatch(_) => None,
+
+            AwaitingCustomer { .. } | Dispatch(_) => None,
         }
     }
 
@@ -263,14 +267,18 @@ impl EventSourced for SupportTicket {
         entity: &Self,
         event: &SupportTicketEvent,
     ) -> Result<Option<Self>, SupportTicketError> {
+        use SupportTicketEvent::{AwaitingCustomer, Dispatch, Opened};
+
         match event {
-            SupportTicketEvent::Opened { .. } => Ok(None),
-            SupportTicketEvent::AwaitingCustomer { at } => Ok(Some(Self {
+            Opened { .. } => Ok(None),
+
+            AwaitingCustomer { at } => Ok(Some(Self {
                 status: Status::Pending,
                 last_updated_at: *at,
                 ..entity.clone()
             })),
-            SupportTicketEvent::Dispatch(dispatch_event) => {
+
+            Dispatch(dispatch_event) => {
                 let Ok(notify) = entity.notify.evolve(dispatch_event) else {
                     return Ok(None);
                 };
@@ -294,19 +302,20 @@ impl EventSourced for SupportTicket {
     }
 
     async fn initialize(command: SupportTicketCommand) -> Result<Effect<Self>, SupportTicketError> {
+        use SupportTicketCommand::{AwaitCustomer, Close, Open, Settle};
+
         match command {
-            SupportTicketCommand::Open {
+            Open {
                 ticket,
                 subject,
                 at,
-            } => Ok(Effect::Events(vec![SupportTicketEvent::Opened {
+            } => fx(SupportTicketEvent::Opened {
                 ticket,
                 subject,
                 at,
-            }])),
-            SupportTicketCommand::AwaitCustomer { .. }
-            | SupportTicketCommand::Close { .. }
-            | SupportTicketCommand::Settle(_) => Err(SupportTicketError::NotOpen),
+            }),
+
+            AwaitCustomer { .. } | Close { .. } | Settle(_) => fx(SupportTicketError::NotOpen),
         }
     }
 
@@ -314,38 +323,29 @@ impl EventSourced for SupportTicket {
         &self,
         command: SupportTicketCommand,
     ) -> Result<Effect<Self>, SupportTicketError> {
+        use SupportTicketCommand::{AwaitCustomer, Close, Open, Settle};
+
         match command {
-            SupportTicketCommand::Open { .. } => Err(SupportTicketError::AlreadyOpen),
-            SupportTicketCommand::AwaitCustomer { at } => match self.status {
-                Status::Closing | Status::Closed => Err(SupportTicketError::AlreadyClosed),
-                Status::Open | Status::Pending => {
-                    Ok(Effect::Events(vec![SupportTicketEvent::AwaitingCustomer {
-                        at,
-                    }]))
-                }
+            Open { .. } => fx(SupportTicketError::AlreadyOpen),
+
+            AwaitCustomer { at } => match self.status {
+                Status::Closing | Status::Closed => fx(SupportTicketError::AlreadyClosed),
+                Status::Open | Status::Pending => fx(SupportTicketEvent::AwaitingCustomer { at }),
             },
-            SupportTicketCommand::Close { at } => match self.status {
-                Status::Closing | Status::Closed => Err(SupportTicketError::AlreadyClosed),
+
+            Close { at } => match self.status {
+                Status::Closing | Status::Closed => fx(SupportTicketError::AlreadyClosed),
                 // Closing IS kicking off the notify job. The framework emits
                 // the `Dispatched` event and enqueues in one transaction; the
                 // ticket only reaches `Closed` when the verdict lands.
-                Status::Open | Status::Pending => {
-                    Ok(Effect::Dispatch(self.notify.dispatch(NotifyClosed {
-                        ticket: self.ticket,
-                        subject: self.subject.clone(),
-                        closed_at: at,
-                    })?))
-                }
+                Status::Open | Status::Pending => fx(self.notify.dispatch(NotifyClosed {
+                    ticket: self.ticket,
+                    subject: self.subject.clone(),
+                    closed_at: at,
+                })?),
             },
-            SupportTicketCommand::Settle(outcome) => {
-                let events = self.notify.settle(outcome)?;
-                Ok(Effect::Events(
-                    events
-                        .into_iter()
-                        .map(SupportTicketEvent::Dispatch)
-                        .collect(),
-                ))
-            }
+
+            Settle(outcome) => fx(self.notify.settle(outcome)?),
         }
     }
 }

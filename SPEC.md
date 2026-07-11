@@ -226,7 +226,10 @@ contract itself, not opt-in plumbing (see
   state exists yet) -- the only paths to an enqueue from a handler. The
   framework emits the `Dispatched` event (which carries the job value: the
   intent IS the job) and enqueues in the same transaction, so there is no
-  intent/call crash window and no free-form event can accompany the enqueue.
+  intent/call crash window and no free-form event can accompany the enqueue. The
+  `fx` helper wraps any handler-arm outcome (events, a job, a guarded dispatch,
+  or the domain error) into the full `Result<Effect, Error>` so every arm reads
+  uniformly.
 - **`DispatchedJob<J>`** is the library-owned machine embedded in entity state
   (`Idle -> InFlight -> Confirmed(Settled) | Failed(SettledFailure)`), with
   `DispatchEvent<J>` wrappers nested in the entity's event enum. The state guard
