@@ -443,7 +443,7 @@ mod tests {
 
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
         pool
     }
 

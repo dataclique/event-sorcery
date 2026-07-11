@@ -73,10 +73,13 @@ Two crates, no application binaries:
   `cqrs-es`, the typed `Store`, projections, the schema registry, the reactor,
   and the `ViewBackend` GAT.
 
-The canonical SQLite schema for the event/snapshot tables lives at
-`migrations/20251016210348_init.sql` at the workspace root. Tests apply it
-in-memory via `sqlite_es::testing::create_test_pool()`. Consumers apply the same
-migration in their application database.
+The canonical SQLite schema -- events, snapshots, the job queue, and the schema
+registry -- lives in `crates/sqlite-es/migrations/` (inside the crate so
+`sqlx::migrate!` can embed it when the crate is vendored as a git dependency)
+and is exported as `sqlite_es::MIGRATOR`. Tests apply it in-memory via
+`sqlite_es::testing::create_test_pool()`. Consumers apply the same migrations in
+their application database, either by running `MIGRATOR` or by copying all of
+the `.sql` files together into their own migration directory.
 
 ## Components
 
