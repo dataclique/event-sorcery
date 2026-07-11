@@ -56,8 +56,9 @@ mod view_repository;
 /// Run it against an application database with
 /// `MIGRATOR.run(&pool)`. Consumers that manage their own migration
 /// history instead copy the `.sql` files from this crate's
-/// `migrations/` directory into their application's and never edit
-/// them afterwards.
+/// `migrations/` directory into their application's migration
+/// directory -- all of them together, never a subset -- and never
+/// edit them afterwards.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub use cqrs::{SqliteCqrs, sqlite_cqrs};

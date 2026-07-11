@@ -212,13 +212,13 @@ workspace has two crates and no application binaries:
   schema registry, reactor.
 
 The `crates/sqlite-es/migrations/` directory holds the canonical SQLite schema
-(events + snapshots tables), embedded at compile time as `sqlite_es::MIGRATOR`
-and applied to in-memory test databases by
+(events, snapshots, job queue, and schema registry tables), embedded at compile
+time as `sqlite_es::MIGRATOR` and applied to in-memory test databases by
 `sqlite_es::testing::create_test_pool`. It lives inside the crate (never at the
 workspace root) so `sqlx::migrate!` still resolves when the crate is vendored as
 a git dependency (crane/nix vendoring keeps only crate directories). Consumers
 run the same migrations in their application database via `MIGRATOR` or by
-copying the `.sql` files.
+copying ALL of the `.sql` files together -- never a subset.
 
 ## Key Development Commands
 
@@ -246,8 +246,9 @@ verification before a release).
 
 This library doesn't run a long-lived database itself; tests use in-memory
 SQLite pools via `sqlite_es::testing::create_test_pool()`. The migrations in
-`crates/sqlite-es/migrations/` are the canonical event/snapshots schema;
-consumers apply them (and any of their own view migrations) in their app.
+`crates/sqlite-es/migrations/` are the canonical event-store schema (events,
+snapshots, job queue, schema registry); consumers apply them (and any of their
+own view migrations) in their app.
 
 - `sqlx migrate add <migration_name>` - Create a new migration file
 - **CRITICAL: NEVER manually create migration files.** Always use
@@ -294,13 +295,13 @@ ignore rule cover it.
 
 ### Configuration Files
 
-| File                           | Purpose                                                                    |
-| ------------------------------ | -------------------------------------------------------------------------- |
-| `Cargo.toml`                   | Workspace definition, `[workspace.lints]` lint config, shared dependencies |
-| `clippy.toml`                  | Clippy behavior settings (thresholds, test permissions)                    |
-| `flake.nix`                    | Nix flake: dev shell                                                       |
-| `crates/*/Cargo.toml`          | Per-crate dependencies and `[lints] workspace = true`                      |
-| `crates/sqlite-es/migrations/` | Canonical SQLite event/snapshots schema (`sqlite_es::MIGRATOR`)            |
+| File                           | Purpose                                                                                             |
+| ------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `Cargo.toml`                   | Workspace definition, `[workspace.lints]` lint config, shared dependencies                          |
+| `clippy.toml`                  | Clippy behavior settings (thresholds, test permissions)                                             |
+| `flake.nix`                    | Nix flake: dev shell                                                                                |
+| `crates/*/Cargo.toml`          | Per-crate dependencies and `[lints] workspace = true`                                               |
+| `crates/sqlite-es/migrations/` | Canonical event-store schema: events, snapshots, job queue, schema registry (`sqlite_es::MIGRATOR`) |
 
 ## Development Workflow Notes
 
