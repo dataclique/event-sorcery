@@ -241,11 +241,13 @@ contract itself, not opt-in plumbing (see
   and delivers it to the origin (through `OriginPort`, implemented by `Store`
   when the origin's command enum absorbs it via `From`) **before** acking the
   job. Failed delivery defers (never counts an attempt); duplicates are absorbed
-  by the guard; execution-time dead letters (a terminal rejection or an
-  exhausted retry budget) deliver `Failed` first, so those never leave the
-  entity dangling in flight. Known gap: a claim-budget `Abandoned` dead letter
-  fires before any execution and cannot deliver -- the ADR-0007 item-4
-  terminal-failure hook is the planned fix.
+  by the guard. A terminal rejection cannot dead-letter undelivered: its failed
+  delivery defers the job, so the `Failed` verdict lands before the job dies. An
+  exhausted retry budget delivers `DeadLettered` best-effort only -- if that
+  delivery fails, the worker logs `DISPATCH DANGLING` and dead-letters anyway,
+  leaving the origin in flight. Same class of gap: a claim-budget `Abandoned`
+  dead letter fires before any execution and cannot deliver at all -- the
+  ADR-0007 item-4 terminal-failure hook is the planned fix for both.
 - **Submit/reconcile routing.** Whether an execution is the first try or a
   follow-up is a safety invariant for financial operations, so the framework
   routes it: the first claim runs `submit`; every later claim runs `reconcile`,

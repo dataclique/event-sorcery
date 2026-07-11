@@ -733,7 +733,8 @@ fn delivery_deferral(ctx: &JobContext, delivery_error: &OriginDeliveryError) -> 
 /// and re-delivered until the origin accepts it, and duplicates are absorbed
 /// by the [`DispatchedJob`] guard. A transient failure that exhausts the
 /// retry budget best-effort delivers a dead-letter verdict before the worker
-/// dead-letters, so the origin does not dangle in flight.
+/// dead-letters; if even that delivery fails, the worker logs loudly and
+/// dead-letters anyway, leaving the origin in flight.
 impl<J: Job> StandaloneJob for J {
     type Input = JobInput<J>;
     type Output = ();
