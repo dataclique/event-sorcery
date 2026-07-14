@@ -1,0 +1,46 @@
+[package]
+name = "event-sorcery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+apalis-core.workspace = true
+async-trait.workspace = true
+cqrs-es.workspace = true
+sqlite-es.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono = { version = "0.4.45", features = ["serde"] }
+ulid = { version = "1.2.1", features = ["serde"] }
+tokio-util = "0.7.18"
+tokio-stream = "0.1.18"
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
+tower = { version = "0.5.3", features = ["limit"] }
+futures-util = "0.3.32"
+
+[features]
+test-support = []
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "dispatch"
+harness = false
+required-features = ["test-support"]
+
+[[bench]]
+name = "store"
+harness = false
+required-features = ["test-support"]
