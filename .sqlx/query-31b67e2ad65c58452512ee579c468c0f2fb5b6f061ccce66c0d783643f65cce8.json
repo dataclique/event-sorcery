@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT version,\n               payload,\n               lease_until AS \"lease_until_ms\"\n        FROM job_queue\n        WHERE view_id = ?1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "version",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "job_queue",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "name": "payload",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "job_queue",
+            "name": "payload"
+          }
+        }
+      },
+      {
+        "name": "lease_until_ms",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "job_queue",
+            "name": "lease_until"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "31b67e2ad65c58452512ee579c468c0f2fb5b6f061ccce66c0d783643f65cce8"
+}
