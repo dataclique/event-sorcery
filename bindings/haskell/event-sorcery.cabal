@@ -44,9 +44,12 @@ library
   import:          strict
   hs-source-dirs:  src
   exposed-modules:
+    EventSorcery.Engine
     EventSorcery.Engine.Codec
     EventSorcery.Engine.Types
 
+  other-modules:   EventSorcery.Engine.Internal.FFI
+  extra-libraries: event_sorcery_ffi
   build-depends:
     , base        >=4.18 && <5
     , bytestring
@@ -63,3 +66,13 @@ test-suite codec-spec
     , bytestring
     , event-sorcery
     , text
+
+test-suite engine-spec
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        EngineSpec.hs
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring
+    , event-sorcery
