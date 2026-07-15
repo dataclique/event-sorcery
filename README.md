@@ -21,11 +21,14 @@ you need lower-level control.
 
 ## Status
 
-Extracted from internal services
-([st0x.issuance](https://github.com/ST0x-Technology/st0x.issuance) and
-[st0x.liquidity](https://github.com/ST0x-Technology/st0x.liquidity)) and made
-standalone so they can share the implementation. External users are welcome but
-the API surface is still in flux.
+This repository is an experimental fork maintained by Data Clique Software
+Design FZCO in the `dataclique` GitHub organization. It contains work unrelated
+to ST0x, including the Haskell binding in 0.4.0.
+
+The original Event Sorcery project remains owned and maintained by ST0x, with
+contributions from Data Clique Software Design FZCO and other contributors.
+Features developed in this fork do not imply ST0x ownership or adoption.
+External users are welcome, but the API surface is still in flux.
 
 ## Examples
 

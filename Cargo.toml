@@ -7,7 +7,7 @@ resolver = "2"
 edition = "2024"
 version = "0.4.0"
 license = "MIT"
-homepage = "https://github.com/ST0x-Technology/event-sorcery"
+homepage = "https://github.com/dataclique/event-sorcery"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
