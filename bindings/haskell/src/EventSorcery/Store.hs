@@ -16,6 +16,7 @@ import Data.Unrestricted.Linear (Ur (Ur))
 import Data.Word (Word64)
 import EventSorcery.Aggregate (Effect (..), EventSourced, EventVersion (..))
 import EventSorcery.Aggregate qualified as Aggregate
+import EventSorcery.Dispatch (dispatchJob)
 import EventSorcery.Engine (EngineError)
 import EventSorcery.Engine qualified as Engine
 import EventSorcery.Job (
@@ -228,8 +229,9 @@ prepareEffect _ expected current (Events events) =
       ( PreparedCommand
           (Ur (PreparedEvents next expected (encodeEvents events)))
       )
-prepareEffect (Store _ nextJobId) expected current (Dispatch job) = do
+prepareEffect (Store _ nextJobId) expected current (Dispatch request) = do
   identifier <- nextJobId
+  let job = dispatchJob request
   let intent = Aggregate.injectDispatchIntent (Aggregate.dispatchIntent identifier job)
 
   pure do

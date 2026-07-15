@@ -94,6 +94,7 @@ import EventSorcery.Engine.Internal.FFI (
   esJobRetry,
  )
 import EventSorcery.Job.Definition (
+  DeadReason (..),
   Job (..),
   JobDecodeError (..),
   JobId (..),
@@ -198,14 +199,6 @@ data JobSettlement
 
 
 newtype JobSettlementToken = JobSettlementToken ByteString
-  deriving stock (Eq, Show)
-
-
-data DeadReason
-  = RetriesExhausted
-  | Rejected
-  | Undecodable
-  | Abandoned
   deriving stock (Eq, Show)
 
 
