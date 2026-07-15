@@ -8,5 +8,9 @@ homepage.workspace = true
 [dependencies]
 ciborium.workspace = true
 
+[dev-dependencies]
+sqlx.workspace = true
+tokio.workspace = true
+
 [lints]
 workspace = true
