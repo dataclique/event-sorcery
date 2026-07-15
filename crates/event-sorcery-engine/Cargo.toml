@@ -1,0 +1,9 @@
+[package]
+name = "event-sorcery-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true

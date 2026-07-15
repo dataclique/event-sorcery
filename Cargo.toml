@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/sqlite-es", "crates/event-sorcery"]
+members = [
+  "crates/event-sorcery",
+  "crates/event-sorcery-engine",
+  "crates/sqlite-es",
+]
 exclude = ["examples/simple", "examples/complex"]
 resolver = "2"
 
