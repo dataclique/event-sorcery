@@ -121,10 +121,7 @@ impl PersistedEventRepository for SqliteEventRepository {
         let jobs = crate::job::take_pending().map_err(EngineError::from)?;
         let mut request = CommitRequest::new(stream, events).with_jobs(jobs);
         if let Some((_, aggregate, snapshot_version)) = snapshot_update {
-            request = request.with_snapshot(SnapshotUpdate {
-                aggregate,
-                snapshot_version,
-            });
+            request = request.with_snapshot(SnapshotUpdate::new(aggregate, snapshot_version));
         }
 
         Ok(self.engine.commit(request).await?)
