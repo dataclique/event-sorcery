@@ -50,6 +50,7 @@ library
     EventSorcery.Dispatch.TestSupport
     EventSorcery.Engine
     EventSorcery.Job
+    EventSorcery.Job.Execution
     EventSorcery.Snapshot
     EventSorcery.Store
     EventSorcery.Stream
@@ -131,6 +132,17 @@ test-suite dispatch-spec
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        DispatchSpec.hs
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring
+    , event-sorcery
+    , text
+
+test-suite job-execution-spec
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        JobExecutionSpec.hs
   build-depends:
     , base           >=4.18 && <5
     , bytestring
