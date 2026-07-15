@@ -122,10 +122,7 @@ impl PersistedEventRepository for SqliteEventRepository {
         let mut request =
             CommitRequest::new(stream, events).with_jobs(pending_jobs.take_requests());
         if let Some((_, aggregate, snapshot_version)) = snapshot_update {
-            request = request.with_snapshot(SnapshotUpdate {
-                aggregate,
-                snapshot_version,
-            });
+            request = request.with_snapshot(SnapshotUpdate::new(aggregate, snapshot_version))?;
         }
 
         self.engine.commit(request).await?;
@@ -147,6 +144,8 @@ impl PersistedEventRepository for SqliteEventRepository {
 
 #[cfg(test)]
 mod tests {
+    //! Repository integration coverage for atomic engine delegation.
+
     use cqrs_es::event_sink::EventSink;
     use cqrs_es::persist::PersistedEventStore;
     use cqrs_es::{AggregateContext, AggregateError, DomainEvent, EventStore};
@@ -290,6 +289,21 @@ mod tests {
         .unwrap()
     }
 
+    async fn count_snapshots(pool: &SqlitePool, aggregate_type: &str, aggregate_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            r"
+            SELECT COUNT(*)
+            FROM snapshots
+            WHERE aggregate_type = ?1 AND aggregate_id = ?2
+            ",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     async fn queue_row(pool: &SqlitePool, job_id: &str) -> (String, i64, String, Option<i64>) {
         sqlx::query_as::<_, (String, i64, String, Option<i64>)>(
             r"
@@ -319,6 +333,39 @@ mod tests {
         let queue_rows = count_queue_rows(&pool, &job_id).await;
 
         assert_eq!((aggregate_events, job_events, queue_rows), (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn empty_snapshot_update_propagates_without_writing() {
+        let pool = create_test_pool().await.unwrap();
+        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+
+        let result = repo
+            .persist::<TestAggregate>(
+                &[],
+                Some((
+                    "empty-snapshot".to_string(),
+                    serde_json::json!({ "state": "invalid" }),
+                    1,
+                )),
+            )
+            .await;
+
+        let Err(PersistenceError::UnknownError(source)) = result else {
+            panic!("empty snapshot update must propagate the engine error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<EngineError>(),
+            Some(EngineError::EmptySnapshotUpdate)
+        ));
+        assert_eq!(
+            count_events(&pool, TestAggregate::TYPE, "empty-snapshot").await,
+            0
+        );
+        assert_eq!(
+            count_snapshots(&pool, TestAggregate::TYPE, "empty-snapshot").await,
+            0
+        );
     }
 
     #[tokio::test]
