@@ -5,14 +5,14 @@ import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text.Encoding qualified as Text
 import EventSorcery.Aggregate (
   DecodeCause (DecodeCause),
-  Dispatches (injectDispatchIntent),
+  Dispatches (..),
   Effect (..),
   EventSourced (..),
   EventVersion (EventVersion),
   SchemaVersion (SchemaVersion),
   dispatchJobId,
  )
-import EventSorcery.Dispatch (kickoff)
+import EventSorcery.Dispatch (DispatchOutcome, kickoff)
 import EventSorcery.Engine (
   OpenOptions (OpenOptions),
   closeStore,
@@ -150,6 +150,7 @@ data AccountCommand
   | Deposit Int
   | EmitInvalidEvent
   | SendWelcome
+  | SettleWelcome (DispatchOutcome SendWelcomeEmail)
 
 
 data AccountEvent
@@ -184,6 +185,7 @@ instance Job SendWelcomeEmail where
 
 instance Dispatches Account SendWelcomeEmail where
   injectDispatchIntent intent = WelcomeRequested (dispatchJobId intent)
+  injectDispatchOutcome = SettleWelcome
 
 
 instance EventSourced Account where
@@ -229,6 +231,7 @@ instance EventSourced Account where
   transition _ (Deposit amount) = Right (Events (FundsDeposited amount :| []))
   transition _ EmitInvalidEvent = Right (Events (AccountOpened 99 :| []))
   transition _ SendWelcome = Right (Dispatch (kickoff SendWelcomeEmail))
+  transition _ (SettleWelcome _) = Left AlreadyOpen
 
 
 decodeAmount

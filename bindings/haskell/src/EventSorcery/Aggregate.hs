@@ -1,3 +1,5 @@
+{-# LANGUAGE FunctionalDependencies #-}
+
 module EventSorcery.Aggregate (
   DecodeCause (..),
   DispatchIntent,
@@ -8,6 +10,7 @@ module EventSorcery.Aggregate (
   Member,
   SchemaVersion (..),
   dispatchIntent,
+  dispatchIntentJob,
   dispatchJobId,
 ) where
 
@@ -18,11 +21,10 @@ import Data.Proxy (Proxy)
 import Data.Text (Text)
 import Data.Type.Equality (type (~))
 import Data.Word (Word16)
-import EventSorcery.Dispatch (JobDispatch)
+import EventSorcery.Dispatch (DispatchOutcome, JobDispatch)
 import EventSorcery.Job.Definition (
   Job (..),
   JobId,
-  jobType,
  )
 import Prelude (Bool (..), Either, Eq, Ord, Show)
 
@@ -39,11 +41,12 @@ newtype DecodeCause = DecodeCause Text
   deriving stock (Eq, Show)
 
 
-data DispatchIntent job = DispatchIntent JobId Text ByteString
+data DispatchIntent job = DispatchIntent JobId job
 
 
-class Dispatches entity job where
+class Dispatches entity job | job -> entity where
   injectDispatchIntent :: DispatchIntent job -> Event entity
+  injectDispatchOutcome :: DispatchOutcome job -> Command entity
 
 
 type Member item items = Elem item items ~ 'True
@@ -57,6 +60,7 @@ type family Elem (item :: Type) (items :: [Type]) :: Bool where
 
 data Effect entity where
   Events :: NonEmpty (Event entity) -> Effect entity
+  Unchanged :: Effect entity
   Dispatch
     :: (Job job, Member job (Jobs entity), Dispatches entity job)
     => JobDispatch job
@@ -90,10 +94,13 @@ class EventSourced entity where
     -> Either (CommandError entity) (Effect entity)
 
 
-dispatchIntent :: forall job. Job job => JobId -> job -> DispatchIntent job
-dispatchIntent identifier job =
-  DispatchIntent identifier (jobType @job) (encodeJob job)
+dispatchIntent :: JobId -> job -> DispatchIntent job
+dispatchIntent = DispatchIntent
 
 
 dispatchJobId :: DispatchIntent job -> JobId
-dispatchJobId (DispatchIntent identifier _ _) = identifier
+dispatchJobId (DispatchIntent identifier _) = identifier
+
+
+dispatchIntentJob :: DispatchIntent job -> job
+dispatchIntentJob (DispatchIntent _ job) = job
