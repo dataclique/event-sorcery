@@ -51,6 +51,7 @@ library
     EventSorcery.Engine
     EventSorcery.Job
     EventSorcery.Job.Execution
+    EventSorcery.Job.Worker
     EventSorcery.Snapshot
     EventSorcery.Store
     EventSorcery.Stream
@@ -143,6 +144,17 @@ test-suite job-execution-spec
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        JobExecutionSpec.hs
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring
+    , event-sorcery
+    , text
+
+test-suite job-worker-spec
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        JobWorkerSpec.hs
   build-depends:
     , base           >=4.18 && <5
     , bytestring
