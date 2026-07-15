@@ -775,6 +775,12 @@ pub(crate) struct PendingPush {
     pub(crate) delay: Option<Duration>,
 }
 
+/// Encoded pending jobs whose source buffer remains intact until commit.
+pub(crate) struct PreparedPendingJobs {
+    requests: Vec<EnqueueRequest>,
+    scope_active: bool,
+}
+
 /// Type erasure over a dispatched [`crate::Job`] so the pending buffer can
 /// hold heterogeneous job types; the flush needs only the routing kind and
 /// the encoded payload.
@@ -793,15 +799,29 @@ impl<J: crate::Job> ErasedJob for J {
     }
 }
 
+impl PreparedPendingJobs {
+    /// Moves the encoded requests into an engine commit while retaining their source buffer.
+    pub(crate) fn take_requests(&mut self) -> Vec<EnqueueRequest> {
+        std::mem::take(&mut self.requests)
+    }
+
+    /// Clears the retained source pushes after their database commit succeeds.
+    pub(crate) fn mark_committed(self) {
+        if self.scope_active {
+            PENDING_JOBS.with(|pending| pending.borrow_mut().clear());
+        }
+    }
+}
+
 tokio::task_local! {
-    /// Per-command buffer of jobs awaiting flush, drained by the event
-    /// repository inside its commit transaction.
+    /// Per-command buffer of jobs awaiting flush, cleared by the event
+    /// repository only after its commit transaction succeeds.
     static PENDING_JOBS: RefCell<Vec<PendingPush>>;
 }
 
 /// Runs `command_execution` with a fresh pending-job scope active, so the
 /// framework's [`buffer`] of a [`crate::Effect::Dispatch`] lands where the
-/// repository's flush ([`take_pending`]) will drain it -- in the same
+/// repository's flush ([`prepare_pending`]) will clear it -- in the same
 /// transaction that commits the events.
 pub(crate) async fn with_pending_scope<Output>(
     command_execution: impl Future<Output = Output>,
@@ -828,30 +848,48 @@ pub(crate) fn buffer(push: PendingPush) -> Result<(), DispatchNotBuffered> {
 #[error("job dispatch buffered outside a command scope")]
 pub struct DispatchNotBuffered;
 
-/// Drains the per-command pending-job buffer into [`EnqueueRequest`]s (each
-/// keeping the [`JobId`] minted at push time, with a resolved `run_at`). A no-op
-/// when no buffer scope is active or it is empty.
-pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
-    let pending = PENDING_JOBS
-        .try_with(|buffer| buffer.borrow_mut().drain(..).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    pending
-        .into_iter()
-        .map(|push| {
-            Ok(EnqueueRequest {
-                job_id: push.job_id,
-                kind: push.job.kind(),
-                payload: push.job.encode()?,
-                run_at_ms: resolve_run_at_ms(push.delay)?,
+/// Prepares the pending jobs without clearing their task-local buffer. The
+/// caller marks the batch committed only after its database transaction
+/// succeeds, leaving the original pushes available after any failure.
+pub(crate) fn prepare_pending() -> Result<PreparedPendingJobs, JobStoreError> {
+    let prepared = PENDING_JOBS.try_with(|pending| {
+        pending
+            .borrow()
+            .iter()
+            .map(|push| {
+                Ok(EnqueueRequest {
+                    job_id: push.job_id,
+                    kind: push.job.kind(),
+                    payload: push.job.encode()?,
+                    run_at_ms: resolve_run_at_ms(push.delay)?,
+                })
             })
-        })
-        .collect()
+            .collect::<Result<Vec<_>, JobStoreError>>()
+    });
+    let (requests, scope_active) = match prepared {
+        Ok(requests) => (requests?, true),
+        Err(_) => (Vec::new(), false),
+    };
+    Ok(PreparedPendingJobs {
+        requests,
+        scope_active,
+    })
+}
+
+/// Drains the per-command pending-job buffer into [`EnqueueRequest`]s for tests
+/// and non-transactional inspection. Production commits use [`prepare_pending`]
+/// so a failed transaction cannot lose buffered jobs.
+#[cfg(test)]
+pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
+    let mut pending = prepare_pending()?;
+    let requests = pending.take_requests();
+    pending.mark_committed();
+    Ok(requests)
 }
 
 /// Builds a standalone [`EnqueueRequest`] (fresh ULID, resolved `run_at`) for one
 /// `job` -- the reactor / poller / job-chain enqueue path, without the
-/// command-scope buffer [`take_pending`] drains.
+/// command-scope buffer [`prepare_pending`] flushes.
 pub(crate) fn enqueue_request<J: StandaloneJob>(
     job: &J,
     delay: Option<Duration>,
