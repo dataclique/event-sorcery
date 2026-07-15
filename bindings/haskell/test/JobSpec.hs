@@ -4,6 +4,8 @@ import Conduit (runConduit, sinkList, (.|))
 import Control.Monad.Trans.Except (runExceptT)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)))
+import Data.Maybe (Maybe (..))
+import Data.Text (Text)
 import Data.Unrestricted.Linear (Ur (Ur))
 import EventSorcery.Engine (
   EngineError,
@@ -19,7 +21,7 @@ import EventSorcery.Job (
   JobClaimDetails (..),
   JobClaimResult (JobClaimed),
   JobExecutionRoute (ReconcileExecution, SubmitExecution),
-  JobId (JobId),
+  JobId,
   JobInstant (JobInstant),
   JobKind (JobKind),
   JobLeaseResult (LeaseHeld),
@@ -35,6 +37,7 @@ import EventSorcery.Job (
   deadLetterJob,
   deferJob,
   enqueueJob,
+  mkJobId,
   pollJobs,
   renewJob,
   retryJob,
@@ -102,7 +105,7 @@ exerciseAtomicCommit store = do
     then pure ()
     else error "claimed job metadata or settlement was incorrect"
   where
-    identifier = JobId "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    identifier = validJobId "01ARZ3NDEKTSV4RRFFQ69G5FAV"
     stream = StreamIdentity "haskell-account" "account-1"
     seed = JobSeed identifier kind payload now
 
@@ -133,7 +136,7 @@ exerciseRetry store = do
     then pure ()
     else error "retried claim metadata was incorrect"
   where
-    identifier = JobId "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+    identifier = validJobId "01ARZ3NDEKTSV4RRFFQ69G5FAW"
     seed = JobSeed identifier kind payload now
 
 
@@ -154,7 +157,7 @@ exerciseDeferral store = do
   acknowledged <- acknowledgeJob store secondToken
   expectSettlement "deferred job acknowledgement failed" acknowledged
   where
-    identifier = JobId "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+    identifier = validJobId "01ARZ3NDEKTSV4RRFFQ69G5FAX"
     seed = JobSeed identifier kind payload now
 
 
@@ -171,7 +174,7 @@ exerciseDeadLetter store = do
     then pure ()
     else error "dead-lettered job remained runnable"
   where
-    identifier = JobId "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+    identifier = validJobId "01ARZ3NDEKTSV4RRFFQ69G5FAY"
     seed = JobSeed identifier kind payload now
 
 
@@ -224,6 +227,12 @@ later = JobInstant 90_000
 
 payload :: ByteString.ByteString
 payload = ByteString.pack [0, 1, 255]
+
+
+validJobId :: Text -> JobId
+validJobId value = case mkJobId value of
+  Just identifier -> identifier
+  Nothing -> error "valid test job identifier was rejected"
 
 
 releaseClaim

@@ -34,6 +34,7 @@ common strict
     TypeFamilies
     TypeFamilyDependencies
     UndecidableInstances
+    UndecidableSuperClasses
 
   ghc-options:
     -Wall -Wcompat -Werror -Widentities -Wincomplete-record-updates
@@ -44,6 +45,7 @@ library
   import:          strict
   hs-source-dirs:  src
   exposed-modules:
+    EventSorcery.Aggregate
     EventSorcery.Engine
     EventSorcery.Job
     EventSorcery.Stream
@@ -51,6 +53,7 @@ library
   other-modules:
     EventSorcery.Engine.Internal
     EventSorcery.Engine.Internal.FFI
+    EventSorcery.Job.Definition
 
   extra-libraries: event_sorcery_ffi
   build-depends:
@@ -94,4 +97,15 @@ test-suite job-spec
     , conduit
     , event-sorcery
     , linear-base
+    , text
     , transformers
+
+test-suite domain-spec
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        DomainSpec.hs
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring
+    , event-sorcery

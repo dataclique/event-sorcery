@@ -1,7 +1,14 @@
 module EventSorcery.Stream (
+  ActualSequence (..),
+  ExpectedSequence (..),
+  MetadataMismatch (..),
   ProposedEvent (..),
+  ReplayError (..),
   StoredEvent (..),
   StreamIdentity (..),
+  StreamKey,
+  StreamPosition (..),
+  StreamVersion (..),
   commit,
   currentVersion,
   decodeStoredEvents,
@@ -10,6 +17,10 @@ module EventSorcery.Stream (
   encodeLoadStream,
   encodeProposedEvent,
   loadStream,
+  replay,
+  resume,
+  streamKey,
+  streamKeyIdentity,
 ) where
 
 import Codec.CBOR.Decoding (
@@ -31,17 +42,24 @@ import Codec.CBOR.Encoding (
  )
 import Codec.CBOR.Read (deserialiseFromBytes)
 import Codec.CBOR.Write (toStrictByteString)
-import Control.Monad (replicateM)
+import Control.Monad (foldM, replicateM)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Foldable (foldMap)
 import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NonEmpty
-import Data.Maybe (maybe)
+import Data.Maybe (fromMaybe, maybe)
+import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Word (Word64)
+import EventSorcery.Aggregate (
+  DecodeCause,
+  EventSourced,
+  EventVersion (..),
+ )
+import EventSorcery.Aggregate qualified as Aggregate
 import EventSorcery.Engine.Internal (
   EngineError (BindingProtocolError),
   Store,
@@ -62,17 +80,22 @@ import Prelude (
   Eq,
   IO,
   Int,
-  Maybe,
+  Maybe (..),
+  Ord,
   Show,
   String,
   fail,
   fromIntegral,
+  fst,
   length,
+  maxBound,
   otherwise,
   pure,
   show,
   ($),
+  (+),
   (.),
+  (/=),
   (<$>),
   (<>),
   (==),
@@ -85,6 +108,48 @@ data StreamIdentity = StreamIdentity
   , aggregateId :: Text
   }
   deriving stock (Eq, Show)
+
+
+newtype StreamVersion = StreamVersion Word64
+  deriving stock (Eq, Ord, Show)
+
+
+newtype StreamPosition = StreamPosition Word64
+  deriving stock (Eq, Ord, Show)
+
+
+newtype ExpectedSequence = ExpectedSequence StreamPosition
+  deriving stock (Eq, Show)
+
+
+newtype ActualSequence = ActualSequence StreamPosition
+  deriving stock (Eq, Show)
+
+
+newtype StreamKey entity = StreamKey StreamIdentity
+  deriving stock (Eq, Show)
+
+
+data MetadataMismatch
+  = EventTypeMismatch Text Text
+  | EventVersionMismatch EventVersion EventVersion
+  deriving stock (Eq, Show)
+
+
+data ReplayError entity
+  = EventDecodeFailed StreamPosition DecodeCause
+  | EventMetadataMismatch StreamPosition MetadataMismatch
+  | EventSequenceMismatch ExpectedSequence ActualSequence
+  | EventSequenceOverflow StreamPosition
+  | EventApplicationFailed StreamPosition (Aggregate.ApplyError entity)
+
+
+deriving stock instance
+  Eq (Aggregate.ApplyError entity) => Eq (ReplayError entity)
+
+
+deriving stock instance
+  Show (Aggregate.ApplyError entity) => Show (ReplayError entity)
 
 
 data ProposedEvent = ProposedEvent
@@ -102,6 +167,116 @@ data StoredEvent = StoredEvent
   , payload :: ByteString
   }
   deriving stock (Eq, Show)
+
+
+streamKey
+  :: forall entity
+   . EventSourced entity
+  => Aggregate.EntityId entity
+  -> StreamKey entity
+streamKey identifier =
+  StreamKey
+    StreamIdentity
+      { aggregateType = Aggregate.aggregateType (Proxy @entity)
+      , aggregateId = Aggregate.encodeEntityId identifier
+      }
+
+
+streamKeyIdentity :: StreamKey entity -> StreamIdentity
+streamKeyIdentity (StreamKey identity) = identity
+
+
+replay
+  :: forall entity
+   . EventSourced entity
+  => StreamKey entity
+  -> [StoredEvent]
+  -> Either (ReplayError entity) (Maybe entity)
+replay _ events =
+  fst <$> foldM replayEvent (Nothing, StreamPosition 1) events
+
+
+resume
+  :: forall entity
+   . EventSourced entity
+  => StreamKey entity
+  -> StreamVersion
+  -> entity
+  -> [StoredEvent]
+  -> Either (ReplayError entity) entity
+resume _ (StreamVersion version) entity events = do
+  initialPosition <- nextPosition (StreamPosition version)
+  (result, _) <- foldM replayEvent (Just entity, initialPosition) events
+
+  pure (fromMaybe entity result)
+
+
+replayEvent
+  :: forall entity
+   . EventSourced entity
+  => (Maybe entity, StreamPosition)
+  -> StoredEvent
+  -> Either (ReplayError entity) (Maybe entity, StreamPosition)
+replayEvent (currentState, expectedPosition) stored = do
+  let storedPosition = StreamPosition stored.sequence
+
+  validateSequence expectedPosition storedPosition
+  event <-
+    first
+      (EventDecodeFailed storedPosition)
+      (Aggregate.decodeEvent @entity stored.payload)
+  validateEventMetadata storedPosition stored event
+  nextState <-
+    first (EventApplicationFailed storedPosition) case currentState of
+      Nothing -> Aggregate.originate event
+      Just current -> Aggregate.evolve current event
+  followingPosition <- nextPosition expectedPosition
+
+  pure (Just nextState, followingPosition)
+
+
+validateSequence
+  :: StreamPosition
+  -> StreamPosition
+  -> Either (ReplayError entity) ()
+validateSequence expected actual
+  | actual == expected = Right ()
+  | otherwise =
+      Left
+        ( EventSequenceMismatch
+            (ExpectedSequence expected)
+            (ActualSequence actual)
+        )
+
+
+validateEventMetadata
+  :: EventSourced entity
+  => StreamPosition
+  -> StoredEvent
+  -> Aggregate.Event entity
+  -> Either (ReplayError entity) ()
+validateEventMetadata position stored event
+  | stored.eventType /= expectedType =
+      mismatch (EventTypeMismatch expectedType stored.eventType)
+  | EventVersion stored.eventVersion /= expectedVersion =
+      mismatch
+        ( EventVersionMismatch
+            expectedVersion
+            (EventVersion stored.eventVersion)
+        )
+  | otherwise = Right ()
+  where
+    expectedType = Aggregate.eventType event
+    expectedVersion = Aggregate.eventVersion event
+    mismatch = Left . EventMetadataMismatch position
+
+
+nextPosition
+  :: StreamPosition
+  -> Either (ReplayError entity) StreamPosition
+nextPosition position@(StreamPosition sequence)
+  | sequence == maxBound = Left (EventSequenceOverflow position)
+  | otherwise = Right (StreamPosition (sequence + 1))
 
 
 loadStream
