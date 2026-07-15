@@ -193,6 +193,12 @@ over `EventBackend`. The default is `SqliteBackend`; a Postgres/MySQL backend
 implements the one trait (only dialect deltas differ). See
 [ADR-0006](adrs/0006-cqrs-native-durable-jobs.md).
 
+The SQLite claim transaction is owned by SQLx's transaction guard from
+`BEGIN IMMEDIATE` through its explicit commit or rollback. Cancelling a claim
+future drops that guard, which queues a rollback before the connection can be
+reused by the pool. A cancelled worker must never return an open transaction to
+the pool or retain SQLite's writer lock.
+
 ### Durable jobs
 
 Side effects run as durable, at-least-once worker jobs -- never inline in

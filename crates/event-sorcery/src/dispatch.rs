@@ -705,7 +705,7 @@ impl Default for DeliveryPolicy {
     fn default() -> Self {
         Self {
             retry_delay: Duration::from_secs(5),
-            refused_backoff: Duration::from_secs(300),
+            refused_backoff: Duration::from_mins(5),
         }
     }
 }
@@ -1256,7 +1256,7 @@ mod tests {
                 ProbeVerdict::Settled => Ok(Reconciliation::Settled("reconciled".to_string())),
                 ProbeVerdict::NotSubmitted => Ok(Reconciliation::NotSubmitted),
                 ProbeVerdict::Indeterminate => {
-                    Ok(Reconciliation::Indeterminate(Duration::from_secs(60)))
+                    Ok(Reconciliation::Indeterminate(Duration::from_mins(1)))
                 }
             }
         }
@@ -1420,7 +1420,7 @@ mod tests {
     #[test]
     fn delivery_deferral_uses_the_configured_delays() {
         let retry_delay = Duration::from_millis(250);
-        let refused_backoff = Duration::from_secs(60);
+        let refused_backoff = Duration::from_mins(1);
         let ctx = JobContext {
             delivery: DeliveryPolicy {
                 retry_delay,

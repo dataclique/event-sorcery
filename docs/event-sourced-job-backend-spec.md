@@ -56,7 +56,9 @@ lease column, which cqrs-es cannot express.
   `job_queue` row, lets a crate-side closure (`plan_claim`) decide, and enacts
   the decision** (events-UNIQUE compare-and-swap append + row write). The in-txn
   re-read of the renewed lease **column** is why a live lease cannot be stolen —
-  reading a folded event lease would miss intervening renewals.
+  reading a folded event lease would miss intervening renewals. The SQLx
+  transaction guard owns the connection until commit or rollback; cancellation
+  drops the guard and queues rollback before pool reuse.
 - **D3 Concurrency bound is a mandatory `ConcurrencyLimit` layer in
   `middleware()`.** apalis pulls the next stream item only after `poll_ready` is
   `Ready`, and the claim happens inside the stream's `poll_next` -> **a job is
@@ -148,7 +150,9 @@ retried pending row keeps a stale lease): a runnable Pending/Claimed -> `Claim`
 events UNIQUE (`OptimisticLock` -> `Contended`), then write
 `(version=claim_seq, payload,
 lease_until)`. The won claim carries `claim_seq`
-(renew/ack key), `claim_id` (fence key), `attempt`, and the decoded `args`.
+(renew/ack key), `claim_id` (fence key), `attempt`, and the decoded `args`. The
+transaction is cancellation-safe: if the claim future is dropped at any await
+point, SQLx rolls the transaction back before that pooled connection is reused.
 
 **Ack** (`AckService`): spawn a `renew_loop` (D1, projection-only UPDATE keyed
 on `claim_seq`) bound to the whole op; run `perform` under `timeout` (D4); ack
