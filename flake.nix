@@ -41,7 +41,13 @@
         };
         but = but-nix.packages.${system}.default;
         haskellPackages = pkgs.haskell.packages.ghc914;
-        haskellBindingBase = haskellPackages.callCabal2nix "event-sorcery" ./bindings/haskell {
+        haskellSource = pkgs.runCommand "event-sorcery-haskell-source" { } ''
+          mkdir -p $out/bindings/haskell
+          cp ${./event-sorcery.cabal} $out/event-sorcery.cabal
+          cp -R ${./bindings/haskell}/. $out/bindings/haskell/
+          cp -R ${./conformance} $out/conformance
+        '';
+        haskellBindingBase = haskellPackages.callCabal2nix "event-sorcery" haskellSource {
           event_sorcery_ffi = ffiEngine;
           linear-base = pkgs.haskell.lib.dontCheck haskellPackages.linear-base;
         };
@@ -78,6 +84,7 @@
           cp ${./Cargo.lock} $out/Cargo.lock
           cp -R ${./crates} $out/crates
           cp -R ${./.sqlx} $out/.sqlx
+          cp -R ${./conformance} $out/conformance
         '';
         ffiEngine = pkgs.rustPlatform.buildRustPackage {
           pname = "event-sorcery-ffi";

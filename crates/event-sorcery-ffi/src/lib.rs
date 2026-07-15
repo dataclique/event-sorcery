@@ -754,6 +754,7 @@ struct OpenOptions {
     runtime_threads: usize,
 }
 
+#[derive(Debug)]
 enum AbiError {
     Decode(String),
     Conflict,
@@ -977,6 +978,27 @@ fn write_error(out_error: *mut EsBuf, error: AbiError) -> i32 {
 mod tests {
     use super::*;
 
+    const ENCODING_VECTORS: &str = include_str!("../../../conformance/encoding-v1.vectors");
+
+    fn conformance_vector(name: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        for encoded in ENCODING_VECTORS.lines() {
+            let mut fields = encoded.split_ascii_whitespace();
+            if fields.next() == Some(name) {
+                bytes
+                    .extend(fields.map(|byte| byte.parse::<u8>().expect("valid conformance byte")));
+            }
+        }
+
+        assert!(!bytes.is_empty(), "missing conformance vector: {name}");
+        bytes
+    }
+
+    fn encode_conformance(value: &impl Serialize) -> Vec<u8> {
+        encode_bytes(value).expect("conformance value must encode")
+    }
+
     fn input(value: &impl Serialize) -> (Vec<u8>, EsBuf) {
         let mut bytes = Vec::new();
         ciborium::into_writer(value, &mut bytes).unwrap();
@@ -1034,6 +1056,38 @@ mod tests {
             panic!("expected a won claim");
         };
         handle
+    }
+
+    #[test]
+    fn rust_codec_matches_the_shared_encoding_corpus() {
+        let stream = ("account", "one");
+        let proposed = ("Created", "1.0", OpaqueBytes(vec![0, 1]));
+        let stored = (1_u64, "Created", "1.0", OpaqueBytes(vec![0, 1]));
+
+        assert_eq!(
+            encode_conformance(&(1_u8, "sqlite::memory:", 5_000_u64, 1_u32, 1_usize)),
+            conformance_vector("open-options")
+        );
+        assert_eq!(
+            encode_conformance(&(1_u8, stream.0, stream.1, Option::<u64>::None)),
+            conformance_vector("load-stream")
+        );
+        assert_eq!(
+            encode_conformance(&(1_u8, stream.0, stream.1)),
+            conformance_vector("current-version")
+        );
+        assert_eq!(
+            encode_conformance(&(1_u8, stream.0, stream.1, 0_u64, vec![proposed])),
+            conformance_vector("commit")
+        );
+        assert_eq!(
+            encode_conformance(&(1_u8, vec![stored])),
+            conformance_vector("stored-events")
+        );
+        assert_eq!(
+            encode_conformance(&(1_u8, ES_ERR_CONFLICT, "optimistic conflict")),
+            conformance_vector("conflict-error")
+        );
     }
 
     #[test]
