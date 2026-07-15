@@ -1,5 +1,6 @@
 .direnv/
 .sqlx/
+.stack-work/
 .tmp/
 target/
 .env
