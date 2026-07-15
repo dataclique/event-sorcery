@@ -823,8 +823,9 @@ tokio::task_local! {
 
 /// Runs `command_execution` with a fresh pending-job scope active, so the
 /// framework's [`buffer`] of a [`crate::Effect::Dispatch`] lands where the
-/// repository's flush ([`prepare_pending`]) will clear it -- in the same
-/// transaction that commits the events.
+/// repository's [`prepare_pending`] can prepare it for the event transaction.
+/// [`PreparedPendingJobs::mark_committed`] clears the prepared entries only
+/// after that transaction commits successfully.
 pub(crate) async fn with_pending_scope<Output>(
     command_execution: impl Future<Output = Output>,
 ) -> Output {

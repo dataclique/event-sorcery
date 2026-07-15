@@ -1,17 +1,19 @@
-//! SQLite implementation of [`EventBackend`] -- the default durable-job backend.
+//! Native Rust [`EventBackend`] adapter over the shared SQLite engine.
 //!
-//! Two job-shaped primitives: the [`claim`](EventBackend::claim) transaction
-//! (`BEGIN IMMEDIATE`, re-read the row, enact the crate's decision via the events
-//! UNIQUE compare-and-swap, write the projection row) and the projection-only
-//! [`renew`](EventBackend::renew). Everything else is cqrs-es. See
-//! [ADR-0006](../../adrs/0006-cqrs-native-durable-jobs.md).
+//! Three job-shaped primitives delegate to the shared engine:
+//! [`enqueue`](EventBackend::enqueue), the [`claim`](EventBackend::claim)
+//! transaction (`BEGIN IMMEDIATE`, re-read the projection, enact the crate's
+//! decision via the event stream's UNIQUE compare-and-swap, update the
+//! projection), and projection-only [`renew`](EventBackend::renew). Everything
+//! else is cqrs-es. See [ADR-0006](../../adrs/0006-cqrs-native-durable-jobs.md).
 
 use cqrs_es::persist::SerializedEvent;
-use sqlx::{Row, SqliteConnection, SqlitePool};
+use sqlx::SqlitePool;
 
-use sqlite_es::{SqliteAggregateError, insert_serialized_events_batch};
+use sqlite_es::SqliteAggregateError;
 
 use crate::CompactionPolicy;
+use crate::engine::Engine;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use crate::sqlite_event_repository::SqliteEventRepository;
 
@@ -23,19 +25,21 @@ use crate::sqlite_event_repository::SqliteEventRepository;
 /// check, defeating the conflict contract).
 #[derive(Clone)]
 pub struct SqliteBackend {
-    pool: SqlitePool,
+    engine: Engine,
 }
 
 impl SqliteBackend {
     /// Builds a SQLite job backend over `pool`.
     #[must_use]
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            engine: Engine::new(pool),
+        }
     }
 
     /// The underlying pool, for the SQLite-bound view reconciliation paths.
     pub(crate) fn pool(&self) -> &SqlitePool {
-        &self.pool
+        self.engine.pool()
     }
 }
 
@@ -67,12 +71,12 @@ impl EventBackend for SqliteBackend {
     type Error = SqliteJobError;
 
     fn event_repo(&self, compaction_policy: CompactionPolicy) -> SqliteEventRepository {
-        SqliteEventRepository::new(self.pool.clone(), compaction_policy)
+        SqliteEventRepository::new(self.engine.pool().clone(), compaction_policy)
     }
 
     async fn migrate(&self) -> Result<(), SqliteJobError> {
         sqlite_es::MIGRATOR
-            .run(&self.pool)
+            .run(self.engine.pool())
             .await
             .map_err(|error| SqliteJobError::Sql(error.into()))?;
         Ok(())
@@ -87,16 +91,7 @@ impl EventBackend for SqliteBackend {
         Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won> + Send,
         Won: Send,
     {
-        immediate_transaction(&self.pool, job_id, async move |connection| {
-            let outcome = claim_in_txn(connection, job_id, decide).await?;
-            Ok(match outcome {
-                ClaimOutcome::Won(won) => TransactionOutcome::Commit(ClaimOutcome::Won(won)),
-                ClaimOutcome::Abandoned => TransactionOutcome::Commit(ClaimOutcome::Abandoned),
-                ClaimOutcome::Contended => TransactionOutcome::Rollback(ClaimOutcome::Contended),
-                ClaimOutcome::Skip => TransactionOutcome::Rollback(ClaimOutcome::Skip),
-            })
-        })
-        .await
+        self.engine.claim_job(job_id, decide).await
     }
 
     async fn renew(
@@ -105,216 +100,12 @@ impl EventBackend for SqliteBackend {
         claim_seq: i64,
         new_lease_until_ms: i64,
     ) -> Result<LeaseRenewal, SqliteJobError> {
-        let done = sqlx::query(
-            "UPDATE job_queue SET lease_until = ?1 \
-             WHERE view_id = ?2 AND version = ?3 AND status = 'claimed'",
-        )
-        .bind(new_lease_until_ms)
-        .bind(job_id)
-        .bind(claim_seq)
-        .execute(&self.pool)
-        .await?;
-
-        if done.rows_affected() == 0 {
-            Ok(LeaseRenewal::Lost)
-        } else {
-            Ok(LeaseRenewal::Held)
-        }
+        self.engine
+            .renew_job(job_id, claim_seq, new_lease_until_ms)
+            .await
     }
 
     async fn enqueue(&self, event: SerializedEvent, payload: String) -> Result<(), SqliteJobError> {
-        let job_id = event.aggregate_id.clone();
-        let mut tx = self.pool.begin().await?;
-
-        let seeded = match append(&mut tx, &event).await? {
-            // The Enqueued event committed at sequence 1; seed the pending row.
-            Some(version) => write_row(&mut tx, &job_id, version, &payload, None).await,
-            // The events UNIQUE rejected sequence 1 -- this view_id already has a
-            // stream, i.e. the caller reused a job id.
-            None => Err(SqliteJobError::DuplicateEnqueue { job_id }),
-        };
-
-        match seeded {
-            Ok(()) => {
-                tx.commit().await?;
-                Ok(())
-            }
-            Err(error) => {
-                tx.rollback().await?;
-                Err(error)
-            }
-        }
-    }
-}
-
-enum TransactionOutcome<Output> {
-    Commit(Output),
-    Rollback(Output),
-}
-
-async fn immediate_transaction<Output, Operation>(
-    pool: &SqlitePool,
-    job_id: &str,
-    operation: Operation,
-) -> Result<Output, SqliteJobError>
-where
-    Operation:
-        AsyncFnOnce(&mut SqliteConnection) -> Result<TransactionOutcome<Output>, SqliteJobError>,
-{
-    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let outcome = operation(&mut transaction).await;
-
-    match outcome {
-        Ok(TransactionOutcome::Commit(output)) => {
-            transaction.commit().await?;
-            Ok(output)
-        }
-        Ok(TransactionOutcome::Rollback(output)) => {
-            if let Err(error) = transaction.rollback().await {
-                tracing::warn!(target: "cqrs", ?error, job_id, "job claim rollback failed");
-            }
-            Ok(output)
-        }
-        Err(claim_error) => {
-            if let Err(error) = transaction.rollback().await {
-                tracing::warn!(target: "cqrs", ?error, job_id, "job claim rollback failed");
-            }
-            Err(claim_error)
-        }
-    }
-}
-
-async fn claim_in_txn<Decide, Won>(
-    connection: &mut SqliteConnection,
-    job_id: &str,
-    decide: Decide,
-) -> Result<ClaimOutcome<Won>, SqliteJobError>
-where
-    Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won>,
-{
-    let read = read_claim_row(connection, job_id).await?;
-    match decide(read) {
-        ClaimDecision::Skip => Ok(ClaimOutcome::Skip),
-        ClaimDecision::Claim {
-            event,
-            payload,
-            lease_until_ms,
-            won,
-        } => match append(connection, &event).await? {
-            Some(version) => {
-                write_row(connection, job_id, version, &payload, Some(lease_until_ms)).await?;
-                Ok(ClaimOutcome::Won(won))
-            }
-            None => Ok(ClaimOutcome::Contended),
-        },
-        ClaimDecision::Abandon { event, payload } => match append(connection, &event).await? {
-            Some(version) => {
-                // A dead-lettered job is terminal: clear the lease.
-                write_row(connection, job_id, version, &payload, None).await?;
-                Ok(ClaimOutcome::Abandoned)
-            }
-            None => Ok(ClaimOutcome::Contended),
-        },
-    }
-}
-
-/// Compare-and-swap-appends one event. `Ok(Some(version))` committed at that
-/// sequence; `Ok(None)` lost the CAS (the events UNIQUE rejected the sequence).
-async fn append(
-    connection: &mut SqliteConnection,
-    event: &SerializedEvent,
-) -> Result<Option<i64>, SqliteJobError> {
-    match insert_serialized_events_batch(connection, "events", std::slice::from_ref(event)).await {
-        Ok(()) => Ok(Some(i64::try_from(event.sequence)?)),
-        Err(SqliteAggregateError::OptimisticLock) => Ok(None),
-        Err(other) => Err(SqliteJobError::Append(other)),
-    }
-}
-
-async fn read_claim_row(
-    connection: &mut SqliteConnection,
-    job_id: &str,
-) -> Result<Option<ClaimRead>, SqliteJobError> {
-    let row = sqlx::query("SELECT version, payload, lease_until FROM job_queue WHERE view_id = ?1")
-        .bind(job_id)
-        .fetch_optional(connection)
-        .await?;
-
-    let Some(row) = row else { return Ok(None) };
-    Ok(Some(ClaimRead {
-        version: row.try_get("version")?,
-        payload: row.try_get("payload")?,
-        lease_until_ms: row.try_get("lease_until")?,
-    }))
-}
-
-/// Writes the projection row at `version`; the generated `kind`/`status`/`run_at`
-/// columns derive from `payload`. `lease_until` is the projection-only column.
-async fn write_row(
-    connection: &mut SqliteConnection,
-    job_id: &str,
-    version: i64,
-    payload: &str,
-    lease_until_ms: Option<i64>,
-) -> Result<(), SqliteJobError> {
-    sqlx::query(
-        "INSERT INTO job_queue (view_id, version, payload, lease_until) VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT(view_id) DO UPDATE SET \
-           version = excluded.version, payload = excluded.payload, lease_until = excluded.lease_until",
-    )
-    .bind(job_id)
-    .bind(version)
-    .bind(payload)
-    .bind(lease_until_ms)
-    .execute(connection)
-    .await?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::future::pending;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use sqlx::sqlite::SqlitePoolOptions;
-    use tokio::sync::Notify;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn cancelled_immediate_transaction_does_not_poison_the_pooled_connection() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect");
-        let operation_started = Arc::new(Notify::new());
-        let task_pool = pool.clone();
-        let task_started = Arc::clone(&operation_started);
-
-        let claim = tokio::spawn(async move {
-            immediate_transaction(&task_pool, "cancelled-job", async move |_connection| {
-                task_started.notify_one();
-                pending::<Result<TransactionOutcome<()>, SqliteJobError>>().await
-            })
-            .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), operation_started.notified())
-            .await
-            .expect("claim entered its transaction");
-        claim.abort();
-        assert!(claim.await.expect_err("claim was cancelled").is_cancelled());
-
-        let mut connection = pool.acquire().await.expect("reacquire connection");
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
-            .await
-            .expect("cancelled transaction was rolled back before pool reuse");
-        sqlx::query("ROLLBACK")
-            .execute(&mut *connection)
-            .await
-            .expect("close verification transaction");
+        self.engine.enqueue_job(event, payload).await
     }
 }

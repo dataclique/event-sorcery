@@ -21,7 +21,6 @@ pub async fn create_test_pool() -> Result<Pool<Sqlite>, sqlx::Error> {
 
     Ok(pool)
 }
-
 #[cfg(test)]
 mod tests {
     //! Tests for SQLite fixture connection persistence.
@@ -45,7 +44,10 @@ mod tests {
 
         let mut second_connection = pool.acquire().await.unwrap();
         let schema_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'fixture_probe'",
+            "SELECT COUNT(*)
+             FROM sqlite_schema
+             WHERE type = 'table'
+               AND name = 'fixture_probe'",
         )
         .fetch_one(&mut *second_connection)
         .await
