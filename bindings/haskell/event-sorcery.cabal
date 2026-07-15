@@ -45,10 +45,12 @@ library
   hs-source-dirs:  src
   exposed-modules:
     EventSorcery.Engine
-    EventSorcery.Engine.Codec
-    EventSorcery.Engine.Types
+    EventSorcery.Stream
 
-  other-modules:   EventSorcery.Engine.Internal.FFI
+  other-modules:
+    EventSorcery.Engine.Internal
+    EventSorcery.Engine.Internal.FFI
+
   extra-libraries: event_sorcery_ffi
   build-depends:
     , base        >=4.18 && <5

@@ -62,7 +62,7 @@ foreign import capi unsafe "event_sorcery.h es_abi_version"
   esAbiVersion :: IO Word32
 
 
-foreign import capi safe "event_sorcery.h es_open"
+foreign import capi safe "event_sorcery.h es_hs_open"
   esOpen :: Ptr EsBuf -> Ptr (Ptr EsStore) -> Ptr EsBuf -> IO CInt
 
 
@@ -79,7 +79,7 @@ foreign import capi safe "event_sorcery.h es_commit"
   esCommit :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
 
 
-foreign import capi safe "event_sorcery.h es_close"
+foreign import capi safe "event_sorcery.h es_hs_close"
   esClose :: Ptr (Ptr EsStore) -> IO CInt
 
 

@@ -3,26 +3,28 @@ module Main (main) where
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty (..))
 import EventSorcery.Engine (
-  abiVersion,
-  closeStore,
-  commit,
-  currentVersion,
-  loadStream,
-  openStore,
- )
-import EventSorcery.Engine.Types (
   EngineError (EngineError),
   ErrorClass (ConflictError, StateError),
   OpenOptions (..),
+  abiVersion,
+  closeStore,
+  openStore,
+  supportsAbiVersion,
+ )
+import EventSorcery.Stream (
   ProposedEvent (..),
   StoredEvent (..),
   StreamIdentity (..),
+  commit,
+  currentVersion,
+  loadStream,
  )
 import Prelude (
   Either (..),
   IO,
   Maybe (Nothing),
   error,
+  not,
   pure,
   show,
   (&&),
@@ -33,10 +35,22 @@ import Prelude (
 
 main :: IO ()
 main = do
+  exerciseAbiCompatibility
+
   version <- abiVersion
-  if version == 2
+  if version == 3
     then exerciseStore
     else error "unexpected engine ABI version"
+
+
+exerciseAbiCompatibility :: IO ()
+exerciseAbiCompatibility =
+  if supportsAbiVersion 2
+    && supportsAbiVersion 3
+    && not (supportsAbiVersion 1)
+    && not (supportsAbiVersion 65_538)
+    then pure ()
+    else error "engine ABI compatibility was classified incorrectly"
 
 
 exerciseStore :: IO ()

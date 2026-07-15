@@ -1,21 +1,21 @@
 module Main (main) where
 
 import Data.ByteString qualified as ByteString
-import EventSorcery.Engine.Codec (
+import EventSorcery.Engine (
+  EngineError (..),
+  ErrorClass (ConflictError),
+  OpenOptions (..),
   decodeEngineError,
+  encodeOpenOptions,
+ )
+import EventSorcery.Stream (
+  ProposedEvent (..),
+  StoredEvent (..),
+  StreamIdentity (..),
   decodeStoredEvents,
   encodeCommit,
   encodeCurrentVersion,
   encodeLoadStream,
-  encodeOpenOptions,
- )
-import EventSorcery.Engine.Types (
-  EngineError (..),
-  ErrorClass (ConflictError),
-  OpenOptions (..),
-  ProposedEvent (..),
-  StoredEvent (..),
-  StreamIdentity (..),
  )
 import Prelude (Either (..), IO, Maybe (Nothing), error, pure, (&&), (==))
 
