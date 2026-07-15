@@ -1,4 +1,6 @@
 module EventSorcery.Engine.Types (
+  EngineError (..),
+  ErrorClass (..),
   OpenOptions (..),
   ProposedEvent (..),
   StoredEvent (..),
@@ -17,6 +19,24 @@ data OpenOptions = OpenOptions
   , poolSize :: Word32
   , runtimeThreads :: Word64
   }
+  deriving stock (Eq, Show)
+
+
+data ErrorClass
+  = DecodeError
+  | ConflictError
+  | JobError
+  | StorageError
+  | StateError
+  | AbiMismatch
+  | PanicError
+  | UnknownError Word32
+  deriving stock (Eq, Show)
+
+
+data EngineError
+  = EngineError ErrorClass Text
+  | BindingProtocolError Text
   deriving stock (Eq, Show)
 
 

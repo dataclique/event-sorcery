@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -7,8 +8,8 @@ use std::time::Duration;
 
 use cqrs_es::persist::SerializedEvent;
 use event_sorcery::{CommitRequest, Engine, EngineError, StreamIdentity};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 const ABI_MAJOR: u32 = 0;
@@ -20,10 +21,49 @@ const ES_ERR_STORAGE: i32 = 4;
 const ES_ERR_STATE: i32 = 5;
 const ES_ERR_PANIC: i32 = 100;
 
-type ProposedEventWire = (String, String, Vec<u8>);
+type ProposedEventWire = (String, String, OpaqueBytes);
 type CommitWire = (u8, String, String, u64, Vec<ProposedEventWire>);
-type StoredEventWire = (u64, String, String, Vec<u8>);
+type StoredEventWire = (u64, String, String, OpaqueBytes);
 type StoredEventsWire = (u8, Vec<StoredEventWire>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct OpaqueBytes(Vec<u8>);
+
+impl Serialize for OpaqueBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for OpaqueBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_byte_buf(OpaqueBytesVisitor)
+    }
+}
+
+struct OpaqueBytesVisitor;
+
+impl Visitor<'_> for OpaqueBytesVisitor {
+    type Value = OpaqueBytes;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a CBOR byte string")
+    }
+
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E> {
+        Ok(OpaqueBytes(value.to_vec()))
+    }
+
+    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(OpaqueBytes(value))
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -51,7 +91,7 @@ pub const extern "C" fn es_abi_version() -> u32 {
 /// `options` must reference readable bytes for the duration of the call.
 /// `out_store` must be writable, and `out_error` must be null or writable.
 pub unsafe extern "C" fn es_open(
-    options: EsBuf,
+    options: *const EsBuf,
     out_store: *mut *mut EsStore,
     out_error: *mut EsBuf,
 ) -> i32 {
@@ -101,7 +141,7 @@ pub unsafe extern "C" fn es_open(
 /// `out_events` must be writable, and `out_error` must be null or writable.
 pub unsafe extern "C" fn es_load_stream(
     store: *mut EsStore,
-    request: EsBuf,
+    request: *const EsBuf,
     out_events: *mut EsBuf,
     out_error: *mut EsBuf,
 ) -> i32 {
@@ -143,7 +183,7 @@ pub unsafe extern "C" fn es_load_stream(
 /// `out_version` must be writable, and `out_error` must be null or writable.
 pub unsafe extern "C" fn es_current_version(
     store: *mut EsStore,
-    request: EsBuf,
+    request: *const EsBuf,
     out_version: *mut u64,
     out_error: *mut EsBuf,
 ) -> i32 {
@@ -178,7 +218,7 @@ pub unsafe extern "C" fn es_current_version(
 /// `out_error` must be null or writable.
 pub unsafe extern "C" fn es_commit(
     store: *mut EsStore,
-    request: EsBuf,
+    request: *const EsBuf,
     out_error: *mut EsBuf,
 ) -> i32 {
     let Some(store) = (unsafe { store.as_ref() }) else {
@@ -208,7 +248,7 @@ pub unsafe extern "C" fn es_commit(
                     event_type,
                     event_version,
                     payload: serde_json::Value::Array(
-                        payload.into_iter().map(Into::into).collect(),
+                        payload.0.into_iter().map(Into::into).collect(),
                     ),
                     metadata: serde_json::json!({ "$event-sorcery-ffi": 1 }),
                 })
@@ -223,32 +263,46 @@ pub unsafe extern "C" fn es_commit(
 }
 
 #[unsafe(no_mangle)]
-/// Closes a store returned by [`es_open`]. A null pointer is a no-op.
+/// Closes a store returned by [`es_open`]. A null pointer or null handle is a no-op.
 ///
 /// # Safety
 ///
-/// A non-null `store` must be an unclosed pointer returned by [`es_open`].
-pub unsafe extern "C" fn es_close(store: *mut EsStore) -> i32 {
+/// A non-null handle must have been returned by [`es_open`].
+pub unsafe extern "C" fn es_close(store: *mut *mut EsStore) -> i32 {
+    let Some(store) = (unsafe { store.as_mut() }) else {
+        return ES_OK;
+    };
     if store.is_null() {
         return ES_OK;
     }
-    match catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(store)) })) {
+    let owned = std::mem::replace(store, ptr::null_mut());
+    match catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(owned)) })) {
         Ok(()) => ES_OK,
         Err(_) => ES_ERR_PANIC,
     }
 }
 
 #[unsafe(no_mangle)]
-/// Releases an engine-owned output buffer. A null buffer is a no-op.
+/// Releases an engine-owned output buffer. A null pointer or null buffer is a no-op.
 ///
 /// # Safety
 ///
-/// A non-null buffer must have been returned by this library and not yet freed.
-pub unsafe extern "C" fn es_buf_free(buffer: EsBuf) {
+/// A non-null buffer must have been returned by this library.
+pub unsafe extern "C" fn es_buf_free(buffer: *mut EsBuf) {
+    let Some(buffer) = (unsafe { buffer.as_mut() }) else {
+        return;
+    };
     if buffer.ptr.is_null() {
         return;
     }
-    let slice = ptr::slice_from_raw_parts_mut(buffer.ptr, buffer.len);
+    let owned = std::mem::replace(
+        buffer,
+        EsBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        },
+    );
+    let slice = ptr::slice_from_raw_parts_mut(owned.ptr, owned.len);
     unsafe { drop(Box::from_raw(slice)) };
 }
 
@@ -276,7 +330,10 @@ impl From<EngineError> for AbiError {
     }
 }
 
-fn decode<T: DeserializeOwned>(buffer: EsBuf) -> Result<T, AbiError> {
+fn decode<T: DeserializeOwned>(buffer: *const EsBuf) -> Result<T, AbiError> {
+    let Some(buffer) = (unsafe { buffer.as_ref() }) else {
+        return Err(AbiError::Decode("input buffer is null".to_string()));
+    };
     if buffer.ptr.is_null() {
         return Err(AbiError::Decode("input buffer is null".to_string()));
     }
@@ -326,14 +383,11 @@ fn event_to_wire(event: SerializedEvent) -> Result<StoredEventWire, AbiError> {
         u64::try_from(event.sequence).map_err(|error| AbiError::Storage(error.to_string()))?,
         event.event_type,
         event.event_version,
-        payload,
+        OpaqueBytes(payload),
     ))
 }
 
-fn decode_open_options(buffer: EsBuf) -> Result<OpenOptions, AbiError> {
-    if buffer.ptr.is_null() {
-        return Err(AbiError::Decode("options buffer is null".to_string()));
-    }
+fn decode_open_options(buffer: *const EsBuf) -> Result<OpenOptions, AbiError> {
     let (version, path, busy_timeout_ms, pool_size, runtime_threads): (
         u8,
         String,
@@ -416,11 +470,13 @@ mod tests {
         };
 
         assert_eq!(
-            unsafe { es_open(options, &raw mut store, &raw mut error) },
+            unsafe { es_open(&raw const options, &raw mut store, &raw mut error) },
             ES_OK
         );
         assert!(!store.is_null());
-        assert_eq!(unsafe { es_close(store) }, ES_OK);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+        assert!(store.is_null());
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
         assert!(error.ptr.is_null());
     }
 
@@ -437,17 +493,12 @@ mod tests {
             ptr: ptr::null_mut(),
             len: 0,
         };
+        let options = EsBuf {
+            ptr: options.as_mut_ptr(),
+            len: options.len(),
+        };
         assert_eq!(
-            unsafe {
-                es_open(
-                    EsBuf {
-                        ptr: options.as_mut_ptr(),
-                        len: options.len(),
-                    },
-                    &raw mut store,
-                    &raw mut error,
-                )
-            },
+            unsafe { es_open(&raw const options, &raw mut store, &raw mut error,) },
             ES_OK
         );
 
@@ -459,54 +510,40 @@ mod tests {
                 "ffi-test",
                 "one",
                 0_u64,
-                vec![("Created", "1.0", payload.clone())],
+                vec![("Created", "1.0", OpaqueBytes(payload.clone()))],
             ),
             &mut commit,
         )
         .unwrap();
+        let commit = EsBuf {
+            ptr: commit.as_mut_ptr(),
+            len: commit.len(),
+        };
         assert_eq!(
-            unsafe {
-                es_commit(
-                    store,
-                    EsBuf {
-                        ptr: commit.as_mut_ptr(),
-                        len: commit.len(),
-                    },
-                    &raw mut error,
-                )
-            },
+            unsafe { es_commit(store, &raw const commit, &raw mut error) },
             ES_OK
         );
         assert_eq!(
-            unsafe {
-                es_commit(
-                    store,
-                    EsBuf {
-                        ptr: commit.as_mut_ptr(),
-                        len: commit.len(),
-                    },
-                    &raw mut error,
-                )
-            },
+            unsafe { es_commit(store, &raw const commit, &raw mut error) },
             ES_ERR_CONFLICT
         );
-        unsafe { es_buf_free(error) };
-        error = EsBuf {
-            ptr: ptr::null_mut(),
-            len: 0,
-        };
+        unsafe { es_buf_free(&raw mut error) };
+        assert!(error.ptr.is_null());
+        assert_eq!(error.len, 0);
+        unsafe { es_buf_free(&raw mut error) };
 
         let mut version_request = Vec::new();
         ciborium::into_writer(&(1_u8, "ffi-test", "one"), &mut version_request).unwrap();
+        let version_request = EsBuf {
+            ptr: version_request.as_mut_ptr(),
+            len: version_request.len(),
+        };
         let mut current_version = 0_u64;
         assert_eq!(
             unsafe {
                 es_current_version(
                     store,
-                    EsBuf {
-                        ptr: version_request.as_mut_ptr(),
-                        len: version_request.len(),
-                    },
+                    &raw const version_request,
                     &raw mut current_version,
                     &raw mut error,
                 )
@@ -517,32 +554,32 @@ mod tests {
 
         let mut load = Vec::new();
         ciborium::into_writer(&(1_u8, "ffi-test", "one", Option::<u64>::None), &mut load).unwrap();
+        let load = EsBuf {
+            ptr: load.as_mut_ptr(),
+            len: load.len(),
+        };
         let mut output = EsBuf {
             ptr: ptr::null_mut(),
             len: 0,
         };
         assert_eq!(
-            unsafe {
-                es_load_stream(
-                    store,
-                    EsBuf {
-                        ptr: load.as_mut_ptr(),
-                        len: load.len(),
-                    },
-                    &raw mut output,
-                    &raw mut error,
-                )
-            },
+            unsafe { es_load_stream(store, &raw const load, &raw mut output, &raw mut error,) },
             ES_OK
         );
         let bytes = unsafe { std::slice::from_raw_parts(output.ptr, output.len) };
         let response: StoredEventsWire = ciborium::from_reader(Cursor::new(bytes)).unwrap();
         assert_eq!(
             response,
-            (1, vec![(1, "Created".into(), "1.0".into(), payload)])
+            (
+                1,
+                vec![(1, "Created".into(), "1.0".into(), OpaqueBytes(payload))]
+            )
         );
 
-        unsafe { es_buf_free(output) };
-        assert_eq!(unsafe { es_close(store) }, ES_OK);
+        unsafe { es_buf_free(&raw mut output) };
+        assert!(output.ptr.is_null());
+        assert_eq!(output.len, 0);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+        assert!(store.is_null());
     }
 }
