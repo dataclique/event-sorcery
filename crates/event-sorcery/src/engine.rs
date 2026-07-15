@@ -14,23 +14,48 @@ use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 
 /// Identifies one serialized aggregate event stream at the storage boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StreamIdentity {
-    /// Stable aggregate kind stored with every event and snapshot.
-    pub(crate) aggregate_type: String,
-    /// Serialized domain identifier for one aggregate instance.
-    pub(crate) aggregate_id: String,
+pub struct StreamIdentity {
+    aggregate_type: String,
+    aggregate_id: String,
 }
 
 /// Snapshot payload written atomically with the events it covers.
-pub(crate) struct SnapshotUpdate {
-    /// Serialized aggregate state.
-    pub(crate) aggregate: Value,
-    /// Aggregate schema version used to decode the snapshot.
-    pub(crate) snapshot_version: usize,
+impl StreamIdentity {
+    /// Creates a storage-boundary identity from serialized aggregate values.
+    pub fn new(aggregate_type: impl Into<String>, aggregate_id: impl Into<String>) -> Self {
+        Self {
+            aggregate_type: aggregate_type.into(),
+            aggregate_id: aggregate_id.into(),
+        }
+    }
+
+    fn matches(&self, event: &SerializedEvent) -> bool {
+        self.aggregate_type == event.aggregate_type && self.aggregate_id == event.aggregate_id
+    }
+
+    fn from_event(event: &SerializedEvent) -> Self {
+        Self::new(&event.aggregate_type, &event.aggregate_id)
+    }
+}
+
+/// Snapshot payload written atomically with the events it covers.
+pub struct SnapshotUpdate {
+    aggregate: Value,
+    snapshot_version: usize,
+}
+
+impl SnapshotUpdate {
+    /// Creates a serialized snapshot update at its aggregate schema version.
+    pub fn new(aggregate: Value, snapshot_version: usize) -> Self {
+        Self {
+            aggregate,
+            snapshot_version,
+        }
+    }
 }
 
 /// One atomic event-store commit, including optional snapshot and job intent.
-pub(crate) struct CommitRequest<'events> {
+pub struct CommitRequest<'events> {
     stream: StreamIdentity,
     events: &'events [SerializedEvent],
     snapshot: Option<SnapshotUpdate>,
@@ -39,13 +64,13 @@ pub(crate) struct CommitRequest<'events> {
 
 /// Shared serialized SQLite persistence engine.
 #[derive(Clone)]
-pub(crate) struct Engine {
+pub struct Engine {
     pool: SqlitePool,
 }
 
 /// Failures produced by serialized engine operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum EngineError {
+pub enum EngineError {
     #[error("optimistic lock error: aggregate has been modified concurrently")]
     OptimisticLock,
     #[error("snapshot update was requested without persisted events")]
@@ -65,27 +90,9 @@ pub(crate) enum EngineError {
     JobFlush(#[from] crate::job::JobStoreError),
 }
 
-impl StreamIdentity {
-    /// Creates a storage-boundary identity from serialized aggregate values.
-    pub(crate) fn new(aggregate_type: impl Into<String>, aggregate_id: impl Into<String>) -> Self {
-        Self {
-            aggregate_type: aggregate_type.into(),
-            aggregate_id: aggregate_id.into(),
-        }
-    }
-
-    fn matches(&self, event: &SerializedEvent) -> bool {
-        self.aggregate_type == event.aggregate_type && self.aggregate_id == event.aggregate_id
-    }
-
-    fn from_event(event: &SerializedEvent) -> Self {
-        Self::new(&event.aggregate_type, &event.aggregate_id)
-    }
-}
-
 impl<'events> CommitRequest<'events> {
     /// Starts a commit for one stream and its proposed events.
-    pub(crate) fn new(stream: StreamIdentity, events: &'events [SerializedEvent]) -> Self {
+    pub fn new(stream: StreamIdentity, events: &'events [SerializedEvent]) -> Self {
         Self {
             stream,
             events,
@@ -96,7 +103,7 @@ impl<'events> CommitRequest<'events> {
 
     #[must_use]
     /// Attaches the snapshot covered by this commit's events.
-    pub(crate) fn with_snapshot(mut self, snapshot: SnapshotUpdate) -> Self {
+    pub fn with_snapshot(mut self, snapshot: SnapshotUpdate) -> Self {
         self.snapshot = Some(snapshot);
         self
     }
@@ -111,17 +118,24 @@ impl<'events> CommitRequest<'events> {
 
 impl Engine {
     /// Creates an engine over a migrated SQLite pool.
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
-    /// Loads one stream, optionally after an exclusive sequence checkpoint.
+    /// Migrates the engine's existing SQLite schema.
+    pub async fn migrate(&self) -> Result<(), SqliteJobError> {
+        sqlite_es::MIGRATOR
+            .run(&self.pool)
+            .await
+            .map_err(|error| SqliteJobError::Sql(error.into()))?;
+        Ok(())
+    }
 
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
-    pub(crate) async fn claim_job<Decide, Won>(
+    pub async fn claim_job<Decide, Won>(
         &self,
         job_id: &str,
         decide: Decide,
@@ -142,7 +156,7 @@ impl Engine {
         .await
     }
 
-    pub(crate) async fn renew_job(
+    pub async fn renew_job(
         &self,
         job_id: &str,
         claim_seq: i64,
@@ -170,7 +184,7 @@ impl Engine {
         }
     }
 
-    pub(crate) async fn enqueue_job(
+    pub async fn enqueue_job(
         &self,
         event: SerializedEvent,
         payload: String,
@@ -197,7 +211,7 @@ impl Engine {
         }
     }
 
-    pub(crate) async fn load_events(
+    pub async fn load_events(
         &self,
         stream: &StreamIdentity,
         after_sequence: Option<usize>,
@@ -255,7 +269,7 @@ impl Engine {
     }
 
     /// Loads the current snapshot for one stream when present.
-    pub(crate) async fn load_snapshot(
+    pub async fn load_snapshot(
         &self,
         stream: &StreamIdentity,
     ) -> Result<Option<SerializedSnapshot>, EngineError> {
@@ -359,7 +373,7 @@ impl Engine {
     }
 
     /// Atomically persists a validated event, snapshot, and durable-job batch.
-    pub(crate) async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
+    pub async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
         let CommitRequest {
             stream,
             events,
@@ -681,6 +695,29 @@ mod tests {
 
     use super::*;
     use crate::job::{JobId, JobKind, WorkerId, enqueued_event, pending_seed_payload, plan_claim};
+
+    #[tokio::test]
+    async fn migrate_initializes_the_existing_sqlite_schema() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let engine = Engine::new(pool);
+
+        engine.migrate().await.unwrap();
+
+        let stream = StreamIdentity::new("engine-migration-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "engine-migration-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        engine
+            .commit(CommitRequest::new(stream, std::slice::from_ref(&event)))
+            .await
+            .unwrap();
+    }
 
     fn serialized_event(stream: &StreamIdentity, sequence: usize) -> SerializedEvent {
         SerializedEvent {

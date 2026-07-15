@@ -74,11 +74,7 @@ impl EventBackend for SqliteBackend {
     }
 
     async fn migrate(&self) -> Result<(), SqliteJobError> {
-        sqlite_es::MIGRATOR
-            .run(self.engine.pool())
-            .await
-            .map_err(|error| SqliteJobError::Sql(error.into()))?;
-        Ok(())
+        self.engine.migrate().await
     }
 
     async fn claim<Decide, Won>(

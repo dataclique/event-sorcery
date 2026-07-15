@@ -122,10 +122,7 @@ impl PersistedEventRepository for SqliteEventRepository {
         let mut request =
             CommitRequest::new(stream, events).with_jobs(pending_jobs.take_requests());
         if let Some((_, aggregate, snapshot_version)) = snapshot_update {
-            request = request.with_snapshot(SnapshotUpdate {
-                aggregate,
-                snapshot_version,
-            });
+            request = request.with_snapshot(SnapshotUpdate::new(aggregate, snapshot_version));
         }
 
         self.engine.commit(request).await?;
