@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT COUNT(*)\n            FROM events\n            WHERE aggregate_type = 'job' AND aggregate_id = ?1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "COUNT(*)",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8583cfb342c957b555202f46b51ece85ef7fb66072ce129cb3f2f65b12c6e0e3"
+}

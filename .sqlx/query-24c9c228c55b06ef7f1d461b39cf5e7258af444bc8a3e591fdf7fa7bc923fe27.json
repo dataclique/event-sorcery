@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT COUNT(*)\n            FROM events\n            WHERE aggregate_type = ?1 AND aggregate_id = ?2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "COUNT(*)",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "24c9c228c55b06ef7f1d461b39cf5e7258af444bc8a3e591fdf7fa7bc923fe27"
+}
