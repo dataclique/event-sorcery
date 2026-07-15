@@ -11,7 +11,10 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 ciborium = "0.2.2"
+cqrs-es.workspace = true
 event-sorcery = { path = "../event-sorcery" }
+serde.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 
