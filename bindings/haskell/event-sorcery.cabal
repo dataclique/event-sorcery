@@ -1,0 +1,45 @@
+cabal-version: 3.0
+name:          event-sorcery
+version:       0.4.0.0
+synopsis:      Type-driven event sourcing over the event-sorcery engine
+description:
+  An idiomatic Haskell binding over the shared event-sorcery Rust engine.
+
+homepage:      https://github.com/dataclique/event-sorcery
+bug-reports:   https://github.com/dataclique/event-sorcery/issues
+license:       MIT
+license-file:  LICENSE
+build-type:    Simple
+category:      Database
+
+common strict
+  default-language:   GHC2024
+  default-extensions:
+    BlockArguments
+    CApiFFI
+    DeriveAnyClass
+    DerivingVia
+    DuplicateRecordFields
+    GADTs
+    LinearTypes
+    MultiParamTypeClasses
+    MultilineStrings
+    NoFieldSelectors
+    NoImplicitPrelude
+    OverloadedRecordDot
+    OverloadedStrings
+    RankNTypes
+    StandaloneDeriving
+    TypeApplications
+    TypeFamilies
+    TypeFamilyDependencies
+    UndecidableInstances
+
+  ghc-options:
+    -Wall -Wcompat -Werror -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wmissing-export-lists
+    -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+
+library
+  import:        strict
+  build-depends: base >=4.18 && <5

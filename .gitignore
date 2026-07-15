@@ -5,6 +5,7 @@
 .conflict-side-*/
 .DS_Store
 .sqlx/
+.stack-work/
 .tmp/
 .worktrees/
 result

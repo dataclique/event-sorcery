@@ -1,7 +1,9 @@
 [package]
 name = "sqlite-es"
-version = "0.1.2"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
 
 [dependencies]
 cqrs-es.workspace = true
