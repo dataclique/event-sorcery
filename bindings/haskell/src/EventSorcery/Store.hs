@@ -4,6 +4,7 @@ module EventSorcery.Store (
   executeCommand,
   loadEntity,
   mkStore,
+  snapshotEntity,
 ) where
 
 import Control.Monad (foldM)
@@ -26,15 +27,19 @@ import EventSorcery.Job (
   commitWithJob,
   jobType,
  )
+import EventSorcery.Snapshot (StoredSnapshot (StoredSnapshot))
+import EventSorcery.Snapshot qualified as Snapshot
 import EventSorcery.Stream (
   ProposedEvent (ProposedEvent),
   ReplayError,
   StoredEvent (StoredEvent),
   StreamIdentity,
   StreamKey,
+  StreamVersion (StreamVersion),
   commit,
   loadStream,
   replay,
+  resume,
   streamKeyIdentity,
  )
 import Prelude (
@@ -58,6 +63,7 @@ data StoreError entity
   | StoreReplayFailed (ReplayError entity)
   | StoreCommandRejected (Aggregate.CommandError entity)
   | StoreDecisionRejected (Aggregate.ApplyError entity)
+  | StoreSnapshotDecodeFailed Word64 Aggregate.DecodeCause
 
 
 deriving stock instance
@@ -87,6 +93,33 @@ data CommitPlan entity
 
 mkStore :: Engine.Store -> IO JobId -> Store entity
 mkStore = Store
+
+
+snapshotEntity
+  :: forall entity
+   . EventSourced entity
+  => Store entity
+  -> StreamKey entity
+  -> IO (Either (StoreError entity) (Maybe entity))
+snapshotEntity store@(Store engine _) key = do
+  loaded <- loadCurrent store key
+
+  case loaded of
+    Left failure -> pure (Left failure)
+    Right (Nothing, _) -> pure (Right Nothing)
+    Right (Just entity, sequence) -> do
+      stored <-
+        Snapshot.storeSnapshot
+          engine
+          ( Snapshot.snapshotWrite
+              (streamKeyIdentity key)
+              sequence
+              (Aggregate.encodeSnapshot entity)
+          )
+
+      pure case stored of
+        Left failure -> Left (StoreEngineFailed failure)
+        Right _ -> Right (Just entity)
 
 
 loadEntity
@@ -134,6 +167,20 @@ loadCurrent
   -> StreamKey entity
   -> IO (Either (StoreError entity) (Maybe entity, Word64))
 loadCurrent (Store engine _) key = do
+  loadedSnapshot <- Snapshot.loadSnapshot engine (streamKeyIdentity key)
+
+  case loadedSnapshot of
+    Left failure -> pure (Left (StoreEngineFailed failure))
+    Right Nothing -> replayFullStream engine key
+    Right (Just snapshot) -> resumeSnapshot engine key snapshot
+
+
+replayFullStream
+  :: EventSourced entity
+  => Engine.Store
+  -> StreamKey entity
+  -> IO (Either (StoreError entity) (Maybe entity, Word64))
+replayFullStream engine key = do
   loaded <- loadStream engine (streamKeyIdentity key) Nothing
 
   pure do
@@ -141,6 +188,29 @@ loadCurrent (Store engine _) key = do
     entity <- first StoreReplayFailed (replay key events)
 
     pure (entity, latestSequence events)
+
+
+resumeSnapshot
+  :: EventSourced entity
+  => Engine.Store
+  -> StreamKey entity
+  -> StoredSnapshot
+  -> IO (Either (StoreError entity) (Maybe entity, Word64))
+resumeSnapshot engine key (StoredSnapshot sequence _ payload) =
+  case Aggregate.decodeSnapshot payload of
+    Left failure ->
+      pure (Left (StoreSnapshotDecodeFailed sequence failure))
+    Right entity -> do
+      loaded <- loadStream engine (streamKeyIdentity key) (Just sequence)
+
+      pure do
+        events <- first StoreEngineFailed loaded
+        resumed <-
+          first
+            StoreReplayFailed
+            (resume key (StreamVersion sequence) entity events)
+
+        pure (Just resumed, latestSequenceAfter sequence events)
 
 
 prepareEffect
@@ -240,6 +310,10 @@ jobKind _ = JobKind (jobType @job)
 
 
 latestSequence :: [StoredEvent] -> Word64
-latestSequence = foldl' useSequence 0
+latestSequence = latestSequenceAfter 0
+
+
+latestSequenceAfter :: Word64 -> [StoredEvent] -> Word64
+latestSequenceAfter = foldl' useSequence
   where
     useSequence _ (StoredEvent sequence _ _ _) = sequence

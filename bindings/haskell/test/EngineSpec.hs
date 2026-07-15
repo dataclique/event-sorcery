@@ -38,16 +38,16 @@ main = do
   exerciseAbiCompatibility
 
   version <- abiVersion
-  if version == 3
+  if version == 4
     then exerciseStore
     else error "unexpected engine ABI version"
 
 
 exerciseAbiCompatibility :: IO ()
 exerciseAbiCompatibility =
-  if supportsAbiVersion 3
-    && supportsAbiVersion 4
-    && not (supportsAbiVersion 2)
+  if supportsAbiVersion 4
+    && supportsAbiVersion 5
+    && not (supportsAbiVersion 3)
     && not (supportsAbiVersion 65_539)
     then pure ()
     else error "engine ABI compatibility was classified incorrectly"

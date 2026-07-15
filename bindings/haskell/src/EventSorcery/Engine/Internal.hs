@@ -218,7 +218,7 @@ supportedAbiMajor = 0
 
 
 minimumSupportedAbiMinor :: Word32
-minimumSupportedAbiMinor = 3
+minimumSupportedAbiMinor = 4
 
 
 abiMinorMask :: Word32

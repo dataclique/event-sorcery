@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            DELETE FROM snapshots\n            WHERE aggregate_type = ?1 AND aggregate_id = ?2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "d8d7bee8e77c496d9510ccb0a632d70da8f647b4ce32ca7526a5e18d709d1d65"
+}
