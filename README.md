@@ -21,11 +21,13 @@ you need lower-level control.
 
 ## Status
 
-Extracted from internal services
+Developed and maintained by Data Clique Software Design FZCO. The original Rust
+implementation was extracted from service work for ST0x
 ([st0x.issuance](https://github.com/ST0x-Technology/st0x.issuance) and
-[st0x.liquidity](https://github.com/ST0x-Technology/st0x.liquidity)) and made
-standalone so they can share the implementation. External users are welcome but
-the API surface is still in flux.
+[st0x.liquidity](https://github.com/ST0x-Technology/st0x.liquidity)) so those
+services could share the implementation. The Haskell binding and the 0.4.0
+multi-language engine are owned and developed by Data Clique Software Design
+FZCO. External users are welcome, but the API surface is still in flux.
 
 ## Examples
 
