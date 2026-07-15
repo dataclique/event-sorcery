@@ -54,10 +54,10 @@ tests =
     , testCase "accepts compatible ABI minors only" $
         assertBool
           "engine ABI compatibility was classified incorrectly"
-          ( supportsAbiVersion 2
-              && supportsAbiVersion 3
-              && not (supportsAbiVersion 1)
-              && not (supportsAbiVersion 65_538)
+          ( supportsAbiVersion 3
+              && supportsAbiVersion 4
+              && not (supportsAbiVersion 2)
+              && not (supportsAbiVersion 65_539)
           )
     , testCase "commits and loads opaque event bytes" $
         withStore $ \store -> do

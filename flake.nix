@@ -43,10 +43,12 @@
         haskellPackages = pkgs.haskell.packages.ghc914;
         haskellBindingBase = haskellPackages.callCabal2nix "event-sorcery" ./bindings/haskell {
           event_sorcery_ffi = ffiEngine;
+          linear-base = pkgs.haskell.lib.dontCheck haskellPackages.linear-base;
         };
         haskellBinding = haskellBindingBase.overrideAttrs (old: {
           buildInputs = (old.buildInputs or [ ]) ++ [ ffiEngine ];
           configureFlags = (old.configureFlags or [ ]) ++ [
+            "-fdevelopment"
             "--extra-include-dirs=${ffiEngine}/include"
             "--extra-lib-dirs=${ffiEngine}/lib"
           ];
