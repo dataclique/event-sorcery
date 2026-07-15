@@ -126,13 +126,15 @@ pub use dispatch::{
     uneventful,
 };
 pub use engine::{
-    CommitRequest, Engine, EngineError, LoadedEvent, LoadedPayload, SnapshotUpdate, StreamIdentity,
+    CommitRequest, Engine, EngineError, JobSeed, LoadedEvent, LoadedPayload, SnapshotUpdate,
+    StreamIdentity,
 };
 pub use job::{
     DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,
 };
 pub use job_backend::{
-    Backoff, Clock, EventStoreBackend, JobEnqueueError, JobRuntime, JobWorkerConfig, run_job,
+    Backoff, ClaimedJob, Clock, EventStoreBackend, JobClaimHandle, JobClaimResult, JobEnqueueError,
+    JobLeaseResult, JobRuntime, JobRuntimeError, JobSettlementResult, JobWorkerConfig, run_job,
 };
 pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
