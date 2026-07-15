@@ -90,6 +90,27 @@ pub enum EngineError {
     JobFlush(#[from] crate::job::JobStoreError),
 }
 
+/// An erased durable-job intent committed atomically with domain events.
+pub struct JobSeed(EnqueueRequest);
+
+impl JobSeed {
+    /// Builds a language-neutral seed for the existing event-sourced job aggregate.
+    #[must_use]
+    pub fn new(
+        job_id: crate::JobId,
+        kind: impl Into<String>,
+        payload: Value,
+        run_at_ms: i64,
+    ) -> Self {
+        Self(EnqueueRequest {
+            job_id,
+            kind: crate::job::JobKind::new(kind),
+            payload,
+            run_at_ms,
+        })
+    }
+}
+
 impl<'events> CommitRequest<'events> {
     /// Starts a commit for one stream and its proposed events.
     pub fn new(stream: StreamIdentity, events: &'events [SerializedEvent]) -> Self {
@@ -112,6 +133,14 @@ impl<'events> CommitRequest<'events> {
     /// Attaches durable jobs that must commit atomically with the events.
     pub(crate) fn with_jobs(mut self, jobs: Vec<EnqueueRequest>) -> Self {
         self.jobs = jobs;
+        self
+    }
+
+    /// Includes one durable job intent in the same event-store transaction.
+    #[must_use]
+    pub fn with_job(mut self, job: JobSeed) -> Self {
+        let JobSeed(request) = job;
+        self.jobs.push(request);
         self
     }
 }
@@ -864,7 +893,6 @@ mod tests {
         ));
         assert_eq!(engine.load_events(&job_stream, None).await.unwrap(), events);
     }
-
     #[tokio::test]
     async fn cancelled_immediate_transaction_does_not_poison_the_pooled_connection() {
         let pool = SqlitePoolOptions::new()
@@ -899,5 +927,43 @@ mod tests {
             .execute(&mut *connection)
             .await
             .expect("close verification transaction");
+    }
+    #[tokio::test]
+    async fn language_neutral_job_seed_commits_with_domain_events() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
+        let engine = Engine::new(pool);
+        let stream = StreamIdentity::new("engine-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "engine-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        let job_id = JobId::new();
+        let request =
+            CommitRequest::new(stream, std::slice::from_ref(&event)).with_job(JobSeed::new(
+                job_id,
+                "haskell-test",
+                serde_json::json!([0, 1, 255]),
+                1_000,
+            ));
+
+        engine.commit(request).await.unwrap();
+
+        let job_stream = StreamIdentity::new("job", job_id.to_string());
+        assert_eq!(
+            engine
+                .load_events(&job_stream, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            ["JobEnqueued"]
+        );
     }
 }
