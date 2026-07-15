@@ -1,0 +1,31 @@
+[package]
+name = "event-sorcery-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+ciborium = "0.2.2"
+event-sorcery = { path = "../event-sorcery" }
+sqlx.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+cbindgen = "=0.29.2"
+
+[lints.rust]
+unsafe_code = "allow"
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
