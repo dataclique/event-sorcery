@@ -4,14 +4,18 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.Either (Either (Right), isLeft)
 import EventSorcery.Engine.Codec (
+  decodeEngineError,
   decodeStoredEvents,
   encodeCommit,
+  encodeCurrentVersion,
   encodeLoadStream,
   encodeOpenOptions,
  )
 import EventSorcery.Engine.Protocol (
   AggregateId (..),
   AggregateType (..),
+  EngineError (..),
+  ErrorClass (ConflictError),
   EventType (..),
   EventVersion (..),
   OpenOptions (..),
@@ -40,6 +44,8 @@ tests =
             encodeLoadStream stream Nothing @?= expectedLoadWithoutCursor
         , testCase "load stream after a cursor" $
             encodeLoadStream stream (Just 256) @?= expectedLoadAfterCursor
+        , testCase "current version" $
+            encodeCurrentVersion stream @?= expectedCurrentVersion
         , testCase "commit" $
             encodeCommit stream 0 [proposed] @?= expectedCommit
         ]
@@ -47,6 +53,9 @@ tests =
         "decoding"
         [ testCase "stored event" $
             decodeStoredEvents stored @?= Right [expectedStored]
+        , testCase "engine error" $
+            decodeEngineError conflict
+              @?= Right (EngineError ConflictError "optimistic conflict")
         , testCase "rejects trailing bytes" $
             assertBool
               "trailing byte must fail"
@@ -168,6 +177,26 @@ expectedLoadAfterCursor =
     , 25
     , 1
     , 0 -- uint16(256) cursor
+    ]
+
+
+expectedCurrentVersion :: ByteString
+expectedCurrentVersion =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 103
+    , 97
+    , 99
+    , 99
+    , 111
+    , 117
+    , 110
+    , 116 -- text(7) account
+    , 99
+    , 111
+    , 110
+    , 101 -- text(3) one
     ]
 
 
@@ -298,4 +327,33 @@ arrayPayload =
     , 130
     , 0
     , 1 -- array(2), not bytes(2)
+    ]
+
+
+conflict :: ByteString
+conflict =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 2 -- conflict error
+    , 115
+    , 111
+    , 112
+    , 116
+    , 105
+    , 109
+    , 105
+    , 115
+    , 116
+    , 105
+    , 99
+    , 32
+    , 99
+    , 111
+    , 110
+    , 102
+    , 108
+    , 105
+    , 99
+    , 116 -- text(19) optimistic conflict
     ]

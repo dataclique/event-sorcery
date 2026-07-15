@@ -1,6 +1,8 @@
 module EventSorcery.Engine.Codec (
+  decodeEngineError,
   decodeStoredEvents,
   encodeCommit,
+  encodeCurrentVersion,
   encodeLoadStream,
   encodeOpenOptions,
 ) where
@@ -11,6 +13,7 @@ import Codec.CBOR.Decoding (
   decodeListLen,
   decodeString,
   decodeWord,
+  decodeWord32,
   decodeWord64,
  )
 import Codec.CBOR.Encoding (
@@ -30,10 +33,12 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Foldable (foldMap)
 import Data.Maybe (maybe)
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import EventSorcery.Engine.Protocol (
   AggregateId (..),
   AggregateType (..),
+  EngineError (..),
+  ErrorClass (..),
   EventType (..),
   EventVersion (..),
   OpenOptions (..),
@@ -80,6 +85,15 @@ encodeLoadStream stream after =
       <> maybe encodeNull encodeWord64 after
 
 
+encodeCurrentVersion :: StreamIdentity -> ByteString
+encodeCurrentVersion stream =
+  toStrictByteString $
+    encodeListLen 3
+      <> encodeWord 1
+      <> encodeAggregateType stream.aggregateType
+      <> encodeAggregateId stream.aggregateId
+
+
 encodeCommit :: StreamIdentity -> Word64 -> [ProposedEvent] -> ByteString
 encodeCommit stream expected events =
   toStrictByteString $
@@ -107,6 +121,37 @@ decodeStoredEvents bytes =
     Right (remaining, events)
       | LazyByteString.null remaining -> Right events
       | otherwise -> Left "trailing bytes after stored events"
+
+
+decodeEngineError :: ByteString -> Either String EngineError
+decodeEngineError bytes =
+  case deserialiseFromBytes decodeEngineErrorWire (LazyByteString.fromStrict bytes) of
+    Left failure -> Left (show failure)
+    Right (remaining, engineError)
+      | LazyByteString.null remaining -> Right engineError
+      | otherwise -> Left "trailing bytes after engine error"
+
+
+decodeEngineErrorWire :: Decoder s EngineError
+decodeEngineErrorWire = do
+  expectListLength 3
+  version <- decodeWord
+  if version == 1
+    then do
+      errorClass <- decodeErrorClass <$> decodeWord32
+      EngineError errorClass <$> decodeString
+    else fail "unsupported engine-error format version"
+
+
+decodeErrorClass :: Word32 -> ErrorClass
+decodeErrorClass 1 = DecodeError
+decodeErrorClass 2 = ConflictError
+decodeErrorClass 3 = JobError
+decodeErrorClass 4 = StorageError
+decodeErrorClass 5 = StateError
+decodeErrorClass 6 = AbiMismatch
+decodeErrorClass 100 = PanicError
+decodeErrorClass value = UnknownError value
 
 
 decodeStoredEventsWire :: Decoder s [StoredEvent]
