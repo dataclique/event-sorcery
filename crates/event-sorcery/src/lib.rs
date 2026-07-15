@@ -85,6 +85,7 @@
 
 pub(crate) mod dependency;
 mod dispatch;
+pub(crate) mod engine;
 mod job;
 mod job_backend;
 mod job_sqlite;

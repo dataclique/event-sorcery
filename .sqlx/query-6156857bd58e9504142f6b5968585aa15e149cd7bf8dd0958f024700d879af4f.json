@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                INSERT OR REPLACE INTO snapshots (\n                    aggregate_type,\n                    aggregate_id,\n                    last_sequence,\n                    snapshot_version,\n                    payload,\n                    timestamp\n                )\n                VALUES (\n                    ?1,\n                    ?2,\n                    ?3,\n                    ?4,\n                    ?5,\n                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')\n                )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "6156857bd58e9504142f6b5968585aa15e149cd7bf8dd0958f024700d879af4f"
+}

@@ -1,0 +1,98 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                        SELECT aggregate_type,\n                               aggregate_id,\n                               sequence,\n                               event_type,\n                               event_version,\n                               payload AS \"payload: String\",\n                               metadata AS \"metadata: String\"\n                        FROM events\n                        WHERE aggregate_type = ?1\n                        ORDER BY sequence\n                        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "aggregate_type",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "aggregate_type"
+          }
+        }
+      },
+      {
+        "name": "aggregate_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "aggregate_id"
+          }
+        }
+      },
+      {
+        "name": "sequence",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "sequence"
+          }
+        }
+      },
+      {
+        "name": "event_type",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "event_type"
+          }
+        }
+      },
+      {
+        "name": "event_version",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "event_version"
+          }
+        }
+      },
+      {
+        "name": "payload: String",
+        "ordinal": 5,
+        "type_info": "Null",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "payload"
+          }
+        }
+      },
+      {
+        "name": "metadata: String",
+        "ordinal": 6,
+        "type_info": "Null",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "metadata"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d1c3210612a24af9fc04cc0d1b8612b39799289d35baa94db025caf7611b15e5"
+}
