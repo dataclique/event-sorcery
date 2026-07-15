@@ -83,6 +83,29 @@ impl JobPayload {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredJob {
+    job_type: String,
+    payload: JobPayload,
+}
+
+impl StoredJob {
+    pub fn new(job_type: impl Into<String>, payload: JobPayload) -> Self {
+        Self {
+            job_type: job_type.into(),
+            payload,
+        }
+    }
+
+    pub fn job_type(&self) -> &str {
+        &self.job_type
+    }
+
+    pub const fn payload(&self) -> &JobPayload {
+        &self.payload
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LeaseToken(u64);
 

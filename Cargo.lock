@@ -530,6 +530,9 @@ dependencies = [
 [[package]]
 name = "event-sorcery-engine"
 version = "0.4.0"
+dependencies = [
+ "ciborium",
+]
 
 [[package]]
 name = "find-msvc-tools"
