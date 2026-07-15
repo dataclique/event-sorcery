@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                SELECT MAX(sequence) AS \"sequence?: i64\"\n                FROM events\n                WHERE aggregate_type = ?1\n                  AND aggregate_id = ?2\n                ",
+  "describe": {
+    "columns": [
+      {
+        "name": "sequence?: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "4d7bad65f4441d98a87a97cf251c6f71485fa5b5e22a38ef47f4cee6c9f88e84"
+}
