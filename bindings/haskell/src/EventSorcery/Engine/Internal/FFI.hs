@@ -5,7 +5,16 @@ module EventSorcery.Engine.Internal.FFI (
   esBufFree,
   esClose,
   esCommit,
+  esCommitWithJob,
   esCurrentVersion,
+  esJobAcknowledge,
+  esJobClaim,
+  esJobDeadLetter,
+  esJobDefer,
+  esJobEnqueue,
+  esJobPoll,
+  esJobRenew,
+  esJobRetry,
   esLoadStream,
   esOpen,
 ) where
@@ -77,6 +86,48 @@ foreign import capi safe "event_sorcery.h es_current_version"
 
 foreign import capi safe "event_sorcery.h es_commit"
   esCommit :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_commit_with_job"
+  esCommitWithJob :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_job_enqueue"
+  esJobEnqueue :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_job_poll"
+  esJobPoll :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_job_claim"
+  esJobClaim :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_job_renew"
+  esJobRenew :: Ptr EsStore -> Ptr EsBuf -> Ptr Word8 -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_job_ack"
+  esJobAcknowledge
+    :: Ptr EsStore -> Ptr EsBuf -> Ptr Word8 -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_job_retry"
+  esJobRetry :: Ptr EsStore -> Ptr EsBuf -> Ptr Word8 -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_job_defer"
+  esJobDefer :: Ptr EsStore -> Ptr EsBuf -> Ptr Word8 -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_job_dead_letter"
+  esJobDeadLetter
+    :: Ptr EsStore
+    -> Ptr EsBuf
+    -> Ptr Word8
+    -> Ptr EsBuf
+    -> IO CInt
 
 
 foreign import capi safe "event_sorcery.h es_hs_close"

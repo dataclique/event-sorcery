@@ -45,6 +45,7 @@ library
   hs-source-dirs:  src
   exposed-modules:
     EventSorcery.Engine
+    EventSorcery.Job
     EventSorcery.Stream
 
   other-modules:
@@ -53,10 +54,13 @@ library
 
   extra-libraries: event_sorcery_ffi
   build-depends:
-    , base        >=4.18 && <5
+    , base          >=4.18 && <5
     , bytestring
     , cborg
+    , conduit
+    , linear-base
     , text
+    , transformers
 
 test-suite codec-spec
   import:         strict
@@ -78,3 +82,16 @@ test-suite engine-spec
     , base           >=4.18 && <5
     , bytestring
     , event-sorcery
+
+test-suite job-spec
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        JobSpec.hs
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring
+    , conduit
+    , event-sorcery
+    , linear-base
+    , transformers

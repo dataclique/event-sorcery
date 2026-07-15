@@ -45,10 +45,10 @@ main = do
 
 exerciseAbiCompatibility :: IO ()
 exerciseAbiCompatibility =
-  if supportsAbiVersion 2
-    && supportsAbiVersion 3
-    && not (supportsAbiVersion 1)
-    && not (supportsAbiVersion 65_538)
+  if supportsAbiVersion 3
+    && supportsAbiVersion 4
+    && not (supportsAbiVersion 2)
+    && not (supportsAbiVersion 65_539)
     then pure ()
     else error "engine ABI compatibility was classified incorrectly"
 
