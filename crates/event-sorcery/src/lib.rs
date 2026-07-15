@@ -125,12 +125,13 @@ pub use dispatch::{
     OriginDeliveryError, OriginPort, Reconciliation, Settled, SettledFailure, There, fx,
     uneventful,
 };
-pub use engine::{CommitRequest, Engine, EngineError, SnapshotUpdate, StreamIdentity};
+pub use engine::{CommitRequest, Engine, EngineError, JobSeed, SnapshotUpdate, StreamIdentity};
 pub use job::{
     DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,
 };
 pub use job_backend::{
-    Backoff, Clock, EventStoreBackend, JobEnqueueError, JobRuntime, JobWorkerConfig, run_job,
+    Backoff, ClaimedJob, Clock, EventStoreBackend, JobClaimHandle, JobClaimResult, JobEnqueueError,
+    JobLeaseResult, JobRuntime, JobRuntimeError, JobSettlementResult, JobWorkerConfig, run_job,
 };
 pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
