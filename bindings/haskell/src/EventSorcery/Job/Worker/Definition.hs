@@ -3,8 +3,11 @@ module EventSorcery.Job.Worker.Definition (
   JobRunError (..),
   JobRunResult (..),
   JobWorker (..),
+  RenewalSchedule (..),
   jobWorker,
   mkAttemptLimit,
+  renewalSchedule,
+  renewingJobWorker,
 ) where
 
 import Data.Maybe (Maybe (..))
@@ -22,7 +25,7 @@ import EventSorcery.Job.Execution (
   DurableJob (JobInput),
   JobAttempt,
  )
-import Prelude (Eq, Show, otherwise, (==))
+import Prelude (Eq, IO, Show, otherwise, (==))
 
 
 newtype AttemptLimit = AttemptLimit Word32
@@ -37,6 +40,13 @@ data JobWorker job = JobWorker
   , attemptLimit :: AttemptLimit
   , retryAt :: JobAttempt -> JobInstant
   , input :: JobInput job
+  , leaseRenewal :: Maybe RenewalSchedule
+  }
+
+
+data RenewalSchedule = RenewalSchedule
+  { waitBeforeRenewal :: IO ()
+  , renewalDeadline :: IO JobInstant
   }
 
 
@@ -74,4 +84,22 @@ jobWorker
   -> (JobAttempt -> JobInstant)
   -> JobInput job
   -> JobWorker job
-jobWorker = JobWorker
+jobWorker store workerId leaseDuration claimBudget attemptLimit retryAt input =
+  JobWorker
+    { store
+    , workerId
+    , leaseDuration
+    , claimBudget
+    , attemptLimit
+    , retryAt
+    , input
+    , leaseRenewal = Nothing
+    }
+
+
+renewalSchedule :: IO () -> IO JobInstant -> RenewalSchedule
+renewalSchedule = RenewalSchedule
+
+
+renewingJobWorker :: JobWorker job -> RenewalSchedule -> JobWorker job
+renewingJobWorker worker schedule = worker {leaseRenewal = Just schedule}

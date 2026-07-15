@@ -3,8 +3,11 @@ module EventSorcery.Job.Worker (
   JobRunError (..),
   JobRunResult (..),
   JobWorker,
+  RenewalSchedule,
   jobWorker,
   mkAttemptLimit,
+  renewalSchedule,
+  renewingJobWorker,
   runJobOnce,
 ) where
 
@@ -15,8 +18,11 @@ import EventSorcery.Job.Worker.Definition (
   JobRunError (..),
   JobRunResult (..),
   JobWorker,
+  RenewalSchedule,
   jobWorker,
   mkAttemptLimit,
+  renewalSchedule,
+  renewingJobWorker,
  )
 import EventSorcery.Job.Worker.Internal (
   genericSettlement,
