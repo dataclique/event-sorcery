@@ -15,6 +15,11 @@ concurrency:
 permissions:
   contents: read
 
+# Nix is installed with nix-quick-install-action. The shared Cachix warms each
+# job before builds begin, while cache-nix-action preserves the runner's Nix
+# store between runs. Cachix remains optional so fork PRs without the org token
+# still build against cache.nixos.org.
+
 jobs:
   cargo:
     name: ${{ matrix.name }}
@@ -40,16 +45,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@b6e4494ddccc51b56de1189099089a3514a69245
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
         with:
-          extra-conf: |
+          nix_version: "2.31.2"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
 
-      - uses: DeterminateSystems/magic-nix-cache-action@5626df0a8b8f16cb060538f6d3041500a2d10cb0
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc  # v15
+        continue-on-error: true
+        with:
+          name: data-cartel-public
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
+        with:
+          primary-key: nix-${{ runner.os }}-cargo-${{ matrix.name }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-cargo-${{ matrix.name }}-
+          gc-max-store-size-linux: 5G
 
       - name: Cache cargo artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/git/db/
@@ -68,13 +87,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@b6e4494ddccc51b56de1189099089a3514a69245
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
         with:
-          extra-conf: |
+          nix_version: "2.31.2"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
 
-      - uses: DeterminateSystems/magic-nix-cache-action@5626df0a8b8f16cb060538f6d3041500a2d10cb0
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc  # v15
+        continue-on-error: true
+        with:
+          name: data-cartel-public
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - name: pre-commit hooks
-        run: nix develop -c pre-commit run --all-files
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
+        with:
+          primary-key: nix-${{ runner.os }}-hooks-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-hooks-
+          gc-max-store-size-linux: 5G
+
+      - name: prek hooks
+        run: nix develop -c prek run --all-files

@@ -27,6 +27,7 @@
               cargo-expand
               cargo-nextest
               nushell
+              prek
             ]
             ++ rainix.devShells.${system}.default.buildInputs;
         };
