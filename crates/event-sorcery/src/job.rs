@@ -775,6 +775,12 @@ pub(crate) struct PendingPush {
     pub(crate) delay: Option<Duration>,
 }
 
+/// Encoded pending jobs whose source buffer remains intact until commit.
+pub(crate) struct PreparedPendingJobs {
+    requests: Vec<EnqueueRequest>,
+    prepared_count: Option<usize>,
+}
+
 /// Type erasure over a dispatched [`crate::Job`] so the pending buffer can
 /// hold heterogeneous job types; the flush needs only the routing kind and
 /// the encoded payload.
@@ -793,15 +799,31 @@ impl<J: crate::Job> ErasedJob for J {
     }
 }
 
+impl PreparedPendingJobs {
+    /// Moves the encoded requests into an engine commit while retaining their source buffer.
+    pub(crate) fn take_requests(&mut self) -> Vec<EnqueueRequest> {
+        std::mem::take(&mut self.requests)
+    }
+
+    /// Removes the retained source pushes included in a successful database commit.
+    pub(crate) fn mark_committed(self) {
+        if let Some(prepared_count) = self.prepared_count {
+            PENDING_JOBS.with(|pending| {
+                drop(pending.borrow_mut().drain(..prepared_count));
+            });
+        }
+    }
+}
+
 tokio::task_local! {
-    /// Per-command buffer of jobs awaiting flush, drained by the event
-    /// repository inside its commit transaction.
+    /// Per-command buffer of jobs awaiting flush, cleared by the event
+    /// repository only after its commit transaction succeeds.
     static PENDING_JOBS: RefCell<Vec<PendingPush>>;
 }
 
 /// Runs `command_execution` with a fresh pending-job scope active, so the
 /// framework's [`buffer`] of a [`crate::Effect::Dispatch`] lands where the
-/// repository's flush ([`take_pending`]) will drain it -- in the same
+/// repository's flush ([`prepare_pending`]) will clear it -- in the same
 /// transaction that commits the events.
 pub(crate) async fn with_pending_scope<Output>(
     command_execution: impl Future<Output = Output>,
@@ -828,30 +850,52 @@ pub(crate) fn buffer(push: PendingPush) -> Result<(), DispatchNotBuffered> {
 #[error("job dispatch buffered outside a command scope")]
 pub struct DispatchNotBuffered;
 
-/// Drains the per-command pending-job buffer into [`EnqueueRequest`]s (each
-/// keeping the [`JobId`] minted at push time, with a resolved `run_at`). A no-op
-/// when no buffer scope is active or it is empty.
-pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
-    let pending = PENDING_JOBS
-        .try_with(|buffer| buffer.borrow_mut().drain(..).collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    pending
-        .into_iter()
-        .map(|push| {
-            Ok(EnqueueRequest {
-                job_id: push.job_id,
-                kind: push.job.kind(),
-                payload: push.job.encode()?,
-                run_at_ms: resolve_run_at_ms(push.delay)?,
+/// Prepares the pending jobs without clearing their task-local buffer. The
+/// caller marks the batch committed only after its database transaction
+/// succeeds, leaving the original pushes available after any failure.
+pub(crate) fn prepare_pending() -> Result<PreparedPendingJobs, JobStoreError> {
+    let prepared = PENDING_JOBS.try_with(|pending| {
+        let pending = pending.borrow();
+        let requests = pending
+            .iter()
+            .map(|push| {
+                Ok(EnqueueRequest {
+                    job_id: push.job_id,
+                    kind: push.job.kind(),
+                    payload: push.job.encode()?,
+                    run_at_ms: resolve_run_at_ms(push.delay)?,
+                })
             })
-        })
-        .collect()
+            .collect::<Result<Vec<_>, JobStoreError>>()?;
+        Ok::<_, JobStoreError>((requests, pending.len()))
+    });
+    let (requests, prepared_count) = match prepared {
+        Ok(prepared) => {
+            let (requests, prepared_count) = prepared?;
+            (requests, Some(prepared_count))
+        }
+        Err(_) => (Vec::new(), None),
+    };
+    Ok(PreparedPendingJobs {
+        requests,
+        prepared_count,
+    })
+}
+
+/// Drains the per-command pending-job buffer into [`EnqueueRequest`]s for tests
+/// and non-transactional inspection. Production commits use [`prepare_pending`]
+/// so a failed transaction cannot lose buffered jobs.
+#[cfg(test)]
+pub(crate) fn take_pending() -> Result<Vec<EnqueueRequest>, JobStoreError> {
+    let mut pending = prepare_pending()?;
+    let requests = pending.take_requests();
+    pending.mark_committed();
+    Ok(requests)
 }
 
 /// Builds a standalone [`EnqueueRequest`] (fresh ULID, resolved `run_at`) for one
 /// `job` -- the reactor / poller / job-chain enqueue path, without the
-/// command-scope buffer [`take_pending`] drains.
+/// command-scope buffer [`prepare_pending`] flushes.
 pub(crate) fn enqueue_request<J: StandaloneJob>(
     job: &J,
     delay: Option<Duration>,
@@ -888,6 +932,18 @@ mod tests {
     enum SendEmail {
         Welcome { address: String },
         Reminder { address: String },
+    }
+
+    struct TestPendingJob;
+
+    impl ErasedJob for TestPendingJob {
+        fn kind(&self) -> JobKind {
+            JobKind::new("test-pending")
+        }
+
+        fn encode(&self) -> Result<serde_json::Value, serde_json::Error> {
+            Ok(serde_json::json!({ "payload": "test" }))
+        }
     }
 
     impl StandaloneJob for SendEmail {
@@ -928,6 +984,40 @@ mod tests {
             attempt: 0,
             claims,
         }
+    }
+
+    #[tokio::test]
+    async fn committed_batch_preserves_jobs_buffered_after_prepare() {
+        with_pending_scope(async {
+            let committed_job_id = JobId::new();
+            buffer(PendingPush {
+                job_id: committed_job_id,
+                job: Box::new(TestPendingJob),
+                delay: None,
+            })
+            .unwrap();
+
+            let mut prepared = prepare_pending().unwrap();
+            let committed = prepared.take_requests();
+            assert_eq!(committed.len(), 1);
+            assert_eq!(committed[0].job_id, committed_job_id);
+
+            let later_job_id = JobId::new();
+            tokio::task::yield_now().await;
+            buffer(PendingPush {
+                job_id: later_job_id,
+                job: Box::new(TestPendingJob),
+                delay: None,
+            })
+            .unwrap();
+
+            prepared.mark_committed();
+
+            let remaining = take_pending().unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].job_id, later_job_id);
+        })
+        .await;
     }
 
     #[test]
