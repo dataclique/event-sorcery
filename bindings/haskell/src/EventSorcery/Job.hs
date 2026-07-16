@@ -2,11 +2,13 @@ module EventSorcery.Job (
   ClaimBudget (..),
   ClaimedJob,
   DeadReason (..),
+  Job (..),
   JobClaimDetails (..),
   JobClaimReference,
   JobClaimResult (..),
+  JobDecodeError (..),
   JobExecutionRoute (..),
-  JobId (..),
+  JobId,
   JobInstant (..),
   JobKind (..),
   JobLeaseResult (..),
@@ -22,6 +24,9 @@ module EventSorcery.Job (
   deadLetterJob,
   deferJob,
   enqueueJob,
+  jobIdText,
+  jobType,
+  mkJobId,
   pollJobs,
   renewJob,
   retryJob,
@@ -88,6 +93,14 @@ import EventSorcery.Engine.Internal.FFI (
   esJobRenew,
   esJobRetry,
  )
+import EventSorcery.Job.Definition (
+  Job (..),
+  JobDecodeError (..),
+  JobId (..),
+  jobIdText,
+  jobType,
+  mkJobId,
+ )
 import EventSorcery.Stream (
   ProposedEvent,
   StreamIdentity (..),
@@ -118,10 +131,6 @@ import Prelude (
   (==),
   (>>=),
  )
-
-
-newtype JobId = JobId Text
-  deriving stock (Eq, Show)
 
 
 newtype JobKind = JobKind Text
