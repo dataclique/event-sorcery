@@ -1227,6 +1227,20 @@ mod tests {
         }
     }
 
+    async fn queue_row_count(engine: &Engine, job_id: &JobId) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            r"
+            SELECT COUNT(*)
+            FROM job_queue
+            WHERE view_id = ?1
+            ",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(engine.pool())
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn bounded_stream_reads_stop_at_the_requested_page_size() {
         let engine = Engine::new(create_test_pool().await.unwrap());
@@ -1532,6 +1546,7 @@ mod tests {
         engine.commit(request).await.unwrap();
 
         assert_eq!(engine.load_events(&stream, None).await.unwrap(), [event]);
+        assert_eq!(queue_row_count(&engine, &job_id).await, 1);
         let job_stream = StreamIdentity::new("job", job_id.to_string());
         assert_eq!(
             engine
@@ -1571,6 +1586,7 @@ mod tests {
             EngineError::JobFlush(JobStoreError::InvalidInstant(i64::MAX))
         ));
         assert!(engine.load_events(&stream, None).await.unwrap().is_empty());
+        assert_eq!(queue_row_count(&engine, &job_id).await, 0);
         let job_stream = StreamIdentity::new("job", job_id.to_string());
         assert!(
             engine

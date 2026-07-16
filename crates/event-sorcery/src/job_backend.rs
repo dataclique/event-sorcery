@@ -1106,10 +1106,9 @@ macro_rules! build_supervised_worker {
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
-    use sqlx::SqlitePool;
-
     use sqlite_es::insert_serialized_events_batch;
     use sqlite_es::testing::create_test_pool;
+    use sqlx::SqlitePool;
 
     use crate::job::{EnqueueRequest, JobKind, Label, enqueued_event, pending_seed_payload};
 
