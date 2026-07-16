@@ -87,30 +87,16 @@ impl EventBackend for SqliteBackend {
         Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won> + Send,
         Won: Send,
     {
-        let mut connection = self.pool.acquire().await?;
-
-        // BEGIN IMMEDIATE takes the write lock up front, so the row we re-read is
-        // the row we write -- and the events UNIQUE is the sole claim arbiter.
-        if let Err(error) = sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
-            .await
-        {
-            return Err(SqliteJobError::Sql(error));
-        }
-
-        // `?`-free between BEGIN and the closer: every path runs COMMIT/ROLLBACK.
-        let outcome = claim_in_txn(&mut connection, job_id, decide).await;
-        let commit = matches!(outcome, Ok(ClaimOutcome::Won(_) | ClaimOutcome::Abandoned));
-        let closer = if commit { "COMMIT" } else { "ROLLBACK" };
-        match sqlx::query(closer).execute(&mut *connection).await {
-            // A failed COMMIT means the claim did not durably happen.
-            Err(error) if commit => Err(SqliteJobError::Sql(error)),
-            Err(error) => {
-                tracing::warn!(target: "cqrs", ?error, job_id, "job claim rollback failed");
-                outcome
-            }
-            Ok(_) => outcome,
-        }
+        immediate_transaction(&self.pool, job_id, async move |connection| {
+            let outcome = claim_in_txn(connection, job_id, decide).await?;
+            Ok(match outcome {
+                ClaimOutcome::Won(won) => TransactionOutcome::Commit(ClaimOutcome::Won(won)),
+                ClaimOutcome::Abandoned => TransactionOutcome::Commit(ClaimOutcome::Abandoned),
+                ClaimOutcome::Contended => TransactionOutcome::Rollback(ClaimOutcome::Contended),
+                ClaimOutcome::Skip => TransactionOutcome::Rollback(ClaimOutcome::Skip),
+            })
+        })
+        .await
     }
 
     async fn renew(
@@ -157,6 +143,43 @@ impl EventBackend for SqliteBackend {
                 tx.rollback().await?;
                 Err(error)
             }
+        }
+    }
+}
+
+enum TransactionOutcome<Output> {
+    Commit(Output),
+    Rollback(Output),
+}
+
+async fn immediate_transaction<Output, Operation>(
+    pool: &SqlitePool,
+    job_id: &str,
+    operation: Operation,
+) -> Result<Output, SqliteJobError>
+where
+    Operation:
+        AsyncFnOnce(&mut SqliteConnection) -> Result<TransactionOutcome<Output>, SqliteJobError>,
+{
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let outcome = operation(&mut transaction).await;
+
+    match outcome {
+        Ok(TransactionOutcome::Commit(output)) => {
+            transaction.commit().await?;
+            Ok(output)
+        }
+        Ok(TransactionOutcome::Rollback(output)) => {
+            if let Err(error) = transaction.rollback().await {
+                tracing::warn!(target: "cqrs", ?error, job_id, "job claim rollback failed");
+            }
+            Ok(output)
+        }
+        Err(claim_error) => {
+            if let Err(error) = transaction.rollback().await {
+                tracing::warn!(target: "cqrs", ?error, job_id, "job claim rollback failed");
+            }
+            Err(claim_error)
         }
     }
 }
@@ -246,4 +269,52 @@ async fn write_row(
     .execute(connection)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_immediate_transaction_does_not_poison_the_pooled_connection() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        let operation_started = Arc::new(Notify::new());
+        let task_pool = pool.clone();
+        let task_started = Arc::clone(&operation_started);
+
+        let claim = tokio::spawn(async move {
+            immediate_transaction(&task_pool, "cancelled-job", async move |_connection| {
+                task_started.notify_one();
+                pending::<Result<TransactionOutcome<()>, SqliteJobError>>().await
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), operation_started.notified())
+            .await
+            .expect("claim entered its transaction");
+        claim.abort();
+        assert!(claim.await.expect_err("claim was cancelled").is_cancelled());
+
+        let mut connection = pool.acquire().await.expect("reacquire connection");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .expect("cancelled transaction was rolled back before pool reuse");
+        sqlx::query("ROLLBACK")
+            .execute(&mut *connection)
+            .await
+            .expect("close verification transaction");
+    }
 }

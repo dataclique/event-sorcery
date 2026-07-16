@@ -361,7 +361,7 @@ impl Default for JobWorkerConfig {
             max_concurrency: 8,
             lease_duration: Duration::from_secs(30),
             renew_interval: Duration::from_secs(10),
-            execution_timeout: Duration::from_secs(300),
+            execution_timeout: Duration::from_mins(5),
             max_attempts: 5,
             max_claims: 50,
             backoff: Backoff::default(),
@@ -386,7 +386,7 @@ impl Default for Backoff {
         Self {
             base: Duration::from_secs(1),
             factor: 2.0,
-            cap: Duration::from_secs(300),
+            cap: Duration::from_mins(5),
         }
     }
 }
@@ -1119,7 +1119,7 @@ mod tests {
         let runtime = JobRuntime::build(pool.clone()).await.unwrap();
 
         let job_id = runtime
-            .enqueue_with_delay(TestJob { n: 1 }, std::time::Duration::from_secs(3600))
+            .enqueue_with_delay(TestJob { n: 1 }, std::time::Duration::from_hours(1))
             .await
             .unwrap();
 
@@ -1199,7 +1199,7 @@ mod tests {
             &JobWorkerConfig::default(),
             &Clock::system(),
             &ctx,
-            AckPlan::Deferred(Duration::from_secs(3600)),
+            AckPlan::Deferred(Duration::from_hours(1)),
         )
         .await;
 

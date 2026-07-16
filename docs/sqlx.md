@@ -55,6 +55,22 @@ let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM my_table")
 Note the type annotation on the `let` binding -- the runtime function doesn't
 infer return types like the macro does.
 
+## Cancellation and pooled transactions
+
+Never pair a raw `BEGIN` statement on a `PoolConnection` with a later raw
+`COMMIT` or `ROLLBACK`. An async future can be cancelled between those
+statements. Dropping the future then returns a connection with an open
+transaction to the pool, where the next borrower sees
+`cannot start a
+transaction within a transaction` and the retained writer lock
+makes other connections see `SQLITE_BUSY`.
+
+Use `Pool::begin` or `Pool::begin_with` and keep the returned SQLx `Transaction`
+guard alive across the whole operation. Its drop path queues a rollback before
+the pooled connection is reused. The durable-job claim uses
+`begin_with("BEGIN IMMEDIATE")` because it needs the write lock at transaction
+start.
+
 ## `SQLITE_BUSY` vs `SQLITE_BUSY_SNAPSHOT`
 
 `sqlx-sqlite` surfaces both as the _extended_ result code via
