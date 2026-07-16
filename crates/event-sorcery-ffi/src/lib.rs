@@ -9,14 +9,14 @@ use std::time::Duration;
 use cqrs_es::persist::SerializedEvent;
 use event_sorcery::{
     CommitRequest, DeadReason, Engine, EngineError, JobClaimHandle, JobClaimResult, JobId,
-    JobLeaseResult, JobRuntime, JobSeed, JobSettlementResult, StreamIdentity,
+    JobLeaseResult, JobRuntime, JobSeed, JobSettlementResult, SnapshotWrite, StreamIdentity,
 };
 use serde::de::{DeserializeOwned, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 const ABI_MAJOR: u32 = 0;
-const ABI_MINOR: u32 = 3;
+const ABI_MINOR: u32 = 4;
 const ES_OK: i32 = 0;
 const ES_ERR_DECODE: i32 = 1;
 const ES_ERR_CONFLICT: i32 = 2;
@@ -36,6 +36,7 @@ type CommitWithJobWire = (
 );
 type StoredEventWire = (u64, String, String, OpaqueBytes);
 type StoredEventsWire = (u8, Vec<StoredEventWire>);
+type StoredSnapshotWire = (u8, Option<(u64, u64, OpaqueBytes)>);
 type JobClaimWire = (
     u8,
     u8,
@@ -295,6 +296,122 @@ pub unsafe extern "C" fn es_commit_with_job(
 }
 
 #[unsafe(no_mangle)]
+/// Loads an opaque snapshot through the shared engine.
+///
+/// # Safety
+///
+/// `store` must be open. `request` must reference readable bytes.
+/// `out_snapshot` must be writable, and `out_error` must be null or writable.
+pub unsafe extern "C" fn es_snapshot_load(
+    store: *mut EsStore,
+    request: *const EsBuf,
+    out_snapshot: *mut EsBuf,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let Some(store) = (unsafe { store.as_ref() }) else {
+        return write_error(out_error, AbiError::State("store is null".to_string()));
+    };
+    ffi_call(Some(store), out_error, || {
+        if out_snapshot.is_null() {
+            return Err(AbiError::State("out_snapshot is null".to_string()));
+        }
+        let (version, aggregate_type, aggregate_id): (u8, String, String) = decode(request)?;
+        require_version(version)?;
+        let stream = StreamIdentity::new(aggregate_type, aggregate_id);
+        let snapshot = store
+            .runtime
+            .block_on(store.engine.load_snapshot(&stream))
+            .map_err(AbiError::from)?
+            .map(|snapshot| -> Result<(u64, u64, OpaqueBytes), AbiError> {
+                Ok((
+                    u64::try_from(snapshot.current_sequence)
+                        .map_err(|error| AbiError::Storage(error.to_string()))?,
+                    u64::try_from(snapshot.current_snapshot)
+                        .map_err(|error| AbiError::Storage(error.to_string()))?,
+                    OpaqueBytes(opaque_json_bytes(snapshot.aggregate, "snapshot")?),
+                ))
+            })
+            .transpose()?;
+        let response: StoredSnapshotWire = (1, snapshot);
+        unsafe { out_snapshot.write(encode(&response)?) };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Stores an opaque snapshot through the shared engine.
+///
+/// # Safety
+///
+/// `store` must be open. `request` must reference readable bytes.
+/// `out_version` must be writable, and `out_error` must be null or writable.
+pub unsafe extern "C" fn es_snapshot_store(
+    store: *mut EsStore,
+    request: *const EsBuf,
+    out_version: *mut u64,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let Some(store) = (unsafe { store.as_ref() }) else {
+        return write_error(out_error, AbiError::State("store is null".to_string()));
+    };
+    ffi_call(Some(store), out_error, || {
+        if out_version.is_null() {
+            return Err(AbiError::State("out_version is null".to_string()));
+        }
+        let (version, aggregate_type, aggregate_id, sequence, payload): (
+            u8,
+            String,
+            String,
+            u64,
+            OpaqueBytes,
+        ) = decode(request)?;
+        require_version(version)?;
+        let sequence =
+            usize::try_from(sequence).map_err(|error| AbiError::Decode(error.to_string()))?;
+        let aggregate = serde_json::Value::Array(payload.0.into_iter().map(Into::into).collect());
+        let stream = StreamIdentity::new(aggregate_type, aggregate_id);
+        let snapshot_version = store
+            .runtime
+            .block_on(
+                store
+                    .engine
+                    .store_snapshot(&stream, SnapshotWrite::new(aggregate, sequence)),
+            )
+            .map_err(AbiError::from)?;
+        let snapshot_version = u64::try_from(snapshot_version)
+            .map_err(|error| AbiError::Storage(error.to_string()))?;
+        unsafe { out_version.write(snapshot_version) };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Discards an opaque snapshot through the shared engine.
+///
+/// # Safety
+///
+/// `store` must be open. `request` must reference readable bytes, and
+/// `out_error` must be null or writable.
+pub unsafe extern "C" fn es_snapshot_discard(
+    store: *mut EsStore,
+    request: *const EsBuf,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let Some(store) = (unsafe { store.as_ref() }) else {
+        return write_error(out_error, AbiError::State("store is null".to_string()));
+    };
+    ffi_call(Some(store), out_error, || {
+        let (version, aggregate_type, aggregate_id): (u8, String, String) = decode(request)?;
+        require_version(version)?;
+        let stream = StreamIdentity::new(aggregate_type, aggregate_id);
+        store
+            .runtime
+            .block_on(store.engine.discard_snapshot(&stream))
+            .map_err(AbiError::from)
+    })
+}
+
+#[unsafe(no_mangle)]
 /// Enqueues an erased job payload through the retained event-sourced job runtime.
 ///
 /// # Safety
@@ -409,7 +526,7 @@ pub unsafe extern "C" fn es_job_claim(
                     Some(OpaqueBytes(encode_bytes(&claim.handle)?)),
                     Some(attempt),
                     Some(route),
-                    Some(OpaqueBytes(json_payload_bytes(claim.payload)?)),
+                    Some(OpaqueBytes(opaque_json_bytes(claim.payload, "job")?)),
                 )
             }
             JobClaimResult::Abandoned => (1, 1, None, None, None, None),
@@ -679,18 +796,20 @@ fn decode_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, AbiError> {
     ciborium::from_reader(Cursor::new(bytes)).map_err(|error| AbiError::Decode(error.to_string()))
 }
 
-fn json_payload_bytes(payload: serde_json::Value) -> Result<Vec<u8>, AbiError> {
+fn opaque_json_bytes(payload: serde_json::Value, resource: &str) -> Result<Vec<u8>, AbiError> {
     let serde_json::Value::Array(bytes) = payload else {
-        return Err(AbiError::Storage(
-            "claimed foreign job payload is not opaque bytes".to_string(),
-        ));
+        return Err(AbiError::Storage(format!(
+            "foreign {resource} payload is not opaque bytes"
+        )));
     };
     bytes
         .into_iter()
         .map(|byte| {
             byte.as_u64()
                 .and_then(|byte| u8::try_from(byte).ok())
-                .ok_or_else(|| AbiError::Storage("invalid foreign job payload byte".to_string()))
+                .ok_or_else(|| {
+                    AbiError::Storage(format!("invalid foreign {resource} payload byte"))
+                })
         })
         .collect()
 }
@@ -1047,6 +1166,91 @@ mod tests {
         assert_eq!(output.len, 0);
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
         assert!(store.is_null());
+    }
+
+    #[test]
+    fn snapshot_exports_round_trip_opaque_payloads() {
+        let mut error = EsBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let mut store = open_test_store(&mut error);
+        let (_commit_bytes, commit) = input(&(
+            1_u8,
+            "ffi-snapshot-test",
+            "one",
+            0_u64,
+            vec![("Created", "1.0", OpaqueBytes(vec![1]))],
+        ));
+        assert_eq!(
+            unsafe { es_commit(store, &raw const commit, &raw mut error) },
+            ES_OK
+        );
+
+        let payload = vec![0_u8, 1, 2, 255];
+        let (_store_bytes, store_request) = input(&(
+            1_u8,
+            "ffi-snapshot-test",
+            "one",
+            1_u64,
+            OpaqueBytes(payload.clone()),
+        ));
+        let mut snapshot_version = 0_u64;
+        assert_eq!(
+            unsafe {
+                es_snapshot_store(
+                    store,
+                    &raw const store_request,
+                    &raw mut snapshot_version,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(snapshot_version, 1);
+
+        let (_load_bytes, load_request) = input(&(1_u8, "ffi-snapshot-test", "one"));
+        let mut output = EsBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            unsafe {
+                es_snapshot_load(
+                    store,
+                    &raw const load_request,
+                    &raw mut output,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(output.ptr, output.len) };
+        let snapshot: StoredSnapshotWire = ciborium::from_reader(Cursor::new(bytes)).unwrap();
+        assert_eq!(snapshot, (1, Some((1, 1, OpaqueBytes(payload)))));
+        unsafe { es_buf_free(&raw mut output) };
+
+        assert_eq!(
+            unsafe { es_snapshot_discard(store, &raw const load_request, &raw mut error) },
+            ES_OK
+        );
+        assert_eq!(
+            unsafe {
+                es_snapshot_load(
+                    store,
+                    &raw const load_request,
+                    &raw mut output,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(output.ptr, output.len) };
+        let snapshot: StoredSnapshotWire = ciborium::from_reader(Cursor::new(bytes)).unwrap();
+        assert_eq!(snapshot, (1, None));
+
+        unsafe { es_buf_free(&raw mut output) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
     }
 
     #[test]

@@ -54,6 +54,22 @@ impl SnapshotUpdate {
     }
 }
 
+/// Snapshot state stored independently after replaying through a known sequence.
+pub struct SnapshotWrite {
+    aggregate: Value,
+    last_sequence: usize,
+}
+
+impl SnapshotWrite {
+    /// Creates a snapshot write covering events through `last_sequence`.
+    pub fn new(aggregate: Value, last_sequence: usize) -> Self {
+        Self {
+            aggregate,
+            last_sequence,
+        }
+    }
+}
+
 /// One atomic event-store commit, including optional snapshot and job intent.
 pub struct CommitRequest<'events> {
     stream: StreamIdentity,
@@ -75,6 +91,10 @@ pub enum EngineError {
     OptimisticLock,
     #[error("snapshot update was requested without persisted events")]
     EmptySnapshotUpdate,
+    #[error("snapshot sequence {proposed} is beyond the current stream version {current}")]
+    SnapshotBeyondCurrentVersion { proposed: usize, current: usize },
+    #[error("snapshot version is exhausted")]
+    SnapshotVersionExhausted,
     #[error("commit event stream {actual:?} does not match requested stream {expected:?}")]
     StreamIdentityMismatch {
         expected: StreamIdentity,
@@ -245,56 +265,8 @@ impl Engine {
         stream: &StreamIdentity,
         after_sequence: Option<usize>,
     ) -> Result<Vec<SerializedEvent>, EngineError> {
-        let rows = match after_sequence {
-            None => {
-                sqlx::query_as!(
-                    StoredEventRow,
-                    r#"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload AS "payload: String",
-                           metadata AS "metadata: String"
-                    FROM events
-                    WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                    ORDER BY sequence
-                    "#,
-                    stream.aggregate_type,
-                    stream.aggregate_id,
-                )
-                .fetch_all(&self.pool)
-                .await?
-            }
-            Some(after_sequence) => {
-                let after_sequence = i64::try_from(after_sequence)?;
-                sqlx::query_as!(
-                    StoredEventRow,
-                    r#"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload AS "payload: String",
-                           metadata AS "metadata: String"
-                    FROM events
-                    WHERE aggregate_type = ?1
-                      AND aggregate_id = ?2
-                      AND sequence > ?3
-                    ORDER BY sequence
-                    "#,
-                    stream.aggregate_type,
-                    stream.aggregate_id,
-                    after_sequence,
-                )
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
-
-        rows.into_iter().map(SerializedEvent::try_from).collect()
+        let mut connection = self.pool.acquire().await?;
+        load_events_on(&mut connection, stream, after_sequence).await
     }
 
     /// Loads the current snapshot for one stream when present.
@@ -302,23 +274,50 @@ impl Engine {
         &self,
         stream: &StreamIdentity,
     ) -> Result<Option<SerializedSnapshot>, EngineError> {
-        let row = sqlx::query_as!(
-            StoredSnapshotRow,
+        let mut connection = self.pool.acquire().await?;
+        load_snapshot_on(&mut connection, stream).await
+    }
+
+    pub async fn store_snapshot(
+        &self,
+        stream: &StreamIdentity,
+        snapshot: SnapshotWrite,
+    ) -> Result<usize, EngineError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query!("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+        let result = store_snapshot_in_transaction(&mut connection, stream, snapshot).await;
+        let commit = result.is_ok();
+        let close = if commit {
+            sqlx::query!("COMMIT").execute(&mut *connection).await
+        } else {
+            sqlx::query!("ROLLBACK").execute(&mut *connection).await
+        };
+
+        match close {
+            Err(error) if commit => Err(EngineError::Sql(error)),
+            Err(error) => {
+                tracing::warn!(target: "cqrs", ?error, "snapshot rollback failed");
+                result
+            }
+            Ok(_) => result,
+        }
+    }
+
+    pub async fn discard_snapshot(&self, stream: &StreamIdentity) -> Result<(), EngineError> {
+        sqlx::query!(
             r#"
-            SELECT aggregate_id,
-                   last_sequence,
-                   snapshot_version,
-                   payload AS "payload: String"
-            FROM snapshots
+            DELETE FROM snapshots
             WHERE aggregate_type = ?1 AND aggregate_id = ?2
             "#,
             stream.aggregate_type,
             stream.aggregate_id,
         )
-        .fetch_optional(&self.pool)
+        .execute(&self.pool)
         .await?;
 
-        row.map(SerializedSnapshot::try_from).transpose()
+        Ok(())
     }
 
     /// Replays matching events through a bounded feed without materializing the full result.
@@ -517,6 +516,152 @@ where
     }
 }
 
+async fn load_events_on(
+    connection: &mut SqliteConnection,
+    stream: &StreamIdentity,
+    after_sequence: Option<usize>,
+) -> Result<Vec<SerializedEvent>, EngineError> {
+    let rows = match after_sequence {
+        None => {
+            sqlx::query_as!(
+                StoredEventRow,
+                r#"
+                    SELECT aggregate_type,
+                           aggregate_id,
+                           sequence,
+                           event_type,
+                           event_version,
+                           payload AS "payload: String",
+                           metadata AS "metadata: String"
+                    FROM events
+                    WHERE aggregate_type = ?1 AND aggregate_id = ?2
+                    ORDER BY sequence
+                    "#,
+                stream.aggregate_type,
+                stream.aggregate_id,
+            )
+            .fetch_all(connection)
+            .await?
+        }
+        Some(after_sequence) => {
+            let after_sequence = i64::try_from(after_sequence)?;
+            sqlx::query_as!(
+                StoredEventRow,
+                r#"
+                    SELECT aggregate_type,
+                           aggregate_id,
+                           sequence,
+                           event_type,
+                           event_version,
+                           payload AS "payload: String",
+                           metadata AS "metadata: String"
+                    FROM events
+                    WHERE aggregate_type = ?1
+                      AND aggregate_id = ?2
+                      AND sequence > ?3
+                    ORDER BY sequence
+                    "#,
+                stream.aggregate_type,
+                stream.aggregate_id,
+                after_sequence,
+            )
+            .fetch_all(connection)
+            .await?
+        }
+    };
+
+    rows.into_iter().map(SerializedEvent::try_from).collect()
+}
+
+async fn load_snapshot_on(
+    connection: &mut SqliteConnection,
+    stream: &StreamIdentity,
+) -> Result<Option<SerializedSnapshot>, EngineError> {
+    let row = sqlx::query_as!(
+        StoredSnapshotRow,
+        r#"
+            SELECT aggregate_id,
+                   last_sequence,
+                   snapshot_version,
+                   payload AS "payload: String"
+            FROM snapshots
+            WHERE aggregate_type = ?1 AND aggregate_id = ?2
+            "#,
+        stream.aggregate_type,
+        stream.aggregate_id,
+    )
+    .fetch_optional(connection)
+    .await?;
+
+    row.map(SerializedSnapshot::try_from).transpose()
+}
+
+async fn store_snapshot_in_transaction(
+    connection: &mut SqliteConnection,
+    stream: &StreamIdentity,
+    snapshot: SnapshotWrite,
+) -> Result<usize, EngineError> {
+    let events = load_events_on(connection, stream, None).await?;
+    let current_sequence = events
+        .last()
+        .map(|event| event.sequence)
+        .ok_or(EngineError::EmptySnapshotUpdate)?;
+
+    if snapshot.last_sequence > current_sequence {
+        return Err(EngineError::SnapshotBeyondCurrentVersion {
+            proposed: snapshot.last_sequence,
+            current: current_sequence,
+        });
+    }
+
+    let stored = load_snapshot_on(connection, stream).await?;
+    if stored
+        .as_ref()
+        .is_some_and(|current| current.current_sequence > snapshot.last_sequence)
+    {
+        return Err(EngineError::OptimisticLock);
+    }
+    let snapshot_version = stored.map_or(Ok(1), |current| {
+        current
+            .current_snapshot
+            .checked_add(1)
+            .ok_or(EngineError::SnapshotVersionExhausted)
+    })?;
+    let last_sequence = i64::try_from(snapshot.last_sequence)?;
+    let stored_version = i64::try_from(snapshot_version)?;
+    let aggregate = serde_json::to_string(&snapshot.aggregate)?;
+
+    sqlx::query!(
+        r#"
+                INSERT OR REPLACE INTO snapshots (
+                    aggregate_type,
+                    aggregate_id,
+                    last_sequence,
+                    snapshot_version,
+                    payload,
+                    timestamp
+                )
+                VALUES (
+                    ?1,
+                    ?2,
+                    ?3,
+                    ?4,
+                    ?5,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                )
+                "#,
+        stream.aggregate_type,
+        stream.aggregate_id,
+        last_sequence,
+        stored_version,
+        aggregate,
+    )
+    .execute(connection)
+    .await?;
+
+    Ok(snapshot_version)
+}
+
 async fn claim_job_in_transaction<Decide, Won>(
     connection: &mut SqliteConnection,
     job_id: &str,
@@ -625,9 +770,10 @@ impl From<EngineError> for PersistenceError {
         use EngineError::*;
         match error {
             OptimisticLock => Self::OptimisticLockError,
-            EmptySnapshotUpdate | StreamIdentityMismatch { .. } => {
-                Self::UnknownError(Box::new(error))
-            }
+            EmptySnapshotUpdate
+            | StreamIdentityMismatch { .. }
+            | SnapshotBeyondCurrentVersion { .. }
+            | SnapshotVersionExhausted => Self::UnknownError(Box::new(error)),
             Sql(source) => Self::ConnectionError(Box::new(source)),
             Json(source) => Self::DeserializationError(Box::new(source)),
             Integer(source) => Self::UnknownError(Box::new(source)),
@@ -965,5 +1111,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["JobEnqueued"]
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_operations_use_the_existing_snapshot_table() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
+        let engine = Engine::new(pool);
+        let stream = StreamIdentity::new("engine-snapshot-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "engine-snapshot-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        engine
+            .commit(CommitRequest::new(stream.clone(), &[event]))
+            .await
+            .unwrap();
+
+        let version = engine
+            .store_snapshot(
+                &stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 42 }), 1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(version, 1);
+        let snapshot = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        assert_eq!(snapshot.current_sequence, 1);
+        assert_eq!(snapshot.current_snapshot, 1);
+        assert_eq!(snapshot.aggregate, serde_json::json!({ "value": 42 }));
+
+        let second_event = SerializedEvent {
+            aggregate_type: "engine-snapshot-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 2,
+            event_type: "Changed".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        engine
+            .commit(CommitRequest::new(stream.clone(), &[second_event]))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .store_snapshot(
+                    &stream,
+                    SnapshotWrite::new(serde_json::json!({ "value": 84 }), 2),
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            engine
+                .store_snapshot(
+                    &stream,
+                    SnapshotWrite::new(serde_json::json!({ "value": 21 }), 1),
+                )
+                .await,
+            Err(EngineError::OptimisticLock)
+        ));
+        let current = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        assert_eq!(current.current_sequence, 2);
+        assert_eq!(current.current_snapshot, 2);
+        assert_eq!(current.aggregate, serde_json::json!({ "value": 84 }));
+
+        engine.discard_snapshot(&stream).await.unwrap();
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
     }
 }
