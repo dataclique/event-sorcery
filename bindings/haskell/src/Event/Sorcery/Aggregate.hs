@@ -1,6 +1,7 @@
 {-# LANGUAGE FunctionalDependencies #-}
 
 module Event.Sorcery.Aggregate (
+  CompactionPolicy (..),
   DecodeCause (..),
   DispatchIntent,
   Dispatches (..),
@@ -35,6 +36,12 @@ newtype EventVersion = EventVersion Text
 
 newtype SchemaVersion = SchemaVersion Word16
   deriving stock (Eq, Ord, Show)
+
+
+data CompactionPolicy
+  = Retain
+  | CompactAfterSnapshot
+  deriving stock (Eq, Show)
 
 
 newtype DecodeCause = DecodeCause Text
@@ -81,6 +88,8 @@ class EventSourced entity where
   eventType :: Event entity -> Text
   eventVersion :: Event entity -> EventVersion
   schemaVersion :: Proxy entity -> SchemaVersion
+  compactionPolicy :: Proxy entity -> CompactionPolicy
+  compactionPolicy _ = Retain
   encodeEvent :: Event entity -> ByteString
   decodeEvent :: ByteString -> Either DecodeCause (Event entity)
   encodeSnapshot :: entity -> ByteString
