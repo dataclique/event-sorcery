@@ -60,6 +60,120 @@ static inline int32_t es_hs_commit(
     return es_commit((struct EsStore **)store, request, out_error);
 }
 
+static inline int32_t es_hs_commit_with_job(
+    void **store,
+    const struct EsBuf *request,
+    struct EsBuf *out_error
+) {
+    return es_commit_with_job((struct EsStore **)store, request, out_error);
+}
+
+static inline int32_t es_hs_job_enqueue(
+    void **store,
+    const struct EsBuf *request,
+    struct EsBuf *out_error
+) {
+    return es_job_enqueue((struct EsStore **)store, request, out_error);
+}
+
+static inline int32_t es_hs_job_poll(
+    void **store,
+    const struct EsBuf *request,
+    struct EsBuf *out_jobs,
+    struct EsBuf *out_error
+) {
+    return es_job_poll(
+        (struct EsStore **)store,
+        request,
+        out_jobs,
+        out_error
+    );
+}
+
+static inline int32_t es_hs_job_claim(
+    void **store,
+    const struct EsBuf *request,
+    struct EsBuf *out_claim,
+    struct EsBuf *out_error
+) {
+    return es_job_claim(
+        (struct EsStore **)store,
+        request,
+        out_claim,
+        out_error
+    );
+}
+
+static inline int32_t es_hs_job_renew(
+    void **store,
+    const struct EsBuf *request,
+    uint8_t *out_renewal,
+    struct EsBuf *out_error
+) {
+    return es_job_renew(
+        (struct EsStore **)store,
+        request,
+        out_renewal,
+        out_error
+    );
+}
+
+static inline int32_t es_hs_job_ack(
+    void **store,
+    const struct EsBuf *request,
+    uint8_t *out_settlement,
+    struct EsBuf *out_error
+) {
+    return es_job_ack(
+        (struct EsStore **)store,
+        request,
+        out_settlement,
+        out_error
+    );
+}
+
+static inline int32_t es_hs_job_retry(
+    void **store,
+    const struct EsBuf *request,
+    uint8_t *out_settlement,
+    struct EsBuf *out_error
+) {
+    return es_job_retry(
+        (struct EsStore **)store,
+        request,
+        out_settlement,
+        out_error
+    );
+}
+
+static inline int32_t es_hs_job_defer(
+    void **store,
+    const struct EsBuf *request,
+    uint8_t *out_settlement,
+    struct EsBuf *out_error
+) {
+    return es_job_defer(
+        (struct EsStore **)store,
+        request,
+        out_settlement,
+        out_error
+    );
+}
+
+static inline int32_t es_hs_job_dead_letter(
+    void **store,
+    const struct EsBuf *request,
+    uint8_t *out_settlement,
+    struct EsBuf *out_error
+) {
+    return es_job_dead_letter(
+        (struct EsStore **)store,
+        request,
+        out_settlement,
+        out_error
+    );
+}
+
 static inline int32_t es_hs_close(void **store) {
     return es_close((struct EsStore **)store);
 }

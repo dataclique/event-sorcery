@@ -1,3 +1,4 @@
 packages: bindings/haskell
 
+flags: +development
 tests: True
