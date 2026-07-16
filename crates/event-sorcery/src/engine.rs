@@ -1507,8 +1507,7 @@ mod tests {
 
     #[tokio::test]
     async fn language_neutral_job_seed_commits_with_domain_events() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
+        let pool = create_test_pool().await.unwrap();
         let engine = Engine::new(pool);
         let stream = StreamIdentity::new("engine-test", "one");
         let event = SerializedEvent {
@@ -1521,16 +1520,18 @@ mod tests {
             metadata: serde_json::json!({}),
         };
         let job_id = JobId::new();
-        let request =
-            CommitRequest::new(stream, std::slice::from_ref(&event)).with_job(JobSeed::new(
+        let request = CommitRequest::new(stream.clone(), std::slice::from_ref(&event)).with_job(
+            JobSeed::new(
                 job_id,
                 "haskell-test",
                 serde_json::json!([0, 1, 255]),
                 1_000,
-            ));
+            ),
+        );
 
         engine.commit(request).await.unwrap();
 
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), [event]);
         let job_stream = StreamIdentity::new("job", job_id.to_string());
         assert_eq!(
             engine
@@ -1546,8 +1547,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_job_seed_instant_rolls_back_the_domain_event() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
+        let pool = create_test_pool().await.unwrap();
         let engine = Engine::new(pool);
         let stream = StreamIdentity::new("engine-test", "invalid-job-instant");
         let event = SerializedEvent {

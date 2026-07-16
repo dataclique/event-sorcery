@@ -28,7 +28,6 @@ use cqrs_es::AggregateError;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use futures_util::{FutureExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -63,10 +62,11 @@ pub struct JobRuntime<Backend: EventBackend = SqliteBackend> {
 
 /// A won claim that can be consumed exactly once by a worker adapter.
 ///
-/// Its fields are intentionally private: foreign bindings carry the serialized
-/// value opaquely and return it to one settlement operation. The claim id and
-/// event sequence remain the existing event-sourced fencing identity.
-#[derive(Debug, Serialize, Deserialize)]
+/// Its fields are intentionally private and the capability is deliberately not
+/// serializable: accepting caller-produced claim state would allow attempts to
+/// forge its fencing identity. Foreign bindings must retain it in trusted
+/// process memory and expose only a binding-owned opaque token.
+#[derive(Debug)]
 pub struct JobClaimHandle {
     job_id: JobId,
     claim_seq: i64,
@@ -143,10 +143,10 @@ pub enum JobRuntimeError<BackendError> {
     Backend(#[source] BackendError),
     /// The rebuildable queue projection could not be queried.
     #[error("job queue projection failed: {0}")]
-    Projection(String),
+    Projection(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// cqrs-es could not load or persist the job aggregate.
     #[error("job aggregate operation failed: {0}")]
-    Aggregate(String),
+    Aggregate(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// A millisecond instant was outside chrono's supported range.
     #[error("job instant is out of range: {0}")]
     InvalidInstant(i64),
@@ -161,7 +161,7 @@ pub enum JobRuntimeError<BackendError> {
 fn runtime_job_error<BackendError>(error: JobStoreError) -> JobRuntimeError<BackendError> {
     match error {
         JobStoreError::InvalidInstant(millis) => JobRuntimeError::InvalidInstant(millis),
-        other => JobRuntimeError::Aggregate(other.to_string()),
+        other => JobRuntimeError::Aggregate(Box::new(other)),
     }
 }
 
@@ -212,7 +212,7 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
                 i64::from(limit),
             )
             .await
-            .map_err(|error| JobRuntimeError::Projection(error.to_string()))
+            .map_err(|error| JobRuntimeError::Projection(Box::new(error)))
     }
 
     /// Claims one existing queue candidate through the canonical claim planner.
@@ -229,7 +229,7 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
         }
         let job_id = job_id
             .parse::<JobId>()
-            .map_err(|error| JobRuntimeError::Aggregate(error.to_string()))?;
+            .map_err(|error| JobRuntimeError::Aggregate(Box::new(error)))?;
         let job_id_text = job_id.to_string();
         let worker = WorkerId::new(worker_name);
         let outcome = self
@@ -362,7 +362,7 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
                 AggregateError::UserError(LifecycleError::Apply(JobError::Fenced))
                 | AggregateError::AggregateConflict,
             ) => Ok(JobSettlementResult::Fenced),
-            Err(error) => Err(JobRuntimeError::Aggregate(error.to_string())),
+            Err(error) => Err(JobRuntimeError::Aggregate(Box::new(error))),
         }
     }
 
@@ -1313,6 +1313,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_facade_skips_a_lease_instant_outside_chronos_range() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = enqueue(&pool, 1_000).await;
+
+        let result = runtime
+            .claim_job(&job_id.to_string(), "ffi-worker", i64::MAX - 1, 1, 50)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, JobClaimResult::Skipped));
+        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
     }
 
     #[tokio::test]
