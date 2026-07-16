@@ -23,7 +23,8 @@ you need lower-level control.
 
 This repository is an experimental fork maintained by Data Clique Software
 Design FZCO in the `dataclique` GitHub organization. It contains work unrelated
-to ST0x, including the Haskell binding in 0.4.0.
+to ST0x, including the Haskell binding in 0.4.0 and the planned TypeScript
+binding in 0.5.0.
 
 The original Event Sorcery project remains owned and maintained by ST0x, with
 contributions from Data Clique Software Design FZCO and other contributors.

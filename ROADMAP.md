@@ -36,6 +36,16 @@ flowchart TD
       backends and decisions
 - [ ] [#13 Durable protocols lack end-to-end cross-binding conformance coverage](https://github.com/dataclique/event-sorcery/issues/13)
 
+## TypeScript access to the shared engine
+
+Release 0.5.0 is intended to add a typed TypeScript binding over the shared Rust
+engine. The binding will reuse the same versioned engine contract rather than
+own storage or durable protocol decisions. Runtime integration, packaging, and
+the public TypeScript surface remain to be specified after 0.4.0; no TypeScript
+implementation is part of the current release.
+
+- [ ] [#50 TypeScript services cannot use the shared engine](https://github.com/dataclique/event-sorcery/issues/50)
+
 ## Not epic
 
 - [ ] [#6 sqlite_event_repository is SQLite-specific code inside the backend-agnostic core](https://github.com/dataclique/event-sorcery/issues/6)
