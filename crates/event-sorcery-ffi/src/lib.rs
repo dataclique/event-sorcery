@@ -6,17 +6,19 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use cqrs_es::AggregateError;
 use cqrs_es::persist::SerializedEvent;
 use event_sorcery::{
-    CommitRequest, DeadReason, Engine, EngineError, JobClaimHandle, JobClaimResult, JobId,
-    JobLeaseResult, JobRuntime, JobSeed, JobSettlementResult, SnapshotWrite, StreamIdentity,
+    CommitRequest, CompactionPolicy, DeadReason, Engine, EngineError, JobClaimHandle,
+    JobClaimResult, JobId, JobLeaseResult, JobRuntime, JobSeed, JobSettlementResult,
+    ReconcileError, SchemaReconciliation, SchemaTarget, SnapshotWrite, StreamIdentity,
 };
 use serde::de::{DeserializeOwned, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 const ABI_MAJOR: u32 = 0;
-const ABI_MINOR: u32 = 4;
+const ABI_MINOR: u32 = 5;
 const ES_OK: i32 = 0;
 const ES_ERR_DECODE: i32 = 1;
 const ES_ERR_CONFLICT: i32 = 2;
@@ -412,6 +414,65 @@ pub unsafe extern "C" fn es_snapshot_discard(
 }
 
 #[unsafe(no_mangle)]
+/// Reconciles aggregate schema metadata through the shared engine.
+///
+/// # Safety
+///
+/// `store` must be open. `request` must reference readable bytes.
+/// `out_reconciliation` must be writable, and `out_error` must be null or
+/// writable.
+pub unsafe extern "C" fn es_schema_reconcile(
+    store: *mut EsStore,
+    request: *const EsBuf,
+    out_reconciliation: *mut u8,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let Some(store) = (unsafe { store.as_ref() }) else {
+        return write_error(out_error, AbiError::State("store is null".to_string()));
+    };
+    ffi_call(Some(store), out_error, || {
+        if out_reconciliation.is_null() {
+            return Err(AbiError::State("out_reconciliation is null".to_string()));
+        }
+        let target = decode_schema_target(request)?;
+        let reconciliation = store
+            .runtime
+            .block_on(store.engine.reconcile_schema(&target))
+            .map_err(AbiError::from)?;
+        let reconciliation = match reconciliation {
+            SchemaReconciliation::Changed => 0,
+            SchemaReconciliation::Unchanged => 1,
+        };
+        unsafe { out_reconciliation.write(reconciliation) };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Records an aggregate schema version after recovery completes.
+///
+/// # Safety
+///
+/// `store` must be open. `request` must reference readable bytes, and
+/// `out_error` must be null or writable.
+pub unsafe extern "C" fn es_schema_record(
+    store: *mut EsStore,
+    request: *const EsBuf,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let Some(store) = (unsafe { store.as_ref() }) else {
+        return write_error(out_error, AbiError::State("store is null".to_string()));
+    };
+    ffi_call(Some(store), out_error, || {
+        let target = decode_schema_target(request)?;
+        store
+            .runtime
+            .block_on(store.engine.record_schema(&target))
+            .map_err(AbiError::from)
+    })
+}
+
+#[unsafe(no_mangle)]
 /// Enqueues an erased job payload through the retained event-sourced job runtime.
 ///
 /// # Safety
@@ -767,6 +828,12 @@ impl From<EngineError> for AbiError {
     fn from(error: EngineError) -> Self {
         match error {
             EngineError::OptimisticLock => Self::Conflict,
+            EngineError::Schema(ReconcileError::Aggregate(AggregateError::AggregateConflict)) => {
+                Self::Conflict
+            }
+            EngineError::Schema(source @ ReconcileError::CompactedSnapshotClear { .. }) => {
+                Self::State(source.to_string())
+            }
             other => Self::Storage(other.to_string()),
         }
     }
@@ -781,6 +848,23 @@ fn decode<T: DeserializeOwned>(buffer: *const EsBuf) -> Result<T, AbiError> {
     }
     let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) };
     ciborium::from_reader(Cursor::new(bytes)).map_err(|error| AbiError::Decode(error.to_string()))
+}
+
+fn decode_schema_target(buffer: *const EsBuf) -> Result<SchemaTarget, AbiError> {
+    let (version, aggregate_type, schema_version, compaction): (u8, String, u64, u8) =
+        decode(buffer)?;
+    require_version(version)?;
+    let compaction = match compaction {
+        0 => CompactionPolicy::Retain,
+        1 => CompactionPolicy::CompactAfterSnapshot,
+        _ => return Err(AbiError::Decode("invalid compaction policy".to_string())),
+    };
+
+    Ok(SchemaTarget::new(
+        aggregate_type,
+        schema_version,
+        compaction,
+    ))
 }
 
 fn encode(value: &impl Serialize) -> Result<EsBuf, AbiError> {
@@ -1522,6 +1606,68 @@ mod tests {
         let polled: (u8, Vec<String>) = ciborium::from_reader(Cursor::new(bytes)).unwrap();
         assert_eq!(polled, (1, vec![job_id]));
         unsafe { es_buf_free(&raw mut jobs) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn schema_exports_preserve_the_existing_recovery_protocol() {
+        let mut error = EsBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let mut store = open_test_store(&mut error);
+        let (_bytes, request) = input(&(1_u8, "ffi-schema", 1_u64, 0_u8));
+        let mut reconciliation = u8::MAX;
+
+        assert_eq!(
+            unsafe {
+                es_schema_reconcile(
+                    store,
+                    &raw const request,
+                    &raw mut reconciliation,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(reconciliation, 0);
+
+        assert_eq!(
+            unsafe { es_schema_record(store, &raw const request, &raw mut error) },
+            ES_OK
+        );
+
+        reconciliation = u8::MAX;
+        assert_eq!(
+            unsafe {
+                es_schema_reconcile(
+                    store,
+                    &raw const request,
+                    &raw mut reconciliation,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(reconciliation, 1);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn schema_exports_reject_unknown_compaction_policy() {
+        let mut error = EsBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let mut store = open_test_store(&mut error);
+        let (_bytes, request) = input(&(1_u8, "ffi-schema", 1_u64, 2_u8));
+
+        assert_eq!(
+            unsafe { es_schema_record(store, &raw const request, &raw mut error) },
+            ES_ERR_DECODE
+        );
+
+        unsafe { es_buf_free(&raw mut error) };
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
     }
 }

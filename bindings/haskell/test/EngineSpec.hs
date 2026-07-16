@@ -38,7 +38,7 @@ main = do
   exerciseAbiCompatibility
 
   version <- abiVersion
-  if version == 4
+  if version == 5
     then exerciseStore
     else error "unexpected engine ABI version"
 
