@@ -3,6 +3,8 @@
 //! The engine owns storage-boundary reads and replay plus the transactions that
 //! atomically commit aggregate events, snapshots, and durable job intent.
 
+use std::num::NonZeroUsize;
+
 use cqrs_es::persist::{PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot};
 use futures_util::TryStreamExt;
 use serde_json::Value;
@@ -14,23 +16,48 @@ use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 
 /// Identifies one serialized aggregate event stream at the storage boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StreamIdentity {
-    /// Stable aggregate kind stored with every event and snapshot.
-    pub(crate) aggregate_type: String,
-    /// Serialized domain identifier for one aggregate instance.
-    pub(crate) aggregate_id: String,
+pub struct StreamIdentity {
+    aggregate_type: String,
+    aggregate_id: String,
+}
+
+/// Constructs and compares storage-boundary stream identities.
+impl StreamIdentity {
+    /// Creates a storage-boundary identity from serialized aggregate values.
+    pub fn new(aggregate_type: impl Into<String>, aggregate_id: impl Into<String>) -> Self {
+        Self {
+            aggregate_type: aggregate_type.into(),
+            aggregate_id: aggregate_id.into(),
+        }
+    }
+
+    fn matches(&self, event: &SerializedEvent) -> bool {
+        self.aggregate_type == event.aggregate_type && self.aggregate_id == event.aggregate_id
+    }
+
+    fn from_event(event: &SerializedEvent) -> Self {
+        Self::new(&event.aggregate_type, &event.aggregate_id)
+    }
 }
 
 /// Snapshot payload written atomically with the events it covers.
-pub(crate) struct SnapshotUpdate {
-    /// Serialized aggregate state.
-    pub(crate) aggregate: Value,
-    /// Aggregate schema version used to decode the snapshot.
-    pub(crate) snapshot_version: usize,
+pub struct SnapshotUpdate {
+    aggregate: Value,
+    snapshot_version: usize,
+}
+
+impl SnapshotUpdate {
+    /// Creates a serialized snapshot update at its aggregate schema version.
+    pub fn new(aggregate: Value, snapshot_version: usize) -> Self {
+        Self {
+            aggregate,
+            snapshot_version,
+        }
+    }
 }
 
 /// One atomic event-store commit, including optional snapshot and job intent.
-pub(crate) struct CommitRequest<'events> {
+pub struct CommitRequest<'events> {
     stream: StreamIdentity,
     events: &'events [SerializedEvent],
     snapshot: Option<SnapshotUpdate>,
@@ -39,13 +66,14 @@ pub(crate) struct CommitRequest<'events> {
 
 /// Shared serialized SQLite persistence engine.
 #[derive(Clone)]
-pub(crate) struct Engine {
+pub struct Engine {
     pool: SqlitePool,
 }
 
 /// Failures produced by serialized engine operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum EngineError {
+#[non_exhaustive]
+pub enum EngineError {
     #[error("optimistic lock error: aggregate has been modified concurrently")]
     OptimisticLock,
     #[error("snapshot update was requested without persisted events")]
@@ -65,27 +93,9 @@ pub(crate) enum EngineError {
     JobFlush(#[from] crate::job::JobStoreError),
 }
 
-impl StreamIdentity {
-    /// Creates a storage-boundary identity from serialized aggregate values.
-    pub(crate) fn new(aggregate_type: impl Into<String>, aggregate_id: impl Into<String>) -> Self {
-        Self {
-            aggregate_type: aggregate_type.into(),
-            aggregate_id: aggregate_id.into(),
-        }
-    }
-
-    fn matches(&self, event: &SerializedEvent) -> bool {
-        self.aggregate_type == event.aggregate_type && self.aggregate_id == event.aggregate_id
-    }
-
-    fn from_event(event: &SerializedEvent) -> Self {
-        Self::new(&event.aggregate_type, &event.aggregate_id)
-    }
-}
-
 impl<'events> CommitRequest<'events> {
     /// Starts a commit for one stream and its proposed events.
-    pub(crate) fn new(stream: StreamIdentity, events: &'events [SerializedEvent]) -> Self {
+    pub fn new(stream: StreamIdentity, events: &'events [SerializedEvent]) -> Self {
         Self {
             stream,
             events,
@@ -94,11 +104,18 @@ impl<'events> CommitRequest<'events> {
         }
     }
 
-    #[must_use]
     /// Attaches the snapshot covered by this commit's events.
-    pub(crate) fn with_snapshot(mut self, snapshot: SnapshotUpdate) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::EmptySnapshotUpdate`] when this request has no
+    /// events to persist.
+    pub fn with_snapshot(mut self, snapshot: SnapshotUpdate) -> Result<Self, EngineError> {
+        if self.events.is_empty() {
+            return Err(EngineError::EmptySnapshotUpdate);
+        }
         self.snapshot = Some(snapshot);
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -110,16 +127,28 @@ impl<'events> CommitRequest<'events> {
 }
 
 impl Engine {
-    /// Creates an engine over a migrated SQLite pool.
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    /// Creates an engine over a SQLite pool.
+    ///
+    /// This constructor does not run migrations. Call [`Self::migrate`] before
+    /// using storage operations when the pool's schema is not initialized.
+    pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Migrates the engine's existing SQLite schema.
+    pub async fn migrate(&self) -> Result<(), SqliteJobError> {
+        sqlite_es::MIGRATOR
+            .run(&self.pool)
+            .await
+            .map_err(|error| SqliteJobError::Sql(error.into()))?;
+        Ok(())
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
-    pub(crate) async fn claim_job<Decide, Won>(
+    pub async fn claim_job<Decide, Won>(
         &self,
         job_id: &str,
         decide: Decide,
@@ -140,7 +169,7 @@ impl Engine {
         .await
     }
 
-    pub(crate) async fn renew_job(
+    pub async fn renew_job(
         &self,
         job_id: &str,
         claim_seq: i64,
@@ -168,7 +197,7 @@ impl Engine {
         }
     }
 
-    pub(crate) async fn enqueue_job(
+    pub async fn enqueue_job(
         &self,
         event: SerializedEvent,
         payload: String,
@@ -196,7 +225,7 @@ impl Engine {
     }
 
     /// Loads one stream, optionally after an exclusive sequence checkpoint.
-    pub(crate) async fn load_events(
+    pub async fn load_events(
         &self,
         stream: &StreamIdentity,
         after_sequence: Option<usize>,
@@ -253,8 +282,89 @@ impl Engine {
         rows.into_iter().map(SerializedEvent::try_from).collect()
     }
 
+    /// Loads at most `limit` events from one stream after an optional exclusive
+    /// sequence checkpoint.
+    pub async fn load_events_page(
+        &self,
+        stream: &StreamIdentity,
+        after_sequence: Option<usize>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<SerializedEvent>, EngineError> {
+        let limit = i64::try_from(limit.get())?;
+        let rows = match after_sequence {
+            None => {
+                sqlx::query_as::<_, StoredEventRow>(
+                    r"
+                    SELECT aggregate_type,
+                           aggregate_id,
+                           sequence,
+                           event_type,
+                           event_version,
+                           payload,
+                           metadata
+                    FROM events
+                    WHERE aggregate_type = ?1 AND aggregate_id = ?2
+                    ORDER BY sequence
+                    LIMIT ?3
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            Some(after_sequence) => {
+                let after_sequence = i64::try_from(after_sequence)?;
+                sqlx::query_as::<_, StoredEventRow>(
+                    r"
+                    SELECT aggregate_type,
+                           aggregate_id,
+                           sequence,
+                           event_type,
+                           event_version,
+                           payload,
+                           metadata
+                    FROM events
+                    WHERE aggregate_type = ?1
+                      AND aggregate_id = ?2
+                      AND sequence > ?3
+                    ORDER BY sequence
+                    LIMIT ?4
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(after_sequence)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        rows.into_iter().map(SerializedEvent::try_from).collect()
+    }
+
+    /// Reads the current stream version, where zero means no events.
+    pub async fn current_version(&self, stream: &StreamIdentity) -> Result<usize, EngineError> {
+        let version = sqlx::query_scalar::<_, Option<i64>>(
+            r"
+            SELECT MAX(sequence)
+            FROM events
+            WHERE aggregate_type = ?1 AND aggregate_id = ?2
+            ",
+        )
+        .bind(&stream.aggregate_type)
+        .bind(&stream.aggregate_id)
+        .fetch_one(&self.pool)
+        .await?;
+        version.map_or(Ok(0), |version| {
+            usize::try_from(version).map_err(Into::into)
+        })
+    }
+
     /// Loads the current snapshot for one stream when present.
-    pub(crate) async fn load_snapshot(
+    pub async fn load_snapshot(
         &self,
         stream: &StreamIdentity,
     ) -> Result<Option<SerializedSnapshot>, EngineError> {
@@ -358,7 +468,7 @@ impl Engine {
     }
 
     /// Atomically persists a validated event, snapshot, and durable-job batch.
-    pub(crate) async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
+    pub async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
         let CommitRequest {
             stream,
             events,
@@ -620,6 +730,7 @@ fn validate_event_stream(
         )
 }
 
+#[derive(sqlx::FromRow)]
 struct StoredEventRow {
     aggregate_type: String,
     aggregate_id: String,
@@ -668,15 +779,45 @@ impl TryFrom<StoredSnapshotRow> for SerializedSnapshot {
 
 #[cfg(test)]
 mod tests {
+    //! Integration coverage for the serialized engine facade.
+
     use std::future::pending;
     use std::sync::Arc;
     use std::time::Duration;
 
     use sqlite_es::testing::create_test_pool;
+    use sqlx::sqlite::SqlitePoolOptions;
     use tokio::sync::Notify;
 
     use super::*;
     use crate::job::{JobId, JobKind, WorkerId, enqueued_event, pending_seed_payload, plan_claim};
+
+    #[tokio::test]
+    async fn migrate_initializes_the_existing_sqlite_schema() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        let engine = Engine::new(pool);
+
+        engine.migrate().await.unwrap();
+
+        let stream = StreamIdentity::new("engine-migration-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "engine-migration-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        engine
+            .commit(CommitRequest::new(stream, std::slice::from_ref(&event)))
+            .await
+            .unwrap();
+    }
 
     fn serialized_event(stream: &StreamIdentity, sequence: usize) -> SerializedEvent {
         SerializedEvent {
@@ -688,6 +829,45 @@ mod tests {
             payload: serde_json::json!({ "sequence": sequence }),
             metadata: serde_json::json!({}),
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_reads_stop_at_the_requested_page_size() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-page-test", "one");
+        let events = (1..=3)
+            .map(|sequence| serialized_event(&stream, sequence))
+            .collect::<Vec<_>>();
+        engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await
+            .unwrap();
+
+        let page = engine
+            .load_events_page(&stream, None, NonZeroUsize::new(2).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let page = engine
+            .load_events_page(&stream, Some(1), NonZeroUsize::MIN)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 3);
+        assert_eq!(
+            engine
+                .current_version(&StreamIdentity::new("engine-page-test", "missing"))
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -750,6 +930,15 @@ mod tests {
         assert_eq!(event_count, 0);
     }
 
+    #[test]
+    fn snapshot_attachment_requires_persisted_events() {
+        let stream = StreamIdentity::new("engine-test", "empty-snapshot");
+        let request = CommitRequest::new(stream, &[])
+            .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 0 }), 1));
+
+        assert!(matches!(request, Err(EngineError::EmptySnapshotUpdate)));
+    }
+
     #[tokio::test]
     async fn commit_rejects_snapshot_identity_mismatch_without_writing() {
         let pool = create_test_pool().await.unwrap();
@@ -761,7 +950,8 @@ mod tests {
             .with_snapshot(SnapshotUpdate {
                 aggregate: serde_json::json!({ "sequence": 1 }),
                 snapshot_version: 1,
-            });
+            })
+            .unwrap();
 
         let result = engine.commit(request).await;
 

@@ -75,11 +75,7 @@ impl EventBackend for SqliteBackend {
     }
 
     async fn migrate(&self) -> Result<(), SqliteJobError> {
-        sqlite_es::MIGRATOR
-            .run(self.engine.pool())
-            .await
-            .map_err(|error| SqliteJobError::Sql(error.into()))?;
-        Ok(())
+        self.engine.migrate().await
     }
 
     async fn claim<Decide, Won>(
@@ -107,5 +103,44 @@ impl EventBackend for SqliteBackend {
 
     async fn enqueue(&self, event: SerializedEvent, payload: String) -> Result<(), SqliteJobError> {
         self.engine.enqueue_job(event, payload).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Adapter-level migration coverage for the native SQLite backend.
+
+    use cqrs_es::persist::SerializedEvent;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+    use crate::engine::{CommitRequest, StreamIdentity};
+
+    #[tokio::test]
+    async fn event_backend_migrate_initializes_the_existing_sqlite_schema() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        let backend = SqliteBackend::new(pool);
+
+        EventBackend::migrate(&backend).await.unwrap();
+
+        let stream = StreamIdentity::new("backend-migration-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "backend-migration-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        backend
+            .engine
+            .commit(CommitRequest::new(stream, std::slice::from_ref(&event)))
+            .await
+            .unwrap();
     }
 }

@@ -125,6 +125,7 @@ pub use dispatch::{
     OriginDeliveryError, OriginPort, Reconciliation, Settled, SettledFailure, There, fx,
     uneventful,
 };
+pub use engine::{CommitRequest, Engine, EngineError, SnapshotUpdate, StreamIdentity};
 pub use job::{
     DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,
 };
