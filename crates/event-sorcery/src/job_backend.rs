@@ -814,7 +814,7 @@ mod tests {
     use sqlx::SqlitePool;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use sqlite_es::insert_serialized_events_batch;
+    use sqlite_es::{insert_serialized_events_batch, testing::create_test_pool};
 
     use crate::job::{EnqueueRequest, JobKind, Label, enqueued_event, pending_seed_payload};
 
@@ -1110,6 +1110,33 @@ mod tests {
         assert_eq!(
             event_types(&pool, &job_id).await,
             ["JobEnqueued", "JobClaimed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn job_queue_rebuilds_from_the_job_event_stream() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = runtime.enqueue(TestJob { n: 7 }).await.unwrap();
+
+        sqlx::query(
+            r"
+            DELETE FROM job_queue
+            WHERE view_id = ?1
+            ",
+        )
+        .bind(job_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(queue_status(&pool, &job_id).await, None);
+
+        let _rebuilt = JobRuntime::build(pool.clone()).await.unwrap();
+
+        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
         );
     }
 

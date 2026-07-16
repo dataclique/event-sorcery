@@ -387,7 +387,15 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
 
+    use sqlite_es::testing::create_test_pool;
+
     use super::*;
+    use crate::SqliteBackend;
+    use crate::job::{
+        EnqueueRequest, ErasedJob, JobId, JobKind, PendingPush, enqueued_event,
+        pending_seed_payload,
+    };
+    use crate::job_store::EventBackend;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     struct TestAggregate {
@@ -411,6 +419,18 @@ mod tests {
 
     #[derive(Debug)]
     struct TestError;
+
+    struct TestPendingJob;
+
+    impl ErasedJob for TestPendingJob {
+        fn kind(&self) -> JobKind {
+            JobKind::new("test-pending")
+        }
+
+        fn encode(&self) -> Result<Value, serde_json::Error> {
+            Ok(serde_json::json!({ "payload": "test" }))
+        }
+    }
 
     impl Display for TestError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -441,12 +461,6 @@ mod tests {
         }
     }
 
-    async fn test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
-        pool
-    }
-
     fn covering_events(aggregate_id: &str, through: usize) -> Vec<SerializedEvent> {
         (1..=through)
             .map(|sequence| SerializedEvent {
@@ -461,12 +475,124 @@ mod tests {
             .collect()
     }
 
+    async fn persist_with_pending_job(
+        pool: SqlitePool,
+        aggregate_id: &str,
+        job_id: JobId,
+    ) -> Result<(), PersistenceError> {
+        let repo = SqliteEventRepository::new(pool, CompactionPolicy::Retain);
+        crate::job::with_pending_scope(async move {
+            crate::job::buffer(PendingPush {
+                job_id,
+                job: Box::new(TestPendingJob),
+                delay: None,
+            })
+            .unwrap();
+
+            repo.persist::<TestAggregate>(&covering_events(aggregate_id, 1), None)
+                .await
+        })
+        .await
+    }
+
+    async fn count_events(pool: &SqlitePool, aggregate_type: &str, aggregate_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            r"
+            SELECT COUNT(*)
+            FROM events
+            WHERE aggregate_type = ?1 AND aggregate_id = ?2
+            ",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn count_queue_rows(pool: &SqlitePool, job_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            r"
+            SELECT COUNT(*)
+            FROM job_queue
+            WHERE view_id = ?1
+            ",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn queue_row(pool: &SqlitePool, job_id: &str) -> (String, i64, String, Option<i64>) {
+        sqlx::query_as::<_, (String, i64, String, Option<i64>)>(
+            r"
+            SELECT view_id, version, payload, lease_until
+            FROM job_queue
+            WHERE view_id = ?1
+            ",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn aggregate_event_job_event_and_queue_seed_commit_together() {
+        let pool = create_test_pool().await.unwrap();
+        let job_id = JobId::new();
+
+        persist_with_pending_job(pool.clone(), "atomic-success", job_id)
+            .await
+            .unwrap();
+
+        let aggregate_events = count_events(&pool, TestAggregate::TYPE, "atomic-success").await;
+        let job_id = job_id.to_string();
+        let job_events = count_events(&pool, "job", &job_id).await;
+        let queue_rows = count_queue_rows(&pool, &job_id).await;
+
+        assert_eq!((aggregate_events, job_events, queue_rows), (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn job_identity_conflict_rolls_back_the_aggregate_event() {
+        let pool = create_test_pool().await.unwrap();
+        let job_id = JobId::new();
+        let request = EnqueueRequest {
+            job_id,
+            kind: JobKind::new("existing-job"),
+            payload: serde_json::json!({ "payload": "existing" }),
+            run_at_ms: 0,
+        };
+        SqliteBackend::new(pool.clone())
+            .enqueue(
+                enqueued_event(&request).unwrap(),
+                pending_seed_payload(&request).unwrap(),
+            )
+            .await
+            .unwrap();
+        let job_id_string = job_id.to_string();
+        let queue_row_before_conflict = queue_row(&pool, &job_id_string).await;
+
+        let result = persist_with_pending_job(pool.clone(), "atomic-rollback", job_id).await;
+
+        assert!(matches!(result, Err(PersistenceError::OptimisticLockError)));
+        let aggregate_events = count_events(&pool, TestAggregate::TYPE, "atomic-rollback").await;
+        let existing_job_events = count_events(&pool, "job", &job_id_string).await;
+        let queue_row_after_conflict = queue_row(&pool, &job_id_string).await;
+
+        assert_eq!(aggregate_events, 0);
+        assert_eq!(existing_job_events, 1);
+        assert_eq!(queue_row_after_conflict, queue_row_before_conflict);
+    }
+
     /// For a `Retain` entity, get_snapshot returns the incompatible snapshot
     /// unchanged (no shape check, no discard); cqrs-es then rebuilds from the
     /// always-complete event history. See the end-to-end rebuild test below.
     #[tokio::test]
     async fn incompatible_snapshot_returned_unchanged_for_retain_entity() {
-        let pool = test_pool().await;
+        let pool = create_test_pool().await.unwrap();
         let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
 
         repo.persist::<TestAggregate>(
@@ -498,7 +624,7 @@ mod tests {
     /// The policy alone decides this -- no inspection of the event rows.
     #[tokio::test]
     async fn incompatible_snapshot_preserved_for_compactable_entity() {
-        let pool = test_pool().await;
+        let pool = create_test_pool().await.unwrap();
         let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::CompactAfterSnapshot);
 
         repo.persist::<TestAggregate>(
@@ -531,7 +657,7 @@ mod tests {
     /// discards it and reconstructs correct state from the full event history.
     #[tokio::test]
     async fn load_aggregate_rebuilds_after_discard_for_retain_entity() {
-        let pool = test_pool().await;
+        let pool = create_test_pool().await.unwrap();
         let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
 
         repo.persist::<TestAggregate>(
@@ -572,7 +698,7 @@ mod tests {
     /// recovery, which fires only on `Ok(Some(..))`/`Ok(None)`).
     #[tokio::test]
     async fn load_aggregate_errors_for_compactable_entity_with_incompatible_snapshot() {
-        let pool = test_pool().await;
+        let pool = create_test_pool().await.unwrap();
         let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::CompactAfterSnapshot);
 
         repo.persist::<TestAggregate>(
