@@ -41,6 +41,7 @@ const MAX_CBOR_DEPTH: usize = 32;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_COMMIT_EVENTS: usize = 1024;
 const MAX_LIST_ITEMS: usize = 4096;
+const MAX_ACTIVE_CLAIMS: usize = MAX_LIST_ITEMS;
 const MAX_ERROR_TEXT_BYTES: usize = 4 * 1024;
 /// Maximum worker threads accepted from the fixed-width C ABI options product.
 const MAX_RUNTIME_THREADS: u32 = 256;
@@ -255,7 +256,7 @@ pub unsafe extern "C" fn es_open(
                     runtime,
                     engine,
                     jobs,
-                    claims: Mutex::new(HashMap::new()),
+                    claims: Mutex::new(ClaimRegistry::default()),
                     claim_token_key: RandomState::new(),
                     next_claim_token: AtomicU64::new(1),
                 }))),
@@ -596,6 +597,7 @@ pub unsafe extern "C" fn es_job_claim(
             require_version(version)?;
             require_error_text_limit(job_id.len())?;
             require_error_text_limit(worker_name.len())?;
+            let reservation = lease.inner.prepare_claim(now_ms)?;
             let result = lease
                 .inner
                 .runtime
@@ -610,22 +612,31 @@ pub unsafe extern "C" fn es_job_claim(
             let wire: JobClaimWire = match result {
                 JobClaimResult::Claimed(claimed) => {
                     let attempt = claimed.handle.attempt();
-                    let first_execution = u8::from(!claimed.handle.is_first_execution());
+                    let has_prior_execution = u8::from(!claimed.handle.is_first_execution());
                     let payload = json_payload_bytes(claimed.payload)?;
                     require_payload_limit(payload.len())?;
-                    let token = lease.inner.issue_claim(claimed.handle);
+                    let lease_until_ms = now_ms
+                        .checked_add(lease_ms)
+                        .ok_or(AbiError::State("claim lease instant overflowed"))?;
+                    let token = reservation.issue(claimed.handle, now_ms, lease_until_ms);
                     (
                         1,
                         0,
                         Some(OpaqueBytes(token.to_vec())),
                         Some(attempt),
-                        Some(first_execution),
+                        Some(has_prior_execution),
                         Some(OpaqueBytes(payload)),
                     )
                 }
-                JobClaimResult::Abandoned => (1, 1, None, None, None, None),
+                JobClaimResult::Abandoned => {
+                    lease.inner.retire_expired_claims(&job_id, now_ms);
+                    (1, 1, None, None, None, None)
+                }
                 JobClaimResult::Contended => (1, 2, None, None, None, None),
-                JobClaimResult::Skipped => (1, 3, None, None, None, None),
+                JobClaimResult::Skipped => {
+                    lease.inner.retire_expired_claims(&job_id, now_ms);
+                    (1, 3, None, None, None, None)
+                }
             };
             unsafe { out_claim.write(encode_response(&wire)?) };
             Ok(())
@@ -667,16 +678,24 @@ pub unsafe extern "C" fn es_job_renew(
             }
             let (version, OpaqueBytes(encoded), new_lease_until_ms) = decoded;
             require_version(version)?;
-            let (token, claim) = lease.inner.claim(&encoded)?;
+            let renewal = lease.inner.begin_renewal(&encoded)?;
             let result = lease
                 .inner
                 .runtime
-                .block_on(lease.inner.jobs.renew_job(&claim, new_lease_until_ms))
+                .block_on(
+                    lease
+                        .inner
+                        .jobs
+                        .renew_job(&renewal.handle(), new_lease_until_ms),
+                )
                 .map_err(job_runtime_error)?;
             let tag = match result {
-                JobLeaseResult::Held => 0,
+                JobLeaseResult::Held => {
+                    renewal.complete(new_lease_until_ms);
+                    0
+                }
                 JobLeaseResult::Lost => {
-                    lease.inner.retire_claim(token);
+                    renewal.retire();
                     1
                 }
             };
@@ -707,13 +726,12 @@ pub unsafe extern "C" fn es_job_ack(
         out_settlement,
         out_error,
         |decoded| require_version(decoded.0),
-        |inner, (_, OpaqueBytes(encoded))| {
-            let (token, claim) = inner.claim(&encoded)?;
-            let result = inner
+        |(_, OpaqueBytes(encoded))| decode_claim_token(encoded),
+        |inner, claim, _| {
+            inner
                 .runtime
                 .block_on(inner.jobs.acknowledge_job(claim))
-                .map_err(job_runtime_error)?;
-            Ok((token, result))
+                .map_err(job_runtime_error)
         },
     )
 }
@@ -741,13 +759,12 @@ pub unsafe extern "C" fn es_job_retry(
         |decoded| {
             require_version(decoded.0).and_then(|()| require_error_text_limit(decoded.3.len()))
         },
-        |inner, (_, OpaqueBytes(encoded), run_at_ms, error)| {
-            let (token, claim) = inner.claim(&encoded)?;
-            let result = inner
+        |(_, OpaqueBytes(encoded), _, _)| decode_claim_token(encoded),
+        |inner, claim, (_, _, run_at_ms, error)| {
+            inner
                 .runtime
                 .block_on(inner.jobs.retry_job(claim, run_at_ms, error))
-                .map_err(job_runtime_error)?;
-            Ok((token, result))
+                .map_err(job_runtime_error)
         },
     )
 }
@@ -773,13 +790,12 @@ pub unsafe extern "C" fn es_job_defer(
         out_settlement,
         out_error,
         |decoded| require_version(decoded.0),
-        |inner, (_, OpaqueBytes(encoded), run_at_ms)| {
-            let (token, claim) = inner.claim(&encoded)?;
-            let result = inner
+        |(_, OpaqueBytes(encoded), _)| decode_claim_token(encoded),
+        |inner, claim, (_, _, run_at_ms)| {
+            inner
                 .runtime
                 .block_on(inner.jobs.defer_job(claim, run_at_ms))
-                .map_err(job_runtime_error)?;
-            Ok((token, result))
+                .map_err(job_runtime_error)
         },
     )
 }
@@ -809,14 +825,13 @@ pub unsafe extern "C" fn es_job_dead_letter(
                 .and_then(|()| require_error_text_limit(decoded.3.len()))
                 .and_then(|()| dead_reason(decoded.2).map(drop))
         },
-        |inner, (_, OpaqueBytes(encoded), reason, error)| {
+        |(_, OpaqueBytes(encoded), _, _)| decode_claim_token(encoded),
+        |inner, claim, (_, _, reason, error)| {
             let reason = dead_reason(reason)?;
-            let (token, claim) = inner.claim(&encoded)?;
-            let result = inner
+            inner
                 .runtime
                 .block_on(inner.jobs.dead_letter_job(claim, reason, error))
-                .map_err(job_runtime_error)?;
-            Ok((token, result))
+                .map_err(job_runtime_error)
         },
     )
 }
@@ -880,13 +895,40 @@ struct StoreInner {
     runtime: tokio::runtime::Runtime,
     engine: Engine,
     jobs: JobRuntime,
-    claims: Mutex<HashMap<ClaimToken, JobClaimHandle>>,
+    claims: Mutex<ClaimRegistry>,
     claim_token_key: RandomState,
     next_claim_token: AtomicU64,
 }
 
 impl StoreInner {
-    fn issue_claim(&self, handle: JobClaimHandle) -> ClaimToken {
+    fn prepare_claim(&self, now_ms: i64) -> Result<ClaimReservation<'_>, AbiError> {
+        let mut registry = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.prune_expired(now_ms);
+        let observed = registry
+            .retained
+            .len()
+            .checked_add(registry.reservations)
+            .and_then(|used| used.checked_add(1))
+            .ok_or(AbiError::State("active claim capacity overflowed"))?;
+        if observed > MAX_ACTIVE_CLAIMS {
+            return Err(AbiError::ResourceLimit {
+                resource: "active_claims",
+                observed,
+                limit: MAX_ACTIVE_CLAIMS,
+            });
+        }
+        registry.reservations += 1;
+        drop(registry);
+        Ok(ClaimReservation {
+            inner: self,
+            state: ClaimOperationState::Pending,
+        })
+    }
+
+    fn claim_token(&self) -> ClaimToken {
         let nonce = self.next_claim_token.fetch_add(1, Ordering::Relaxed);
         let mut first = self.claim_token_key.build_hasher();
         first.write_u64(nonce);
@@ -896,34 +938,257 @@ impl StoreInner {
         let mut token = [0_u8; 16];
         token[..8].copy_from_slice(&first.finish().to_be_bytes());
         token[8..].copy_from_slice(&second.finish().to_be_bytes());
-        let job_id = handle.job_id();
-        let mut claims = self
-            .claims
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        claims.retain(|_, existing| existing.job_id() != job_id);
-        claims.insert(token, handle);
         token
     }
 
-    fn claim(&self, encoded: &[u8]) -> Result<(ClaimToken, JobClaimHandle), AbiError> {
-        let token = ClaimToken::try_from(encoded).map_err(|_| AbiError::MalformedInput)?;
-        let handle = self
+    fn begin_renewal(&self, encoded: &[u8]) -> Result<ClaimRenewal<'_>, AbiError> {
+        let token = decode_claim_token(encoded)?;
+        let mut registry = self
             .claims
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&token)
-            .cloned()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retained = registry
+            .retained
+            .get_mut(&token)
+            .filter(|claim| claim.state == ClaimState::Available)
             .ok_or(AbiError::State("claim handle is invalid"))?;
-        Ok((token, handle))
+        retained.state = ClaimState::Renewing;
+        let handle = retained.handle.clone();
+        drop(registry);
+        Ok(ClaimRenewal {
+            inner: self,
+            token,
+            handle,
+            state: ClaimOperationState::Pending,
+        })
+    }
+
+    fn begin_settlement(&self, token: ClaimToken) -> Result<ClaimSettlement<'_>, AbiError> {
+        let mut registry = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retained = registry
+            .retained
+            .get_mut(&token)
+            .filter(|claim| claim.state == ClaimState::Available)
+            .ok_or(AbiError::State("claim handle is invalid"))?;
+        retained.state = ClaimState::Settling;
+        let handle = retained.handle.clone();
+        drop(registry);
+        Ok(ClaimSettlement {
+            inner: self,
+            token,
+            handle,
+            state: ClaimOperationState::Pending,
+        })
+    }
+
+    fn retire_expired_claims(&self, job_id: &str, now_ms: i64) {
+        self.claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained
+            .retain(|_, claim| {
+                claim.handle.job_id().to_string() != job_id || !claim.is_expired(now_ms)
+            });
     }
 
     fn retire_claim(&self, token: ClaimToken) {
         self.claims
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained
             .remove(&token);
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimState {
+    Available,
+    Renewing,
+    Settling,
+}
+
+#[derive(Default)]
+struct ClaimRegistry {
+    retained: HashMap<ClaimToken, RetainedClaim>,
+    reservations: usize,
+}
+
+impl ClaimRegistry {
+    fn prune_expired(&mut self, now_ms: i64) {
+        self.retained
+            .retain(|_, retained| !retained.is_expired(now_ms));
+    }
+
+    fn release_reservation(&mut self) {
+        let Some(remaining) = self.reservations.checked_sub(1) else {
+            unreachable!("claim reservation count must be positive while a guard exists");
+        };
+        self.reservations = remaining;
+    }
+}
+
+struct RetainedClaim {
+    handle: JobClaimHandle,
+    lease_until_ms: i64,
+    state: ClaimState,
+}
+
+impl RetainedClaim {
+    fn is_expired(&self, now_ms: i64) -> bool {
+        self.state == ClaimState::Available && self.lease_until_ms < now_ms
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimOperationState {
+    Pending,
+    Completed,
+}
+
+struct ClaimReservation<'store> {
+    inner: &'store StoreInner,
+    state: ClaimOperationState,
+}
+
+impl ClaimReservation<'_> {
+    fn issue(mut self, handle: JobClaimHandle, now_ms: i64, lease_until_ms: i64) -> ClaimToken {
+        let token = self.inner.claim_token();
+        let job_id = handle.job_id();
+        let mut registry = self
+            .inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.prune_expired(now_ms);
+        registry.retained.retain(|_, existing| {
+            existing.state != ClaimState::Available || existing.handle.job_id() != job_id
+        });
+        registry.retained.insert(
+            token,
+            RetainedClaim {
+                handle,
+                lease_until_ms,
+                state: ClaimState::Available,
+            },
+        );
+        registry.release_reservation();
+        drop(registry);
+        self.state = ClaimOperationState::Completed;
+        token
+    }
+}
+
+impl Drop for ClaimReservation<'_> {
+    fn drop(&mut self) {
+        if self.state == ClaimOperationState::Completed {
+            return;
+        }
+        self.inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release_reservation();
+    }
+}
+
+struct ClaimRenewal<'store> {
+    inner: &'store StoreInner,
+    token: ClaimToken,
+    handle: JobClaimHandle,
+    state: ClaimOperationState,
+}
+
+impl ClaimRenewal<'_> {
+    fn handle(&self) -> JobClaimHandle {
+        self.handle.clone()
+    }
+
+    fn complete(mut self, lease_until_ms: i64) {
+        let mut registry = self
+            .inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(retained) = registry
+            .retained
+            .get_mut(&self.token)
+            .filter(|retained| retained.state == ClaimState::Renewing)
+        else {
+            unreachable!("renewing claim must remain retained until renewal completes");
+        };
+        retained.lease_until_ms = lease_until_ms;
+        retained.state = ClaimState::Available;
+        drop(registry);
+        self.state = ClaimOperationState::Completed;
+    }
+
+    fn retire(mut self) {
+        self.inner.retire_claim(self.token);
+        self.state = ClaimOperationState::Completed;
+    }
+}
+
+impl Drop for ClaimRenewal<'_> {
+    fn drop(&mut self) {
+        if self.state == ClaimOperationState::Completed {
+            return;
+        }
+        if let Some(claim) = self
+            .inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained
+            .get_mut(&self.token)
+            .filter(|claim| claim.state == ClaimState::Renewing)
+        {
+            claim.state = ClaimState::Available;
+        }
+    }
+}
+
+struct ClaimSettlement<'store> {
+    inner: &'store StoreInner,
+    token: ClaimToken,
+    handle: JobClaimHandle,
+    state: ClaimOperationState,
+}
+
+impl ClaimSettlement<'_> {
+    fn handle(&self) -> JobClaimHandle {
+        self.handle.clone()
+    }
+
+    fn complete(mut self) {
+        self.inner.retire_claim(self.token);
+        self.state = ClaimOperationState::Completed;
+    }
+}
+
+impl Drop for ClaimSettlement<'_> {
+    fn drop(&mut self) {
+        if self.state == ClaimOperationState::Completed {
+            return;
+        }
+        if let Some(claim) = self
+            .inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained
+            .get_mut(&self.token)
+            .filter(|claim| claim.state == ClaimState::Settling)
+        {
+            claim.state = ClaimState::Available;
+        }
+    }
+}
+
+fn decode_claim_token(encoded: &[u8]) -> Result<ClaimToken, AbiError> {
+    ClaimToken::try_from(encoded).map_err(|_| AbiError::MalformedInput)
 }
 
 fn settle_claim_with<Decoded: DeserializeOwned + Serialize>(
@@ -932,7 +1197,12 @@ fn settle_claim_with<Decoded: DeserializeOwned + Serialize>(
     out_settlement: *mut u8,
     out_error: *mut EsBuf,
     validate: impl FnOnce(&Decoded) -> Result<(), AbiError>,
-    operation: impl FnOnce(&StoreInner, Decoded) -> Result<(ClaimToken, JobSettlementResult), AbiError>,
+    claim_token: impl FnOnce(&Decoded) -> Result<ClaimToken, AbiError>,
+    operation: impl FnOnce(
+        &StoreInner,
+        JobClaimHandle,
+        Decoded,
+    ) -> Result<JobSettlementResult, AbiError>,
 ) -> i32 {
     let lease = match EsStore::acquire(store) {
         Ok(lease) => lease,
@@ -952,8 +1222,10 @@ fn settle_claim_with<Decoded: DeserializeOwned + Serialize>(
                 return Err(AbiError::State("out_settlement is null"));
             }
             validate(&decoded)?;
-            let (token, result) = operation(&lease.inner, decoded)?;
-            lease.inner.retire_claim(token);
+            let token = claim_token(&decoded)?;
+            let settlement = lease.inner.begin_settlement(token)?;
+            let result = operation(&lease.inner, settlement.handle(), decoded)?;
+            settlement.complete();
             unsafe { out_settlement.write(settlement_tag(result)) };
             Ok(())
         },
@@ -2772,6 +3044,266 @@ mod tests {
     }
 
     #[test]
+    fn renewal_excludes_replay_survives_pruning_and_restores_when_interrupted() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+
+        let lease = EsStore::acquire(&raw mut store).unwrap();
+        let renewal = lease.inner.begin_renewal(&token).unwrap();
+        let pruning_reservation = lease.inner.prepare_claim(100_000).unwrap();
+        assert!(matches!(
+            lease.inner.begin_renewal(&token),
+            Err(AbiError::State("claim handle is invalid"))
+        ));
+        drop(pruning_reservation);
+        drop(renewal);
+        drop(lease);
+
+        let mut ack_encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+        let ack = caller_buffer(&mut ack_encoded);
+        let mut settlement = u8::MAX;
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 0);
+        assert!(error.ptr.is_null());
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn concurrent_job_ack_consumes_exactly_one_claim_token() {
+        const CALLERS: usize = 16;
+
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+        let owner_address = (&raw mut store) as usize;
+        let barrier = Arc::new(std::sync::Barrier::new(CALLERS));
+
+        let results = std::thread::scope(|scope| {
+            (0..CALLERS)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let token = token.clone();
+                    scope.spawn(move || {
+                        let mut encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+                        let request = caller_buffer(&mut encoded);
+                        let mut settlement = u8::MAX;
+                        let mut error = empty_buffer();
+                        barrier.wait();
+                        let result = unsafe {
+                            es_job_ack(
+                                owner_address as *mut *mut EsStore,
+                                &raw const request,
+                                &raw mut settlement,
+                                &raw mut error,
+                            )
+                        };
+                        unsafe { es_buf_free(&raw mut error) };
+                        (result, settlement)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(result, settlement)| *result == ES_OK && *settlement == 0)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(result, settlement)| *result == ES_ERR_STATE && *settlement == 0)
+                .count(),
+            CALLERS - 1
+        );
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn concurrent_claims_reserve_the_last_active_claim_slot_once() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = ClaimToken::try_from(claim_test_job(&mut store, &job_id, 1_000, 0, 0)).unwrap();
+        let lease = EsStore::acquire(&raw mut store).unwrap();
+        let retained = {
+            let claims = lease
+                .inner
+                .claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            claims.retained.get(&token).unwrap().handle.clone()
+        };
+        {
+            let mut claims = lease
+                .inner
+                .claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (1..(MAX_ACTIVE_CLAIMS - 1)).for_each(|index| {
+                let mut fabricated_token = [0_u8; 16];
+                fabricated_token[..8].copy_from_slice(&index.to_be_bytes());
+                claims.retained.insert(
+                    fabricated_token,
+                    RetainedClaim {
+                        handle: retained.clone(),
+                        lease_until_ms: 31_000,
+                        state: ClaimState::Available,
+                    },
+                );
+            });
+            assert_eq!(claims.retained.len(), MAX_ACTIVE_CLAIMS - 1);
+            drop(claims);
+        }
+
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let reserved = Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let first_ready = Arc::clone(&ready);
+            let first_reserved = Arc::clone(&reserved);
+            let first_inner = &lease.inner;
+            let first = scope.spawn(move || {
+                first_ready.wait();
+                let reservation = first_inner.prepare_claim(1_000);
+                first_reserved.wait();
+                reservation.is_ok()
+            });
+            let second_inner = &lease.inner;
+            let second = scope.spawn(move || {
+                ready.wait();
+                let reservation = second_inner.prepare_claim(1_000);
+                reserved.wait();
+                reservation.is_ok()
+            });
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+
+        assert_eq!(results.into_iter().filter(|reserved| *reserved).count(), 1);
+        drop(lease);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn abandoned_job_claim_retires_the_expired_token() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+
+        let mut reclaim_encoded =
+            encode_request(&(1_u8, job_id, "ffi-worker", 31_001_i64, 30_000_i64, 1_u32));
+        let reclaim_request = caller_buffer(&mut reclaim_encoded);
+        let mut reclaim = empty_buffer();
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_claim(
+                    &raw mut store,
+                    &raw const reclaim_request,
+                    &raw mut reclaim,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(
+            decode_output::<JobClaimWire>(&reclaim),
+            (1, 1, None, None, None, None)
+        );
+        unsafe { es_buf_free(&raw mut reclaim) };
+
+        let mut ack_encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+        let ack_request = caller_buffer(&mut ack_encoded);
+        let mut settlement = u8::MAX;
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack_request,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert_eq!(settlement, 0);
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn failed_job_settlement_restores_the_claim_token() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+        let mut retry_encoded = encode_request(&(
+            1_u8,
+            OpaqueBytes(token.clone()),
+            i64::MAX,
+            "invalid instant",
+        ));
+        let retry_request = caller_buffer(&mut retry_encoded);
+        let mut settlement = u8::MAX;
+        let mut error = empty_buffer();
+
+        assert_eq!(
+            unsafe {
+                es_job_retry(
+                    &raw mut store,
+                    &raw const retry_request,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STORAGE
+        );
+        assert_eq!(settlement, 0);
+        unsafe { es_buf_free(&raw mut error) };
+
+        let mut ack_encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+        let ack_request = caller_buffer(&mut ack_encoded);
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack_request,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 0);
+        assert!(error.ptr.is_null());
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
     fn commit_with_job_is_atomic_and_invalid_job_instants_do_not_persist() {
         let mut store = ptr::null_mut();
         open_store(&mut store);
@@ -2817,25 +3349,47 @@ mod tests {
             i64::MAX,
         ));
         let invalid = caller_buffer(&mut invalid_encoded);
-        assert_ne!(
+        assert_eq!(
             unsafe { es_job_enqueue(&raw mut store, &raw const invalid, &raw mut error) },
-            ES_OK
+            ES_ERR_STORAGE
+        );
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_STORAGE,
+                Value::Text("storage failure".to_string()),
+            )
         );
         unsafe { es_buf_free(&raw mut error) };
 
         let rollback_job_id = JobId::new().to_string();
+        let rollback_job_kind = "ffi-rollback";
         let mut rollback_encoded = encode_request(&(
             1_u8,
             "ffi-domain",
             "rollback",
             0_u64,
             vec![("Created", "1.0", OpaqueBytes(vec![9]))],
-            (rollback_job_id, "ffi-test", OpaqueBytes(vec![9]), i64::MAX),
+            (
+                rollback_job_id,
+                rollback_job_kind,
+                OpaqueBytes(vec![9]),
+                i64::MAX,
+            ),
         ));
         let rollback = caller_buffer(&mut rollback_encoded);
-        assert_ne!(
+        assert_eq!(
             unsafe { es_commit_with_job(&raw mut store, &raw const rollback, &raw mut error) },
-            ES_OK
+            ES_ERR_STORAGE
+        );
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_STORAGE,
+                Value::Text("storage failure".to_string()),
+            )
         );
         unsafe { es_buf_free(&raw mut error) };
         let mut version_encoded = encode_request(&(1_u8, "ffi-domain", "rollback"));
@@ -2853,6 +3407,26 @@ mod tests {
             ES_OK
         );
         assert_eq!(version, 0);
+        let mut rollback_poll_encoded =
+            encode_request(&(1_u8, rollback_job_kind, i64::MAX, 10_u32));
+        let rollback_poll = caller_buffer(&mut rollback_poll_encoded);
+        let mut rollback_jobs = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_poll(
+                    &raw mut store,
+                    &raw const rollback_poll,
+                    &raw mut rollback_jobs,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(
+            decode_output::<(u8, Vec<String>)>(&rollback_jobs),
+            (1, Vec::new())
+        );
+        unsafe { es_buf_free(&raw mut rollback_jobs) };
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
     }
 
