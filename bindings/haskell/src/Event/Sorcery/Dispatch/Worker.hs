@@ -1,3 +1,4 @@
+-- | Durable job workers that settle sealed verdicts onto origin entities.
 module Event.Sorcery.Dispatch.Worker (
   DeliveryPolicy,
   DispatchWorker,
@@ -47,6 +48,7 @@ import Event.Sorcery.Stream (StreamKey)
 import Prelude (Either (..), IO, pure)
 
 
+-- | A durable job whose payload identifies the entity awaiting its verdict.
 class
   ( DurableJob job
   , EventSourced (Origin job)
@@ -58,16 +60,19 @@ class
   originKey :: job -> StreamKey (Origin job)
 
 
+-- | Classification of a failed attempt to deliver a verdict to its origin.
 data OriginDeliveryError failure
   = OriginUnavailable failure
   | OriginRefused failure
 
 
+-- | Capability for delivering sealed outcomes to an origin entity.
 newtype OriginPort job failure
   = OriginPort
       (job -> DispatchOutcome job -> IO (Either (OriginDeliveryError failure) ()))
 
 
+-- | Backoff and reporting policy for verdict delivery failures.
 data DeliveryPolicy failure
   = DeliveryPolicy
       (JobInstant -> failure -> JobInstant)
@@ -75,6 +80,7 @@ data DeliveryPolicy failure
       (JobId -> failure -> IO ())
 
 
+-- | Worker configuration for an entity-dispatched durable job.
 data DispatchWorker job failure
   = DispatchWorker
       (JobWorker job)
@@ -82,12 +88,14 @@ data DispatchWorker job failure
       (DeliveryPolicy failure)
 
 
+-- | Builds a verdict-delivery port from an application-specific function.
 originPort
   :: (job -> DispatchOutcome job -> IO (Either (OriginDeliveryError failure) ()))
   -> OriginPort job failure
 originPort = OriginPort
 
 
+-- | Builds delivery backoff and terminal-reporting behavior.
 deliveryPolicy
   :: (JobInstant -> failure -> JobInstant)
   -> (JobInstant -> failure -> JobInstant)
@@ -96,6 +104,7 @@ deliveryPolicy
 deliveryPolicy = DeliveryPolicy
 
 
+-- | Combines durable execution with origin delivery and retry policy.
 dispatchWorker
   :: JobWorker job
   -> OriginPort job failure
@@ -104,6 +113,7 @@ dispatchWorker
 dispatchWorker = DispatchWorker
 
 
+-- | Delivers verdicts through the typed command protocol of an engine store.
 storeOriginPort
   :: OriginJob job
   => Store (Origin job)
@@ -122,6 +132,7 @@ storeOriginPort store = OriginPort \job outcome -> do
     Right _ -> Right ()
 
 
+-- | Claims and runs one dispatched job, delivering its verdict before settlement.
 runDispatchJobOnce
   :: forall job failure
    . OriginJob job

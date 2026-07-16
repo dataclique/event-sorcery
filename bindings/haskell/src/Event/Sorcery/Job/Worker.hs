@@ -1,3 +1,4 @@
+-- | Public durable-job worker API.
 module Event.Sorcery.Job.Worker (
   AttemptLimit,
   JobRunError (..),
@@ -31,6 +32,7 @@ import Event.Sorcery.Job.Worker.Internal (
 import Prelude (Either, IO)
 
 
+-- | Claims, executes, and durably settles one job when it is runnable.
 runJobOnce
   :: forall job
    . DurableJob job

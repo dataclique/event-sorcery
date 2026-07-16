@@ -1,3 +1,4 @@
+-- | Pure routing types and effectful execution contract for durable jobs.
 module Event.Sorcery.Job.Execution (
   DurableJob (..),
   JobAttempt (..),
@@ -20,10 +21,12 @@ import Event.Sorcery.Job (
 import Prelude (Either (Left, Right), Eq, IO, Show, pure)
 
 
+-- | Number of failures durably recorded before this execution.
 newtype JobAttempt = JobAttempt Word32
   deriving stock (Eq, Show)
 
 
+-- | Stable identity and attempt metadata supplied to a job body.
 data JobContext = JobContext
   { jobId :: JobId
   , attempt :: JobAttempt
@@ -31,18 +34,21 @@ data JobContext = JobContext
   deriving stock (Eq, Show)
 
 
+-- | Successful completion or productive deferral.
 data JobOutcome output
   = JobDone output
   | JobDeferred JobInstant
   deriving stock (Eq, Show)
 
 
+-- | Explicit retry classification for a job-body failure.
 data JobFailure failure
   = TransientFailure failure
   | TerminalFailure failure
   deriving stock (Eq, Show)
 
 
+-- | Evidence about whether an earlier external submission landed.
 data Reconciliation output
   = Reconciled output
   | NotSubmitted
@@ -50,6 +56,7 @@ data Reconciliation output
   deriving stock (Eq, Show)
 
 
+-- | External execution protocol implemented by a durable job type.
 class Job job => DurableJob job where
   type JobInput job :: Type
 
@@ -71,6 +78,7 @@ class Job job => DurableJob job where
     -> IO (Either (JobFailure (JobError job)) (Reconciliation (JobOutput job)))
 
 
+-- | Routes first claims to submission and later claims through reconciliation.
 executeDurableJob
   :: DurableJob job
   => JobContext

@@ -1,5 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 
+-- | Typed job identities, codecs, and compile-time kind names.
 module Event.Sorcery.Job.Definition (
   DeadReason (..),
   Job (..),
@@ -22,14 +23,17 @@ import GHC.TypeLits (KnownSymbol, Symbol, symbolVal)
 import Prelude (Either (..), Eq, Integer, Ord, Show)
 
 
+-- | Validated ULID identifying one durable job.
 newtype JobId = JobId Text
   deriving stock (Eq, Ord, Show)
 
 
+-- | Domain payload decoding failure.
 newtype JobDecodeError = JobDecodeError Text
   deriving stock (Eq, Show)
 
 
+-- | Terminal reason retained by the engine.
 data DeadReason
   = RetriesExhausted
   | Rejected
@@ -38,6 +42,7 @@ data DeadReason
   deriving stock (Eq, Show)
 
 
+-- | Domain contract for a persistable job payload.
 class KnownSymbol (JobType job) => Job job where
   type JobType job :: Symbol
   type JobOutput job :: Type
@@ -50,6 +55,7 @@ class KnownSymbol (JobType job) => Job job where
   decodeJob :: ByteString -> Either JobDecodeError job
 
 
+-- | Validates canonical ULID text as a job identifier.
 mkJobId :: Text -> Maybe JobId
 mkJobId value =
   case Base32.decode 26 value :: [(Integer, Text)] of
@@ -61,9 +67,11 @@ mkJobId value =
     _ -> Nothing
 
 
+-- | Returns the canonical text representation of a job identifier.
 jobIdText :: JobId -> Text
 jobIdText (JobId value) = value
 
 
+-- | Reflects a job's type-level kind name into text.
 jobType :: forall job. Job job => Text
 jobType = Text.pack (symbolVal (Proxy @(JobType job)))

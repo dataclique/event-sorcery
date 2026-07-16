@@ -1,3 +1,4 @@
+-- | Typed command execution and replay over the shared engine store.
 module Event.Sorcery.Store (
   Store,
   StoreError (..),
@@ -56,9 +57,11 @@ import Prelude (
  )
 
 
+-- | Typed store with an injected source of unique durable job identifiers.
 data Store entity = Store Engine.Store (IO JobId)
 
 
+-- | Failure raised while loading, deciding, applying, or committing a command.
 data StoreError entity
   = StoreEngineFailed EngineError
   | StoreReplayFailed (ReplayError entity)
@@ -94,10 +97,12 @@ data CommitPlan entity
   | PreparedDispatch entity Word64 (NonEmpty ProposedEvent) JobSeed
 
 
+-- | Builds a typed store over an open engine and job-id generator.
 mkStore :: Engine.Store -> IO JobId -> Store entity
 mkStore = Store
 
 
+-- | Loads an entity and stores a snapshot at its current stream sequence.
 snapshotEntity
   :: forall entity
    . EventSourced entity
@@ -125,6 +130,7 @@ snapshotEntity store@(Store engine _) key = do
         Right _ -> Right (Just entity)
 
 
+-- | Loads and replays an entity, resuming from a valid snapshot when present.
 loadEntity
   :: forall entity
    . EventSourced entity
@@ -134,6 +140,7 @@ loadEntity
 loadEntity store key = fmap (fmap fst) (loadCurrent store key)
 
 
+-- | Decides, validates, and atomically commits one typed command.
 executeCommand
   :: forall entity
    . EventSourced entity

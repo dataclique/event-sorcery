@@ -1,3 +1,4 @@
+-- | Safe ownership and error handling for the shared Rust engine.
 module Event.Sorcery.Engine (
   EngineError (..),
   ErrorClass (..),

@@ -1,3 +1,4 @@
+-- | Aggregate schema reconciliation through the shared engine.
 module Event.Sorcery.Schema (
   SchemaReconciliation (..),
   reconcileSchema,
@@ -48,12 +49,14 @@ import Prelude (
  )
 
 
+-- | Whether startup reconciliation invalidated derived aggregate state.
 data SchemaReconciliation
   = Changed
   | Unchanged
   deriving stock (Eq, Show)
 
 
+-- | Reconciles an aggregate definition before loading its streams.
 reconcileSchema
   :: EventSourced entity
   => Store
@@ -73,6 +76,7 @@ reconcileSchema store entity =
           Right () -> decodeReconciliation <$> peek outReconciliation
 
 
+-- | Records a successfully recovered aggregate schema version.
 recordSchema
   :: EventSourced entity
   => Store

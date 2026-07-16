@@ -1,3 +1,4 @@
+-- | State transitions for entity-scoped durable dispatches.
 module Event.Sorcery.Dispatch.Internal (
   DispatchEvent (..),
   DispatchFailure (..),
@@ -27,20 +28,24 @@ import Event.Sorcery.Job.Definition (
 import Prelude (Either (..), Eq, Show, (==))
 
 
+-- | Successful job output correlated with its dispatch and attempt count.
 data Settled output = Settled JobId output Word32
   deriving stock (Eq, Show)
 
 
+-- | Terminal job failure correlated with its dispatch and attempt count.
 data SettledFailure failure = SettledFailure JobId failure Word32
   deriving stock (Eq, Show)
 
 
+-- | A domain rejection or an engine dead-letter verdict.
 data DispatchFailure failure
   = Rejected failure
   | DeadLettered DeadReason Text
   deriving stock (Eq, Show)
 
 
+-- | Lifecycle embedded in an origin entity for one dispatch slot.
 data DispatchedJob job
   = Idle
   | InFlight JobId
@@ -56,6 +61,7 @@ deriving stock instance
   (Show (JobOutput job), Show (JobError job)) => Show (DispatchedJob job)
 
 
+-- | Events that evolve an entity's dispatch lifecycle.
 data DispatchEvent job
   = Dispatched JobId job
   | ConfirmedEvent (Settled (JobOutput job))
@@ -71,14 +77,17 @@ deriving stock instance
   => Show (DispatchEvent job)
 
 
+-- | A command effect requesting exactly one durable job dispatch.
 newtype JobDispatch job = JobDispatch job
 
 
+-- | Sealed worker verdict delivered back to an origin entity.
 data DispatchOutcome job
   = ConfirmedOutcome (Settled (JobOutput job))
   | FailedOutcome (SettledFailure (DispatchFailure (JobError job)))
 
 
+-- | Reasons a fresh dispatch or delivered outcome is invalid.
 data DispatchRefused
   = DispatchInFlight
   | DispatchAlreadyConfirmed
@@ -86,14 +95,17 @@ data DispatchRefused
   deriving stock (Eq, Show)
 
 
+-- | A dispatch event cannot follow the current lifecycle state.
 data DispatchReplay = DispatchReplay
   deriving stock (Eq, Show)
 
 
+-- | Creates a dispatch request for a command effect.
 kickoff :: job -> JobDispatch job
 kickoff = JobDispatch
 
 
+-- | Refuses overlapping or already-confirmed dispatches.
 guardDispatch
   :: DispatchedJob job
   -> job
@@ -105,6 +117,7 @@ guardDispatch state job = case state of
   Confirmed _ -> Left DispatchAlreadyConfirmed
 
 
+-- | Correlates a sealed verdict and absorbs matching redelivery.
 settleDispatch
   :: DispatchedJob job
   -> DispatchOutcome job
@@ -123,12 +136,14 @@ settleDispatch state outcome = case (state, outcome) of
   _ -> Left DispatchOutcomeMismatch
 
 
+-- | Starts a dispatch lifecycle from its first event.
 originateDispatch
   :: DispatchEvent job
   -> Either DispatchReplay (DispatchedJob job)
 originateDispatch = evolveDispatch Idle
 
 
+-- | Applies one dispatch event to an existing lifecycle.
 evolveDispatch
   :: DispatchedJob job
   -> DispatchEvent job
@@ -143,6 +158,7 @@ evolveDispatch state event = case (state, event) of
   _ -> Left DispatchReplay
 
 
+-- | Constructs a sealed successful worker verdict.
 confirmedOutcome
   :: JobId
   -> JobOutput job
@@ -152,6 +168,7 @@ confirmedOutcome identifier output attempts =
   ConfirmedOutcome (Settled identifier output attempts)
 
 
+-- | Constructs a sealed terminal worker verdict.
 failedOutcome
   :: JobId
   -> DispatchFailure (JobError job)

@@ -1,3 +1,4 @@
+-- | Engine handle ownership, CBOR framing, and ABI call helpers.
 module Event.Sorcery.Engine.Internal (
   EngineError (..),
   ErrorClass (..),
@@ -78,6 +79,7 @@ import Prelude (
  )
 
 
+-- | Runtime and SQLite settings used when opening an engine store.
 data OpenOptions = OpenOptions
   { path :: Text
   , busyTimeoutMilliseconds :: Word64
@@ -87,6 +89,7 @@ data OpenOptions = OpenOptions
   deriving stock (Eq, Show)
 
 
+-- | Stable error category returned by the C ABI.
 data ErrorClass
   = DecodeError
   | ConflictError
@@ -99,25 +102,30 @@ data ErrorClass
   deriving stock (Eq, Show)
 
 
+-- | An engine failure or a malformed response at the binding boundary.
 data EngineError
   = EngineError ErrorClass Text
   | BindingProtocolError Text
   deriving stock (Eq, Show)
 
 
+-- | Thread-safe owner of an opaque engine handle.
 data Store = Store (ForeignPtr (Ptr EsStore)) (MVar ())
 
 
+-- | Reads the engine's packed major and minor ABI version.
 abiVersion :: IO Word32
 abiVersion = esAbiVersion
 
 
+-- | Checks compatibility with the ABI range supported by this binding.
 supportsAbiVersion :: Word32 -> Bool
 supportsAbiVersion version =
   version `shiftR` 16 == supportedAbiMajor
     && version .&. abiMinorMask >= minimumSupportedAbiMinor
 
 
+-- | Opens a store after verifying ABI compatibility.
 openStore :: OpenOptions -> IO (Either EngineError Store)
 openStore options = do
   version <- abiVersion
@@ -131,6 +139,7 @@ openStore options = do
           ("unsupported engine ABI version " <> Text.pack (show version))
 
 
+-- | Closes a store; repeated closes are accepted by the engine.
 closeStore :: Store -> IO (Either EngineError ())
 closeStore (Store owner gate) =
   withMVar gate $ \() ->
@@ -139,6 +148,7 @@ closeStore (Store owner gate) =
       pure (statusWithoutDetail status)
 
 
+-- | Encodes open options using the versioned engine CBOR profile.
 encodeOpenOptions :: OpenOptions -> ByteString
 encodeOpenOptions options =
   toStrictByteString $
@@ -150,6 +160,7 @@ encodeOpenOptions options =
       <> encodeWord64 options.runtimeThreads
 
 
+-- | Decodes a complete versioned engine-error payload.
 decodeEngineError :: ByteString -> Either String EngineError
 decodeEngineError bytes =
   case deserialiseFromBytes

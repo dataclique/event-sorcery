@@ -1,3 +1,4 @@
+-- | Validated worker configuration and durable execution results.
 module Event.Sorcery.Job.Worker.Definition (
   AttemptLimit (AttemptLimit),
   JobRunError (..),
@@ -28,10 +29,12 @@ import Event.Sorcery.Job.Execution (
 import Prelude (Eq, IO, Show, otherwise, (==))
 
 
+-- | Positive maximum number of durably recorded execution attempts.
 newtype AttemptLimit = AttemptLimit Word32
   deriving stock (Eq, Show)
 
 
+-- | Complete policy and engine context required to run one job kind.
 data JobWorker job = JobWorker
   { store :: Store
   , workerId :: WorkerId
@@ -44,12 +47,14 @@ data JobWorker job = JobWorker
   }
 
 
+-- | Injected timing operations used to renew long-running claims.
 data RenewalSchedule = RenewalSchedule
   { waitBeforeRenewal :: IO ()
   , renewalDeadline :: IO JobInstant
   }
 
 
+-- | Exhaustive durable outcome of one claim-and-execute cycle.
 data JobRunResult output failure
   = JobSucceeded output
   | JobDeferredUntil JobInstant
@@ -63,18 +68,21 @@ data JobRunResult output failure
   deriving stock (Eq, Show)
 
 
+-- | Failure that prevented a worker cycle from reaching a durable outcome.
 data JobRunError
   = JobRunEngineFailed EngineError
   | JobRunDecodeFailed JobId JobDecodeError
   deriving stock (Eq, Show)
 
 
+-- | Validates that an attempt limit is non-zero.
 mkAttemptLimit :: Word32 -> Maybe AttemptLimit
 mkAttemptLimit value
   | value == 0 = Nothing
   | otherwise = Just (AttemptLimit value)
 
 
+-- | Builds a worker without lease renewal.
 jobWorker
   :: Store
   -> WorkerId
@@ -97,9 +105,11 @@ jobWorker store workerId leaseDuration claimBudget attemptLimit retryAt input =
     }
 
 
+-- | Builds a renewal schedule from injectable waiting and clock operations.
 renewalSchedule :: IO () -> IO JobInstant -> RenewalSchedule
 renewalSchedule = RenewalSchedule
 
 
+-- | Enables periodic lease renewal for a worker.
 renewingJobWorker :: JobWorker job -> RenewalSchedule -> JobWorker job
 renewingJobWorker worker schedule = worker {leaseRenewal = Just schedule}

@@ -1,3 +1,4 @@
+-- | Explicit test-only constructors for otherwise sealed dispatch verdicts.
 module Event.Sorcery.Dispatch.TestSupport (
   confirmedOutcome,
   failedOutcome,
@@ -15,6 +16,7 @@ import Event.Sorcery.Job.Definition (
  )
 
 
+-- | Fabricates a successful verdict for domain tests.
 confirmedOutcome
   :: JobId
   -> JobOutput job
@@ -23,6 +25,7 @@ confirmedOutcome
 confirmedOutcome = Internal.confirmedOutcome
 
 
+-- | Fabricates a failed verdict for domain tests.
 failedOutcome
   :: JobId
   -> DispatchFailure (JobError job)

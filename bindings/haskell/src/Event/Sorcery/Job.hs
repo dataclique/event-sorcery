@@ -1,3 +1,4 @@
+-- | Durable job enqueueing, polling, claiming, fencing, and settlement.
 module Event.Sorcery.Job (
   ClaimBudget (..),
   ClaimedJob,
@@ -134,30 +135,37 @@ import Prelude (
  )
 
 
+-- | Engine poll partition for one declared job type.
 newtype JobKind = JobKind Text
   deriving stock (Eq, Show)
 
 
+-- | Stable identity of a worker process or thread.
 newtype WorkerId = WorkerId Text
   deriving stock (Eq, Show)
 
 
+-- | Milliseconds since the Unix epoch.
 newtype JobInstant = JobInstant Int64
   deriving stock (Eq, Show)
 
 
+-- | Duration in milliseconds granted to a successful claim.
 newtype LeaseDuration = LeaseDuration Int64
   deriving stock (Eq, Show)
 
 
+-- | Maximum claims allowed before abandoning a crash loop.
 newtype ClaimBudget = ClaimBudget Word32
   deriving stock (Eq, Show)
 
 
+-- | Maximum number of runnable identifiers returned by one poll.
 newtype PollLimit = PollLimit Word32
   deriving stock (Eq, Show)
 
 
+-- | Complete engine payload required to enqueue a job.
 data JobSeed = JobSeed
   { jobId :: JobId
   , kind :: JobKind
@@ -167,16 +175,19 @@ data JobSeed = JobSeed
   deriving stock (Eq, Show)
 
 
+-- | Whether a claim may submit or must reconcile first.
 data JobExecutionRoute
   = SubmitExecution
   | ReconcileExecution
   deriving stock (Eq, Show)
 
 
+-- | Opaque fenced reference used to renew a live claim.
 newtype JobClaimReference = JobClaimReference ByteString
   deriving stock (Eq, Show)
 
 
+-- | Metadata and payload supplied to the winning claim consumer.
 data JobClaimDetails = JobClaimDetails
   { reference :: JobClaimReference
   , attempt :: Word32
@@ -186,28 +197,33 @@ data JobClaimDetails = JobClaimDetails
   deriving stock (Eq, Show)
 
 
+-- | Result of attempting to renew a claim lease.
 data JobLeaseResult
   = LeaseHeld
   | LeaseLost
   deriving stock (Eq, Show)
 
 
+-- | Whether a settlement was applied or rejected by its fence.
 data JobSettlement
   = SettlementApplied
   | SettlementFenced
   deriving stock (Eq, Show)
 
 
+-- | One-shot token authorizing exactly one settlement attempt.
 newtype JobSettlementToken = JobSettlementToken ByteString
   deriving stock (Eq, Show)
 
 
+-- | Linear proof that the caller owns a live claimed job.
 data ClaimedJob where
   ClaimedJob
     :: Ur ByteString
     %1 -> ClaimedJob
 
 
+-- | Exhaustive result of a claim attempt.
 data JobClaimResult result
   = JobClaimed result
   | JobAbandoned
@@ -215,6 +231,7 @@ data JobClaimResult result
   | JobSkipped
 
 
+-- | Atomically appends domain events and seeds their dispatched job.
 commitWithJob
   :: Store
   -> StreamIdentity
@@ -229,6 +246,7 @@ commitWithJob store stream expected events seed =
       (callWithoutOutput . esCommitWithJob handle)
 
 
+-- | Enqueues a standalone job idempotently.
 enqueueJob :: Store -> JobSeed -> IO (Either EngineError ())
 enqueueJob store seed =
   withOpenStore store $ \handle ->
@@ -237,6 +255,7 @@ enqueueJob store seed =
       (callWithoutOutput . esJobEnqueue handle)
 
 
+-- | Returns runnable job identifiers for one kind.
 pollJobs
   :: Store
   -> JobKind
@@ -250,6 +269,7 @@ pollJobs store kind now limit =
       pure (response >>= decodeResponse decodePolledJobs)
 
 
+-- | Streams one poll page through a 'ConduitT'.
 streamRunnableJobs
   :: Store
   -> JobKind
@@ -261,6 +281,7 @@ streamRunnableJobs store kind now limit = do
   yieldMany jobs
 
 
+-- | Claims a job and scopes its linear proof to the supplied continuation.
 claimJob
   :: Store
   -> JobId
@@ -277,6 +298,7 @@ claimJob store identifier worker now lease budget useClaim =
       (readClaim useClaim . esJobClaim handle)
 
 
+-- | Extends a live lease without changing its fence.
 renewJob
   :: Store
   -> JobClaimReference
@@ -290,10 +312,12 @@ renewJob store (JobClaimReference reference) newLease =
         decodeLeaseResult
 
 
+-- | Consumes a claim proof and exposes its one-shot settlement token.
 settlementToken :: ClaimedJob %1 -> Ur JobSettlementToken
 settlementToken (ClaimedJob (Ur claim)) = Ur (JobSettlementToken claim)
 
 
+-- | Marks a successfully executed job complete.
 acknowledgeJob
   :: Store
   -> JobSettlementToken
@@ -302,6 +326,7 @@ acknowledgeJob store (JobSettlementToken claim) =
   settleJob store (encodeAcknowledge claim) esJobAcknowledge
 
 
+-- | Records a transient failure and schedules another attempt.
 retryJob
   :: Store
   -> JobSettlementToken
@@ -316,6 +341,7 @@ retryJob
     settleJob store (encodeRetry claim runAt failure) esJobRetry
 
 
+-- | Schedules productive deferral without incrementing attempts.
 deferJob
   :: Store
   -> JobSettlementToken
@@ -325,6 +351,7 @@ deferJob store (JobSettlementToken claim) runAt =
   settleJob store (encodeDefer claim runAt) esJobDefer
 
 
+-- | Retains a terminal job with its explicit reason and detail.
 deadLetterJob
   :: Store
   -> JobSettlementToken

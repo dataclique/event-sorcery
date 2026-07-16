@@ -56,12 +56,24 @@
           event_sorcery_ffi = ffiEngine;
           linear-base = pkgs.haskell.lib.dontCheck haskellPackages.linear-base;
         };
-        haskellBinding = haskellBindingBase.overrideAttrs (old: {
-          buildInputs = (old.buildInputs or [ ]) ++ [ ffiEngine ];
-          configureFlags = (old.configureFlags or [ ]) ++ [
-            "--extra-include-dirs=${ffiEngine}/include"
-            "--extra-lib-dirs=${ffiEngine}/lib"
+        haskellBinding = pkgs.haskell.lib.overrideCabal haskellBindingBase (old: {
+          configureFlags =
+            (old.configureFlags or [ ])
+            ++ [
+              "--extra-include-dirs=${ffiEngine}/include"
+              "--extra-lib-dirs=${ffiEngine}/lib"
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              "--disable-shared"
+            ];
+          haddockFlags = (old.haddockFlags or [ ]) ++ [
+            "--haddock-option=--ignore-link-symbol=Elem"
+            "--haddock-option=--ignore-link-symbol=Ur"
           ];
+          postInstall = (old.postInstall or "") + ''
+            # Haddock 2.33 serializes independent modules in nondeterministic order.
+            rm $doc/share/doc/event-sorcery-0.4.0.0/html/event-sorcery.haddock
+          '';
         });
         haskellBenchmarks = (pkgs.haskell.lib.doBenchmark haskellBinding).overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''

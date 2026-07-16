@@ -1,3 +1,4 @@
+-- | Linear snapshot writes and engine-backed snapshot persistence.
 module Event.Sorcery.Snapshot (
   SnapshotVersion (..),
   SnapshotWrite,
@@ -71,25 +72,30 @@ import Prelude (
  )
 
 
+-- | Monotonic version returned after a snapshot write.
 newtype SnapshotVersion = SnapshotVersion Word64
   deriving stock (Eq, Show)
 
 
+-- | Stored stream sequence, snapshot version, and opaque entity payload.
 data StoredSnapshot = StoredSnapshot Word64 SnapshotVersion ByteString
   deriving stock (Eq, Show)
 
 
+-- | One-shot snapshot write request.
 data SnapshotWrite where
   SnapshotWrite
     :: Ur (StreamIdentity, Word64, ByteString)
     %1 -> SnapshotWrite
 
 
+-- | Prepares a snapshot request that must be consumed exactly once.
 snapshotWrite :: StreamIdentity -> Word64 -> ByteString -> SnapshotWrite
 snapshotWrite identity sequence payload =
   SnapshotWrite (Ur (identity, sequence, payload))
 
 
+-- | Loads the latest snapshot for a stream when one exists.
 loadSnapshot
   :: Engine.Store
   -> StreamIdentity
@@ -101,6 +107,7 @@ loadSnapshot store identity =
       pure (response >>= decodeResponse decodeStoredSnapshot)
 
 
+-- | Consumes and atomically persists a prepared snapshot request.
 storeSnapshot
   :: Engine.Store
   -> SnapshotWrite
@@ -116,6 +123,7 @@ storeSnapshot store (SnapshotWrite (Ur (identity, sequence, payload))) =
           Right () -> Right . SnapshotVersion <$> peek outVersion
 
 
+-- | Discards the current snapshot while retaining the event stream.
 discardSnapshot
   :: Engine.Store
   -> StreamIdentity

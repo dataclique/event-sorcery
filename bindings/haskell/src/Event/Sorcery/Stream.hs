@@ -1,3 +1,4 @@
+-- | Typed stream identities, replay validation, codecs, and engine operations.
 module Event.Sorcery.Stream (
   ActualSequence (..),
   ExpectedSequence (..),
@@ -103,6 +104,7 @@ import Prelude (
  )
 
 
+-- | Erased aggregate type and identifier understood by the engine.
 data StreamIdentity = StreamIdentity
   { aggregateType :: Text
   , aggregateId :: Text
@@ -110,32 +112,39 @@ data StreamIdentity = StreamIdentity
   deriving stock (Eq, Show)
 
 
+-- | Number of events durably committed to a stream.
 newtype StreamVersion = StreamVersion Word64
   deriving stock (Eq, Ord, Show)
 
 
+-- | One-based position of an event within its stream.
 newtype StreamPosition = StreamPosition Word64
   deriving stock (Eq, Ord, Show)
 
 
+-- | Sequence required by the replay fold at its next step.
 newtype ExpectedSequence = ExpectedSequence StreamPosition
   deriving stock (Eq, Show)
 
 
+-- | Sequence observed on a stored event.
 newtype ActualSequence = ActualSequence StreamPosition
   deriving stock (Eq, Show)
 
 
+-- | Stream identity tagged with its aggregate type.
 newtype StreamKey entity = StreamKey StreamIdentity
   deriving stock (Eq, Show)
 
 
+-- | Mismatch between stored metadata and the decoded event declaration.
 data MetadataMismatch
   = EventTypeMismatch Text Text
   | EventVersionMismatch EventVersion EventVersion
   deriving stock (Eq, Show)
 
 
+-- | Position-aware failure that makes a stream lifecycle unusable.
 data ReplayError entity
   = EventDecodeFailed StreamPosition DecodeCause
   | EventMetadataMismatch StreamPosition MetadataMismatch
@@ -152,6 +161,7 @@ deriving stock instance
   Show (Aggregate.ApplyError entity) => Show (ReplayError entity)
 
 
+-- | Opaque domain event prepared for an engine commit.
 data ProposedEvent = ProposedEvent
   { eventType :: Text
   , eventVersion :: Text
@@ -160,6 +170,7 @@ data ProposedEvent = ProposedEvent
   deriving stock (Eq, Show)
 
 
+-- | Opaque domain event loaded from the engine.
 data StoredEvent = StoredEvent
   { sequence :: Word64
   , eventType :: Text
@@ -169,6 +180,7 @@ data StoredEvent = StoredEvent
   deriving stock (Eq, Show)
 
 
+-- | Builds a typed stream key from an aggregate identifier.
 streamKey
   :: forall entity
    . EventSourced entity
@@ -182,10 +194,12 @@ streamKey identifier =
       }
 
 
+-- | Erases the aggregate tag from a typed stream key.
 streamKeyIdentity :: StreamKey entity -> StreamIdentity
 streamKeyIdentity (StreamKey identity) = identity
 
 
+-- | Replays a complete stream from its first event.
 replay
   :: forall entity
    . EventSourced entity
@@ -196,6 +210,7 @@ replay _ events =
   fst <$> foldM replayEvent (Nothing, StreamPosition 1) events
 
 
+-- | Resumes replay after a decoded snapshot at the supplied version.
 resume
   :: forall entity
    . EventSourced entity
@@ -279,6 +294,7 @@ nextPosition position@(StreamPosition sequence)
   | otherwise = Right (StreamPosition (sequence + 1))
 
 
+-- | Loads a full stream or the events strictly after a sequence.
 loadStream
   :: Store
   -> StreamIdentity
@@ -291,6 +307,7 @@ loadStream store stream after =
       pure (response >>= decodeResponse decodeStoredEvents)
 
 
+-- | Returns the number of events currently committed to a stream.
 currentVersion :: Store -> StreamIdentity -> IO (Either EngineError Word64)
 currentVersion store stream =
   withOpenStore store $ \handle ->
@@ -304,6 +321,7 @@ currentVersion store stream =
           Right () -> Right <$> peek outVersion
 
 
+-- | Atomically appends a non-empty event batch at an expected version.
 commit
   :: Store
   -> StreamIdentity
@@ -317,6 +335,7 @@ commit store stream expected events =
       (callWithoutOutput . esCommit handle)
 
 
+-- | Encodes a deterministic engine request for stream loading.
 encodeLoadStream :: StreamIdentity -> Maybe Word64 -> ByteString
 encodeLoadStream stream after =
   toStrictByteString $
@@ -327,6 +346,7 @@ encodeLoadStream stream after =
       <> maybe encodeNull encodeWord64 after
 
 
+-- | Encodes a deterministic current-version request.
 encodeCurrentVersion :: StreamIdentity -> ByteString
 encodeCurrentVersion stream =
   toStrictByteString $
@@ -336,6 +356,7 @@ encodeCurrentVersion stream =
       <> encodeString stream.aggregateId
 
 
+-- | Encodes a deterministic stream commit request.
 encodeCommit :: StreamIdentity -> Word64 -> [ProposedEvent] -> ByteString
 encodeCommit stream expected events =
   toStrictByteString $
@@ -348,6 +369,7 @@ encodeCommit stream expected events =
       <> foldMap encodeProposedEvent events
 
 
+-- | Decodes a deterministic stored-events response with no trailing bytes.
 decodeStoredEvents :: ByteString -> Either String [StoredEvent]
 decodeStoredEvents bytes =
   case deserialiseFromBytes
@@ -359,6 +381,7 @@ decodeStoredEvents bytes =
       | otherwise -> Left "trailing bytes after stored events"
 
 
+-- | Encodes one proposed event using the shared deterministic CBOR profile.
 encodeProposedEvent :: ProposedEvent -> Encoding
 encodeProposedEvent event =
   encodeListLen 3
