@@ -60,13 +60,14 @@ pub struct JobRuntime<Backend: EventBackend = SqliteBackend> {
     queue: Arc<Projection<JobState>>,
 }
 
-/// A won claim that can be consumed exactly once by a worker adapter.
+/// A won claim capability used by a worker adapter to renew or settle execution.
 ///
 /// Its fields are intentionally private and the capability is deliberately not
 /// serializable: accepting caller-produced claim state would allow attempts to
 /// forge its fencing identity. Foreign bindings must retain it in trusted
-/// process memory and expose only a binding-owned opaque token.
-#[derive(Debug)]
+/// process memory and expose only a binding-owned opaque token. The claim id
+/// and event sequence remain the event-sourced fencing identity.
+#[derive(Debug, Clone)]
 pub struct JobClaimHandle {
     job_id: JobId,
     claim_seq: i64,
