@@ -62,7 +62,7 @@ encodeOpenOptions options =
       <> encodeString options.path
       <> encodeWord64 options.busyTimeoutMilliseconds
       <> encodeWord32 options.poolSize
-      <> encodeWord64 options.runtimeThreads
+      <> encodeWord32 options.runtimeThreads
 
 
 encodeLoadStream :: StreamIdentity -> Maybe Word64 -> ByteString

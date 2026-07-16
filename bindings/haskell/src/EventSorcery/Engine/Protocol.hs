@@ -15,7 +15,7 @@ data OpenOptions = OpenOptions
   { path :: Text
   , busyTimeoutMilliseconds :: Word64
   , poolSize :: Word32
-  , runtimeThreads :: Word64
+  , runtimeThreads :: Word32
   }
   deriving stock (Eq, Show)
 

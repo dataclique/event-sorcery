@@ -1,6 +1,8 @@
 module Main (main) where
 
 import Data.ByteString qualified as ByteString
+import Data.Either (isLeft)
+import Data.Word (Word32)
 import EventSorcery.Engine.Codec (
   decodeStoredEvents,
   encodeCommit,
@@ -13,19 +15,39 @@ import EventSorcery.Engine.Protocol (
   StoredEvent (..),
   StreamIdentity (..),
  )
-import Prelude (Either (..), IO, Maybe (Nothing), error, pure, (&&), (==))
+import Prelude (
+  Bool,
+  Either (..),
+  IO,
+  Maybe (Nothing),
+  String,
+  error,
+  pure,
+  ($),
+  (<>),
+  (==),
+ )
 
 
 main :: IO ()
-main =
-  if encodeOpenOptions options == expectedOpen
-    && encodeLoadStream stream Nothing == expectedLoad
-    && encodeCommit stream 0 [proposed] == expectedCommit
-    && decodeStoredEvents stored == Right [expectedStored]
-    then pure ()
-    else error "engine codecs did not match the deterministic CBOR vectors"
+main = do
+  assert "open options encoding" $ encodeOpenOptions options == expectedOpen
+  assert "load stream encoding" $ encodeLoadStream stream Nothing == expectedLoad
+  assert "commit encoding" $ encodeCommit stream 0 [proposed] == expectedCommit
+  assert "stored event decoding" $
+    decodeStoredEvents stored == Right [expectedStored]
+  assert "trailing bytes are rejected" $
+    isLeft (decodeStoredEvents (stored <> ByteString.singleton 0))
+  assert "unsupported versions are rejected" $
+    isLeft (decodeStoredEvents unsupportedVersion)
+  assert "top-level arity is enforced" $
+    isLeft (decodeStoredEvents wrongTopLevelArity)
+  assert "stored-event arity is enforced" $
+    isLeft (decodeStoredEvents wrongEventArity)
+  assert "opaque payloads must be byte strings" $
+    isLeft (decodeStoredEvents arrayPayload)
   where
-    options = OpenOptions "sqlite::memory:" 5000 1 1
+    options = OpenOptions "sqlite::memory:" 5000 1 (256 :: Word32)
     stream = StreamIdentity "account" "one"
     proposed = ProposedEvent "Created" "1.0" (ByteString.pack [0, 1])
     expectedStored = StoredEvent 1 "Created" "1.0" (ByteString.pack [0, 1])
@@ -53,7 +75,9 @@ main =
         , 19
         , 136
         , 1
+        , 25
         , 1
+        , 0
         ]
     expectedLoad =
       ByteString.pack
@@ -116,3 +140,38 @@ main =
         , 0
         , 1
         ]
+    unsupportedVersion = ByteString.pack [130, 2, 128]
+    wrongTopLevelArity = ByteString.pack [129, 1]
+    wrongEventArity =
+      ByteString.pack
+        [130, 1, 129, 131, 1, 103, 67, 114, 101, 97, 116, 101, 100, 99, 49, 46, 48]
+    arrayPayload =
+      ByteString.pack
+        [ 130
+        , 1
+        , 129
+        , 132
+        , 1
+        , 103
+        , 67
+        , 114
+        , 101
+        , 97
+        , 116
+        , 101
+        , 100
+        , 99
+        , 49
+        , 46
+        , 48
+        , 130
+        , 0
+        , 1
+        ]
+
+
+assert :: String -> Bool -> IO ()
+assert message condition =
+  if condition
+    then pure ()
+    else error message
