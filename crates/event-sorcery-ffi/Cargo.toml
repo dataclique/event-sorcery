@@ -10,13 +10,13 @@ build = "build.rs"
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
-ciborium = "0.2.2"
-event-sorcery = { path = "../event-sorcery" }
+ciborium.workspace = true
+event-sorcery.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 
 [build-dependencies]
-cbindgen = "=0.29.2"
+cbindgen.workspace = true
 
 [lints.rust]
 unsafe_code = "allow"

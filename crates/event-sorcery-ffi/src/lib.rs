@@ -1,3 +1,10 @@
+//! Unsafe C ABI for the captive event-sorcery engine.
+//!
+//! Inputs remain caller-owned for each call. Outputs remain engine-owned until
+//! released with [`es_buf_free`]. The owner cell initialized by [`es_open`] must
+//! remain at a stable address; [`es_close`] linearizes concurrent closes through
+//! that cell, waits for acquired calls, and destroys the engine exactly once.
+
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -20,6 +27,8 @@ const ES_ERR_RESOURCE_LIMIT: i32 = 6;
 const ES_ERR_PANIC: i32 = 100;
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CBOR_DEPTH: usize = 32;
+/// Maximum worker threads accepted from the fixed-width C ABI options product.
+const MAX_RUNTIME_THREADS: u32 = 256;
 static STORE_REGISTRY: OnceLock<Mutex<HashMap<usize, StoreEntry>>> = OnceLock::new();
 
 #[repr(C)]
@@ -107,11 +116,11 @@ pub unsafe extern "C" fn es_open(
 /// must not be copied to another owner or modified by the caller. Repeated and
 /// concurrent calls with the same owner are safe.
 pub unsafe extern "C" fn es_close(store: *mut *mut EsStore) -> i32 {
-    let Some(owner) = (unsafe { store.as_mut() }) else {
+    if store.is_null() {
         return ES_OK;
-    };
+    }
     let owner_address = store as usize;
-    let (store, close_role) = match linearize_close(owner_address, owner) {
+    let (store, close_role) = match linearize_close(store) {
         Ok(Some(close)) => close,
         Ok(None) => return ES_OK,
         Err(error) => return error.code(),
@@ -208,17 +217,18 @@ fn publish_store(owner: *mut *mut EsStore, store: Arc<EsStore>) -> Result<(), Ab
 }
 
 fn linearize_close(
-    owner_address: usize,
-    owner: &mut *mut EsStore,
+    owner: *mut *mut EsStore,
 ) -> Result<Option<(Arc<EsStore>, CloseRole)>, AbiError> {
+    let owner_address = owner as usize;
     let registry = store_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(entry) = registry.get(&owner_address) else {
-        *owner = ptr::null_mut();
+        unsafe { owner.write(ptr::null_mut()) };
         return Ok(None);
     };
-    if !owner.is_null() && *owner as usize != entry.raw_store {
+    let raw_store = unsafe { owner.read() };
+    if !raw_store.is_null() && raw_store as usize != entry.raw_store {
         return Err(AbiError::State("store owner does not match its handle"));
     }
     let store = Arc::clone(&entry.store);
@@ -235,7 +245,7 @@ fn linearize_close(
         }
         StoreState::Closing { .. } | StoreState::Closed(_) => CloseRole::Join,
     };
-    *owner = ptr::null_mut();
+    unsafe { owner.write(ptr::null_mut()) };
     drop(state);
     store.state_changed.notify_all();
     drop(registry);
@@ -275,17 +285,18 @@ enum AbiError {
 impl EsStore {
     #[cfg(test)]
     fn acquire(owner: *mut *mut Self) -> Result<StoreLease, AbiError> {
-        let Some(owner) = (unsafe { owner.as_ref() }) else {
+        if owner.is_null() {
             return Err(AbiError::State("store owner is null"));
-        };
-        let owner_address = std::ptr::from_ref(owner).addr();
+        }
+        let owner_address = owner as usize;
         let registry = store_registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(entry) = registry.get(&owner_address) else {
             return Err(AbiError::State("store is closed"));
         };
-        if owner.is_null() || *owner as usize != entry.raw_store {
+        let raw_store = unsafe { owner.read() };
+        if raw_store.is_null() || raw_store as usize != entry.raw_store {
             return Err(AbiError::State("store is closed"));
         }
         let store = Arc::clone(&entry.store);
@@ -438,7 +449,7 @@ fn decode_open_options(buffer: *const EsBuf) -> Result<OpenOptions, AbiError> {
         });
     }
     let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) };
-    let decoded: (u8, String, u64, u32, usize) =
+    let decoded: (u8, String, u64, u32, u32) =
         ciborium::de::from_reader_with_recursion_limit(Cursor::new(bytes), MAX_CBOR_DEPTH)
             .map_err(|_| AbiError::MalformedInput)?;
     let mut canonical = Vec::new();
@@ -446,19 +457,24 @@ fn decode_open_options(buffer: *const EsBuf) -> Result<OpenOptions, AbiError> {
     if canonical != bytes {
         return Err(AbiError::MalformedInput);
     }
-    let (version, path, busy_timeout_ms, pool_size, runtime_threads): (
-        u8,
-        String,
-        u64,
-        u32,
-        usize,
-    ) = decoded;
+    let (version, path, busy_timeout_ms, pool_size, runtime_threads): (u8, String, u64, u32, u32) =
+        decoded;
     if version != 1
         || pool_size == 0
         || runtime_threads == 0
         || (path == "sqlite::memory:" && pool_size != 1)
     {
         return Err(AbiError::MalformedInput);
+    }
+    let runtime_threads = usize::try_from(runtime_threads).map_err(|_| AbiError::MalformedInput)?;
+    let runtime_thread_limit =
+        usize::try_from(MAX_RUNTIME_THREADS).map_err(|_| AbiError::MalformedInput)?;
+    if runtime_threads > runtime_thread_limit {
+        return Err(AbiError::ResourceLimit {
+            resource: "runtime_threads",
+            observed: runtime_threads,
+            limit: runtime_thread_limit,
+        });
     }
     Ok(OpenOptions {
         path,
@@ -544,14 +560,18 @@ mod tests {
         }
     }
 
-    fn open_options() -> Vec<u8> {
+    fn encoded_open_options(runtime_threads: u32) -> Vec<u8> {
         let mut encoded = Vec::new();
         ciborium::into_writer(
-            &(1_u8, "sqlite::memory:", 5_000_u64, 1_u32, 1_usize),
+            &(1_u8, "sqlite::memory:", 5_000_u64, 1_u32, runtime_threads),
             &mut encoded,
         )
         .unwrap();
         encoded
+    }
+
+    fn open_options() -> Vec<u8> {
+        encoded_open_options(1)
     }
 
     fn decode_error(buffer: EsBuf) -> (u8, i32, Value) {
@@ -594,6 +614,45 @@ mod tests {
         assert_eq!(result, ES_ERR_DECODE);
         assert!(store.is_null());
         unsafe { es_buf_free(&raw mut error) };
+    }
+
+    #[test]
+    fn open_options_accept_the_maximum_runtime_thread_count() {
+        let mut encoded = encoded_open_options(MAX_RUNTIME_THREADS);
+        let buffer = EsBuf {
+            ptr: encoded.as_mut_ptr(),
+            len: encoded.len(),
+        };
+
+        let Ok(options) = decode_open_options(&raw const buffer) else {
+            panic!("maximum runtime thread count must be accepted");
+        };
+
+        assert_eq!(
+            options.runtime_threads,
+            usize::try_from(MAX_RUNTIME_THREADS).unwrap()
+        );
+    }
+
+    #[test]
+    fn open_options_reject_the_first_runtime_thread_count_above_the_limit() {
+        let mut encoded = encoded_open_options(MAX_RUNTIME_THREADS + 1);
+        let buffer = EsBuf {
+            ptr: encoded.as_mut_ptr(),
+            len: encoded.len(),
+        };
+
+        let result = decode_open_options(&raw const buffer);
+
+        assert!(matches!(
+            result,
+            Err(AbiError::ResourceLimit {
+                resource: "runtime_threads",
+                observed,
+                limit,
+            }) if observed == usize::try_from(MAX_RUNTIME_THREADS + 1).unwrap()
+                && limit == usize::try_from(MAX_RUNTIME_THREADS).unwrap()
+        ));
     }
 
     #[test]
