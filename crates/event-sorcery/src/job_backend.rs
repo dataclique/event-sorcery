@@ -158,6 +158,13 @@ pub enum JobRuntimeError<BackendError> {
     InvalidClaimPolicy,
 }
 
+fn runtime_job_error<BackendError>(error: JobStoreError) -> JobRuntimeError<BackendError> {
+    match error {
+        JobStoreError::InvalidInstant(millis) => JobRuntimeError::InvalidInstant(millis),
+        other => JobRuntimeError::Aggregate(other.to_string()),
+    }
+}
+
 impl<Backend: EventBackend> Clone for JobRuntime<Backend> {
     fn clone(&self) -> Self {
         Self {
@@ -183,10 +190,8 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
             payload,
             run_at_ms,
         };
-        let event = enqueued_event(&request)
-            .map_err(|error| JobRuntimeError::Aggregate(error.to_string()))?;
-        let projection = pending_seed_payload(&request)
-            .map_err(|error| JobRuntimeError::Aggregate(error.to_string()))?;
+        let event = enqueued_event(&request).map_err(runtime_job_error)?;
+        let projection = pending_seed_payload(&request).map_err(runtime_job_error)?;
         self.backend
             .enqueue(event, projection)
             .await
@@ -1280,6 +1285,33 @@ mod tests {
         assert_eq!(
             runtime.poll_jobs(TestJob::KIND, 1_000, 10).await.unwrap(),
             [job_id.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_facade_rejects_an_out_of_range_enqueue_instant() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = JobId::new();
+
+        let error = runtime
+            .enqueue_job_payload(
+                job_id,
+                TestJob::KIND.to_string(),
+                serde_json::json!({ "n": 1 }),
+                i64::MAX,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, JobRuntimeError::InvalidInstant(i64::MAX)));
+        assert!(event_types(&pool, &job_id).await.is_empty());
+        assert!(
+            runtime
+                .poll_jobs(TestJob::KIND, i64::MAX, 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

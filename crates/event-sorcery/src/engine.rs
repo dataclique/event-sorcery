@@ -1184,7 +1184,9 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::job::{JobId, JobKind, WorkerId, enqueued_event, pending_seed_payload, plan_claim};
+    use crate::job::{
+        JobId, JobKind, JobStoreError, WorkerId, enqueued_event, pending_seed_payload, plan_claim,
+    };
 
     #[tokio::test]
     async fn migrate_initializes_the_existing_sqlite_schema() {
@@ -1539,6 +1541,43 @@ mod tests {
                 .map(|event| event.event_type)
                 .collect::<Vec<_>>(),
             ["JobEnqueued"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_job_seed_instant_rolls_back_the_domain_event() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
+        let engine = Engine::new(pool);
+        let stream = StreamIdentity::new("engine-test", "invalid-job-instant");
+        let event = SerializedEvent {
+            aggregate_type: "engine-test".to_string(),
+            aggregate_id: "invalid-job-instant".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        let job_id = JobId::new();
+        let request = CommitRequest::new(stream.clone(), std::slice::from_ref(&event)).with_job(
+            JobSeed::new(job_id, "haskell-test", serde_json::json!([]), i64::MAX),
+        );
+
+        let error = engine.commit(request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::JobFlush(JobStoreError::InvalidInstant(i64::MAX))
+        ));
+        assert!(engine.load_events(&stream, None).await.unwrap().is_empty());
+        let job_stream = StreamIdentity::new("job", job_id.to_string());
+        assert!(
+            engine
+                .load_events(&job_stream, None)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }
