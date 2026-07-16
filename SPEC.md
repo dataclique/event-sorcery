@@ -17,6 +17,12 @@ typed language surfaces:
 - the current native Rust API; and
 - an idiomatic Haskell binding over a versioned C ABI.
 
+This specification governs the experimental fork hosted in the `dataclique`
+GitHub organization. The original Event Sorcery project remains owned and
+maintained by ST0x, with contributions from Data Clique Software Design FZCO
+and other contributors. Experimental bindings in this fork are not part of the
+ST0x project unless ST0x adopts them separately.
+
 The shared engine MUST be extracted from the implementation already present in
 this repository. It MUST continue to build on:
 
@@ -59,6 +65,17 @@ The following are explicitly out of scope for 0.4.0:
 - making Haskell reproduce Rust storage or job decisions.
 
 Any such change requires a separate specification and compatibility decision.
+
+## 0.5.0 direction
+
+Release 0.5.0 is intended to add a typed TypeScript binding over the shared
+Rust engine. This records the release direction only; TypeScript implementation
+is outside the 0.4.0 scope and contract.
+
+The TypeScript binding MUST remain a veneer over the existing engine and MUST
+NOT introduce independent storage or durable protocol decisions. Its runtime
+integration, packaging, public surface, and conformance requirements require a
+separate 0.5.0 specification and compatibility decision.
 
 ## Architectural rule
 
