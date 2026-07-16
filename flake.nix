@@ -28,6 +28,24 @@
         haskellBinding = haskellPackages.callCabal2nix "event-sorcery" ./bindings/haskell { };
         rustBuildInputs = rainix.rust-build-inputs.${system};
         rustToolchain = rainix.rust-toolchain.${system};
+        rustWorkspace = pkgs.rustPlatform.buildRustPackage {
+          pname = "event-sorcery-workspace";
+          version = "0.4.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          cargoBuildFlags = [
+            "--workspace"
+            "--all-targets"
+            "--all-features"
+          ];
+          nativeBuildInputs = rustBuildInputs;
+
+          meta = {
+            description = "Event Sorcery Rust workspace";
+            license = pkgs.lib.licenses.mit;
+            platforms = pkgs.lib.platforms.unix;
+          };
+        };
         hooks = import ./git-hooks.nix {
           inherit
             git-hooks
@@ -42,11 +60,13 @@
         packages = rainix.packages.${system} // {
           inherit but;
           haskell = haskellBinding;
+          rust = rustWorkspace;
         };
 
         checks = {
           formatting = hooks;
           haskell = haskellBinding;
+          rust = rustWorkspace;
         };
 
         devShells.default = pkgs.mkShell {
