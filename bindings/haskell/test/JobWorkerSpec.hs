@@ -18,13 +18,13 @@ import Data.IORef (
  )
 import Data.Text (Text)
 import Data.Word (Word32)
-import EventSorcery.Engine (
+import Event.Sorcery.Engine (
   OpenOptions (OpenOptions),
   Store,
   closeStore,
   openStore,
  )
-import EventSorcery.Job (
+import Event.Sorcery.Job (
   ClaimBudget (ClaimBudget),
   Job (..),
   JobDecodeError (JobDecodeError),
@@ -37,14 +37,14 @@ import EventSorcery.Job (
   enqueueJob,
   mkJobId,
  )
-import EventSorcery.Job.Execution (
+import Event.Sorcery.Job.Execution (
   DurableJob (..),
   JobAttempt (JobAttempt),
   JobFailure (TerminalFailure, TransientFailure),
   JobOutcome (JobDone),
   Reconciliation (Reconciled),
  )
-import EventSorcery.Job.Worker (
+import Event.Sorcery.Job.Worker (
   AttemptLimit,
   JobRunError (JobRunDecodeFailed),
   JobRunResult (..),

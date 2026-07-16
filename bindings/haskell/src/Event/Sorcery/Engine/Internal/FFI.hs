@@ -1,4 +1,4 @@
-module EventSorcery.Engine.Internal.FFI (
+module Event.Sorcery.Engine.Internal.FFI (
   EsBuf (..),
   EsStore,
   esAbiVersion,

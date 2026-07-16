@@ -17,14 +17,14 @@ import Data.Maybe (Maybe (..))
 import Data.Text qualified as Text
 import Data.Unrestricted.Linear (Ur)
 import Data.Word (Word64)
-import EventSorcery.Engine (
+import Event.Sorcery.Engine (
   EngineError,
   OpenOptions (OpenOptions),
   Store,
   closeStore,
   openStore,
  )
-import EventSorcery.Job (
+import Event.Sorcery.Job (
   ClaimBudget (ClaimBudget),
   ClaimedJob,
   JobClaimDetails,
@@ -43,7 +43,7 @@ import EventSorcery.Job (
   mkJobId,
   settlementToken,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   ProposedEvent (ProposedEvent),
   StoredEvent (StoredEvent),
   StreamIdentity (StreamIdentity),

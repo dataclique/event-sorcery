@@ -7,14 +7,14 @@ import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Maybe (Maybe (..))
 import Data.Text (Text)
 import Data.Unrestricted.Linear (Ur (Ur))
-import EventSorcery.Engine (
+import Event.Sorcery.Engine (
   EngineError,
   OpenOptions (OpenOptions),
   Store,
   closeStore,
   openStore,
  )
-import EventSorcery.Job (
+import Event.Sorcery.Job (
   ClaimBudget (ClaimBudget),
   ClaimedJob,
   DeadReason (Rejected),
@@ -45,7 +45,7 @@ import EventSorcery.Job (
   settlementToken,
   streamRunnableJobs,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   ProposedEvent (ProposedEvent),
   StreamIdentity (StreamIdentity),
   currentVersion,

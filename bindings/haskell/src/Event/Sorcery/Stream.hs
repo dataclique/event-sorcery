@@ -1,4 +1,4 @@
-module EventSorcery.Stream (
+module Event.Sorcery.Stream (
   ActualSequence (..),
   ExpectedSequence (..),
   MetadataMismatch (..),
@@ -54,13 +54,13 @@ import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Word (Word64)
-import EventSorcery.Aggregate (
+import Event.Sorcery.Aggregate (
   DecodeCause,
   EventSourced,
   EventVersion (..),
  )
-import EventSorcery.Aggregate qualified as Aggregate
-import EventSorcery.Engine.Internal (
+import Event.Sorcery.Aggregate qualified as Aggregate
+import Event.Sorcery.Engine.Internal (
   EngineError (BindingProtocolError),
   Store,
   callWithOutput,
@@ -68,7 +68,7 @@ import EventSorcery.Engine.Internal (
   withInputBuffer,
   withOpenStore,
  )
-import EventSorcery.Engine.Internal.FFI (
+import Event.Sorcery.Engine.Internal.FFI (
   esCommit,
   esCurrentVersion,
   esLoadStream,

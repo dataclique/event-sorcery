@@ -1,4 +1,4 @@
-module EventSorcery.Job.Execution (
+module Event.Sorcery.Job.Execution (
   DurableJob (..),
   JobAttempt (..),
   JobContext (..),
@@ -11,7 +11,7 @@ module EventSorcery.Job.Execution (
 import Data.Kind (Type)
 import Data.Text (Text)
 import Data.Word (Word32)
-import EventSorcery.Job (
+import Event.Sorcery.Job (
   Job (JobError, JobOutput),
   JobExecutionRoute (ReconcileExecution, SubmitExecution),
   JobId,

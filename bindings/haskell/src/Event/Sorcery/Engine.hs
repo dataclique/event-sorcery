@@ -1,4 +1,4 @@
-module EventSorcery.Engine (
+module Event.Sorcery.Engine (
   EngineError (..),
   ErrorClass (..),
   OpenOptions (..),
@@ -11,7 +11,7 @@ module EventSorcery.Engine (
   supportsAbiVersion,
 ) where
 
-import EventSorcery.Engine.Internal (
+import Event.Sorcery.Engine.Internal (
   EngineError (..),
   ErrorClass (..),
   OpenOptions (..),

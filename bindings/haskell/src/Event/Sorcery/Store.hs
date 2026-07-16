@@ -1,4 +1,4 @@
-module EventSorcery.Store (
+module Event.Sorcery.Store (
   Store,
   StoreError (..),
   executeCommand,
@@ -14,12 +14,12 @@ import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Unrestricted.Linear (Ur (Ur))
 import Data.Word (Word64)
-import EventSorcery.Aggregate (Effect (..), EventSourced, EventVersion (..))
-import EventSorcery.Aggregate qualified as Aggregate
-import EventSorcery.Dispatch (dispatchJob)
-import EventSorcery.Engine (EngineError)
-import EventSorcery.Engine qualified as Engine
-import EventSorcery.Job (
+import Event.Sorcery.Aggregate (Effect (..), EventSourced, EventVersion (..))
+import Event.Sorcery.Aggregate qualified as Aggregate
+import Event.Sorcery.Dispatch (dispatchJob)
+import Event.Sorcery.Engine (EngineError)
+import Event.Sorcery.Engine qualified as Engine
+import Event.Sorcery.Job (
   Job (encodeJob),
   JobId,
   JobInstant (JobInstant),
@@ -28,9 +28,9 @@ import EventSorcery.Job (
   commitWithJob,
   jobType,
  )
-import EventSorcery.Snapshot (StoredSnapshot (StoredSnapshot))
-import EventSorcery.Snapshot qualified as Snapshot
-import EventSorcery.Stream (
+import Event.Sorcery.Snapshot (StoredSnapshot (StoredSnapshot))
+import Event.Sorcery.Snapshot qualified as Snapshot
+import Event.Sorcery.Stream (
   ProposedEvent (ProposedEvent),
   ReplayError,
   StoredEvent (StoredEvent),

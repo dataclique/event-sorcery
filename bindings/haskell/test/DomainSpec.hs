@@ -3,7 +3,7 @@ module Main (main) where
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text (Text)
-import EventSorcery.Aggregate (
+import Event.Sorcery.Aggregate (
   DecodeCause (DecodeCause),
   Dispatches (..),
   Effect (..),
@@ -13,15 +13,15 @@ import EventSorcery.Aggregate (
   dispatchIntent,
   dispatchJobId,
  )
-import EventSorcery.Dispatch (DispatchOutcome, kickoff)
-import EventSorcery.Job (
+import Event.Sorcery.Dispatch (DispatchOutcome, kickoff)
+import Event.Sorcery.Job (
   Job (..),
   JobId,
   jobIdText,
   jobType,
   mkJobId,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   ActualSequence (ActualSequence),
   ExpectedSequence (ExpectedSequence),
   MetadataMismatch (EventTypeMismatch, EventVersionMismatch),

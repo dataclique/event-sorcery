@@ -3,7 +3,7 @@ module Main (main) where
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text.Encoding qualified as Text
-import EventSorcery.Aggregate (
+import Event.Sorcery.Aggregate (
   DecodeCause (DecodeCause),
   Dispatches (..),
   Effect (..),
@@ -12,13 +12,13 @@ import EventSorcery.Aggregate (
   SchemaVersion (SchemaVersion),
   dispatchJobId,
  )
-import EventSorcery.Dispatch (DispatchOutcome, kickoff)
-import EventSorcery.Engine (
+import Event.Sorcery.Dispatch (DispatchOutcome, kickoff)
+import Event.Sorcery.Engine (
   OpenOptions (OpenOptions),
   closeStore,
   openStore,
  )
-import EventSorcery.Job (
+import Event.Sorcery.Job (
   Job (..),
   JobDecodeError (JobDecodeError),
   JobId,
@@ -29,15 +29,15 @@ import EventSorcery.Job (
   mkJobId,
   pollJobs,
  )
-import EventSorcery.Snapshot qualified as Snapshot
-import EventSorcery.Store (
+import Event.Sorcery.Snapshot qualified as Snapshot
+import Event.Sorcery.Store (
   StoreError (..),
   executeCommand,
   loadEntity,
   mkStore,
   snapshotEntity,
  )
-import EventSorcery.Stream (streamKey, streamKeyIdentity)
+import Event.Sorcery.Stream (streamKey, streamKeyIdentity)
 import Prelude (
   Either (..),
   Eq,
