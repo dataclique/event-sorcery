@@ -83,6 +83,8 @@ pub enum EngineError {
         expected: StreamIdentity,
         actual: StreamIdentity,
     },
+    #[error("event page storage bytes {observed} exceed limit {limit}")]
+    EventPageTooLarge { observed: usize, limit: usize },
     #[error(transparent)]
     Sql(#[from] sqlx::Error),
     #[error(transparent)]
@@ -341,6 +343,151 @@ impl Engine {
                 .await?
             }
         };
+
+        rows.into_iter().map(SerializedEvent::try_from).collect()
+    }
+
+    /// Loads an item- and storage-byte-bounded event page.
+    pub async fn load_events_page_bounded(
+        &self,
+        stream: &StreamIdentity,
+        after_sequence: Option<usize>,
+        item_limit: NonZeroUsize,
+        byte_limit: NonZeroUsize,
+    ) -> Result<Vec<SerializedEvent>, EngineError> {
+        let item_limit = i64::try_from(item_limit.get())?;
+        let mut transaction = self.pool.begin().await?;
+        let storage_bytes = match after_sequence {
+            None => {
+                sqlx::query_scalar::<_, i64>(
+                    r"
+                    SELECT COALESCE(SUM(
+                        length(CAST(aggregate_type AS BLOB))
+                        + length(CAST(aggregate_id AS BLOB))
+                        + 8
+                        + length(CAST(event_type AS BLOB))
+                        + length(CAST(event_version AS BLOB))
+                        + length(CAST(payload AS BLOB))
+                        + length(CAST(metadata AS BLOB))
+                    ), 0)
+                    FROM (
+                        SELECT aggregate_type,
+                               aggregate_id,
+                               sequence,
+                               event_type,
+                               event_version,
+                               payload,
+                               metadata
+                        FROM events
+                        WHERE aggregate_type = ?1 AND aggregate_id = ?2
+                        ORDER BY sequence
+                        LIMIT ?3
+                    )
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(item_limit)
+                .fetch_one(&mut *transaction)
+                .await?
+            }
+            Some(after_sequence) => {
+                let after_sequence = i64::try_from(after_sequence)?;
+                sqlx::query_scalar::<_, i64>(
+                    r"
+                    SELECT COALESCE(SUM(
+                        length(CAST(aggregate_type AS BLOB))
+                        + length(CAST(aggregate_id AS BLOB))
+                        + 8
+                        + length(CAST(event_type AS BLOB))
+                        + length(CAST(event_version AS BLOB))
+                        + length(CAST(payload AS BLOB))
+                        + length(CAST(metadata AS BLOB))
+                    ), 0)
+                    FROM (
+                        SELECT aggregate_type,
+                               aggregate_id,
+                               sequence,
+                               event_type,
+                               event_version,
+                               payload,
+                               metadata
+                        FROM events
+                        WHERE aggregate_type = ?1
+                          AND aggregate_id = ?2
+                          AND sequence > ?3
+                        ORDER BY sequence
+                        LIMIT ?4
+                    )
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(after_sequence)
+                .bind(item_limit)
+                .fetch_one(&mut *transaction)
+                .await?
+            }
+        };
+        let observed = usize::try_from(storage_bytes)?;
+        if observed > byte_limit.get() {
+            return Err(EngineError::EventPageTooLarge {
+                observed,
+                limit: byte_limit.get(),
+            });
+        }
+
+        let rows = match after_sequence {
+            None => {
+                sqlx::query_as::<_, StoredEventRow>(
+                    r"
+                    SELECT aggregate_type,
+                           aggregate_id,
+                           sequence,
+                           event_type,
+                           event_version,
+                           payload,
+                           metadata
+                    FROM events
+                    WHERE aggregate_type = ?1 AND aggregate_id = ?2
+                    ORDER BY sequence
+                    LIMIT ?3
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(item_limit)
+                .fetch_all(&mut *transaction)
+                .await?
+            }
+            Some(after_sequence) => {
+                let after_sequence = i64::try_from(after_sequence)?;
+                sqlx::query_as::<_, StoredEventRow>(
+                    r"
+                    SELECT aggregate_type,
+                           aggregate_id,
+                           sequence,
+                           event_type,
+                           event_version,
+                           payload,
+                           metadata
+                    FROM events
+                    WHERE aggregate_type = ?1
+                      AND aggregate_id = ?2
+                      AND sequence > ?3
+                    ORDER BY sequence
+                    LIMIT ?4
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(after_sequence)
+                .bind(item_limit)
+                .fetch_all(&mut *transaction)
+                .await?
+            }
+        };
+        transaction.commit().await?;
 
         rows.into_iter().map(SerializedEvent::try_from).collect()
     }
@@ -689,7 +836,7 @@ impl From<EngineError> for PersistenceError {
         use EngineError::*;
         match error {
             OptimisticLock => Self::OptimisticLockError,
-            EmptySnapshotUpdate | StreamIdentityMismatch { .. } => {
+            EmptySnapshotUpdate | StreamIdentityMismatch { .. } | EventPageTooLarge { .. } => {
                 Self::UnknownError(Box::new(error))
             }
             Sql(source) => Self::ConnectionError(Box::new(source)),
@@ -868,6 +1015,40 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_reads_reject_storage_bytes_before_loading_the_page() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-byte-page-test", "one");
+        let event = SerializedEvent {
+            payload: serde_json::Value::String("x".repeat(256)),
+            ..serialized_event(&stream, 1)
+        };
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+
+        let result = engine
+            .load_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(64).unwrap(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::EventPageTooLarge {
+                observed,
+                limit: 64,
+            }) if observed > 64
+        ));
     }
 
     #[tokio::test]

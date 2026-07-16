@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Cursor;
+use std::io::{self, Cursor, Write};
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use cqrs_es::persist::SerializedEvent;
 use event_sorcery::{CommitRequest, Engine, EngineError, StreamIdentity};
-use serde::de::{DeserializeOwned, Visitor};
+use serde::de::{DeserializeOwned, Error as DeserializeError, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
@@ -28,6 +28,9 @@ const ES_ERR_RESOURCE_LIMIT: i32 = 6;
 const ES_ERR_PANIC: i32 = 100;
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Stored JSON can expand each opaque byte to four characters plus envelope
+/// overhead before the exact CBOR response limit is applied.
+const MAX_STORED_EVENT_PAGE_BYTES: usize = 4 * MAX_RESPONSE_BYTES + MAX_REQUEST_BYTES;
 const MAX_CBOR_DEPTH: usize = 32;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_COMMIT_EVENTS: usize = 1024;
@@ -38,19 +41,100 @@ const MAX_RUNTIME_THREADS: u32 = 256;
 static STORE_REGISTRY: OnceLock<Mutex<HashMap<usize, StoreEntry>>> = OnceLock::new();
 
 type ProposedEventWire = (String, String, OpaqueBytes);
-type CommitWire = (u8, String, String, u64, Vec<ProposedEventWire>);
+type CommitWire = (u8, String, String, u64, CommitEvents);
 type StoredEventWire = (u64, String, String, OpaqueBytes);
+#[cfg(test)]
 type StoredEventsWire = (u8, Vec<StoredEventWire>);
 
 #[derive(Debug, PartialEq, Eq)]
 struct OpaqueBytes(Vec<u8>);
 
+#[derive(Debug)]
+struct CommitEvents {
+    values: Vec<ProposedEventWire>,
+    observed: usize,
+}
+
+#[derive(Deserialize, Serialize)]
+struct EnginePayloadEnvelope {
+    #[serde(rename = "$event-sorcery-ffi")]
+    opaque: EngineOpaquePayload,
+}
+
+#[derive(Deserialize, Serialize)]
+struct EngineOpaquePayload {
+    version: u8,
+    bytes: Vec<u8>,
+}
+
 impl Serialize for OpaqueBytes {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<SerializerType>(
+        &self,
+        serializer: SerializerType,
+    ) -> Result<SerializerType::Ok, SerializerType::Error>
     where
-        S: Serializer,
+        SerializerType: Serializer,
     {
-        serializer.serialize_bytes(&self.0)
+        let Self(bytes) = self;
+        serializer.serialize_bytes(bytes)
+    }
+}
+
+impl Serialize for CommitEvents {
+    fn serialize<SerializerType>(
+        &self,
+        serializer: SerializerType,
+    ) -> Result<SerializerType::Ok, SerializerType::Error>
+    where
+        SerializerType: Serializer,
+    {
+        self.values.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommitEvents {
+    fn deserialize<DeserializerType>(
+        deserializer: DeserializerType,
+    ) -> Result<Self, DeserializerType::Error>
+    where
+        DeserializerType: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(CommitEventsVisitor)
+    }
+}
+
+struct CommitEventsVisitor;
+
+impl<'de> Visitor<'de> for CommitEventsVisitor {
+    type Value = CommitEvents;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded sequence of proposed events")
+    }
+
+    fn visit_seq<Sequence>(self, mut sequence: Sequence) -> Result<Self::Value, Sequence::Error>
+    where
+        Sequence: SeqAccess<'de>,
+    {
+        let capacity = sequence.size_hint().unwrap_or(0).min(MAX_COMMIT_EVENTS);
+        let mut values = Vec::with_capacity(capacity);
+        while values.len() < MAX_COMMIT_EVENTS {
+            let Some(event) = sequence.next_element()? else {
+                return Ok(CommitEvents {
+                    observed: values.len(),
+                    values,
+                });
+            };
+            values.push(event);
+        }
+
+        let mut observed = values.len();
+        while sequence.next_element::<IgnoredAny>()?.is_some() {
+            observed = observed
+                .checked_add(1)
+                .ok_or_else(|| Sequence::Error::custom("commit event count overflow"))?;
+        }
+        Ok(CommitEvents { values, observed })
     }
 }
 
@@ -107,20 +191,23 @@ pub const extern "C" fn es_abi_version() -> u32 {
 ///
 /// `options` must reference a readable buffer for the duration of the call.
 /// `out_store` must be a stable, unowned writable cell that remains at the same
-/// address until close completes. `out_error` must be null or writable.
+/// address until close completes. `out_error` must be null or writable. The
+/// options buffer may alias `out_error`; options are decoded before either
+/// output is written.
 pub unsafe extern "C" fn es_open(
     options: *const EsBuf,
     out_store: *mut *mut EsStore,
     out_error: *mut EsBuf,
 ) -> i32 {
-    if !out_store.is_null() {
-        unsafe { out_store.write(ptr::null_mut()) };
-    }
     ffi_call(None, out_error, || {
+        let options = decode_open_options(options);
+        if !out_store.is_null() {
+            unsafe { out_store.write(ptr::null_mut()) };
+        }
         if out_store.is_null() {
             return Err(AbiError::State("out_store is null"));
         }
-        let options = decode_open_options(options)?;
+        let options = options?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(options.runtime_threads)
             .enable_all()
@@ -160,24 +247,25 @@ pub unsafe extern "C" fn es_open(
 ///
 /// `store` must be the original owner cell passed to [`es_open`]. `request`
 /// must reference a readable buffer. `out_events` must be writable, and
-/// `out_error` must be null or writable.
+/// `out_error` must be null or writable. The request buffer may alias either
+/// output, but `out_events` and `out_error` must be distinct.
 pub unsafe extern "C" fn es_load_stream(
     store: *mut *mut EsStore,
     request: *const EsBuf,
     out_events: *mut EsBuf,
     out_error: *mut EsBuf,
 ) -> i32 {
-    clear_buffer_output(out_events);
     let lease = match EsStore::acquire(store) {
         Ok(lease) => lease,
         Err(error) => return write_error(out_error, error),
     };
     ffi_call(Some(&lease.store), out_error, || {
+        let request: Result<(u8, String, String, Option<u64>), AbiError> = decode(request);
+        clear_buffer_output(out_events);
         if out_events.is_null() {
             return Err(AbiError::State("out_events is null"));
         }
-        let (version, aggregate_type, aggregate_id, after): (u8, String, String, Option<u64>) =
-            decode(request)?;
+        let (version, aggregate_type, aggregate_id, after) = request?;
         require_version(version)?;
         let after = after
             .map(usize::try_from)
@@ -190,10 +278,13 @@ pub unsafe extern "C" fn es_load_stream(
             .inner
             .runtime
             .block_on(
-                lease
-                    .inner
-                    .engine
-                    .load_events_page(&stream, after, query_limit),
+                lease.inner.engine.load_events_page_bounded(
+                    &stream,
+                    after,
+                    query_limit,
+                    NonZeroUsize::new(MAX_STORED_EVENT_PAGE_BYTES)
+                        .ok_or(AbiError::State("invalid stored page byte limit"))?,
+                ),
             )
             .map_err(AbiError::from)?;
         if events.len() > MAX_LIST_ITEMS {
@@ -203,12 +294,7 @@ pub unsafe extern "C" fn es_load_stream(
                 limit: MAX_LIST_ITEMS,
             });
         }
-        let events = events
-            .into_iter()
-            .map(event_to_wire)
-            .collect::<Result<Vec<_>, _>>()?;
-        let response: StoredEventsWire = (1, events);
-        unsafe { out_events.write(encode(&response)?) };
+        unsafe { out_events.write(encode_event_page(events)?) };
         Ok(())
     })
 }
@@ -220,25 +306,27 @@ pub unsafe extern "C" fn es_load_stream(
 ///
 /// `store` must be the original owner cell passed to [`es_open`]. `request`
 /// must reference a readable buffer. `out_version` must be writable, and
-/// `out_error` must be null or writable.
+/// `out_error` must be null or writable. The request storage may alias either
+/// output, but `out_version` and `out_error` must be distinct.
 pub unsafe extern "C" fn es_current_version(
     store: *mut *mut EsStore,
     request: *const EsBuf,
     out_version: *mut u64,
     out_error: *mut EsBuf,
 ) -> i32 {
-    if !out_version.is_null() {
-        unsafe { out_version.write(0) };
-    }
     let lease = match EsStore::acquire(store) {
         Ok(lease) => lease,
         Err(error) => return write_error(out_error, error),
     };
     ffi_call(Some(&lease.store), out_error, || {
+        let request: Result<(u8, String, String), AbiError> = decode(request);
+        if !out_version.is_null() {
+            unsafe { out_version.write(0) };
+        }
         if out_version.is_null() {
             return Err(AbiError::State("out_version is null"));
         }
-        let (version, aggregate_type, aggregate_id): (u8, String, String) = decode(request)?;
+        let (version, aggregate_type, aggregate_id) = request?;
         require_version(version)?;
         let stream = StreamIdentity::new(aggregate_type, aggregate_id);
         let version = lease
@@ -258,7 +346,9 @@ pub unsafe extern "C" fn es_current_version(
 /// # Safety
 ///
 /// `store` must be the original owner cell passed to [`es_open`]. `request`
-/// must reference a readable buffer. `out_error` must be null or writable.
+/// must reference a readable buffer. `out_error` must be null or writable. The
+/// request buffer may alias `out_error`; it is decoded before the output is
+/// written.
 pub unsafe extern "C" fn es_commit(
     store: *mut *mut EsStore,
     request: *const EsBuf,
@@ -270,42 +360,57 @@ pub unsafe extern "C" fn es_commit(
     };
     ffi_call(Some(&lease.store), out_error, || {
         let (version, aggregate_type, aggregate_id, expected, events): CommitWire =
-            decode(request)?;
+            decode_validated(request, |wire: &CommitWire| {
+                if wire.4.observed <= MAX_COMMIT_EVENTS {
+                    return Ok(());
+                }
+                Err(AbiError::ResourceLimit {
+                    resource: "commit_events",
+                    observed: wire.4.observed,
+                    limit: MAX_COMMIT_EVENTS,
+                })
+            })?;
         require_version(version)?;
         require_error_text_limit(aggregate_type.len())?;
         require_error_text_limit(aggregate_id.len())?;
+        let CommitEvents {
+            values: events,
+            observed: _,
+        } = events;
         if events.is_empty() {
             return Err(AbiError::MalformedInput);
         }
-        if events.len() > MAX_COMMIT_EVENTS {
-            return Err(AbiError::ResourceLimit {
-                resource: "commit_events",
-                observed: events.len(),
-                limit: MAX_COMMIT_EVENTS,
-            });
-        }
         let expected_sequence = usize::try_from(expected).map_err(|_| AbiError::MalformedInput)?;
+        expected_sequence
+            .checked_add(events.len())
+            .ok_or(AbiError::MalformedInput)?;
         let serialized = events
             .into_iter()
             .enumerate()
-            .map(|(index, (event_type, event_version, payload))| {
-                require_payload_limit(payload.0.len())?;
-                let sequence = expected_sequence
-                    .checked_add(index)
-                    .and_then(|sequence| sequence.checked_add(1))
-                    .ok_or(AbiError::MalformedInput)?;
-                Ok(SerializedEvent {
-                    aggregate_type: aggregate_type.clone(),
-                    aggregate_id: aggregate_id.clone(),
-                    sequence,
-                    event_type,
-                    event_version,
-                    payload: serde_json::Value::Array(
-                        payload.0.into_iter().map(Into::into).collect(),
-                    ),
-                    metadata: serde_json::json!({ "$event-sorcery-ffi": 1 }),
-                })
-            })
+            .map(
+                |(index, (event_type, event_version, OpaqueBytes(payload)))| {
+                    require_payload_limit(payload.len())?;
+                    let sequence = expected_sequence
+                        .checked_add(index)
+                        .and_then(|sequence| sequence.checked_add(1))
+                        .ok_or(AbiError::MalformedInput)?;
+                    Ok(SerializedEvent {
+                        aggregate_type: aggregate_type.clone(),
+                        aggregate_id: aggregate_id.clone(),
+                        sequence,
+                        event_type,
+                        event_version,
+                        payload: serde_json::to_value(EnginePayloadEnvelope {
+                            opaque: EngineOpaquePayload {
+                                version: 1,
+                                bytes: payload,
+                            },
+                        })
+                        .map_err(|_| AbiError::Storage)?,
+                        metadata: serde_json::Value::Object(serde_json::Map::new()),
+                    })
+                },
+            )
             .collect::<Result<Vec<_>, AbiError>>()?;
         let stream = StreamIdentity::new(aggregate_type.clone(), aggregate_id.clone());
         match lease.inner.runtime.block_on(
@@ -660,8 +765,15 @@ impl StoreLease {
 }
 
 impl From<EngineError> for AbiError {
-    fn from(_error: EngineError) -> Self {
-        Self::Storage
+    fn from(error: EngineError) -> Self {
+        match error {
+            EngineError::EventPageTooLarge { observed, limit } => Self::ResourceLimit {
+                resource: "stored_event_page",
+                observed,
+                limit,
+            },
+            _ => Self::Storage,
+        }
     }
 }
 
@@ -679,6 +791,13 @@ impl AbiError {
 }
 
 fn decode<T: DeserializeOwned + Serialize>(buffer: *const EsBuf) -> Result<T, AbiError> {
+    decode_validated(buffer, |_| Ok(()))
+}
+
+fn decode_validated<T: DeserializeOwned + Serialize>(
+    buffer: *const EsBuf,
+    validate: impl FnOnce(&T) -> Result<(), AbiError>,
+) -> Result<T, AbiError> {
     let Some(buffer) = (unsafe { buffer.as_ref() }) else {
         return Err(AbiError::MalformedInput);
     };
@@ -696,6 +815,7 @@ fn decode<T: DeserializeOwned + Serialize>(buffer: *const EsBuf) -> Result<T, Ab
     let decoded =
         ciborium::de::from_reader_with_recursion_limit(Cursor::new(bytes), MAX_CBOR_DEPTH)
             .map_err(|_| AbiError::MalformedInput)?;
+    validate(&decoded)?;
     let mut canonical = Vec::new();
     ciborium::into_writer(&decoded, &mut canonical).map_err(|_| AbiError::MalformedInput)?;
     if canonical != bytes {
@@ -704,18 +824,85 @@ fn decode<T: DeserializeOwned + Serialize>(buffer: *const EsBuf) -> Result<T, Ab
     Ok(decoded)
 }
 
-fn encode(value: &impl Serialize) -> Result<EsBuf, AbiError> {
-    let mut bytes = Vec::new();
-    ciborium::into_writer(value, &mut bytes)
-        .map_err(|_| AbiError::State("response encoding failed"))?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(AbiError::ResourceLimit {
-            resource: "encoded_response_buffer",
-            observed: bytes.len(),
-            limit: MAX_RESPONSE_BYTES,
-        });
+struct BoundedResponseWriter {
+    bytes: Vec<u8>,
+    overflow_observed: Option<usize>,
+}
+
+impl BoundedResponseWriter {
+    const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            overflow_observed: None,
+        }
     }
-    Ok(owned_buffer(bytes))
+
+    fn into_buffer(self) -> EsBuf {
+        owned_buffer(self.bytes)
+    }
+
+    fn encoding_error(&self) -> AbiError {
+        self.overflow_observed
+            .map_or(AbiError::State("response encoding failed"), |observed| {
+                AbiError::ResourceLimit {
+                    resource: "encoded_response_buffer",
+                    observed,
+                    limit: MAX_RESPONSE_BYTES,
+                }
+            })
+    }
+}
+
+impl Write for BoundedResponseWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let observed = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("response size overflow"))?;
+        if observed > MAX_RESPONSE_BYTES {
+            self.overflow_observed = Some(observed);
+            return Err(io::Error::other("response byte limit exceeded"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_event_page(events: Vec<SerializedEvent>) -> Result<EsBuf, AbiError> {
+    let mut writer = BoundedResponseWriter::new();
+    writer
+        .write_all(&[0x82, 0x01])
+        .map_err(|_| writer.encoding_error())?;
+    write_array_header(&mut writer, events.len())?;
+    for event in events {
+        let wire = event_to_wire(event)?;
+        if ciborium::into_writer(&wire, &mut writer).is_err() {
+            return Err(writer.encoding_error());
+        }
+    }
+    Ok(writer.into_buffer())
+}
+
+fn write_array_header(writer: &mut BoundedResponseWriter, length: usize) -> Result<(), AbiError> {
+    let encoded = match length {
+        0..=23 => vec![0x80 | u8::try_from(length).map_err(|_| AbiError::Storage)?],
+        24..=255 => vec![0x98, u8::try_from(length).map_err(|_| AbiError::Storage)?],
+        256..=65_535 => {
+            let length = u16::try_from(length).map_err(|_| AbiError::Storage)?;
+            let mut encoded = vec![0x99];
+            encoded.extend_from_slice(&length.to_be_bytes());
+            encoded
+        }
+        _ => return Err(AbiError::State("event page length exceeds ABI limit")),
+    };
+    writer
+        .write_all(&encoded)
+        .map_err(|_| writer.encoding_error())
 }
 
 fn owned_buffer(bytes: Vec<u8>) -> EsBuf {
@@ -735,18 +922,18 @@ const fn require_version(version: u8) -> Result<(), AbiError> {
 }
 
 fn event_to_wire(event: SerializedEvent) -> Result<StoredEventWire, AbiError> {
-    let payload = if event.metadata.get("$event-sorcery-ffi") == Some(&serde_json::json!(1)) {
-        let serde_json::Value::Array(bytes) = event.payload else {
+    let is_engine_envelope = matches!(
+        &event.payload,
+        serde_json::Value::Object(object)
+            if object.len() == 1 && object.contains_key("$event-sorcery-ffi")
+    );
+    let payload = if is_engine_envelope {
+        let envelope: EnginePayloadEnvelope =
+            serde_json::from_value(event.payload).map_err(|_| AbiError::Storage)?;
+        if envelope.opaque.version != 1 {
             return Err(AbiError::Storage);
-        };
-        bytes
-            .into_iter()
-            .map(|byte| {
-                byte.as_u64()
-                    .and_then(|byte| u8::try_from(byte).ok())
-                    .ok_or(AbiError::Storage)
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        }
+        envelope.opaque.bytes
     } else {
         serde_json::to_vec(&event.payload).map_err(|_| AbiError::Storage)?
     };
@@ -814,12 +1001,14 @@ fn ffi_call(
     out_error: *mut EsBuf,
     call: impl FnOnce() -> Result<(), AbiError>,
 ) -> i32 {
-    clear_buffer_output(out_error);
     if store.is_some_and(|store| store.poisoned.load(Ordering::Acquire)) {
         return write_error(out_error, AbiError::State("store is poisoned"));
     }
     match catch_unwind(AssertUnwindSafe(call)) {
-        Ok(Ok(())) => ES_OK,
+        Ok(Ok(())) => {
+            clear_buffer_output(out_error);
+            ES_OK
+        }
         Ok(Err(error)) => write_error(out_error, error),
         Err(_) => {
             if let Some(store) = store {
@@ -1069,6 +1258,228 @@ mod tests {
     }
 
     #[test]
+    fn wire_contract_assigns_sequences_and_pages_after_an_exclusive_checkpoint() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let mut error = empty_buffer();
+        let mut commit = vec![
+            0x85, 0x01, 0x68, b'f', b'f', b'i', b'-', b't', b'e', b's', b't', 0x63, b'o', b'n',
+            b'e', 0x00, 0x82, 0x83, 0x67, b'C', b'r', b'e', b'a', b't', b'e', b'd', 0x63, b'1',
+            b'.', b'0', 0x44, 0x00, 0x01, 0x02, 0xff, 0x83, 0x67, b'R', b'e', b'n', b'a', b'm',
+            b'e', b'd', 0x63, b'1', b'.', b'0', 0x41, 0xff,
+        ];
+        let commit_buffer = caller_buffer(&mut commit);
+
+        assert_eq!(
+            unsafe { es_commit(&raw mut store, &raw const commit_buffer, &raw mut error) },
+            ES_OK
+        );
+
+        let mut load_after_first = vec![
+            0x84, 0x01, 0x68, b'f', b'f', b'i', b'-', b't', b'e', b's', b't', 0x63, b'o', b'n',
+            b'e', 0x01,
+        ];
+        let load_buffer = caller_buffer(&mut load_after_first);
+        let mut output = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_load_stream(
+                    &raw mut store,
+                    &raw const load_buffer,
+                    &raw mut output,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        let response = unsafe { std::slice::from_raw_parts(output.ptr, output.len) };
+        assert_eq!(
+            response,
+            [
+                0x82, 0x01, 0x81, 0x84, 0x02, 0x67, b'R', b'e', b'n', b'a', b'm', b'e', b'd', 0x63,
+                b'1', b'.', b'0', 0x41, 0xff,
+            ]
+        );
+
+        unsafe { es_buf_free(&raw mut output) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn commit_rejects_sequence_overflow_without_persisting_events() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let mut error = empty_buffer();
+        let mut request = encode_request(&(
+            1_u8,
+            "overflow-test",
+            "one",
+            u64::MAX,
+            vec![("Created", "1.0", OpaqueBytes(Vec::new()))],
+        ));
+        let request_buffer = caller_buffer(&mut request);
+
+        assert_eq!(
+            unsafe { es_commit(&raw mut store, &raw const request_buffer, &raw mut error) },
+            ES_ERR_DECODE
+        );
+        unsafe { es_buf_free(&raw mut error) };
+
+        let mut version_request = encode_request(&(1_u8, "overflow-test", "one"));
+        let version_buffer = caller_buffer(&mut version_request);
+        let mut version = u64::MAX;
+        assert_eq!(
+            unsafe {
+                es_current_version(
+                    &raw mut store,
+                    &raw const version_buffer,
+                    &raw mut version,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(version, 0);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn request_deserialization_precedes_writes_to_aliased_outputs() {
+        let mut options = encode_request(&(1_u8, "sqlite::memory:", 5_000_u64, 1_u32, 1_u32));
+        let mut options_buffer = caller_buffer(&mut options);
+        let mut store = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                es_open(
+                    &raw const options_buffer,
+                    &raw mut store,
+                    &raw mut options_buffer,
+                )
+            },
+            ES_OK
+        );
+        assert!(options_buffer.ptr.is_null());
+
+        let mut commit = encode_request(&(
+            1_u8,
+            "alias-test",
+            "one",
+            0_u64,
+            vec![("Created", "1.0", OpaqueBytes(vec![1, 2, 3]))],
+        ));
+        let mut commit_buffer = caller_buffer(&mut commit);
+        assert_eq!(
+            unsafe {
+                es_commit(
+                    &raw mut store,
+                    &raw const commit_buffer,
+                    &raw mut commit_buffer,
+                )
+            },
+            ES_OK
+        );
+        assert!(commit_buffer.ptr.is_null());
+
+        let mut load = encode_request(&(1_u8, "alias-test", "one", Option::<u64>::None));
+        let mut load_buffer = caller_buffer(&mut load);
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_load_stream(
+                    &raw mut store,
+                    &raw const load_buffer,
+                    &raw mut load_buffer,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        unsafe { es_buf_free(&raw mut load_buffer) };
+
+        let mut version_request = encode_request(&(1_u8, "alias-test", "one"));
+        let mut version_buffer = caller_buffer(&mut version_request);
+        let mut version = 0;
+        assert_eq!(
+            unsafe {
+                es_current_version(
+                    &raw mut store,
+                    &raw const version_buffer,
+                    &raw mut version,
+                    &raw mut version_buffer,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(version, 1);
+        assert!(version_buffer.ptr.is_null());
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn native_metadata_cannot_claim_the_opaque_payload_envelope() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let stream = StreamIdentity::new("native-metadata-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "native-metadata-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!(["native"]),
+            metadata: serde_json::json!({ "$event-sorcery-ffi": 1 }),
+        };
+        lease
+            .inner
+            .runtime
+            .block_on(
+                lease
+                    .inner
+                    .engine
+                    .commit(CommitRequest::new(stream, std::slice::from_ref(&event))),
+            )
+            .unwrap();
+        drop(lease);
+
+        let mut request =
+            encode_request(&(1_u8, "native-metadata-test", "one", Option::<u64>::None));
+        let request_buffer = caller_buffer(&mut request);
+        let mut output = empty_buffer();
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_load_stream(
+                    &raw mut store,
+                    &raw const request_buffer,
+                    &raw mut output,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(output.ptr, output.len) };
+        let response: Value = ciborium::from_reader(Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            response,
+            Value::Array(vec![
+                Value::Integer(1.into()),
+                Value::Array(vec![Value::Array(vec![
+                    Value::Integer(1.into()),
+                    Value::Text("Created".to_string()),
+                    Value::Text("1.0".to_string()),
+                    Value::Bytes(br#"["native"]"#.to_vec()),
+                ])]),
+            ])
+        );
+
+        unsafe { es_buf_free(&raw mut output) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
     fn open_clears_outputs_and_enforces_canonical_request_limits() {
         let mut oversized = vec![0_u8; MAX_REQUEST_BYTES + 1];
         let options = caller_buffer(&mut oversized);
@@ -1131,6 +1542,9 @@ mod tests {
             .map(|_| ("Created", "1.0", OpaqueBytes(Vec::new())))
             .collect::<Vec<_>>();
         let mut request = encode_request(&(1_u8, "limit-test", "events", 0_u64, events));
+        let decoded: CommitWire = ciborium::from_reader(Cursor::new(&request)).unwrap();
+        assert_eq!(decoded.4.values.len(), MAX_COMMIT_EVENTS);
+        assert_eq!(decoded.4.observed, MAX_COMMIT_EVENTS + 1);
         let request_buffer = caller_buffer(&mut request);
 
         assert_eq!(
@@ -1279,12 +1693,19 @@ mod tests {
 
     #[test]
     fn response_encoder_rejects_buffers_beyond_the_byte_limit() {
-        let payload = vec![0_u8; MAX_PAYLOAD_BYTES];
-        let payloads = (0..65)
-            .map(|_| OpaqueBytes(payload.clone()))
+        let events = (1..=65)
+            .map(|sequence| SerializedEvent {
+                aggregate_type: "response-limit-test".to_string(),
+                aggregate_id: "one".to_string(),
+                sequence,
+                event_type: "Created".to_string(),
+                event_version: "1.0".to_string(),
+                payload: serde_json::Value::String("x".repeat(MAX_PAYLOAD_BYTES - 2)),
+                metadata: serde_json::Value::Object(serde_json::Map::new()),
+            })
             .collect::<Vec<_>>();
 
-        let result = encode(&(1_u8, payloads));
+        let result = encode_event_page(events);
 
         assert!(matches!(
             result,
