@@ -170,13 +170,13 @@ appear in a binding.
 
 Both language surfaces expose the same domain shape:
 
-The SQLite claim transaction is owned by SQLx's transaction guard from
-`BEGIN IMMEDIATE` through its explicit commit or rollback. Cancelling a claim
-future drops that guard, which queues a rollback before the connection can be
-reused by the pool. A cancelled worker must never return an open transaction to
-the pool or retain SQLite's writer lock.
-
-### Durable jobs
+- a strongly typed aggregate identity;
+- fallible `originate` and `evolve` folds;
+- pure `initialize` and `transition` command handlers;
+- an effect containing either one or more events or one declared job dispatch;
+- compile-checked membership of a dispatched job in an entity's job set;
+- sealed dispatch outcomes; and
+- a failed lifecycle that rejects subsequent commands.
 
 Domain event and job payloads are owned by the binding. The engine treats their
 serialized representation as opaque application data while retaining the
