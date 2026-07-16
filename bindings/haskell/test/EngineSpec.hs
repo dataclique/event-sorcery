@@ -4,35 +4,38 @@ import Control.Exception (finally)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty (..))
 import EventSorcery.Engine (
+  ConflictDetail (..),
+  EngineError (..),
+  OpenOptions (..),
   Store,
   abiVersion,
   closeStore,
-  commit,
-  currentVersion,
-  loadStream,
   openStore,
+  supportsAbiVersion,
  )
-import EventSorcery.Engine.Protocol (
+import EventSorcery.Stream (
   AggregateId (..),
   AggregateType (..),
-  ConflictDetail (..),
-  EngineError (..),
   EventType (..),
   EventVersion (..),
-  OpenOptions (..),
   ProposedEvent (..),
   StoredEvent (..),
   StreamIdentity (..),
+  commit,
+  currentVersion,
+  loadStream,
  )
 import Test.Tasty (TestTree, defaultMain, testGroup)
-import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
+import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
 import Prelude (
   Either (..),
   IO,
   Maybe (Nothing),
   Show (show),
+  not,
   pure,
   ($),
+  (&&),
   (<>),
   (>>=),
  )
@@ -46,8 +49,16 @@ tests :: TestTree
 tests =
   testGroup
     "shared engine FFI"
-    [ testCase "reports ABI 0.2" $
-        abiVersion >>= (@?= 2)
+    [ testCase "reports ABI 0.3" $
+        abiVersion >>= (@?= 3)
+    , testCase "accepts compatible ABI minors only" $
+        assertBool
+          "engine ABI compatibility was classified incorrectly"
+          ( supportsAbiVersion 2
+              && supportsAbiVersion 3
+              && not (supportsAbiVersion 1)
+              && not (supportsAbiVersion 65_538)
+          )
     , testCase "commits and loads opaque event bytes" $
         withStore $ \store -> do
           commitFixture store

@@ -3,26 +3,26 @@ module Main (main) where
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.Either (Either (Right), isLeft)
-import EventSorcery.Engine.Codec (
+import EventSorcery.Engine (
+  ConflictDetail (..),
+  EngineError (..),
+  OpenOptions (..),
+  ResourceLimitDetail (..),
   decodeEngineError,
+  encodeOpenOptions,
+ )
+import EventSorcery.Stream (
+  AggregateId (..),
+  AggregateType (..),
+  EventType (..),
+  EventVersion (..),
+  ProposedEvent (..),
+  StoredEvent (..),
+  StreamIdentity (..),
   decodeStoredEvents,
   encodeCommit,
   encodeCurrentVersion,
   encodeLoadStream,
-  encodeOpenOptions,
- )
-import EventSorcery.Engine.Protocol (
-  AggregateId (..),
-  AggregateType (..),
-  ConflictDetail (..),
-  EngineError (..),
-  EventType (..),
-  EventVersion (..),
-  OpenOptions (..),
-  ProposedEvent (..),
-  ResourceLimitDetail (..),
-  StoredEvent (..),
-  StreamIdentity (..),
  )
 import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit (assertBool, testCase, (@?=))

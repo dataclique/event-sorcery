@@ -1,20 +1,27 @@
-module EventSorcery.Engine.Codec (
-  decodeEngineError,
+module EventSorcery.Stream (
+  AggregateId (..),
+  AggregateType (..),
+  EventType (..),
+  EventVersion (..),
+  ProposedEvent (..),
+  StoredEvent (..),
+  StreamIdentity (..),
+  commit,
+  currentVersion,
   decodeStoredEvents,
   encodeCommit,
   encodeCurrentVersion,
   encodeLoadStream,
-  encodeOpenOptions,
+  encodeProposedEvent,
+  loadStream,
 ) where
 
 import Codec.CBOR.Decoding (
   Decoder,
   decodeBytes,
   decodeListLen,
-  decodeNull,
   decodeString,
   decodeWord,
-  decodeWord32,
   decodeWord64,
  )
 import Codec.CBOR.Encoding (
@@ -24,32 +31,47 @@ import Codec.CBOR.Encoding (
   encodeNull,
   encodeString,
   encodeWord,
-  encodeWord32,
   encodeWord64,
  )
 import Codec.CBOR.Read (deserialiseFromBytes)
 import Codec.CBOR.Write (toStrictByteString)
 import Control.Monad (replicateM)
+import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Foldable (foldMap)
+import Data.List.NonEmpty (NonEmpty)
+import Data.List.NonEmpty qualified as NonEmpty
 import Data.Maybe (maybe)
-import Data.Word (Word32, Word64)
+import Data.Text qualified as Text
+import Data.Word (Word64)
+import EventSorcery.Engine.Internal (
+  Store,
+  callWithOutput,
+  callWithoutOutput,
+  withInputBuffer,
+  withOpenStore,
+ )
+import EventSorcery.Engine.Internal.FFI (
+  esCommit,
+  esCurrentVersion,
+  esLoadStream,
+ )
 import EventSorcery.Engine.Protocol (
   AggregateId (..),
   AggregateType (..),
-  ConflictDetail (..),
-  EngineError (..),
+  EngineError (BindingProtocolError),
   EventType (..),
   EventVersion (..),
-  OpenOptions (..),
   ProposedEvent (..),
-  ResourceLimitDetail (..),
   StoredEvent (..),
   StreamIdentity (..),
  )
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Storable (peek, poke)
 import Prelude (
   Either (..),
+  IO,
   Int,
   Maybe,
   String,
@@ -60,21 +82,49 @@ import Prelude (
   pure,
   show,
   ($),
+  (.),
   (<$>),
   (<>),
   (==),
+  (>>=),
  )
 
 
-encodeOpenOptions :: OpenOptions -> ByteString
-encodeOpenOptions options =
-  toStrictByteString $
-    encodeListLen 5
-      <> encodeWord 1
-      <> encodeString options.path
-      <> encodeWord64 options.busyTimeoutMilliseconds
-      <> encodeWord32 options.poolSize
-      <> encodeWord32 options.runtimeThreads
+loadStream
+  :: Store
+  -> StreamIdentity
+  -> Maybe Word64
+  -> IO (Either EngineError [StoredEvent])
+loadStream store stream after =
+  withOpenStore store $ \handle ->
+    withInputBuffer (encodeLoadStream stream after) $ \request -> do
+      response <- callWithOutput (esLoadStream handle request)
+      pure (response >>= decodeResponse decodeStoredEvents)
+
+
+currentVersion :: Store -> StreamIdentity -> IO (Either EngineError Word64)
+currentVersion store stream =
+  withOpenStore store $ \handle ->
+    withInputBuffer (encodeCurrentVersion stream) $ \request ->
+      alloca $ \outVersion -> do
+        poke outVersion 0
+        result <- callWithoutOutput (esCurrentVersion handle request outVersion)
+        case result of
+          Left engineError -> pure (Left engineError)
+          Right () -> Right <$> peek outVersion
+
+
+commit
+  :: Store
+  -> StreamIdentity
+  -> Word64
+  -> NonEmpty ProposedEvent
+  -> IO (Either EngineError ())
+commit store stream expected events =
+  withOpenStore store $ \handle ->
+    withInputBuffer
+      (encodeCommit stream expected (NonEmpty.toList events))
+      (callWithoutOutput . esCommit handle)
 
 
 encodeLoadStream :: StreamIdentity -> Maybe Word64 -> ByteString
@@ -125,59 +175,6 @@ decodeStoredEvents bytes =
       | otherwise -> Left "trailing bytes after stored events"
 
 
-decodeEngineError :: Word32 -> ByteString -> Either String EngineError
-decodeEngineError expectedCode bytes =
-  case deserialiseFromBytes
-    (decodeEngineErrorWire expectedCode)
-    (LazyByteString.fromStrict bytes) of
-    Left failure -> Left (show failure)
-    Right (remaining, engineError)
-      | LazyByteString.null remaining -> Right engineError
-      | otherwise -> Left "trailing bytes after engine error"
-
-
-decodeEngineErrorWire :: Word32 -> Decoder s EngineError
-decodeEngineErrorWire expectedCode = do
-  expectListLength 3
-  version <- decodeWord
-  if version == 1
-    then do
-      encodedCode <- decodeWord32
-      if encodedCode == expectedCode
-        then decodeEngineErrorDetail encodedCode
-        else fail "engine status does not match encoded error code"
-    else fail "unsupported engine-error format version"
-
-
-decodeEngineErrorDetail :: Word32 -> Decoder s EngineError
-decodeEngineErrorDetail 1 = do
-  _ <- decodeString
-  pure MalformedInput
-decodeEngineErrorDetail 2 = do
-  expectListLength 4
-  aggregateType <- AggregateType <$> decodeString
-  aggregateId <- AggregateId <$> decodeString
-  expectedVersion <- decodeWord64
-  actualVersion <- decodeWord64
-  pure
-    ( OptimisticConflict
-        (ConflictDetail {aggregateType, aggregateId, expectedVersion, actualVersion})
-    )
-decodeEngineErrorDetail 4 = StorageFailure <$> decodeString
-decodeEngineErrorDetail 5 = InvalidState <$> decodeString
-decodeEngineErrorDetail 6 = do
-  expectListLength 3
-  resource <- decodeString
-  observed <- decodeWord64
-  limit <- decodeWord64
-  pure (ResourceLimitExceeded (ResourceLimitDetail {resource, observed, limit}))
-decodeEngineErrorDetail 100 = do
-  decodeNull
-  pure EnginePanic
-decodeEngineErrorDetail value =
-  fail ("unsupported engine error code " <> show value)
-
-
 decodeStoredEventsWire :: Decoder s [StoredEvent]
 decodeStoredEventsWire = do
   expectListLength 2
@@ -221,3 +218,11 @@ expectListLength expected = do
   if actual == expected
     then pure ()
     else fail "unexpected CBOR list length"
+
+
+decodeResponse
+  :: (ByteString -> Either String value)
+  -> ByteString
+  -> Either EngineError value
+decodeResponse decoder =
+  first (BindingProtocolError . Text.pack) . decoder

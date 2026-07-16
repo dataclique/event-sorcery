@@ -62,25 +62,25 @@ foreign import capi unsafe "event_sorcery.h es_abi_version"
   esAbiVersion :: IO Word32
 
 
-foreign import capi safe "event_sorcery.h es_open"
+foreign import capi safe "event_sorcery.h es_hs_open"
   esOpen :: Ptr EsBuf -> Ptr (Ptr EsStore) -> Ptr EsBuf -> IO CInt
 
 
-foreign import capi safe "event_sorcery.h es_load_stream"
+foreign import capi safe "event_sorcery.h es_hs_load_stream"
   esLoadStream
     :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
 
 
-foreign import capi safe "event_sorcery.h es_current_version"
+foreign import capi safe "event_sorcery.h es_hs_current_version"
   esCurrentVersion
     :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr Word64 -> Ptr EsBuf -> IO CInt
 
 
-foreign import capi safe "event_sorcery.h es_commit"
+foreign import capi safe "event_sorcery.h es_hs_commit"
   esCommit :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
 
 
-foreign import capi safe "event_sorcery.h es_close"
+foreign import capi safe "event_sorcery.h es_hs_close"
   esClose :: Ptr (Ptr EsStore) -> IO CInt
 
 
