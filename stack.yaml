@@ -8,7 +8,7 @@ install-ghc: false
 notify-if-nix-on-path: false
 
 packages:
-  - bindings/haskell
+  - .
 
 extra-deps: []
 

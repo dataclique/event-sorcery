@@ -8,9 +8,10 @@ description:
 homepage:      https://github.com/dataclique/event-sorcery
 bug-reports:   https://github.com/dataclique/event-sorcery/issues
 license:       MIT
-license-file:  LICENSE
+license-file:  bindings/haskell/LICENSE
 build-type:    Simple
 category:      Database
+data-files:    conformance/encoding-v1.vectors
 
 common strict
   default-language:   GHC2024
@@ -43,7 +44,7 @@ common strict
 
 library
   import:          strict
-  hs-source-dirs:  src
+  hs-source-dirs:  bindings/haskell/src
   exposed-modules:
     EventSorcery.Aggregate
     EventSorcery.Dispatch
@@ -67,6 +68,7 @@ library
 
   extra-libraries: event_sorcery_ffi
   build-depends:
+    , async
     , base          >=4.18 && <5
     , bytestring
     , cborg
@@ -78,8 +80,9 @@ library
 test-suite codec-spec
   import:         strict
   type:           exitcode-stdio-1.0
-  hs-source-dirs: test
+  hs-source-dirs: bindings/haskell/test
   main-is:        CodecSpec.hs
+  other-modules:  Paths_event_sorcery
   build-depends:
     , base           >=4.18 && <5
     , bytestring
@@ -89,7 +92,7 @@ test-suite codec-spec
 test-suite engine-spec
   import:         strict
   type:           exitcode-stdio-1.0
-  hs-source-dirs: test
+  hs-source-dirs: bindings/haskell/test
   main-is:        EngineSpec.hs
   build-depends:
     , base           >=4.18 && <5
@@ -99,7 +102,7 @@ test-suite engine-spec
 test-suite job-spec
   import:         strict
   type:           exitcode-stdio-1.0
-  hs-source-dirs: test
+  hs-source-dirs: bindings/haskell/test
   main-is:        JobSpec.hs
   build-depends:
     , base           >=4.18 && <5
@@ -113,7 +116,7 @@ test-suite job-spec
 test-suite domain-spec
   import:         strict
   type:           exitcode-stdio-1.0
-  hs-source-dirs: test
+  hs-source-dirs: bindings/haskell/test
   main-is:        DomainSpec.hs
   build-depends:
     , base           >=4.18 && <5
@@ -123,7 +126,7 @@ test-suite domain-spec
 test-suite store-spec
   import:         strict
   type:           exitcode-stdio-1.0
-  hs-source-dirs: test
+  hs-source-dirs: bindings/haskell/test
   main-is:        StoreSpec.hs
   build-depends:
     , base           >=4.18 && <5
@@ -134,7 +137,7 @@ test-suite store-spec
 test-suite dispatch-spec
   import:         strict
   type:           exitcode-stdio-1.0
-  hs-source-dirs: test
+  hs-source-dirs: bindings/haskell/test
   main-is:        DispatchSpec.hs
   build-depends:
     , base           >=4.18 && <5
@@ -145,7 +148,7 @@ test-suite dispatch-spec
 test-suite job-execution-spec
   import:         strict
   type:           exitcode-stdio-1.0
-  hs-source-dirs: test
+  hs-source-dirs: bindings/haskell/test
   main-is:        JobExecutionSpec.hs
   build-depends:
     , base           >=4.18 && <5
@@ -156,7 +159,7 @@ test-suite job-execution-spec
 test-suite job-worker-spec
   import:         strict
   type:           exitcode-stdio-1.0
-  hs-source-dirs: test
+  hs-source-dirs: bindings/haskell/test
   main-is:        JobWorkerSpec.hs
   build-depends:
     , async
@@ -168,7 +171,7 @@ test-suite job-worker-spec
 test-suite dispatch-worker-spec
   import:         strict
   type:           exitcode-stdio-1.0
-  hs-source-dirs: test
+  hs-source-dirs: bindings/haskell/test
   main-is:        DispatchWorkerSpec.hs
   build-depends:
     , base           >=4.18 && <5
