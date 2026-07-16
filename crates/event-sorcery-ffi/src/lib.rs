@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use event_sorcery::Engine;
@@ -18,7 +19,8 @@ const ES_ERR_STATE: i32 = 5;
 const ES_ERR_RESOURCE_LIMIT: i32 = 6;
 const ES_ERR_PANIC: i32 = 100;
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-static CLOSE_GATE: Mutex<()> = Mutex::new(());
+const MAX_CBOR_DEPTH: usize = 32;
+static STORE_REGISTRY: OnceLock<Mutex<HashMap<usize, StoreEntry>>> = OnceLock::new();
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -29,7 +31,8 @@ pub struct EsBuf {
 
 pub struct EsStore {
     state: Mutex<StoreState>,
-    closed: Condvar,
+    state_changed: Condvar,
+    inner: Mutex<Option<Arc<StoreInner>>>,
     poisoned: AtomicBool,
 }
 
@@ -44,7 +47,8 @@ pub const extern "C" fn es_abi_version() -> u32 {
 /// # Safety
 ///
 /// `options` must reference readable bytes for the duration of the call.
-/// `out_store` must be writable, and `out_error` must be null or writable.
+/// `out_store` must be a stable, unowned writable cell that remains at the same
+/// address until close completes. `out_error` must be null or writable.
 pub unsafe extern "C" fn es_open(
     options: *const EsBuf,
     out_store: *mut *mut EsStore,
@@ -80,16 +84,16 @@ pub unsafe extern "C" fn es_open(
         runtime
             .block_on(engine.migrate())
             .map_err(|_| AbiError::Storage)?;
-        let store = Box::new(EsStore {
-            state: Mutex::new(StoreState::Open(StoreInner {
+        let store = Arc::new(EsStore {
+            state: Mutex::new(StoreState::Open { active_calls: 0 }),
+            state_changed: Condvar::new(),
+            inner: Mutex::new(Some(Arc::new(StoreInner {
                 _runtime: runtime,
                 _engine: engine,
-            })),
-            closed: Condvar::new(),
+            }))),
             poisoned: AtomicBool::new(false),
         });
-        unsafe { out_store.write(Box::into_raw(store)) };
-        Ok(())
+        publish_store(out_store, store)
     })
 }
 
@@ -99,31 +103,23 @@ pub unsafe extern "C" fn es_open(
 ///
 /// # Safety
 ///
-/// A non-null owner must contain a pointer returned by [`es_open`]. Repeated
-/// and concurrent calls with the same owner are safe.
+/// A non-null owner must be the original cell passed to [`es_open`]. Its value
+/// must not be copied to another owner or modified by the caller. Repeated and
+/// concurrent calls with the same owner are safe.
 pub unsafe extern "C" fn es_close(store: *mut *mut EsStore) -> i32 {
-    let store = {
-        let _close = CLOSE_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(store) = (unsafe { store.as_mut() }) else {
-            return ES_OK;
-        };
-        std::mem::replace(store, ptr::null_mut())
-    };
-    if store.is_null() {
+    let Some(owner) = (unsafe { store.as_mut() }) else {
         return ES_OK;
-    }
-    let store = unsafe { Box::from_raw(store) };
-    match catch_unwind(AssertUnwindSafe(move || {
-        let result = store.close();
-        drop(store);
-        result
-    })) {
-        Ok(Ok(())) => ES_OK,
-        Ok(Err(error)) => error.code(),
-        Err(_) => ES_ERR_PANIC,
-    }
+    };
+    let owner_address = store as usize;
+    let (store, close_role) = match linearize_close(owner_address, owner) {
+        Ok(Some(close)) => close,
+        Ok(None) => return ES_OK,
+        Err(error) => return error.code(),
+    };
+    let result =
+        catch_unwind(AssertUnwindSafe(|| store.close(close_role))).unwrap_or(Err(AbiError::Panic));
+    retire_store(owner_address, &store);
+    result.map_or_else(|error| error.code(), |()| ES_OK)
 }
 
 #[unsafe(no_mangle)]
@@ -163,10 +159,104 @@ struct StoreInner {
     _engine: Engine,
 }
 
+struct StoreEntry {
+    raw_store: usize,
+    store: Arc<EsStore>,
+}
+
+#[cfg(test)]
+struct StoreLease {
+    store: Arc<EsStore>,
+    _inner: Arc<StoreInner>,
+}
+
 enum StoreState {
-    Open(StoreInner),
-    Closing,
-    Closed,
+    Open { active_calls: usize },
+    Closing { active_calls: usize },
+    Closed(Result<(), AbiError>),
+}
+
+#[derive(Clone, Copy)]
+enum CloseRole {
+    Destroy,
+    Join,
+}
+
+fn store_registry() -> &'static Mutex<HashMap<usize, StoreEntry>> {
+    STORE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn publish_store(owner: *mut *mut EsStore, store: Arc<EsStore>) -> Result<(), AbiError> {
+    let owner_address = owner as usize;
+    let mut registry = store_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if registry.contains_key(&owner_address) {
+        return Err(AbiError::State("store owner is already open"));
+    }
+    let raw_store = Arc::into_raw(Arc::clone(&store)).cast_mut();
+    registry.insert(
+        owner_address,
+        StoreEntry {
+            raw_store: raw_store as usize,
+            store,
+        },
+    );
+    unsafe { owner.write(raw_store) };
+    drop(registry);
+    Ok(())
+}
+
+fn linearize_close(
+    owner_address: usize,
+    owner: &mut *mut EsStore,
+) -> Result<Option<(Arc<EsStore>, CloseRole)>, AbiError> {
+    let registry = store_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = registry.get(&owner_address) else {
+        *owner = ptr::null_mut();
+        return Ok(None);
+    };
+    if !owner.is_null() && *owner as usize != entry.raw_store {
+        return Err(AbiError::State("store owner does not match its handle"));
+    }
+    let store = Arc::clone(&entry.store);
+    let mut state = store
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let role = match &*state {
+        StoreState::Open { active_calls } => {
+            *state = StoreState::Closing {
+                active_calls: *active_calls,
+            };
+            CloseRole::Destroy
+        }
+        StoreState::Closing { .. } | StoreState::Closed(_) => CloseRole::Join,
+    };
+    *owner = ptr::null_mut();
+    drop(state);
+    store.state_changed.notify_all();
+    drop(registry);
+    Ok(Some((store, role)))
+}
+
+fn retire_store(owner_address: usize, store: &Arc<EsStore>) {
+    let mut registry = store_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let should_remove = registry
+        .get(&owner_address)
+        .is_some_and(|entry| Arc::ptr_eq(&entry.store, store));
+    let entry = should_remove
+        .then(|| registry.remove(&owner_address))
+        .flatten();
+    drop(registry);
+    if let Some(entry) = entry {
+        let raw_store: *const EsStore = std::ptr::with_exposed_provenance(entry.raw_store);
+        unsafe { drop(Arc::from_raw(raw_store)) };
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -183,42 +273,141 @@ enum AbiError {
 }
 
 impl EsStore {
-    fn close(&self) -> Result<(), AbiError> {
-        let inner = {
+    #[cfg(test)]
+    fn acquire(owner: *mut *mut Self) -> Result<StoreLease, AbiError> {
+        let Some(owner) = (unsafe { owner.as_ref() }) else {
+            return Err(AbiError::State("store owner is null"));
+        };
+        let owner_address = std::ptr::from_ref(owner).addr();
+        let registry = store_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = registry.get(&owner_address) else {
+            return Err(AbiError::State("store is closed"));
+        };
+        if owner.is_null() || *owner as usize != entry.raw_store {
+            return Err(AbiError::State("store is closed"));
+        }
+        let store = Arc::clone(&entry.store);
+        let mut state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let StoreState::Open { active_calls } = &mut *state else {
+            return Err(AbiError::State("store is closing"));
+        };
+        let inner = store
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+            .ok_or(AbiError::State("store is closed"))?;
+        *active_calls = active_calls
+            .checked_add(1)
+            .ok_or(AbiError::State("active call count overflow"))?;
+        drop(state);
+        drop(registry);
+        Ok(StoreLease {
+            store,
+            _inner: inner,
+        })
+    }
+
+    fn close(&self, role: CloseRole) -> Result<(), AbiError> {
+        if matches!(role, CloseRole::Join) {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
                 match &*state {
-                    StoreState::Open(_) => {
-                        let StoreState::Open(inner) =
-                            std::mem::replace(&mut *state, StoreState::Closing)
-                        else {
-                            unreachable!();
-                        };
-                        break inner;
-                    }
-                    StoreState::Closing => {
+                    StoreState::Closed(result) => return *result,
+                    StoreState::Open { .. } | StoreState::Closing { .. } => {
                         state = self
-                            .closed
+                            .state_changed
                             .wait(state)
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
-                    StoreState::Closed => return Ok(()),
                 }
             }
-        };
+        }
 
-        let close_result = catch_unwind(AssertUnwindSafe(|| drop(inner)));
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = StoreState::Closed;
+        while matches!(&*state, StoreState::Closing { active_calls } if *active_calls != 0) {
+            state = self
+                .state_changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
         drop(state);
-        self.closed.notify_all();
-        close_result.map_err(|_| AbiError::Panic)
+
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let result = catch_unwind(AssertUnwindSafe(|| drop(inner))).map_err(|_| AbiError::Panic);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = StoreState::Closed(result);
+        drop(state);
+        self.state_changed.notify_all();
+        result
+    }
+}
+
+#[cfg(test)]
+impl StoreLease {
+    fn wait_until_closing(&self) {
+        let mut state = self
+            .store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while matches!(&*state, StoreState::Open { .. }) {
+            state = self
+                .store
+                .state_changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(state);
+    }
+}
+
+#[cfg(test)]
+impl Drop for StoreLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let drained = match &mut *state {
+            StoreState::Open { active_calls } | StoreState::Closing { active_calls } => {
+                if let Some(remaining) = active_calls.checked_sub(1) {
+                    *active_calls = remaining;
+                    remaining == 0
+                } else {
+                    self.store.poisoned.store(true, Ordering::Release);
+                    true
+                }
+            }
+            StoreState::Closed(_) => {
+                self.store.poisoned.store(true, Ordering::Release);
+                true
+            }
+        };
+        drop(state);
+        if drained {
+            self.store.state_changed.notify_all();
+        }
     }
 }
 
@@ -250,7 +439,8 @@ fn decode_open_options(buffer: *const EsBuf) -> Result<OpenOptions, AbiError> {
     }
     let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) };
     let decoded: (u8, String, u64, u32, usize) =
-        ciborium::from_reader(Cursor::new(bytes)).map_err(|_| AbiError::MalformedInput)?;
+        ciborium::de::from_reader_with_recursion_limit(Cursor::new(bytes), MAX_CBOR_DEPTH)
+            .map_err(|_| AbiError::MalformedInput)?;
     let mut canonical = Vec::new();
     ciborium::into_writer(&decoded, &mut canonical).map_err(|_| AbiError::MalformedInput)?;
     if canonical != bytes {
@@ -549,6 +739,46 @@ mod tests {
         assert_eq!(results, [ES_OK; 4]);
         assert!(store.is_null());
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn close_waits_for_calls_that_acquired_the_store() {
+        let mut encoded = open_options();
+        let mut store = ptr::null_mut();
+        let mut error = empty_buffer();
+        let options = EsBuf {
+            ptr: encoded.as_mut_ptr(),
+            len: encoded.len(),
+        };
+        assert_eq!(
+            unsafe { es_open(&raw const options, &raw mut store, &raw mut error) },
+            ES_OK
+        );
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let owner_address = (&raw mut store) as usize;
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let result = unsafe { es_close(owner_address as *mut *mut EsStore) };
+                closed_tx.send(result).unwrap();
+            });
+
+            lease.wait_until_closing();
+            assert!(matches!(
+                closed_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            drop(lease);
+            assert_eq!(
+                closed_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ES_OK
+            );
+        });
+
+        assert!(store.is_null());
     }
 
     #[test]
