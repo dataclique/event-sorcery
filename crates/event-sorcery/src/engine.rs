@@ -11,6 +11,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use crate::job::EnqueueRequest;
 use crate::job_sqlite::SqliteJobError;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
+use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaTarget};
 
 /// Identifies one serialized aggregate event stream at the storage boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +109,8 @@ pub enum EngineError {
     Integer(#[from] std::num::TryFromIntError),
     #[error(transparent)]
     JobFlush(#[from] crate::job::JobStoreError),
+    #[error(transparent)]
+    Schema(#[from] ReconcileError),
 }
 
 /// An erased durable-job intent committed atomically with domain events.
@@ -177,6 +180,25 @@ impl Engine {
             .run(&self.pool)
             .await
             .map_err(|error| SqliteJobError::Sql(error.into()))?;
+        Ok(())
+    }
+
+    /// Runs the existing schema-registry recovery for language-neutral metadata.
+    pub async fn reconcile_schema(
+        &self,
+        target: &SchemaTarget,
+    ) -> Result<SchemaReconciliation, EngineError> {
+        Ok(Reconciler::new(self.pool.clone())
+            .reconcile_target(target)
+            .await?)
+    }
+
+    /// Records a schema version after its recovery has durably completed.
+    pub async fn record_schema(&self, target: &SchemaTarget) -> Result<(), EngineError> {
+        Reconciler::new(self.pool.clone())
+            .record_target(target)
+            .await?;
+
         Ok(())
     }
 
@@ -778,6 +800,7 @@ impl From<EngineError> for PersistenceError {
             Json(source) => Self::DeserializationError(Box::new(source)),
             Integer(source) => Self::UnknownError(Box::new(source)),
             JobFlush(source) => Self::UnknownError(Box::new(source)),
+            Schema(source) => Self::UnknownError(Box::new(source)),
         }
     }
 }
@@ -869,6 +892,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::CompactionPolicy;
     use crate::job::{JobId, JobKind, WorkerId, enqueued_event, pending_seed_payload, plan_claim};
 
     #[tokio::test]
@@ -904,6 +928,81 @@ mod tests {
             payload: serde_json::json!({ "sequence": sequence }),
             metadata: serde_json::json!({}),
         }
+    }
+
+    #[tokio::test]
+    async fn schema_reconciliation_uses_the_existing_event_sourced_registry() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let engine = Engine::new(pool);
+        engine.migrate().await.unwrap();
+        let target = SchemaTarget::new("engine-schema-test", 1, CompactionPolicy::Retain);
+
+        assert_eq!(
+            engine.reconcile_schema(&target).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        assert_eq!(
+            engine.reconcile_schema(&target).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+
+        engine.record_schema(&target).await.unwrap();
+
+        assert_eq!(
+            engine.reconcile_schema(&target).await.unwrap(),
+            SchemaReconciliation::Unchanged
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_version_change_clears_derived_snapshots() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let engine = Engine::new(pool);
+        engine.migrate().await.unwrap();
+        let stream = StreamIdentity::new("engine-schema-snapshot", "one");
+        let version_one = SchemaTarget::new("engine-schema-snapshot", 1, CompactionPolicy::Retain);
+        assert_eq!(
+            engine.reconcile_schema(&version_one).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        engine.record_schema(&version_one).await.unwrap();
+        persist_test_snapshot(&engine, &stream).await;
+
+        let version_two = SchemaTarget::new("engine-schema-snapshot", 2, CompactionPolicy::Retain);
+        let outcome = engine.reconcile_schema(&version_two).await.unwrap();
+
+        assert_eq!(outcome, SchemaReconciliation::Changed);
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn schema_version_change_preserves_compacted_snapshots_by_refusing_recovery() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let engine = Engine::new(pool);
+        engine.migrate().await.unwrap();
+        let stream = StreamIdentity::new("engine-schema-compact", "one");
+        let version_one = SchemaTarget::new("engine-schema-compact", 1, CompactionPolicy::Retain);
+        assert_eq!(
+            engine.reconcile_schema(&version_one).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        engine.record_schema(&version_one).await.unwrap();
+        persist_test_snapshot(&engine, &stream).await;
+        let version_two = SchemaTarget::new(
+            "engine-schema-compact",
+            2,
+            CompactionPolicy::CompactAfterSnapshot,
+        );
+
+        let result = engine.reconcile_schema(&version_two).await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::Schema(
+                ReconcileError::CompactedSnapshotClear { .. }
+            ))
+        ));
+        assert!(engine.load_snapshot(&stream).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1186,5 +1285,28 @@ mod tests {
 
         engine.discard_snapshot(&stream).await.unwrap();
         assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    async fn persist_test_snapshot(engine: &Engine, stream: &StreamIdentity) {
+        let event = SerializedEvent {
+            aggregate_type: stream.aggregate_type.clone(),
+            aggregate_id: stream.aggregate_id.clone(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        engine
+            .commit(CommitRequest::new(stream.clone(), &[event]))
+            .await
+            .unwrap();
+        engine
+            .store_snapshot(
+                stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 42 }), 1),
+            )
+            .await
+            .unwrap();
     }
 }
