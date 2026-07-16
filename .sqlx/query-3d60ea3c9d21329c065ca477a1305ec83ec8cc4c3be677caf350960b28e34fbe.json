@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            UPDATE job_queue\n            SET lease_until = ?1\n            WHERE view_id = ?2\n              AND version = ?3\n              AND status = 'claimed'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "3d60ea3c9d21329c065ca477a1305ec83ec8cc4c3be677caf350960b28e34fbe"
+}
