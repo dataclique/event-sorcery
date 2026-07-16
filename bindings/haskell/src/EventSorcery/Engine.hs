@@ -11,7 +11,7 @@ module EventSorcery.Engine (
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (finally)
 import Data.Bifunctor (first)
-import Data.Bits (shiftR)
+import Data.Bits (shiftR, (.&.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty)
@@ -38,8 +38,8 @@ import EventSorcery.Engine.Internal.FFI (
   esOpen,
  )
 import EventSorcery.Engine.Protocol (
+  AbiVersionDetail (..),
   EngineError (..),
-  ErrorClass (..),
   OpenOptions,
   ProposedEvent,
   StoredEvent,
@@ -63,10 +63,12 @@ import Prelude (
   fromIntegral,
   pure,
   ($),
+  (&&),
   (.),
   (<$>),
   (<>),
   (>),
+  (>=),
   (>>=),
  )
 
@@ -81,13 +83,9 @@ abiVersion = esAbiVersion
 openStore :: OpenOptions -> IO (Either EngineError Store)
 openStore options = do
   version <- abiVersion
-  if version `shiftR` 16 == supportedAbiMajor
-    then openCompatibleStore options
-    else
-      pure . Left $
-        EngineError
-          AbiMismatch
-          ("unsupported engine ABI version " <> Text.pack (show version))
+  case checkAbiVersion version of
+    Right () -> openCompatibleStore options
+    Left engineError -> pure (Left engineError)
 
 
 closeStore :: Store -> IO (Either EngineError ())
@@ -139,6 +137,29 @@ supportedAbiMajor :: Word32
 supportedAbiMajor = 0
 
 
+minimumAbiMinor :: Word32
+minimumAbiMinor = 2
+
+
+checkAbiVersion :: Word32 -> Either EngineError ()
+checkAbiVersion version =
+  if actualMajor == supportedAbiMajor && actualMinor >= minimumAbiMinor
+    then Right ()
+    else
+      Left
+        ( AbiVersionMismatch
+            ( AbiVersionDetail
+                supportedAbiMajor
+                minimumAbiMinor
+                actualMajor
+                actualMinor
+            )
+        )
+  where
+    actualMajor = version `shiftR` 16
+    actualMinor = version .&. 0xffff
+
+
 openCompatibleStore :: OpenOptions -> IO (Either EngineError Store)
 openCompatibleStore options = do
   cell <- malloc
@@ -161,15 +182,15 @@ openCompatibleStore options = do
 
 withOpenStore
   :: Store
-  -> (Ptr EsStore -> IO (Either EngineError value))
+  -> (Ptr (Ptr EsStore) -> IO (Either EngineError value))
   -> IO (Either EngineError value)
 withOpenStore (Store owner gate) action =
   withMVar gate $ \() ->
     withForeignPtr owner $ \cell -> do
       handle <- peek cell
       if handle == nullPtr
-        then pure (Left (EngineError StateError "store is closed"))
-        else action handle
+        then pure (Left (InvalidState "store is closed"))
+        else action cell
 
 
 withInputBuffer :: ByteString -> (Ptr EsBuf -> IO value) -> IO value
@@ -237,7 +258,7 @@ readEngineError status buffer = do
   pure case bytes of
     Left protocolError -> protocolError
     Right encoded ->
-      case decodeEngineError encoded of
+      case decodeEngineError (fromIntegral status) encoded of
         Right engineError -> engineError
         Left cause ->
           BindingProtocolError
@@ -258,13 +279,9 @@ decodeResponse decoder =
 
 statusWithoutDetail :: CInt -> Either EngineError ()
 statusWithoutDetail 0 = Right ()
-statusWithoutDetail 100 = Left (EngineError PanicError "engine panic")
+statusWithoutDetail 100 = Left EnginePanic
 statusWithoutDetail status =
-  Left
-    ( EngineError
-        (UnknownError (fromIntegral status))
-        "engine returned an unknown status"
-    )
+  Left (UnknownEngineError (fromIntegral status))
 
 
 emptyBuffer :: EsBuf

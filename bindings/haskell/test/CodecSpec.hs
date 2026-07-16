@@ -14,12 +14,13 @@ import EventSorcery.Engine.Codec (
 import EventSorcery.Engine.Protocol (
   AggregateId (..),
   AggregateType (..),
+  ConflictDetail (..),
   EngineError (..),
-  ErrorClass (ConflictError),
   EventType (..),
   EventVersion (..),
   OpenOptions (..),
   ProposedEvent (..),
+  ResourceLimitDetail (..),
   StoredEvent (..),
   StreamIdentity (..),
  )
@@ -53,9 +54,29 @@ tests =
         "decoding"
         [ testCase "stored event" $
             decodeStoredEvents stored @?= Right [expectedStored]
-        , testCase "engine error" $
-            decodeEngineError conflict
-              @?= Right (EngineError ConflictError "optimistic conflict")
+        , testCase "conflict detail" $
+            decodeEngineError 2 conflict
+              @?= Right
+                ( OptimisticConflict
+                    ( ConflictDetail
+                        (AggregateType "account")
+                        (AggregateId "one")
+                        0
+                        1
+                    )
+                )
+        , testCase "resource-limit detail" $
+            decodeEngineError 6 resourceLimit
+              @?= Right
+                ( ResourceLimitExceeded
+                    (ResourceLimitDetail "payload" 65 64)
+                )
+        , testCase "panic detail" $
+            decodeEngineError 100 enginePanic @?= Right EnginePanic
+        , testCase "rejects disagreement between status and encoded code" $
+            assertBool
+              "status mismatch must fail"
+              (isLeft (decodeEngineError 4 conflict))
         , testCase "rejects trailing bytes" $
             assertBool
               "trailing byte must fail"
@@ -336,24 +357,52 @@ conflict =
     [ 131 -- array(3)
     , 1 -- format version 1
     , 2 -- conflict error
-    , 115
-    , 111
-    , 112
-    , 116
-    , 105
-    , 109
-    , 105
-    , 115
-    , 116
-    , 105
+    , 132 -- array(4) conflict detail
+    , 103
+    , 97
     , 99
-    , 32
+    , 99
+    , 111
+    , 117
+    , 110
+    , 116 -- text(7) account
     , 99
     , 111
     , 110
-    , 102
+    , 101 -- text(3) one
+    , 0 -- expected version 0
+    , 1 -- actual version 1
+    ]
+
+
+resourceLimit :: ByteString
+resourceLimit =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 6 -- resource-limit error
+    , 131 -- array(3) resource detail
+    , 103
+    , 112
+    , 97
+    , 121
     , 108
-    , 105
-    , 99
-    , 116 -- text(19) optimistic conflict
+    , 111
+    , 97
+    , 100 -- text(7) payload
+    , 24
+    , 65 -- observed 65
+    , 24
+    , 64 -- limit 64
+    ]
+
+
+enginePanic :: ByteString
+enginePanic =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 24
+    , 100 -- panic error
+    , 246 -- null detail
     ]

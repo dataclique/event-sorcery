@@ -67,16 +67,17 @@ foreign import capi safe "event_sorcery.h es_open"
 
 
 foreign import capi safe "event_sorcery.h es_load_stream"
-  esLoadStream :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+  esLoadStream
+    :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
 
 
 foreign import capi safe "event_sorcery.h es_current_version"
   esCurrentVersion
-    :: Ptr EsStore -> Ptr EsBuf -> Ptr Word64 -> Ptr EsBuf -> IO CInt
+    :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr Word64 -> Ptr EsBuf -> IO CInt
 
 
 foreign import capi safe "event_sorcery.h es_commit"
-  esCommit :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+  esCommit :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
 
 
 foreign import capi safe "event_sorcery.h es_close"

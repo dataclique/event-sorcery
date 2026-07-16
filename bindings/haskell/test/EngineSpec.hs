@@ -1,8 +1,10 @@
 module Main (main) where
 
+import Control.Exception (finally)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty (..))
 import EventSorcery.Engine (
+  Store,
   abiVersion,
   closeStore,
   commit,
@@ -13,8 +15,8 @@ import EventSorcery.Engine (
 import EventSorcery.Engine.Protocol (
   AggregateId (..),
   AggregateType (..),
-  EngineError (EngineError),
-  ErrorClass (ConflictError, StateError),
+  ConflictDetail (..),
+  EngineError (..),
   EventType (..),
   EventVersion (..),
   OpenOptions (..),
@@ -22,67 +24,97 @@ import EventSorcery.Engine.Protocol (
   StoredEvent (..),
   StreamIdentity (..),
  )
+import Test.Tasty (TestTree, defaultMain, testGroup)
+import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
 import Prelude (
   Either (..),
   IO,
   Maybe (Nothing),
-  error,
+  Show (show),
   pure,
-  show,
-  (&&),
+  ($),
   (<>),
-  (==),
+  (>>=),
  )
 
 
 main :: IO ()
-main = do
-  version <- abiVersion
-  if version == 2
-    then exerciseStore
-    else error "unexpected engine ABI version"
+main = defaultMain tests
 
 
-exerciseStore :: IO ()
-exerciseStore = do
-  opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)
+tests :: TestTree
+tests =
+  testGroup
+    "shared engine FFI"
+    [ testCase "reports ABI 0.2" $
+        abiVersion >>= (@?= 2)
+    , testCase "commits and loads opaque event bytes" $
+        withStore $ \store -> do
+          commitFixture store
+          currentVersion store stream >>= (@?= Right 1)
+          loadStream store stream Nothing >>= (@?= Right [stored])
+    , testCase "preserves optimistic conflict identity and versions" $
+        withStore $ \store -> do
+          commitFixture store
+          conflict <- commit store stream 0 (proposed :| [])
+          conflict
+            @?= Left
+              ( OptimisticConflict
+                  (ConflictDetail aggregateType aggregateId 0 1)
+              )
+    , testCase "closes idempotently and rejects later operations" $
+        withStore $ \store -> do
+          closeStore store >>= (@?= Right ())
+          loadStream store stream Nothing
+            >>= (@?= Left (InvalidState "store is closed"))
+          closeStore store >>= (@?= Right ())
+    ]
+
+
+withStore :: (Store -> IO ()) -> IO ()
+withStore action = do
+  opened <- openStore options
   case opened of
-    Left _ -> error "failed to open the shared engine"
-    Right store -> do
-      committed <- commit store stream 0 (proposed :| [])
-      case committed of
-        Left _ -> error "failed to commit through the shared engine"
-        Right () -> pure ()
-      version <- currentVersion store stream
-      if version == Right 1
-        then pure ()
-        else error "engine did not report the committed stream version"
-      conflict <- commit store stream 0 (proposed :| [])
-      case conflict of
-        Left (EngineError ConflictError "optimistic conflict") -> pure ()
-        _ -> error "Haskell did not preserve optimistic-conflict identity"
-      loaded <- loadStream store stream Nothing
-      if loaded == Right [stored]
-        then pure ()
-        else error ("Haskell loaded an unexpected event: " <> show loaded)
-      firstClose <- closeStore store
-      afterClose <- loadStream store stream Nothing
-      secondClose <- closeStore store
-      if firstClose == Right ()
-        && afterClose == Left (EngineError StateError "store is closed")
-        && secondClose == Right ()
-        then pure ()
-        else error "engine close was not idempotent"
-  where
-    stream = StreamIdentity (AggregateType "account") (AggregateId "one")
-    proposed =
-      ProposedEvent
-        (EventType "Created")
-        (EventVersion "1.0")
-        (ByteString.pack [0, 1])
-    stored =
-      StoredEvent
-        1
-        (EventType "Created")
-        (EventVersion "1.0")
-        (ByteString.pack [0, 1])
+    Left engineError -> assertFailure ("failed to open the shared engine: " <> show engineError)
+    Right store ->
+      action store `finally` do
+        _ <- closeStore store
+        pure ()
+
+
+commitFixture :: Store -> IO ()
+commitFixture store =
+  commit store stream 0 (proposed :| []) >>= (@?= Right ())
+
+
+options :: OpenOptions
+options = OpenOptions "sqlite::memory:" 5000 1 1
+
+
+aggregateType :: AggregateType
+aggregateType = AggregateType "account"
+
+
+aggregateId :: AggregateId
+aggregateId = AggregateId "one"
+
+
+stream :: StreamIdentity
+stream = StreamIdentity aggregateType aggregateId
+
+
+proposed :: ProposedEvent
+proposed =
+  ProposedEvent
+    (EventType "Created")
+    (EventVersion "1.0")
+    (ByteString.pack [0, 1])
+
+
+stored :: StoredEvent
+stored =
+  StoredEvent
+    1
+    (EventType "Created")
+    (EventVersion "1.0")
+    (ByteString.pack [0, 1])

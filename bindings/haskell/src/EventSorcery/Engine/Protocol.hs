@@ -1,12 +1,14 @@
 module EventSorcery.Engine.Protocol (
   AggregateId (..),
   AggregateType (..),
+  AbiVersionDetail (..),
+  ConflictDetail (..),
   EngineError (..),
-  ErrorClass (..),
   EventType (..),
   EventVersion (..),
   OpenOptions (..),
   ProposedEvent (..),
+  ResourceLimitDetail (..),
   StoredEvent (..),
   StreamIdentity (..),
 ) where
@@ -42,20 +44,41 @@ data OpenOptions = OpenOptions
   deriving stock (Eq, Show)
 
 
-data ErrorClass
-  = DecodeError
-  | ConflictError
-  | JobError
-  | StorageError
-  | StateError
-  | AbiMismatch
-  | PanicError
-  | UnknownError Word32
+data ConflictDetail = ConflictDetail
+  { aggregateType :: AggregateType
+  , aggregateId :: AggregateId
+  , expectedVersion :: Word64
+  , actualVersion :: Word64
+  }
+  deriving stock (Eq, Show)
+
+
+data ResourceLimitDetail = ResourceLimitDetail
+  { resource :: Text
+  , observed :: Word64
+  , limit :: Word64
+  }
+  deriving stock (Eq, Show)
+
+
+data AbiVersionDetail = AbiVersionDetail
+  { expectedMajor :: Word32
+  , minimumMinor :: Word32
+  , actualMajor :: Word32
+  , actualMinor :: Word32
+  }
   deriving stock (Eq, Show)
 
 
 data EngineError
-  = EngineError ErrorClass Text
+  = MalformedInput
+  | OptimisticConflict ConflictDetail
+  | StorageFailure Text
+  | InvalidState Text
+  | ResourceLimitExceeded ResourceLimitDetail
+  | AbiVersionMismatch AbiVersionDetail
+  | EnginePanic
+  | UnknownEngineError Word32
   | BindingProtocolError Text
   deriving stock (Eq, Show)
 
