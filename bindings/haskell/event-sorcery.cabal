@@ -46,6 +46,8 @@ library
   hs-source-dirs:  src
   exposed-modules:
     EventSorcery.Aggregate
+    EventSorcery.Dispatch
+    EventSorcery.Dispatch.TestSupport
     EventSorcery.Engine
     EventSorcery.Job
     EventSorcery.Snapshot
@@ -53,6 +55,7 @@ library
     EventSorcery.Stream
 
   other-modules:
+    EventSorcery.Dispatch.Internal
     EventSorcery.Engine.Internal
     EventSorcery.Engine.Internal.FFI
     EventSorcery.Job.Definition
@@ -117,6 +120,17 @@ test-suite store-spec
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        StoreSpec.hs
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring
+    , event-sorcery
+    , text
+
+test-suite dispatch-spec
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        DispatchSpec.hs
   build-depends:
     , base           >=4.18 && <5
     , bytestring
