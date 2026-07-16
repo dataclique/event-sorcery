@@ -23,6 +23,22 @@
       system:
       let
         pkgs = rainix.pkgs.${system};
+        checkExamples = pkgs.writeShellApplication {
+          name = "check-examples";
+          meta = {
+            description = "Validate the event-sorcery example crates";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "check-examples";
+          };
+          runtimeInputs = rustBuildInputs ++ [
+            pkgs.cargo-nextest
+            pkgs.nushell
+          ];
+          text = ''
+            export CARGO_INCREMENTAL=0
+            exec nu ${./scripts/check-examples.nu}
+          '';
+        };
         but = but-nix.packages.${system}.default;
         haskellPackages = pkgs.haskell.packages.ghc914;
         haskellBinding = haskellPackages.callCabal2nix "event-sorcery" ./bindings/haskell { };
@@ -40,8 +56,14 @@
       in
       {
         packages = rainix.packages.${system} // {
+          check-examples = checkExamples;
           inherit but;
           haskell = haskellBinding;
+        };
+
+        apps.check-examples = {
+          type = "app";
+          program = pkgs.lib.getExe checkExamples;
         };
 
         checks = {
