@@ -127,7 +127,10 @@ impl<'events> CommitRequest<'events> {
 }
 
 impl Engine {
-    /// Creates an engine over a migrated SQLite pool.
+    /// Creates an engine over a SQLite pool.
+    ///
+    /// This constructor does not run migrations. Call [`Self::migrate`] before
+    /// using storage operations when the pool's schema is not initialized.
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
