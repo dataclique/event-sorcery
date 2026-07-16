@@ -918,6 +918,7 @@ fn resolve_run_at_ms(delay: Option<Duration>) -> Result<i64, JobStoreError> {
 mod tests {
     use std::convert::Infallible;
 
+    use proptest::prelude::*;
     use serde::{Deserialize, Serialize};
 
     use super::*;
@@ -1050,5 +1051,103 @@ mod tests {
         };
         assert_eq!(claims, 3);
         assert_eq!(attempt, 1);
+    }
+
+    proptest! {
+        #[test]
+        fn claiming_preserves_attempt_and_increments_claims(
+            attempt in any::<u32>(),
+            claims in 0..u32::MAX,
+            payload in any::<i64>(),
+        ) {
+            let pending = JobState::Pending {
+                kind: JobKind::new("property-job"),
+                payload: serde_json::json!(payload),
+                run_at: at(0),
+                attempt,
+                claims,
+            };
+            let event = JobEvent::Claimed {
+                worker: WorkerId::new("property-worker"),
+                claim_id: ClaimId("property-claim".to_string()),
+                lease_until: at(100),
+            };
+
+            let evolved = JobState::evolve(&pending, &event);
+
+            match evolved {
+                Ok(Some(JobState::Claimed {
+                    payload: next_payload,
+                    attempt: next_attempt,
+                    claims: next_claims,
+                    ..
+                })) => {
+                    prop_assert_eq!(next_payload, serde_json::json!(payload));
+                    prop_assert_eq!(next_attempt, attempt);
+                    prop_assert_eq!(next_claims, claims + 1);
+                }
+                other => prop_assert!(false, "expected claimed state, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn retry_preserves_claim_budget_and_records_attempt(
+            claims in any::<u32>(),
+            next_attempt in any::<u32>(),
+            run_at in -1_000_i64..1_000_i64,
+        ) {
+            let state = claimed("property-claim", claims);
+            let event = JobEvent::RetryScheduled {
+                run_at: at(run_at),
+                attempt: next_attempt,
+                error: "transient".to_string(),
+            };
+
+            let evolved = JobState::evolve(&state, &event);
+
+            match evolved {
+                Ok(Some(JobState::Pending {
+                    attempt,
+                    claims: next_claims,
+                    ..
+                })) => {
+                    prop_assert_eq!(attempt, next_attempt);
+                    prop_assert_eq!(next_claims, claims);
+                }
+                other => prop_assert!(false, "expected pending state, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn defer_resets_claim_budget_without_counting_attempt(
+            claims in any::<u32>(),
+            attempt in any::<u32>(),
+            run_at in -1_000_i64..1_000_i64,
+        ) {
+            let state = JobState::Claimed {
+                kind: JobKind::new("property-job"),
+                payload: serde_json::json!({}),
+                worker: WorkerId::new("property-worker"),
+                claim_id: ClaimId("property-claim".to_string()),
+                run_at: at(0),
+                attempt,
+                claims,
+            };
+            let event = JobEvent::Rescheduled { run_at: at(run_at) };
+
+            let evolved = JobState::evolve(&state, &event);
+
+            match evolved {
+                Ok(Some(JobState::Pending {
+                    attempt: next_attempt,
+                    claims: next_claims,
+                    ..
+                })) => {
+                    prop_assert_eq!(next_attempt, attempt);
+                    prop_assert_eq!(next_claims, 0);
+                }
+                other => prop_assert!(false, "expected pending state, got {other:?}"),
+            }
+        }
     }
 }
