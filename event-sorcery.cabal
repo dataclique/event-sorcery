@@ -101,6 +101,7 @@ test-suite spec
   main-is:            Spec.hs
   other-modules:
     CodecSpec
+    DispatchPropertySpec
     DispatchSpec
     DispatchWorkerSpec
     DomainSpec
@@ -119,6 +120,7 @@ test-suite spec
     , event-sorcery
     , hspec
     , linear-base
+    , QuickCheck
     , text
     , transformers
 
