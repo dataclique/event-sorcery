@@ -37,6 +37,29 @@ use crate::{DomainEvent, Effect, EventSourced, Nil, uneventful};
 /// Singleton aggregate ID for the schema registry.
 const REGISTRY_ID: &str = "schema";
 
+/// Language-neutral aggregate schema metadata used during startup recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaTarget {
+    aggregate_type: String,
+    version: u64,
+    compaction: CompactionPolicy,
+}
+
+impl SchemaTarget {
+    #[must_use]
+    pub fn new(
+        aggregate_type: impl Into<String>,
+        version: u64,
+        compaction: CompactionPolicy,
+    ) -> Self {
+        Self {
+            aggregate_type: aggregate_type.into(),
+            version,
+            compaction,
+        }
+    }
+}
+
 /// Tracks schema versions for all aggregates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchemaRegistry {
@@ -153,13 +176,89 @@ impl Reconciler {
         Self { cqrs, pool }
     }
 
+    /// Reconciles language-neutral schema metadata through the same registry
+    /// and snapshot recovery used by the native typed API.
+    pub async fn reconcile_target(
+        &self,
+        target: &SchemaTarget,
+    ) -> Result<SchemaReconciliation, ReconcileError> {
+        let stored_version = self
+            .load_registry()
+            .await?
+            .and_then(|registry| registry.version_of(&target.aggregate_type));
+
+        debug!(
+            target: "cqrs",
+            aggregate = target.aggregate_type,
+            ?stored_version,
+            "Loaded stored schema version"
+        );
+
+        if stored_version == Some(target.version) {
+            debug!(
+                target: "cqrs",
+                aggregate = target.aggregate_type,
+                version = target.version,
+                "Schema version unchanged"
+            );
+
+            return Ok(SchemaReconciliation::Unchanged);
+        }
+
+        if stored_version.is_some() && target.compaction == CompactionPolicy::CompactAfterSnapshot {
+            return Err(ReconcileError::CompactedSnapshotClear {
+                aggregate: target.aggregate_type.clone(),
+                old_version: stored_version,
+                new_version: target.version,
+            });
+        }
+
+        sqlx::query!(
+            r#"
+            DELETE FROM snapshots
+            WHERE aggregate_type = ?1
+            "#,
+            target.aggregate_type,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        info!(
+            target: "cqrs",
+            aggregate = target.aggregate_type,
+            old_version = ?stored_version,
+            new_version = target.version,
+            "Cleared stale snapshots for schema version change"
+        );
+
+        Ok(SchemaReconciliation::Changed)
+    }
+
+    /// Records a schema version only after its recovery has durably completed.
+    pub async fn record_target(&self, target: &SchemaTarget) -> Result<(), ReconcileError> {
+        self.cqrs
+            .execute(
+                REGISTRY_ID,
+                SchemaRegistryCommand::Register {
+                    name: target.aggregate_type.clone(),
+                    version: target.version,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Rebuilds SchemaRegistry state from the full event log.
     async fn load_registry(&self) -> Result<Option<SchemaRegistry>, ReconcileError> {
-        let payloads: Vec<String> = sqlx::query_scalar(
-            "SELECT payload FROM events \
-             WHERE aggregate_type = 'SchemaRegistry' \
-             AND aggregate_id = 'schema' \
-             ORDER BY sequence",
+        let payloads = sqlx::query_scalar!(
+            r#"
+            SELECT payload AS "payload: String"
+            FROM events
+            WHERE aggregate_type = 'SchemaRegistry'
+              AND aggregate_id = 'schema'
+            ORDER BY sequence
+            "#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -196,58 +295,12 @@ impl Reconciler {
     pub async fn reconcile<Entity: EventSourced>(
         &self,
     ) -> Result<SchemaReconciliation, ReconcileError> {
-        let name = Entity::AGGREGATE_TYPE;
-        let current_version = Entity::SCHEMA_VERSION;
-
-        let stored_version = self
-            .load_registry()
-            .await?
-            .and_then(|registry| registry.version_of(name));
-
-        debug!(target: "cqrs", aggregate = %name, ?stored_version, "Loaded stored schema version");
-
-        let needs_clear = stored_version != Some(current_version);
-
-        if needs_clear {
-            // Compactable aggregates may have deleted their pre-snapshot
-            // events. Clearing their snapshots would permanently lose
-            // that state with no way to rebuild. Refuse and require an
-            // explicit migration instead.
-            //
-            // Skip the guard on first registration (stored_version = None):
-            // there are no snapshots to clear and no compacted events yet.
-            if stored_version.is_some()
-                && matches!(
-                    Entity::COMPACTION_POLICY,
-                    CompactionPolicy::CompactAfterSnapshot
-                )
-            {
-                return Err(ReconcileError::CompactedSnapshotClear {
-                    aggregate: name.to_string(),
-                    old_version: stored_version,
-                    new_version: current_version,
-                });
-            }
-
-            sqlx::query("DELETE FROM snapshots WHERE aggregate_type = ?")
-                .bind(name)
-                .execute(&self.pool)
-                .await?;
-
-            info!(
-                target: "cqrs",
-                aggregate = name,
-                old_version = ?stored_version,
-                new_version = current_version,
-                "Cleared stale snapshots for schema version change"
-            );
-
-            Ok(SchemaReconciliation::Changed)
-        } else {
-            debug!(target: "cqrs", aggregate = %name, version = current_version, "Schema version unchanged");
-
-            Ok(SchemaReconciliation::Unchanged)
-        }
+        self.reconcile_target(&SchemaTarget::new(
+            Entity::AGGREGATE_TYPE,
+            Entity::SCHEMA_VERSION,
+            Entity::COMPACTION_POLICY,
+        ))
+        .await
     }
 
     /// Records that `Entity`'s current [`SCHEMA_VERSION`] has been fully
@@ -257,17 +310,12 @@ impl Reconciler {
     ///
     /// [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
     pub async fn record_version<Entity: EventSourced>(&self) -> Result<(), ReconcileError> {
-        self.cqrs
-            .execute(
-                REGISTRY_ID,
-                SchemaRegistryCommand::Register {
-                    name: Entity::AGGREGATE_TYPE.to_string(),
-                    version: Entity::SCHEMA_VERSION,
-                },
-            )
-            .await?;
-
-        Ok(())
+        self.record_target(&SchemaTarget::new(
+            Entity::AGGREGATE_TYPE,
+            Entity::SCHEMA_VERSION,
+            Entity::COMPACTION_POLICY,
+        ))
+        .await
     }
 }
 

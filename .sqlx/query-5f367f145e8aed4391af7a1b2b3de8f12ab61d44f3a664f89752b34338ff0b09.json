@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT payload AS \"payload: String\"\n            FROM events\n            WHERE aggregate_type = 'SchemaRegistry'\n              AND aggregate_id = 'schema'\n            ORDER BY sequence\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "payload: String",
+        "ordinal": 0,
+        "type_info": "Null",
+        "origin": {
+          "Table": {
+            "table": "events",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5f367f145e8aed4391af7a1b2b3de8f12ab61d44f3a664f89752b34338ff0b09"
+}

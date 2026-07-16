@@ -144,7 +144,9 @@ pub use reactor::{
     IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,
     RetryOnBusy, is_retryable_sqlite_busy, retry_with_backoff,
 };
-pub use schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry};
+pub use schema_registry::{
+    ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry, SchemaTarget,
+};
 pub use sqlite_event_repository::SqliteEventRepository;
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
