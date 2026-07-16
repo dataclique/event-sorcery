@@ -9,7 +9,7 @@ module EventSorcery.Engine (
 ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
-import Control.Exception (finally)
+import Control.Exception (finally, mask, onException)
 import Data.Bifunctor (first)
 import Data.Bits (shiftR, (.&.))
 import Data.ByteString (ByteString)
@@ -161,22 +161,26 @@ checkAbiVersion version =
 
 
 openCompatibleStore :: OpenOptions -> IO (Either EngineError Store)
-openCompatibleStore options = do
+openCompatibleStore options = mask $ \restore -> do
   cell <- malloc
   poke cell nullPtr
+  let release = do
+        _ <- esClose cell
+        free cell
   opened <-
-    withInputBuffer (encodeOpenOptions options) $ \request ->
-      callWithoutOutput (esOpen request cell)
+    restore
+      ( withInputBuffer (encodeOpenOptions options) $ \request ->
+          callWithoutOutput (esOpen request cell)
+      )
+      `onException` release
   case opened of
     Left engineError -> do
-      free cell
+      release
       pure (Left engineError)
     Right () -> do
-      gate <- newMVar ()
+      gate <- newMVar () `onException` release
       owner <-
-        Foreign.newForeignPtr cell do
-          _ <- esClose cell
-          free cell
+        Foreign.newForeignPtr cell release `onException` release
       pure (Right (Store owner gate))
 
 

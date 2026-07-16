@@ -78,8 +78,11 @@ withStore action = do
     Left engineError -> assertFailure ("failed to open the shared engine: " <> show engineError)
     Right store ->
       action store `finally` do
-        _ <- closeStore store
-        pure ()
+        closed <- closeStore store
+        case closed of
+          Left engineError ->
+            assertFailure ("failed to close the shared engine: " <> show engineError)
+          Right () -> pure ()
 
 
 commitFixture :: Store -> IO ()
