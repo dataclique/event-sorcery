@@ -17,6 +17,8 @@ module Event.Sorcery.Engine.Internal.FFI (
   esJobRetry,
   esLoadStream,
   esOpen,
+  esSchemaReconcile,
+  esSchemaRecord,
   esSnapshotDiscard,
   esSnapshotLoad,
   esSnapshotStore,
@@ -93,6 +95,15 @@ foreign import capi safe "event_sorcery.h es_commit"
 
 foreign import capi safe "event_sorcery.h es_commit_with_job"
   esCommitWithJob :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_schema_reconcile"
+  esSchemaReconcile
+    :: Ptr EsStore -> Ptr EsBuf -> Ptr Word8 -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_schema_record"
+  esSchemaRecord :: Ptr EsStore -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
 
 
 foreign import capi safe "event_sorcery.h es_snapshot_load"
