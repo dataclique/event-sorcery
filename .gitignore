@@ -1,6 +1,14 @@
 .direnv/
+.auto-resolution/
+.conflict-base-*/
+.conflict-files
+.conflict-side-*/
+.DS_Store
 .sqlx/
+.stack-work/
 .tmp/
+.worktrees/
+result
 target/
 .env
 .pre-commit-config.yaml

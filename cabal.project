@@ -1,0 +1,3 @@
+packages: bindings/haskell
+
+tests: True
