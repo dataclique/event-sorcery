@@ -1,4 +1,4 @@
-module Main (main) where
+module JobExecutionSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
@@ -19,6 +19,7 @@ import Event.Sorcery.Job.Execution (
   Reconciliation (Indeterminate, NotSubmitted, Reconciled),
   executeDurableJob,
  )
+import Test.Hspec (Spec, it)
 import Prelude (
   Bool (False, True),
   Either (Left, Right),
@@ -78,14 +79,16 @@ instance DurableJob ProbeJob where
       _ -> Right NotSubmitted
 
 
-main :: IO ()
-main = do
-  firstExecutionRunsSubmit
-  laterExecutionRunsReconcile
-  missingSubmissionAuthorizesSubmit
-  indeterminateReconciliationDefers
-  submitFailureKeepsItsClassification
-  reconcileFailureKeepsItsClassification
+spec :: Spec
+spec = do
+  it "routes first execution to submit" firstExecutionRunsSubmit
+  it "routes later execution through reconciliation" laterExecutionRunsReconcile
+  it "submits after reconciliation proves the job missing" do
+    missingSubmissionAuthorizesSubmit
+  it "defers indeterminate reconciliation" indeterminateReconciliationDefers
+  it "preserves submit failure classification" submitFailureKeepsItsClassification
+  it "preserves reconcile failure classification" do
+    reconcileFailureKeepsItsClassification
 
 
 firstExecutionRunsSubmit :: IO ()

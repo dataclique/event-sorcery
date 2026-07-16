@@ -1,4 +1,4 @@
-module Main (main) where
+module DispatchWorkerSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
@@ -69,6 +69,7 @@ import Event.Sorcery.Store (
   mkStore,
  )
 import Event.Sorcery.Stream (StreamKey, streamKey)
+import Test.Hspec (Spec, it)
 import Prelude (
   Bool (False, True),
   Either (Left, Right),
@@ -212,8 +213,8 @@ instance EventSourced Account where
         Right (Events (ChargeChanged event :| fmap ChargeChanged remaining))
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "delivers sealed dispatch verdicts" do
   opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)
 
   case opened of

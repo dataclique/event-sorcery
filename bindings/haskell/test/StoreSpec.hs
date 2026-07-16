@@ -1,4 +1,4 @@
-module Main (main) where
+module StoreSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)))
@@ -38,10 +38,10 @@ import Event.Sorcery.Store (
   snapshotEntity,
  )
 import Event.Sorcery.Stream (streamKey, streamKeyIdentity)
+import Test.Hspec (Spec, it)
 import Prelude (
   Either (..),
   Eq,
-  IO,
   Int,
   Maybe (..),
   Show,
@@ -55,8 +55,8 @@ import Prelude (
  )
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "executes typed commands against the shared engine" do
   opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)
 
   case opened of

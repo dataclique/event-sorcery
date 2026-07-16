@@ -1,4 +1,4 @@
-module Main (main) where
+module JobWorkerSpec (spec) where
 
 import Control.Concurrent.Async (async, wait)
 import Control.Concurrent.MVar (
@@ -55,6 +55,7 @@ import Event.Sorcery.Job.Worker (
   renewingJobWorker,
   runJobOnce,
  )
+import Test.Hspec (Spec, it)
 import Prelude (
   Bool (False, True),
   Either (Left, Right),
@@ -149,8 +150,8 @@ instance DurableJob RenewingProbeJob where
     pure (Right (Reconciled "reconciled"))
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "settles and renews durable job executions" do
   opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)
 
   case opened of
