@@ -7,12 +7,15 @@ use std::num::NonZeroUsize;
 
 use cqrs_es::persist::{PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot};
 use futures_util::TryStreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::job::EnqueueRequest;
 use crate::job_sqlite::SqliteJobError;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
+
+const ENGINE_PAYLOAD_KEY: &str = "$event-sorcery-engine";
 
 /// Identifies one serialized aggregate event stream at the storage boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +49,28 @@ pub struct SnapshotUpdate {
     snapshot_version: usize,
 }
 
+/// One event loaded through the erased engine boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedEvent {
+    /// One-based sequence within the aggregate stream.
+    pub sequence: usize,
+    /// Stable domain event type.
+    pub event_type: String,
+    /// Stable domain event schema version.
+    pub event_version: String,
+    /// Payload representation recorded by the engine.
+    pub payload: LoadedPayload,
+}
+
+/// Payload representation recovered from engine-owned persistence metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedPayload {
+    /// A native JSON domain payload.
+    Json(Value),
+    /// Opaque bytes supplied through a foreign-language binding.
+    OpaqueBytes(Vec<u8>),
+}
+
 impl SnapshotUpdate {
     /// Creates a serialized snapshot update at its aggregate schema version.
     pub fn new(aggregate: Value, snapshot_version: usize) -> Self {
@@ -62,6 +87,26 @@ pub struct CommitRequest<'events> {
     events: &'events [SerializedEvent],
     snapshot: Option<SnapshotUpdate>,
     jobs: Vec<EnqueueRequest>,
+    payload_encoding: CommitPayloadEncoding,
+}
+
+#[derive(Clone, Copy)]
+enum CommitPayloadEncoding {
+    NativeJson,
+    OpaqueBytes,
+}
+
+#[derive(Deserialize, Serialize)]
+struct EnginePayloadEnvelope {
+    version: u8,
+    payload: EnginePayload,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EnginePayload {
+    OpaqueBytes(Vec<u8>),
+    EscapedJson(Value),
 }
 
 /// Shared serialized SQLite persistence engine.
@@ -103,7 +148,19 @@ impl<'events> CommitRequest<'events> {
             events,
             snapshot: None,
             jobs: vec![],
+            payload_encoding: CommitPayloadEncoding::NativeJson,
         }
+    }
+
+    /// Marks every event payload as opaque bytes owned by a language binding.
+    ///
+    /// Each event payload must be a JSON byte array. The engine records its
+    /// provenance in a reserved envelope while preserving the shared writer
+    /// transaction.
+    #[must_use]
+    pub fn with_opaque_payloads(mut self) -> Self {
+        self.payload_encoding = CommitPayloadEncoding::OpaqueBytes;
+        self
     }
 
     /// Attaches the snapshot covered by this commit's events.
@@ -354,7 +411,7 @@ impl Engine {
         after_sequence: Option<usize>,
         item_limit: NonZeroUsize,
         byte_limit: NonZeroUsize,
-    ) -> Result<Vec<SerializedEvent>, EngineError> {
+    ) -> Result<Vec<LoadedEvent>, EngineError> {
         let item_limit = i64::try_from(item_limit.get())?;
         let mut transaction = self.pool.begin().await?;
         let storage_bytes = match after_sequence {
@@ -489,7 +546,7 @@ impl Engine {
         };
         transaction.commit().await?;
 
-        rows.into_iter().map(SerializedEvent::try_from).collect()
+        rows.into_iter().map(LoadedEvent::try_from).collect()
     }
 
     /// Reads the current stream version, where zero means no events.
@@ -621,9 +678,33 @@ impl Engine {
             events,
             snapshot,
             jobs,
+            payload_encoding,
         } = request;
         validate_event_stream(&stream, events)?;
-        let mut tx = self.pool.begin().await?;
+        let prepared_events = prepare_event_payloads(events, payload_encoding)?;
+        let events = prepared_events.as_deref().unwrap_or(events);
+        let expected_version = validate_event_sequences(events)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        if let Some(expected_version) = expected_version {
+            let actual_version = sqlx::query_scalar::<_, Option<i64>>(
+                r"
+                SELECT MAX(sequence)
+                FROM events
+                WHERE aggregate_type = ?1 AND aggregate_id = ?2
+                ",
+            )
+            .bind(&stream.aggregate_type)
+            .bind(&stream.aggregate_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .map_or(Ok(0), |version| {
+                usize::try_from(version).map_err(EngineError::from)
+            })?;
+            if actual_version != expected_version {
+                return Err(EngineError::OptimisticLock);
+            }
+        }
 
         sqlite_es::insert_serialized_events_batch(&mut tx, "events", events).await?;
 
@@ -877,6 +958,114 @@ fn validate_event_stream(
         )
 }
 
+fn validate_event_sequences(events: &[SerializedEvent]) -> Result<Option<usize>, EngineError> {
+    let Some(first) = events.first() else {
+        return Ok(None);
+    };
+    let expected_version = first
+        .sequence
+        .checked_sub(1)
+        .ok_or(EngineError::OptimisticLock)?;
+    events.iter().enumerate().try_for_each(|(index, event)| {
+        let expected_sequence = expected_version
+            .checked_add(index)
+            .and_then(|sequence| sequence.checked_add(1))
+            .ok_or(EngineError::OptimisticLock)?;
+        if event.sequence == expected_sequence {
+            Ok(())
+        } else {
+            Err(EngineError::OptimisticLock)
+        }
+    })?;
+    Ok(Some(expected_version))
+}
+
+fn prepare_event_payloads(
+    events: &[SerializedEvent],
+    encoding: CommitPayloadEncoding,
+) -> Result<Option<Vec<SerializedEvent>>, EngineError> {
+    match encoding {
+        CommitPayloadEncoding::NativeJson
+            if !events
+                .iter()
+                .any(|event| reserves_engine_payload(&event.payload)) =>
+        {
+            Ok(None)
+        }
+        CommitPayloadEncoding::NativeJson => events
+            .iter()
+            .map(|event| {
+                let payload = if reserves_engine_payload(&event.payload) {
+                    encode_engine_payload(EnginePayload::EscapedJson(event.payload.clone()))?
+                } else {
+                    event.payload.clone()
+                };
+                Ok(clone_event_with_payload(event, payload))
+            })
+            .collect::<Result<Vec<_>, EngineError>>()
+            .map(Some),
+        CommitPayloadEncoding::OpaqueBytes => events
+            .iter()
+            .map(|event| {
+                let bytes = serde_json::from_value::<Vec<u8>>(event.payload.clone())?;
+                let payload = encode_engine_payload(EnginePayload::OpaqueBytes(bytes))?;
+                Ok(clone_event_with_payload(event, payload))
+            })
+            .collect::<Result<Vec<_>, EngineError>>()
+            .map(Some),
+    }
+}
+
+fn reserves_engine_payload(payload: &Value) -> bool {
+    matches!(payload, Value::Object(object) if object.contains_key(ENGINE_PAYLOAD_KEY))
+}
+
+fn encode_engine_payload(payload: EnginePayload) -> Result<Value, EngineError> {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        ENGINE_PAYLOAD_KEY.to_string(),
+        serde_json::to_value(EnginePayloadEnvelope {
+            version: 1,
+            payload,
+        })?,
+    );
+    Ok(Value::Object(object))
+}
+
+fn decode_engine_payload(payload: Value) -> LoadedPayload {
+    let Value::Object(object) = &payload else {
+        return LoadedPayload::Json(payload);
+    };
+    if object.len() != 1 {
+        return LoadedPayload::Json(payload);
+    }
+    let Some(envelope) = object.get(ENGINE_PAYLOAD_KEY) else {
+        return LoadedPayload::Json(payload);
+    };
+    let Ok(envelope) = serde_json::from_value::<EnginePayloadEnvelope>(envelope.clone()) else {
+        return LoadedPayload::Json(payload);
+    };
+    if envelope.version != 1 {
+        return LoadedPayload::Json(payload);
+    }
+    match envelope.payload {
+        EnginePayload::OpaqueBytes(bytes) => LoadedPayload::OpaqueBytes(bytes),
+        EnginePayload::EscapedJson(payload) => LoadedPayload::Json(payload),
+    }
+}
+
+fn clone_event_with_payload(event: &SerializedEvent, payload: Value) -> SerializedEvent {
+    SerializedEvent {
+        aggregate_type: event.aggregate_type.clone(),
+        aggregate_id: event.aggregate_id.clone(),
+        sequence: event.sequence,
+        event_type: event.event_type.clone(),
+        event_version: event.event_version.clone(),
+        payload,
+        metadata: event.metadata.clone(),
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct StoredEventRow {
     aggregate_type: String,
@@ -892,14 +1081,43 @@ impl TryFrom<StoredEventRow> for SerializedEvent {
     type Error = EngineError;
 
     fn try_from(row: StoredEventRow) -> Result<Self, Self::Error> {
+        let payload = match decode_engine_payload(serde_json::from_str(&row.payload)?) {
+            LoadedPayload::Json(payload) => payload,
+            LoadedPayload::OpaqueBytes(bytes) => {
+                encode_engine_payload(EnginePayload::OpaqueBytes(bytes))?
+            }
+        };
         Ok(Self {
             aggregate_type: row.aggregate_type,
             aggregate_id: row.aggregate_id,
             sequence: usize::try_from(row.sequence)?,
             event_type: row.event_type,
             event_version: row.event_version,
-            payload: serde_json::from_str(&row.payload)?,
+            payload,
             metadata: serde_json::from_str(&row.metadata)?,
+        })
+    }
+}
+
+impl TryFrom<StoredEventRow> for LoadedEvent {
+    type Error = EngineError;
+
+    fn try_from(row: StoredEventRow) -> Result<Self, Self::Error> {
+        let StoredEventRow {
+            aggregate_type: _,
+            aggregate_id: _,
+            sequence,
+            event_type,
+            event_version,
+            payload,
+            metadata,
+        } = row;
+        let _: Value = serde_json::from_str(&metadata)?;
+        Ok(Self {
+            sequence: usize::try_from(sequence)?,
+            event_type,
+            event_version,
+            payload: decode_engine_payload(serde_json::from_str(&payload)?),
         })
     }
 }
@@ -1068,6 +1286,21 @@ mod tests {
         let loaded = engine.load_events(&stream, None).await.unwrap();
         assert_eq!(loaded, vec![event]);
     }
+
+    #[tokio::test]
+    async fn commit_rejects_noncontiguous_sequences_without_writing() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-test", "sequence-gap");
+        let events = [serialized_event(&stream, 1), serialized_event(&stream, 3)];
+
+        let result = engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await;
+
+        assert!(matches!(result, Err(EngineError::OptimisticLock)));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn load_events_returns_only_sequences_after_the_checkpoint() {
         let engine = Engine::new(create_test_pool().await.unwrap());

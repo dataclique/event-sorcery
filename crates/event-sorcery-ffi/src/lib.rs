@@ -12,7 +12,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use cqrs_es::persist::SerializedEvent;
-use event_sorcery::{CommitRequest, Engine, EngineError, StreamIdentity};
+use event_sorcery::{
+    CommitRequest, Engine, EngineError, LoadedEvent, LoadedPayload, StreamIdentity,
+};
 use serde::de::{DeserializeOwned, Error as DeserializeError, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -53,18 +55,6 @@ struct OpaqueBytes(Vec<u8>);
 struct CommitEvents {
     values: Vec<ProposedEventWire>,
     observed: usize,
-}
-
-#[derive(Deserialize, Serialize)]
-struct EnginePayloadEnvelope {
-    #[serde(rename = "$event-sorcery-ffi")]
-    opaque: EngineOpaquePayload,
-}
-
-#[derive(Deserialize, Serialize)]
-struct EngineOpaquePayload {
-    version: u8,
-    bytes: Vec<u8>,
 }
 
 impl Serialize for OpaqueBytes {
@@ -199,45 +189,50 @@ pub unsafe extern "C" fn es_open(
     out_store: *mut *mut EsStore,
     out_error: *mut EsBuf,
 ) -> i32 {
-    ffi_call(None, out_error, || {
-        let options = decode_open_options(options);
-        if !out_store.is_null() {
-            unsafe { out_store.write(ptr::null_mut()) };
-        }
-        if out_store.is_null() {
-            return Err(AbiError::State("out_store is null"));
-        }
-        let options = options?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(options.runtime_threads)
-            .enable_all()
-            .build()
-            .map_err(|_| AbiError::State("runtime initialization failed"))?;
-        let connect = SqliteConnectOptions::from_str(&options.path)
-            .map_err(|_| AbiError::MalformedInput)?
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full)
-            .busy_timeout(options.busy_timeout);
-        let pool = runtime
-            .block_on(
-                SqlitePoolOptions::new()
-                    .max_connections(options.pool_size)
-                    .connect_with(connect),
-            )
-            .map_err(|_| AbiError::Storage)?;
-        let engine = Engine::new(pool);
-        runtime
-            .block_on(engine.migrate())
-            .map_err(|_| AbiError::Storage)?;
-        let store = Arc::new(EsStore {
-            state: Mutex::new(StoreState::Open { active_calls: 0 }),
-            state_changed: Condvar::new(),
-            inner: Mutex::new(Some(Arc::new(StoreInner { runtime, engine }))),
-            poisoned: AtomicBool::new(false),
-        });
-        publish_store(out_store, store)
-    })
+    ffi_call(
+        None,
+        out_error,
+        || {},
+        || {
+            let options = decode_open_options(options);
+            if !out_store.is_null() {
+                unsafe { out_store.write(ptr::null_mut()) };
+            }
+            if out_store.is_null() {
+                return Err(AbiError::State("out_store is null"));
+            }
+            let options = options?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(options.runtime_threads)
+                .enable_all()
+                .build()
+                .map_err(|error| AbiError::state_source("runtime initialization failed", error))?;
+            let connect = SqliteConnectOptions::from_str(&options.path)
+                .map_err(AbiError::decode)?
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Full)
+                .busy_timeout(options.busy_timeout);
+            let pool = runtime
+                .block_on(
+                    SqlitePoolOptions::new()
+                        .max_connections(options.pool_size)
+                        .connect_with(connect),
+                )
+                .map_err(AbiError::storage)?;
+            let engine = Engine::new(pool);
+            runtime
+                .block_on(engine.migrate())
+                .map_err(AbiError::storage)?;
+            let store = Arc::new(EsStore {
+                state: Mutex::new(StoreState::Open { active_calls: 0 }),
+                state_changed: Condvar::new(),
+                inner: Mutex::new(Some(Arc::new(StoreInner { runtime, engine }))),
+                poisoned: AtomicBool::new(false),
+            });
+            publish_store(out_store, store)
+        },
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -257,46 +252,54 @@ pub unsafe extern "C" fn es_load_stream(
 ) -> i32 {
     let lease = match EsStore::acquire(store) {
         Ok(lease) => lease,
-        Err(error) => return write_error(out_error, error),
+        Err(error) => {
+            clear_buffer_output(out_events);
+            return write_error(out_error, error);
+        }
     };
-    ffi_call(Some(&lease.store), out_error, || {
-        let request: Result<(u8, String, String, Option<u64>), AbiError> = decode(request);
-        clear_buffer_output(out_events);
-        if out_events.is_null() {
-            return Err(AbiError::State("out_events is null"));
-        }
-        let (version, aggregate_type, aggregate_id, after) = request?;
-        require_version(version)?;
-        let after = after
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| AbiError::MalformedInput)?;
-        let stream = StreamIdentity::new(aggregate_type, aggregate_id);
-        let query_limit = NonZeroUsize::new(MAX_LIST_ITEMS + 1)
-            .ok_or(AbiError::State("invalid list query limit"))?;
-        let events = lease
-            .inner
-            .runtime
-            .block_on(
-                lease.inner.engine.load_events_page_bounded(
-                    &stream,
-                    after,
-                    query_limit,
-                    NonZeroUsize::new(MAX_STORED_EVENT_PAGE_BYTES)
-                        .ok_or(AbiError::State("invalid stored page byte limit"))?,
-                ),
-            )
-            .map_err(AbiError::from)?;
-        if events.len() > MAX_LIST_ITEMS {
-            return Err(AbiError::ResourceLimit {
-                resource: "list_items",
-                observed: events.len(),
-                limit: MAX_LIST_ITEMS,
-            });
-        }
-        unsafe { out_events.write(encode_event_page(events)?) };
-        Ok(())
-    })
+    ffi_call(
+        Some(&lease.store),
+        out_error,
+        || clear_buffer_output(out_events),
+        || {
+            let request: Result<(u8, String, String, Option<u64>), AbiError> = decode(request);
+            clear_buffer_output(out_events);
+            if out_events.is_null() {
+                return Err(AbiError::State("out_events is null"));
+            }
+            let (version, aggregate_type, aggregate_id, after) = request?;
+            require_version(version)?;
+            let after = after
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| AbiError::MalformedInput)?;
+            let stream = StreamIdentity::new(aggregate_type, aggregate_id);
+            let query_limit = NonZeroUsize::new(MAX_LIST_ITEMS + 1)
+                .ok_or(AbiError::State("invalid list query limit"))?;
+            let events = lease
+                .inner
+                .runtime
+                .block_on(
+                    lease.inner.engine.load_events_page_bounded(
+                        &stream,
+                        after,
+                        query_limit,
+                        NonZeroUsize::new(MAX_STORED_EVENT_PAGE_BYTES)
+                            .ok_or(AbiError::State("invalid stored page byte limit"))?,
+                    ),
+                )
+                .map_err(AbiError::from)?;
+            if events.len() > MAX_LIST_ITEMS {
+                return Err(AbiError::ResourceLimit {
+                    resource: "list_items",
+                    observed: events.len(),
+                    limit: MAX_LIST_ITEMS,
+                });
+            }
+            unsafe { out_events.write(encode_event_page(events)?) };
+            Ok(())
+        },
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -316,28 +319,34 @@ pub unsafe extern "C" fn es_current_version(
 ) -> i32 {
     let lease = match EsStore::acquire(store) {
         Ok(lease) => lease,
-        Err(error) => return write_error(out_error, error),
+        Err(error) => {
+            clear_version_output(out_version);
+            return write_error(out_error, error);
+        }
     };
-    ffi_call(Some(&lease.store), out_error, || {
-        let request: Result<(u8, String, String), AbiError> = decode(request);
-        if !out_version.is_null() {
-            unsafe { out_version.write(0) };
-        }
-        if out_version.is_null() {
-            return Err(AbiError::State("out_version is null"));
-        }
-        let (version, aggregate_type, aggregate_id) = request?;
-        require_version(version)?;
-        let stream = StreamIdentity::new(aggregate_type, aggregate_id);
-        let version = lease
-            .inner
-            .runtime
-            .block_on(lease.inner.engine.current_version(&stream))
-            .map_err(AbiError::from)?;
-        let version = u64::try_from(version).map_err(|_| AbiError::Storage)?;
-        unsafe { out_version.write(version) };
-        Ok(())
-    })
+    ffi_call(
+        Some(&lease.store),
+        out_error,
+        || clear_version_output(out_version),
+        || {
+            let request: Result<(u8, String, String), AbiError> = decode(request);
+            clear_version_output(out_version);
+            if out_version.is_null() {
+                return Err(AbiError::State("out_version is null"));
+            }
+            let (version, aggregate_type, aggregate_id) = request?;
+            require_version(version)?;
+            let stream = StreamIdentity::new(aggregate_type, aggregate_id);
+            let version = lease
+                .inner
+                .runtime
+                .block_on(lease.inner.engine.current_version(&stream))
+                .map_err(AbiError::from)?;
+            let version = u64::try_from(version).map_err(AbiError::storage)?;
+            unsafe { out_version.write(version) };
+            Ok(())
+        },
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -358,85 +367,85 @@ pub unsafe extern "C" fn es_commit(
         Ok(lease) => lease,
         Err(error) => return write_error(out_error, error),
     };
-    ffi_call(Some(&lease.store), out_error, || {
-        let (version, aggregate_type, aggregate_id, expected, events): CommitWire =
-            decode_validated(request, |wire: &CommitWire| {
-                if wire.4.observed <= MAX_COMMIT_EVENTS {
-                    return Ok(());
-                }
-                Err(AbiError::ResourceLimit {
-                    resource: "commit_events",
-                    observed: wire.4.observed,
-                    limit: MAX_COMMIT_EVENTS,
-                })
-            })?;
-        require_version(version)?;
-        require_error_text_limit(aggregate_type.len())?;
-        require_error_text_limit(aggregate_id.len())?;
-        let CommitEvents {
-            values: events,
-            observed: _,
-        } = events;
-        if events.is_empty() {
-            return Err(AbiError::MalformedInput);
-        }
-        let expected_sequence = usize::try_from(expected).map_err(|_| AbiError::MalformedInput)?;
-        expected_sequence
-            .checked_add(events.len())
-            .ok_or(AbiError::MalformedInput)?;
-        let serialized = events
-            .into_iter()
-            .enumerate()
-            .map(
-                |(index, (event_type, event_version, OpaqueBytes(payload)))| {
-                    require_payload_limit(payload.len())?;
-                    let sequence = expected_sequence
-                        .checked_add(index)
-                        .and_then(|sequence| sequence.checked_add(1))
-                        .ok_or(AbiError::MalformedInput)?;
-                    Ok(SerializedEvent {
-                        aggregate_type: aggregate_type.clone(),
-                        aggregate_id: aggregate_id.clone(),
-                        sequence,
-                        event_type,
-                        event_version,
-                        payload: serde_json::to_value(EnginePayloadEnvelope {
-                            opaque: EngineOpaquePayload {
-                                version: 1,
-                                bytes: payload,
-                            },
-                        })
-                        .map_err(|_| AbiError::Storage)?,
-                        metadata: serde_json::Value::Object(serde_json::Map::new()),
+    ffi_call(
+        Some(&lease.store),
+        out_error,
+        || {},
+        || {
+            let (version, aggregate_type, aggregate_id, expected, events): CommitWire =
+                decode_validated(request, |wire: &CommitWire| {
+                    if wire.4.observed <= MAX_COMMIT_EVENTS {
+                        return Ok(());
+                    }
+                    Err(AbiError::ResourceLimit {
+                        resource: "commit_events",
+                        observed: wire.4.observed,
+                        limit: MAX_COMMIT_EVENTS,
                     })
-                },
-            )
-            .collect::<Result<Vec<_>, AbiError>>()?;
-        let stream = StreamIdentity::new(aggregate_type.clone(), aggregate_id.clone());
-        match lease.inner.runtime.block_on(
-            lease
-                .inner
-                .engine
-                .commit(CommitRequest::new(stream.clone(), &serialized)),
-        ) {
-            Ok(()) => Ok(()),
-            Err(EngineError::OptimisticLock) => {
-                let actual = lease
-                    .inner
-                    .runtime
-                    .block_on(lease.inner.engine.current_version(&stream))
-                    .map_err(|_| AbiError::Storage)?;
-                let actual = u64::try_from(actual).map_err(|_| AbiError::Storage)?;
-                Err(AbiError::Conflict {
-                    aggregate_type,
-                    aggregate_id,
-                    expected,
-                    actual,
-                })
+                })?;
+            require_version(version)?;
+            require_error_text_limit(aggregate_type.len())?;
+            require_error_text_limit(aggregate_id.len())?;
+            let CommitEvents {
+                values: events,
+                observed: _,
+            } = events;
+            if events.is_empty() {
+                return Err(AbiError::MalformedInput);
             }
-            Err(_) => Err(AbiError::Storage),
-        }
-    })
+            let expected_sequence =
+                usize::try_from(expected).map_err(|_| AbiError::MalformedInput)?;
+            expected_sequence
+                .checked_add(events.len())
+                .ok_or(AbiError::MalformedInput)?;
+            let serialized = events
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, (event_type, event_version, OpaqueBytes(payload)))| {
+                        require_payload_limit(payload.len())?;
+                        let sequence = expected_sequence
+                            .checked_add(index)
+                            .and_then(|sequence| sequence.checked_add(1))
+                            .ok_or(AbiError::MalformedInput)?;
+                        Ok(SerializedEvent {
+                            aggregate_type: aggregate_type.clone(),
+                            aggregate_id: aggregate_id.clone(),
+                            sequence,
+                            event_type,
+                            event_version,
+                            payload: serde_json::to_value(payload).map_err(AbiError::storage)?,
+                            metadata: serde_json::Value::Object(serde_json::Map::new()),
+                        })
+                    },
+                )
+                .collect::<Result<Vec<_>, AbiError>>()?;
+            let stream = StreamIdentity::new(aggregate_type.clone(), aggregate_id.clone());
+            match lease.inner.runtime.block_on(
+                lease
+                    .inner
+                    .engine
+                    .commit(CommitRequest::new(stream.clone(), &serialized).with_opaque_payloads()),
+            ) {
+                Ok(()) => Ok(()),
+                Err(EngineError::OptimisticLock) => {
+                    let actual = lease
+                        .inner
+                        .runtime
+                        .block_on(lease.inner.engine.current_version(&stream))
+                        .map_err(AbiError::storage)?;
+                    let actual = u64::try_from(actual).map_err(AbiError::storage)?;
+                    Err(AbiError::Conflict {
+                        aggregate_type,
+                        aggregate_id,
+                        expected,
+                        actual,
+                    })
+                }
+                Err(error) => Err(AbiError::storage(error)),
+            }
+        },
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -527,21 +536,36 @@ enum CloseOutcome {
     Panic,
 }
 
+#[derive(Debug, thiserror::Error)]
 enum AbiError {
+    #[error("malformed input")]
     MalformedInput,
+    #[error("input decoding failed")]
+    Decode(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("optimistic conflict")]
     Conflict {
         aggregate_type: String,
         aggregate_id: String,
         expected: u64,
         actual: u64,
     },
-    Storage,
+    #[error("storage operation failed")]
+    Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
     State(&'static str),
+    #[error("{detail}")]
+    StateSource {
+        detail: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("resource {resource} observed {observed} above limit {limit}")]
     ResourceLimit {
         resource: &'static str,
         observed: usize,
         limit: usize,
     },
+    #[error("panic crossed the ABI boundary")]
     Panic,
 }
 
@@ -772,18 +796,36 @@ impl From<EngineError> for AbiError {
                 observed,
                 limit,
             },
-            _ => Self::Storage,
+            other => Self::storage(other),
         }
     }
 }
 
 impl AbiError {
+    fn decode(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Decode(Box::new(error))
+    }
+
+    fn storage(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Storage(Box::new(error))
+    }
+
+    fn state_source(
+        detail: &'static str,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::StateSource {
+            detail,
+            source: Box::new(error),
+        }
+    }
+
     const fn code(&self) -> i32 {
         match self {
-            Self::MalformedInput => ES_ERR_DECODE,
+            Self::MalformedInput | Self::Decode(_) => ES_ERR_DECODE,
             Self::Conflict { .. } => ES_ERR_CONFLICT,
-            Self::Storage => ES_ERR_STORAGE,
-            Self::State(_) => ES_ERR_STATE,
+            Self::Storage(_) => ES_ERR_STORAGE,
+            Self::State(_) | Self::StateSource { .. } => ES_ERR_STATE,
             Self::ResourceLimit { .. } => ES_ERR_RESOURCE_LIMIT,
             Self::Panic => ES_ERR_PANIC,
         }
@@ -814,10 +856,10 @@ fn decode_validated<T: DeserializeOwned + Serialize>(
     let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) };
     let decoded =
         ciborium::de::from_reader_with_recursion_limit(Cursor::new(bytes), MAX_CBOR_DEPTH)
-            .map_err(|_| AbiError::MalformedInput)?;
+            .map_err(AbiError::decode)?;
     validate(&decoded)?;
     let mut canonical = Vec::new();
-    ciborium::into_writer(&decoded, &mut canonical).map_err(|_| AbiError::MalformedInput)?;
+    ciborium::into_writer(&decoded, &mut canonical).map_err(AbiError::decode)?;
     if canonical != bytes {
         return Err(AbiError::MalformedInput);
     }
@@ -873,7 +915,7 @@ impl Write for BoundedResponseWriter {
     }
 }
 
-fn encode_event_page(events: Vec<SerializedEvent>) -> Result<EsBuf, AbiError> {
+fn encode_event_page(events: Vec<LoadedEvent>) -> Result<EsBuf, AbiError> {
     let mut writer = BoundedResponseWriter::new();
     writer
         .write_all(&[0x82, 0x01])
@@ -890,10 +932,10 @@ fn encode_event_page(events: Vec<SerializedEvent>) -> Result<EsBuf, AbiError> {
 
 fn write_array_header(writer: &mut BoundedResponseWriter, length: usize) -> Result<(), AbiError> {
     let encoded = match length {
-        0..=23 => vec![0x80 | u8::try_from(length).map_err(|_| AbiError::Storage)?],
-        24..=255 => vec![0x98, u8::try_from(length).map_err(|_| AbiError::Storage)?],
+        0..=23 => vec![0x80 | u8::try_from(length).map_err(AbiError::storage)?],
+        24..=255 => vec![0x98, u8::try_from(length).map_err(AbiError::storage)?],
         256..=65_535 => {
-            let length = u16::try_from(length).map_err(|_| AbiError::Storage)?;
+            let length = u16::try_from(length).map_err(AbiError::storage)?;
             let mut encoded = vec![0x99];
             encoded.extend_from_slice(&length.to_be_bytes());
             encoded
@@ -921,25 +963,14 @@ const fn require_version(version: u8) -> Result<(), AbiError> {
     }
 }
 
-fn event_to_wire(event: SerializedEvent) -> Result<StoredEventWire, AbiError> {
-    let is_engine_envelope = matches!(
-        &event.payload,
-        serde_json::Value::Object(object)
-            if object.len() == 1 && object.contains_key("$event-sorcery-ffi")
-    );
-    let payload = if is_engine_envelope {
-        let envelope: EnginePayloadEnvelope =
-            serde_json::from_value(event.payload).map_err(|_| AbiError::Storage)?;
-        if envelope.opaque.version != 1 {
-            return Err(AbiError::Storage);
-        }
-        envelope.opaque.bytes
-    } else {
-        serde_json::to_vec(&event.payload).map_err(|_| AbiError::Storage)?
+fn event_to_wire(event: LoadedEvent) -> Result<StoredEventWire, AbiError> {
+    let payload = match event.payload {
+        LoadedPayload::Json(payload) => serde_json::to_vec(&payload).map_err(AbiError::storage)?,
+        LoadedPayload::OpaqueBytes(bytes) => bytes,
     };
     require_payload_limit(payload.len())?;
     Ok((
-        u64::try_from(event.sequence).map_err(|_| AbiError::Storage)?,
+        u64::try_from(event.sequence).map_err(AbiError::storage)?,
         event.event_type,
         event.event_version,
         OpaqueBytes(payload),
@@ -999,9 +1030,11 @@ fn decode_open_options(buffer: *const EsBuf) -> Result<OpenOptions, AbiError> {
 fn ffi_call(
     store: Option<&EsStore>,
     out_error: *mut EsBuf,
+    initialize_result_output: impl Fn(),
     call: impl FnOnce() -> Result<(), AbiError>,
 ) -> i32 {
     if store.is_some_and(|store| store.poisoned.load(Ordering::Acquire)) {
+        initialize_result_output();
         return write_error(out_error, AbiError::State("store is poisoned"));
     }
     match catch_unwind(AssertUnwindSafe(call)) {
@@ -1009,8 +1042,12 @@ fn ffi_call(
             clear_buffer_output(out_error);
             ES_OK
         }
-        Ok(Err(error)) => write_error(out_error, error),
+        Ok(Err(error)) => {
+            initialize_result_output();
+            write_error(out_error, error)
+        }
         Err(_) => {
+            initialize_result_output();
             if let Some(store) = store {
                 store.poisoned.store(true, Ordering::Release);
             }
@@ -1023,7 +1060,9 @@ fn write_error(out_error: *mut EsBuf, error: AbiError) -> i32 {
     clear_buffer_output(out_error);
     let class = error.code();
     let detail = match error {
-        AbiError::MalformedInput => ciborium::Value::Text("malformed input".to_string()),
+        AbiError::MalformedInput | AbiError::Decode(_) => {
+            ciborium::Value::Text("malformed input".to_string())
+        }
         AbiError::Conflict {
             aggregate_type,
             aggregate_id,
@@ -1035,8 +1074,10 @@ fn write_error(out_error: *mut EsBuf, error: AbiError) -> i32 {
             ciborium::Value::Integer(expected.into()),
             ciborium::Value::Integer(actual.into()),
         ]),
-        AbiError::Storage => ciborium::Value::Text("storage failure".to_string()),
-        AbiError::State(detail) => ciborium::Value::Text(detail.to_string()),
+        AbiError::Storage(_) => ciborium::Value::Text("storage failure".to_string()),
+        AbiError::State(detail) | AbiError::StateSource { detail, source: _ } => {
+            ciborium::Value::Text(detail.to_string())
+        }
         AbiError::ResourceLimit {
             resource,
             observed,
@@ -1067,6 +1108,12 @@ const fn clear_buffer_output(output: *mut EsBuf) {
                 len: 0,
             });
         }
+    }
+}
+
+const fn clear_version_output(output: *mut u64) {
+    if !output.is_null() {
+        unsafe { output.write(0) };
     }
 }
 
@@ -1173,6 +1220,24 @@ mod tests {
             }) if observed == usize::try_from(MAX_RUNTIME_THREADS + 1).unwrap()
                 && limit == usize::try_from(MAX_RUNTIME_THREADS).unwrap()
         ));
+    }
+
+    #[test]
+    fn open_options_reject_each_invalid_product() {
+        for options in [
+            (2_u8, "sqlite::memory:", 5_000_u64, 1_u32, 1_u32),
+            (1_u8, "sqlite::memory:", 5_000_u64, 0_u32, 1_u32),
+            (1_u8, "sqlite::memory:", 5_000_u64, 1_u32, 0_u32),
+            (1_u8, "sqlite::memory:", 5_000_u64, 2_u32, 1_u32),
+        ] {
+            let mut encoded = encode_request(&options);
+            let buffer = caller_buffer(&mut encoded);
+
+            assert!(matches!(
+                decode_open_options(&raw const buffer),
+                Err(AbiError::MalformedInput)
+            ));
+        }
     }
 
     #[test]
@@ -1344,6 +1409,57 @@ mod tests {
     }
 
     #[test]
+    fn commit_rejects_an_expected_version_ahead_of_the_stream() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let mut error = empty_buffer();
+        let mut request = encode_request(&(
+            1_u8,
+            "expected-version-test",
+            "one",
+            5_u64,
+            vec![("Created", "1.0", OpaqueBytes(Vec::new()))],
+        ));
+        let request_buffer = caller_buffer(&mut request);
+
+        assert_eq!(
+            unsafe { es_commit(&raw mut store, &raw const request_buffer, &raw mut error) },
+            ES_ERR_CONFLICT
+        );
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_CONFLICT,
+                Value::Array(vec![
+                    Value::Text("expected-version-test".to_string()),
+                    Value::Text("one".to_string()),
+                    Value::Integer(5.into()),
+                    Value::Integer(0.into()),
+                ]),
+            )
+        );
+        unsafe { es_buf_free(&raw mut error) };
+
+        let mut version_request = encode_request(&(1_u8, "expected-version-test", "one"));
+        let version_buffer = caller_buffer(&mut version_request);
+        let mut version = u64::MAX;
+        assert_eq!(
+            unsafe {
+                es_current_version(
+                    &raw mut store,
+                    &raw const version_buffer,
+                    &raw mut version,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(version, 0);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
     fn request_deserialization_precedes_writes_to_aliased_outputs() {
         let mut options = encode_request(&(1_u8, "sqlite::memory:", 5_000_u64, 1_u32, 1_u32));
         let mut options_buffer = caller_buffer(&mut options);
@@ -1480,6 +1596,77 @@ mod tests {
     }
 
     #[test]
+    fn native_payload_cannot_claim_the_opaque_payload_envelope() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let stream = StreamIdentity::new("native-payload-test", "one");
+        let payload = serde_json::json!({
+            "$event-sorcery-engine": {
+                "version": 1,
+                "payload": { "opaque_bytes": [1, 2, 3] },
+            },
+        });
+        let expected_payload = serde_json::to_vec(&payload).unwrap();
+        let event = SerializedEvent {
+            aggregate_type: "native-payload-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        };
+        lease
+            .inner
+            .runtime
+            .block_on(
+                lease
+                    .inner
+                    .engine
+                    .commit(CommitRequest::new(stream, std::slice::from_ref(&event))),
+            )
+            .unwrap();
+        drop(lease);
+
+        let mut request =
+            encode_request(&(1_u8, "native-payload-test", "one", Option::<u64>::None));
+        let request_buffer = caller_buffer(&mut request);
+        let mut output = empty_buffer();
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_load_stream(
+                    &raw mut store,
+                    &raw const request_buffer,
+                    &raw mut output,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(output.ptr, output.len) };
+        let response: StoredEventsWire = ciborium::from_reader(Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            response,
+            (
+                1,
+                vec![(
+                    1,
+                    "Created".to_string(),
+                    "1.0".to_string(),
+                    OpaqueBytes(expected_payload),
+                )],
+            )
+        );
+
+        unsafe { es_buf_free(&raw mut output) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
     fn open_clears_outputs_and_enforces_canonical_request_limits() {
         let mut oversized = vec![0_u8; MAX_REQUEST_BYTES + 1];
         let options = caller_buffer(&mut oversized);
@@ -1529,7 +1716,7 @@ mod tests {
 
         assert!(matches!(
             decode::<Value>(&raw const buffer),
-            Err(AbiError::MalformedInput)
+            Err(AbiError::Decode(_))
         ));
     }
 
@@ -1626,6 +1813,77 @@ mod tests {
         assert_eq!(version, 0);
         unsafe { es_buf_free(&raw mut error) };
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+
+        output = EsBuf {
+            ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(),
+            len: 0,
+        };
+        version = u64::MAX;
+        assert_eq!(
+            unsafe {
+                es_load_stream(
+                    &raw mut store,
+                    &raw const request,
+                    &raw mut output,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert!(output.ptr.is_null());
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(
+            unsafe {
+                es_current_version(
+                    &raw mut store,
+                    &raw const request,
+                    &raw mut version,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert_eq!(version, 0);
+        unsafe { es_buf_free(&raw mut error) };
+
+        open_store(&mut store);
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        lease.store.poisoned.store(true, Ordering::Release);
+        drop(lease);
+        output = EsBuf {
+            ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(),
+            len: 0,
+        };
+        version = u64::MAX;
+        assert_eq!(
+            unsafe {
+                es_load_stream(
+                    &raw mut store,
+                    &raw const request,
+                    &raw mut output,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert!(output.ptr.is_null());
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(
+            unsafe {
+                es_current_version(
+                    &raw mut store,
+                    &raw const request,
+                    &raw mut version,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert_eq!(version, 0);
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
     }
 
     #[test]
@@ -1694,14 +1952,13 @@ mod tests {
     #[test]
     fn response_encoder_rejects_buffers_beyond_the_byte_limit() {
         let events = (1..=65)
-            .map(|sequence| SerializedEvent {
-                aggregate_type: "response-limit-test".to_string(),
-                aggregate_id: "one".to_string(),
+            .map(|sequence| LoadedEvent {
                 sequence,
                 event_type: "Created".to_string(),
                 event_version: "1.0".to_string(),
-                payload: serde_json::Value::String("x".repeat(MAX_PAYLOAD_BYTES - 2)),
-                metadata: serde_json::Value::Object(serde_json::Map::new()),
+                payload: LoadedPayload::Json(serde_json::Value::String(
+                    "x".repeat(MAX_PAYLOAD_BYTES - 2),
+                )),
             })
             .collect::<Vec<_>>();
 
@@ -1720,11 +1977,13 @@ mod tests {
     #[test]
     fn errors_are_stable_and_redacted() {
         let mut error = empty_buffer();
-
+        let storage_error = AbiError::storage(std::io::Error::other("sensitive storage detail"));
         assert_eq!(
-            write_error(&raw mut error, AbiError::Storage),
-            ES_ERR_STORAGE
+            std::error::Error::source(&storage_error).map(std::string::ToString::to_string),
+            Some("sensitive storage detail".to_string())
         );
+
+        assert_eq!(write_error(&raw mut error, storage_error), ES_ERR_STORAGE);
         assert_eq!(
             decode_error(&error),
             (
