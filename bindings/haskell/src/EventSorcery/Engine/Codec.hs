@@ -32,6 +32,10 @@ import Data.Foldable (foldMap)
 import Data.Maybe (maybe)
 import Data.Word (Word64)
 import EventSorcery.Engine.Protocol (
+  AggregateId (..),
+  AggregateType (..),
+  EventType (..),
+  EventVersion (..),
   OpenOptions (..),
   ProposedEvent (..),
   StoredEvent (..),
@@ -49,6 +53,7 @@ import Prelude (
   pure,
   show,
   ($),
+  (<$>),
   (<>),
   (==),
  )
@@ -70,8 +75,8 @@ encodeLoadStream stream after =
   toStrictByteString $
     encodeListLen 4
       <> encodeWord 1
-      <> encodeString stream.aggregateType
-      <> encodeString stream.aggregateId
+      <> encodeAggregateType stream.aggregateType
+      <> encodeAggregateId stream.aggregateId
       <> maybe encodeNull encodeWord64 after
 
 
@@ -80,8 +85,8 @@ encodeCommit stream expected events =
   toStrictByteString $
     encodeListLen 5
       <> encodeWord 1
-      <> encodeString stream.aggregateType
-      <> encodeString stream.aggregateId
+      <> encodeAggregateType stream.aggregateType
+      <> encodeAggregateId stream.aggregateId
       <> encodeWord64 expected
       <> encodeListLen (fromIntegral (length events))
       <> foldMap encodeProposedEvent events
@@ -90,8 +95,8 @@ encodeCommit stream expected events =
 encodeProposedEvent :: ProposedEvent -> Encoding
 encodeProposedEvent event =
   encodeListLen 3
-    <> encodeString event.eventType
-    <> encodeString event.eventVersion
+    <> encodeEventType event.eventType
+    <> encodeEventVersion event.eventVersion
     <> encodeBytes event.payload
 
 
@@ -119,10 +124,26 @@ decodeStoredEvent :: Decoder s StoredEvent
 decodeStoredEvent = do
   expectListLength 4
   sequence <- decodeWord64
-  eventType <- decodeString
-  eventVersion <- decodeString
+  eventType <- EventType <$> decodeString
+  eventVersion <- EventVersion <$> decodeString
   payload <- decodeBytes
   pure StoredEvent {sequence, eventType, eventVersion, payload}
+
+
+encodeAggregateType :: AggregateType -> Encoding
+encodeAggregateType (AggregateType value) = encodeString value
+
+
+encodeAggregateId :: AggregateId -> Encoding
+encodeAggregateId (AggregateId value) = encodeString value
+
+
+encodeEventType :: EventType -> Encoding
+encodeEventType (EventType value) = encodeString value
+
+
+encodeEventVersion :: EventVersion -> Encoding
+encodeEventVersion (EventVersion value) = encodeString value
 
 
 expectListLength :: Int -> Decoder s ()

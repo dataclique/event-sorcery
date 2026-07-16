@@ -48,10 +48,10 @@ library
     EventSorcery.Engine.Protocol
 
   build-depends:
-    , base        >=4.18 && <5
-    , bytestring
-    , cborg
-    , text
+    , base        >=4.18   && <5
+    , bytestring  >=0.11   && <0.13
+    , cborg       >=0.2.10 && <0.3
+    , text        >=2.0    && <2.2
 
 test-suite codec-spec
   import:         strict
@@ -60,6 +60,8 @@ test-suite codec-spec
   main-is:        CodecSpec.hs
   build-depends:
     , base           >=4.18 && <5
-    , bytestring
+    , bytestring     >=0.11 && <0.13
     , event-sorcery
-    , text
+    , tasty          >=1.5  && <1.6
+    , tasty-hunit    >=0.10 && <0.11
+    , text           >=2.0  && <2.2

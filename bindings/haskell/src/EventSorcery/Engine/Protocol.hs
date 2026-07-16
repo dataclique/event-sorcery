@@ -1,4 +1,8 @@
 module EventSorcery.Engine.Protocol (
+  AggregateId (..),
+  AggregateType (..),
+  EventType (..),
+  EventVersion (..),
   OpenOptions (..),
   ProposedEvent (..),
   StoredEvent (..),
@@ -11,6 +15,22 @@ import Data.Word (Word32, Word64)
 import Prelude (Eq, Show)
 
 
+newtype AggregateType = AggregateType Text
+  deriving newtype (Eq, Show)
+
+
+newtype AggregateId = AggregateId Text
+  deriving newtype (Eq, Show)
+
+
+newtype EventType = EventType Text
+  deriving newtype (Eq, Show)
+
+
+newtype EventVersion = EventVersion Text
+  deriving newtype (Eq, Show)
+
+
 data OpenOptions = OpenOptions
   { path :: Text
   , busyTimeoutMilliseconds :: Word64
@@ -21,15 +41,15 @@ data OpenOptions = OpenOptions
 
 
 data StreamIdentity = StreamIdentity
-  { aggregateType :: Text
-  , aggregateId :: Text
+  { aggregateType :: AggregateType
+  , aggregateId :: AggregateId
   }
   deriving stock (Eq, Show)
 
 
 data ProposedEvent = ProposedEvent
-  { eventType :: Text
-  , eventVersion :: Text
+  { eventType :: EventType
+  , eventVersion :: EventVersion
   , payload :: ByteString
   }
   deriving stock (Eq, Show)
@@ -37,8 +57,8 @@ data ProposedEvent = ProposedEvent
 
 data StoredEvent = StoredEvent
   { sequence :: Word64
-  , eventType :: Text
-  , eventVersion :: Text
+  , eventType :: EventType
+  , eventVersion :: EventVersion
   , payload :: ByteString
   }
   deriving stock (Eq, Show)
