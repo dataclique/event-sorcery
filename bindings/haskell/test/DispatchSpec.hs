@@ -69,8 +69,8 @@ instance Job ChargeCard where
 
 main :: IO ()
 main = do
-  let first = requireJobId "job-one"
-      second = requireJobId "job-two"
+  let first = requireJobId "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+      second = requireJobId "01ARZ3NDEKTSV4RRFFQ69G5FAW"
       dispatched = Dispatched first ChargeCard
       confirmed = confirmedOutcome @ChargeCard first Receipt 2
       failed =

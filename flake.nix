@@ -40,7 +40,12 @@
           '';
         };
         but = but-nix.packages.${system}.default;
-        haskellPackages = pkgs.haskell.packages.ghc914;
+        haskellPackages = pkgs.haskell.packages.ghc914.override {
+          overrides = _final: previous: {
+            binary-orphans = pkgs.haskell.lib.doJailbreak previous.binary-orphans;
+            microstache = pkgs.haskell.lib.doJailbreak previous.microstache;
+          };
+        };
         haskellSource = pkgs.runCommand "event-sorcery-haskell-source" { } ''
           mkdir -p $out/bindings/haskell
           cp ${./event-sorcery.cabal} $out/event-sorcery.cabal
@@ -57,6 +62,14 @@
             "--extra-include-dirs=${ffiEngine}/include"
             "--extra-lib-dirs=${ffiEngine}/lib"
           ];
+        });
+        haskellBenchmarks = (pkgs.haskell.lib.doBenchmark haskellBinding).overrideAttrs (old: {
+          postInstall = (old.postInstall or "") + ''
+            mkdir -p $out/bin
+            cp \
+              dist/build/event-sorcery-benchmarks/event-sorcery-benchmarks \
+              $out/bin/
+          '';
         });
         rustBuildInputs = rainix.rust-build-inputs.${system};
         rustToolchain = rainix.rust-toolchain.${system};
@@ -123,18 +136,26 @@
           inherit but;
           engine = ffiEngine;
           haskell = haskellBinding;
+          haskell-benchmarks = haskellBenchmarks;
           rust = rustWorkspace;
         };
 
         apps.check-examples = {
           type = "app";
           program = pkgs.lib.getExe checkExamples;
+          meta = checkExamples.meta;
         };
 
         checks = {
           formatting = hooks;
           haskell = haskellBinding;
           rust = rustWorkspace;
+        };
+
+        apps.haskell-benchmarks = {
+          type = "app";
+          program = "${haskellBenchmarks}/bin/event-sorcery-benchmarks";
+          meta = haskellBenchmarks.meta;
         };
 
         devShells.default = pkgs.mkShell {

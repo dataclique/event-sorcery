@@ -2,6 +2,7 @@ module Main (main) where
 
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)))
+import Data.Text (Text)
 import EventSorcery.Aggregate (
   DecodeCause (DecodeCause),
   Dispatches (..),
@@ -53,9 +54,9 @@ import Prelude (
 main :: IO ()
 main = do
   identifier <-
-    case mkJobId "job-1" of
+    case mkJobId testJobIdText of
       Just value -> pure value
-      Nothing -> error "non-empty job identifier was rejected"
+      Nothing -> error "valid job identifier was rejected"
 
   case mkJobId "" of
     Nothing -> pure ()
@@ -63,7 +64,7 @@ main = do
 
   let intent = dispatchIntent identifier SendWelcomeEmail
 
-  if dispatchJobId intent == identifier && jobIdText identifier == "job-1"
+  if dispatchJobId intent == identifier && jobIdText identifier == testJobIdText
     then pure ()
     else error "dispatch intent did not preserve the job identity"
 
@@ -216,6 +217,10 @@ instance EventSourced Account where
 
 
 testJobId :: JobId
-testJobId = case mkJobId "job-1" of
+testJobId = case mkJobId testJobIdText of
   Just identifier -> identifier
   Nothing -> error "valid test job identifier was rejected"
+
+
+testJobIdText :: Text
+testJobIdText = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
