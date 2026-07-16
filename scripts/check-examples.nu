@@ -9,10 +9,10 @@
 | each { |example|
     let manifest = $"examples/($example)/Cargo.toml"
     print $"==> ($example)"
-    cargo fmt --manifest-path $manifest -- --check
-    cargo clippy --manifest-path $manifest --all-targets -- -D warnings
-    cargo nextest run --manifest-path $manifest
-    cargo run --manifest-path $manifest
+    ^cargo fmt --manifest-path $manifest -- --check
+    ^cargo clippy --locked --manifest-path $manifest --all-targets -- -D warnings
+    ^cargo nextest run --locked --manifest-path $manifest
+    ^cargo run --locked --manifest-path $manifest
     $example
 }
 | ignore
