@@ -2,7 +2,7 @@ module Main (main) where
 
 import Data.ByteString qualified as ByteString
 import Data.Text (Text)
-import EventSorcery.Dispatch (
+import Event.Sorcery.Dispatch (
   DispatchEvent (..),
   DispatchFailure (..),
   DispatchRefused (..),
@@ -20,11 +20,11 @@ import EventSorcery.Dispatch (
   settledJobId,
   settledOutput,
  )
-import EventSorcery.Dispatch.TestSupport (
+import Event.Sorcery.Dispatch.TestSupport (
   confirmedOutcome,
   failedOutcome,
  )
-import EventSorcery.Job (
+import Event.Sorcery.Job (
   DeadReason (RetriesExhausted),
   Job (..),
   JobId,

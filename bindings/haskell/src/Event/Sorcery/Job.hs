@@ -1,4 +1,4 @@
-module EventSorcery.Job (
+module Event.Sorcery.Job (
   ClaimBudget (..),
   ClaimedJob,
   DeadReason (..),
@@ -73,14 +73,14 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Unrestricted.Linear (Ur (Ur))
 import Data.Word (Word32, Word64, Word8)
-import EventSorcery.Engine (EngineError (BindingProtocolError), Store)
-import EventSorcery.Engine.Internal (
+import Event.Sorcery.Engine (EngineError (BindingProtocolError), Store)
+import Event.Sorcery.Engine.Internal (
   callWithOutput,
   callWithoutOutput,
   withInputBuffer,
   withOpenStore,
  )
-import EventSorcery.Engine.Internal.FFI (
+import Event.Sorcery.Engine.Internal.FFI (
   EsBuf,
   EsStore,
   esCommitWithJob,
@@ -93,7 +93,7 @@ import EventSorcery.Engine.Internal.FFI (
   esJobRenew,
   esJobRetry,
  )
-import EventSorcery.Job.Definition (
+import Event.Sorcery.Job.Definition (
   DeadReason (..),
   Job (..),
   JobDecodeError (..),
@@ -102,7 +102,7 @@ import EventSorcery.Job.Definition (
   jobType,
   mkJobId,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   ProposedEvent,
   StreamIdentity (..),
   encodeProposedEvent,

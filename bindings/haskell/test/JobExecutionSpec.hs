@@ -3,14 +3,14 @@ module Main (main) where
 import Data.ByteString qualified as ByteString
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
-import EventSorcery.Job (
+import Event.Sorcery.Job (
   Job (..),
   JobExecutionRoute (ReconcileExecution, SubmitExecution),
   JobId,
   JobInstant (JobInstant),
   mkJobId,
  )
-import EventSorcery.Job.Execution (
+import Event.Sorcery.Job.Execution (
   DurableJob (..),
   JobAttempt (JobAttempt),
   JobContext (JobContext),

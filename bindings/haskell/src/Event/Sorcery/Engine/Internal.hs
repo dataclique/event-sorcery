@@ -1,4 +1,4 @@
-module EventSorcery.Engine.Internal (
+module Event.Sorcery.Engine.Internal (
   EngineError (..),
   ErrorClass (..),
   OpenOptions (..),
@@ -40,7 +40,7 @@ import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Word (Word32, Word64)
-import EventSorcery.Engine.Internal.FFI (
+import Event.Sorcery.Engine.Internal.FFI (
   EsBuf (..),
   EsStore,
   esAbiVersion,

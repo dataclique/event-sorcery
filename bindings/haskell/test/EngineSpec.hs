@@ -2,7 +2,7 @@ module Main (main) where
 
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty (..))
-import EventSorcery.Engine (
+import Event.Sorcery.Engine (
   EngineError (EngineError),
   ErrorClass (ConflictError, StateError),
   OpenOptions (..),
@@ -11,7 +11,7 @@ import EventSorcery.Engine (
   openStore,
   supportsAbiVersion,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   ProposedEvent (..),
   StoredEvent (..),
   StreamIdentity (..),

@@ -47,25 +47,25 @@ library
   import:          strict
   hs-source-dirs:  bindings/haskell/src
   exposed-modules:
-    EventSorcery.Aggregate
-    EventSorcery.Dispatch
-    EventSorcery.Dispatch.TestSupport
-    EventSorcery.Dispatch.Worker
-    EventSorcery.Engine
-    EventSorcery.Job
-    EventSorcery.Job.Execution
-    EventSorcery.Job.Worker
-    EventSorcery.Snapshot
-    EventSorcery.Store
-    EventSorcery.Stream
+    Event.Sorcery.Aggregate
+    Event.Sorcery.Dispatch
+    Event.Sorcery.Dispatch.TestSupport
+    Event.Sorcery.Dispatch.Worker
+    Event.Sorcery.Engine
+    Event.Sorcery.Job
+    Event.Sorcery.Job.Execution
+    Event.Sorcery.Job.Worker
+    Event.Sorcery.Snapshot
+    Event.Sorcery.Store
+    Event.Sorcery.Stream
 
   other-modules:
-    EventSorcery.Dispatch.Internal
-    EventSorcery.Engine.Internal
-    EventSorcery.Engine.Internal.FFI
-    EventSorcery.Job.Definition
-    EventSorcery.Job.Worker.Definition
-    EventSorcery.Job.Worker.Internal
+    Event.Sorcery.Dispatch.Internal
+    Event.Sorcery.Engine.Internal
+    Event.Sorcery.Engine.Internal.FFI
+    Event.Sorcery.Job.Definition
+    Event.Sorcery.Job.Worker.Definition
+    Event.Sorcery.Job.Worker.Internal
 
   extra-libraries: event_sorcery_ffi
   build-depends:

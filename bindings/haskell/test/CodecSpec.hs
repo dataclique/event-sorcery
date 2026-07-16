@@ -1,14 +1,14 @@
 module Main (main) where
 
 import Data.ByteString qualified as ByteString
-import EventSorcery.Engine (
+import Event.Sorcery.Engine (
   EngineError (..),
   ErrorClass (ConflictError),
   OpenOptions (..),
   decodeEngineError,
   encodeOpenOptions,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   ProposedEvent (..),
   StoredEvent (..),
   StreamIdentity (..),

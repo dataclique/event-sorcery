@@ -4,7 +4,7 @@ import Data.ByteString qualified as ByteString
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text (Text)
-import EventSorcery.Aggregate (
+import Event.Sorcery.Aggregate (
   DecodeCause (DecodeCause),
   Dispatches (..),
   Effect (..),
@@ -14,7 +14,7 @@ import EventSorcery.Aggregate (
   dispatchIntentJob,
   dispatchJobId,
  )
-import EventSorcery.Dispatch (
+import Event.Sorcery.Dispatch (
   DispatchEvent (..),
   DispatchOutcome,
   DispatchRefused,
@@ -25,8 +25,8 @@ import EventSorcery.Dispatch (
   settleDispatch,
   settledOutput,
  )
-import EventSorcery.Dispatch.TestSupport (confirmedOutcome)
-import EventSorcery.Dispatch.Worker (
+import Event.Sorcery.Dispatch.TestSupport (confirmedOutcome)
+import Event.Sorcery.Dispatch.Worker (
   DeliveryPolicy,
   OriginJob (..),
   deliveryPolicy,
@@ -34,13 +34,13 @@ import EventSorcery.Dispatch.Worker (
   runDispatchJobOnce,
   storeOriginPort,
  )
-import EventSorcery.Engine (
+import Event.Sorcery.Engine (
   OpenOptions (OpenOptions),
   Store,
   closeStore,
   openStore,
  )
-import EventSorcery.Job (
+import Event.Sorcery.Job (
   ClaimBudget (ClaimBudget),
   Job (..),
   JobDecodeError (JobDecodeError),
@@ -50,25 +50,25 @@ import EventSorcery.Job (
   WorkerId (WorkerId),
   mkJobId,
  )
-import EventSorcery.Job.Execution (
+import Event.Sorcery.Job.Execution (
   DurableJob (..),
   JobAttempt,
   JobOutcome (JobDone),
   Reconciliation (Reconciled),
  )
-import EventSorcery.Job.Worker (
+import Event.Sorcery.Job.Worker (
   AttemptLimit,
   JobRunResult (..),
   JobWorker,
   jobWorker,
   mkAttemptLimit,
  )
-import EventSorcery.Store (
+import Event.Sorcery.Store (
   executeCommand,
   loadEntity,
   mkStore,
  )
-import EventSorcery.Stream (StreamKey, streamKey)
+import Event.Sorcery.Stream (StreamKey, streamKey)
 import Prelude (
   Bool (False, True),
   Either (Left, Right),
