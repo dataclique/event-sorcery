@@ -4,7 +4,7 @@ import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import EventSorcery.Aggregate (
   DecodeCause (DecodeCause),
-  Dispatches (injectDispatchIntent),
+  Dispatches (..),
   Effect (..),
   EventSourced (..),
   EventVersion (EventVersion),
@@ -12,7 +12,7 @@ import EventSorcery.Aggregate (
   dispatchIntent,
   dispatchJobId,
  )
-import EventSorcery.Dispatch (kickoff)
+import EventSorcery.Dispatch (DispatchOutcome, kickoff)
 import EventSorcery.Job (
   Job (..),
   JobId,
@@ -153,6 +153,7 @@ data AccountId = AccountId
 data AccountCommand
   = OpenAccount
   | SendWelcome
+  | SettleWelcome (DispatchOutcome SendWelcomeEmail)
 
 
 data AccountEvent
@@ -178,6 +179,7 @@ instance Job SendWelcomeEmail where
 
 instance Dispatches Account SendWelcomeEmail where
   injectDispatchIntent intent = WelcomeRequested (dispatchJobId intent)
+  injectDispatchOutcome = SettleWelcome
 
 
 instance EventSourced Account where
@@ -207,9 +209,10 @@ instance EventSourced Account where
   evolve account AccountOpened = Right account
   evolve (Account count) (WelcomeRequested _) = Right (Account count)
   initialize OpenAccount = Right (Events (AccountOpened :| []))
-  initialize SendWelcome = Left AccountError
+  initialize _ = Left AccountError
   transition _ OpenAccount = Left AccountError
   transition _ SendWelcome = Right (Dispatch (kickoff SendWelcomeEmail))
+  transition _ (SettleWelcome _) = Left AccountError
 
 
 testJobId :: JobId

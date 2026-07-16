@@ -65,6 +65,7 @@ data StoreError entity
   | StoreCommandRejected (Aggregate.CommandError entity)
   | StoreDecisionRejected (Aggregate.ApplyError entity)
   | StoreSnapshotDecodeFailed Word64 Aggregate.DecodeCause
+  | StoreUneventfulInitialization
 
 
 deriving stock instance
@@ -89,6 +90,7 @@ data PreparedCommand entity where
 
 data CommitPlan entity
   = PreparedEvents entity Word64 (NonEmpty ProposedEvent)
+  | PreparedUnchanged entity
   | PreparedDispatch entity Word64 (NonEmpty ProposedEvent) JobSeed
 
 
@@ -229,6 +231,10 @@ prepareEffect _ expected current (Events events) =
       ( PreparedCommand
           (Ur (PreparedEvents next expected (encodeEvents events)))
       )
+prepareEffect _ _ (Just entity) Unchanged =
+  pure (Right (PreparedCommand (Ur (PreparedUnchanged entity))))
+prepareEffect _ _ Nothing Unchanged =
+  pure (Left StoreUneventfulInitialization)
 prepareEffect (Store _ nextJobId) expected current (Dispatch request) = do
   identifier <- nextJobId
   let job = dispatchJob request
@@ -270,6 +276,7 @@ commitPrepared engine identity (PreparedCommand (Ur plan)) =
       committed <- commit engine identity expected events
 
       pure (next <$ first StoreEngineFailed committed)
+    PreparedUnchanged entity -> pure (Right entity)
     PreparedDispatch next expected events seed -> do
       committed <- commitWithJob engine identity expected events seed
 
