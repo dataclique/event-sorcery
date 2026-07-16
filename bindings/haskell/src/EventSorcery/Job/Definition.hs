@@ -16,8 +16,10 @@ import Data.Maybe (Maybe (..))
 import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text)
 import Data.Text qualified as Text
+import Data.ULID (ulidFromInteger)
+import Data.ULID.Base32 qualified as Base32
 import GHC.TypeLits (KnownSymbol, Symbol, symbolVal)
-import Prelude (Either, Eq, Ord, Show, otherwise, (==))
+import Prelude (Either (..), Eq, Integer, Ord, Show)
 
 
 newtype JobId = JobId Text
@@ -49,9 +51,14 @@ class KnownSymbol (JobType job) => Job job where
 
 
 mkJobId :: Text -> Maybe JobId
-mkJobId value
-  | value == "" = Nothing
-  | otherwise = Just (JobId value)
+mkJobId value =
+  case Base32.decode 26 value :: [(Integer, Text)] of
+    [(decoded, remaining)]
+      | Text.null remaining ->
+          case ulidFromInteger decoded of
+            Left _ -> Nothing
+            Right _ -> Just (JobId value)
+    _ -> Nothing
 
 
 jobIdText :: JobId -> Text

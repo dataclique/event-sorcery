@@ -37,6 +37,7 @@ import EventSorcery.Job (
   deadLetterJob,
   deferJob,
   enqueueJob,
+  jobIdText,
   mkJobId,
   pollJobs,
   renewJob,
@@ -54,6 +55,8 @@ import Prelude (Either (Left, Right), IO, String, error, pure, (&&), (==))
 
 main :: IO ()
 main = do
+  jobIdValidation
+
   opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)
 
   case opened of
@@ -69,6 +72,19 @@ main = do
       if closed == Right ()
         then pure ()
         else error "failed to close the shared engine"
+
+
+jobIdValidation :: IO ()
+jobIdValidation =
+  case ( mkJobId valid
+       , mkJobId "not-a-ulid"
+       , mkJobId "80000000000000000000000000"
+       ) of
+    (Just identifier, Nothing, Nothing)
+      | jobIdText identifier == valid -> pure ()
+    _ -> error "Haskell JobId validation diverged from the Rust engine"
+  where
+    valid = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
 
 exerciseAtomicCommit :: Store -> IO ()

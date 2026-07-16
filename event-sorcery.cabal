@@ -22,6 +22,7 @@ common strict
     DerivingVia
     DuplicateRecordFields
     GADTs
+    ImportQualifiedPost
     LinearTypes
     MultiParamTypeClasses
     MultilineStrings
@@ -76,6 +77,22 @@ library
     , linear-base
     , text
     , transformers
+    , ulid
+
+benchmark event-sorcery-benchmarks
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: bindings/haskell/benchmark
+  main-is:        Main.hs
+  ghc-options:    -O2 -threaded -rtsopts
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring
+    , criterion
+    , deepseq
+    , event-sorcery
+    , linear-base
+    , text
 
 test-suite codec-spec
   import:         strict
@@ -122,6 +139,7 @@ test-suite domain-spec
     , base           >=4.18 && <5
     , bytestring
     , event-sorcery
+    , text
 
 test-suite store-spec
   import:         strict
