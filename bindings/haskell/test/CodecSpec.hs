@@ -1,4 +1,4 @@
-module Main (main) where
+module CodecSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Event.Sorcery.Engine (
@@ -18,6 +18,7 @@ import Event.Sorcery.Stream (
   encodeLoadStream,
  )
 import Paths_event_sorcery (getDataFileName)
+import Test.Hspec (Spec, it)
 import Prelude (
   Either (..),
   IO,
@@ -37,8 +38,8 @@ import Prelude (
  )
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "matches the shared CBOR corpus" do
   vectors <- loadVectors
   let expectedOpen = conformanceVector "open-options" vectors
       expectedLoad = conformanceVector "load-stream" vectors

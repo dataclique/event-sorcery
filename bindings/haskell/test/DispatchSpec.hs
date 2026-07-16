@@ -1,4 +1,4 @@
-module Main (main) where
+module DispatchSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Data.Text (Text)
@@ -30,6 +30,7 @@ import Event.Sorcery.Job (
   JobId,
   mkJobId,
  )
+import Test.Hspec (Spec, it)
 import Prelude (
   Either (..),
   Eq,
@@ -67,8 +68,12 @@ instance Job ChargeCard where
   decodeJob _ = Right ChargeCard
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "preserves the dispatch state machine" exerciseDispatch
+
+
+exerciseDispatch :: IO ()
+exerciseDispatch = do
   let first = requireJobId "01ARZ3NDEKTSV4RRFFQ69G5FAV"
       second = requireJobId "01ARZ3NDEKTSV4RRFFQ69G5FAW"
       dispatched = Dispatched first ChargeCard

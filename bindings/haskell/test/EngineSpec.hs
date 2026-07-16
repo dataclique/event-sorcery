@@ -1,4 +1,4 @@
-module Main (main) where
+module EngineSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty (..))
@@ -19,6 +19,7 @@ import Event.Sorcery.Stream (
   currentVersion,
   loadStream,
  )
+import Test.Hspec (Spec, it)
 import Prelude (
   Either (..),
   IO,
@@ -33,14 +34,14 @@ import Prelude (
  )
 
 
-main :: IO ()
-main = do
-  exerciseAbiCompatibility
-
-  version <- abiVersion
-  if version == 5
-    then exerciseStore
-    else error "unexpected engine ABI version"
+spec :: Spec
+spec = do
+  it "classifies ABI compatibility" exerciseAbiCompatibility
+  it "uses the shared engine store" do
+    version <- abiVersion
+    if version == 5
+      then exerciseStore
+      else error "unexpected engine ABI version"
 
 
 exerciseAbiCompatibility :: IO ()

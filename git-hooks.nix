@@ -20,7 +20,10 @@ git-hooks.lib.${system}.run {
 
   hooks = {
     cabal-fmt.enable = true;
-    fourmolu.enable = true;
+    fourmolu = {
+      enable = true;
+      excludes = [ "bindings/haskell/test/Spec\\.hs" ];
+    };
     hlint.enable = true;
     nixfmt.enable = true;
     rustfmt = {

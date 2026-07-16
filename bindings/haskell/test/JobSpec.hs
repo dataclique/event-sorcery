@@ -1,4 +1,4 @@
-module Main (main) where
+module JobSpec (spec) where
 
 import Conduit (runConduit, sinkList, (.|))
 import Control.Monad.Trans.Except (runExceptT)
@@ -50,11 +50,12 @@ import Event.Sorcery.Stream (
   StreamIdentity (StreamIdentity),
   currentVersion,
  )
+import Test.Hspec (Spec, it)
 import Prelude (Either (Left, Right), IO, String, error, pure, (&&), (==))
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "preserves durable job semantics" do
   jobIdValidation
 
   opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)

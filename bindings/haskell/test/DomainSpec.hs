@@ -1,4 +1,4 @@
-module Main (main) where
+module DomainSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)))
@@ -35,6 +35,7 @@ import Event.Sorcery.Stream (
   streamKey,
   streamKeyIdentity,
  )
+import Test.Hspec (Spec, it)
 import Prelude (
   Either (..),
   Eq,
@@ -51,8 +52,8 @@ import Prelude (
  )
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "preserves the typed domain invariants" do
   identifier <-
     case mkJobId testJobIdText of
       Just value -> pure value

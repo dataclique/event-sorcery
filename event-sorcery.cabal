@@ -94,105 +94,32 @@ benchmark event-sorcery-benchmarks
     , linear-base
     , text
 
-test-suite codec-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: bindings/haskell/test
-  main-is:        CodecSpec.hs
-  other-modules:  Paths_event_sorcery
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring
-    , event-sorcery
-    , text
+test-suite spec
+  import:             strict
+  type:               exitcode-stdio-1.0
+  hs-source-dirs:     bindings/haskell/test
+  main-is:            Spec.hs
+  other-modules:
+    CodecSpec
+    DispatchSpec
+    DispatchWorkerSpec
+    DomainSpec
+    EngineSpec
+    JobExecutionSpec
+    JobSpec
+    JobWorkerSpec
+    Paths_event_sorcery
+    StoreSpec
 
-test-suite engine-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: bindings/haskell/test
-  main-is:        EngineSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring
-    , event-sorcery
-
-test-suite job-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: bindings/haskell/test
-  main-is:        JobSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring
-    , conduit
-    , event-sorcery
-    , linear-base
-    , text
-    , transformers
-
-test-suite domain-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: bindings/haskell/test
-  main-is:        DomainSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring
-    , event-sorcery
-    , text
-
-test-suite store-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: bindings/haskell/test
-  main-is:        StoreSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring
-    , event-sorcery
-    , text
-
-test-suite dispatch-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: bindings/haskell/test
-  main-is:        DispatchSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring
-    , event-sorcery
-    , text
-
-test-suite job-execution-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: bindings/haskell/test
-  main-is:        JobExecutionSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring
-    , event-sorcery
-    , text
-
-test-suite job-worker-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: bindings/haskell/test
-  main-is:        JobWorkerSpec.hs
   build-depends:
     , async
     , base           >=4.18 && <5
     , bytestring
+    , conduit
     , event-sorcery
+    , hspec
+    , linear-base
     , text
+    , transformers
 
-test-suite dispatch-worker-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: bindings/haskell/test
-  main-is:        DispatchWorkerSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring
-    , event-sorcery
-    , text
+  build-tool-depends: hspec-discover:hspec-discover
