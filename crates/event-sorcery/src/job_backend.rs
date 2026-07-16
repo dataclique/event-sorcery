@@ -1114,6 +1114,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_queue_rebuilds_from_the_job_event_stream() {
+        let pool = one_db_pool().await;
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = runtime.enqueue(TestJob { n: 7 }).await.unwrap();
+
+        sqlx::query(
+            r"
+            DELETE FROM job_queue
+            WHERE view_id = ?1
+            ",
+        )
+        .bind(job_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(queue_status(&pool, &job_id).await, None);
+
+        let _rebuilt = JobRuntime::build(pool.clone()).await.unwrap();
+
+        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
+        );
+    }
+
+    #[tokio::test]
     async fn standalone_enqueue_with_delay_is_not_runnable_until_run_at() {
         let pool = one_db_pool().await;
         let runtime = JobRuntime::build(pool.clone()).await.unwrap();
