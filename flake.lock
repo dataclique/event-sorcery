@@ -6,11 +6,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1783635003,
-        "narHash": "sha256-jK3fvDpOF/w9ojqGu3XmiuvR+0lHf5pEOZQIMC6Z1Lo=",
+        "lastModified": 1785658433,
+        "narHash": "sha256-P/o/AEOTklxL1qXDtvxgID0YYfSPEs9JbUQN5eZO2q8=",
         "owner": "dataclique",
         "repo": "but.nix",
-        "rev": "3aa2ef2086cbddff42f8ec877edf1b05a30e1bdd",
+        "rev": "a193504a5e5f5f30d5e07a832c8ca484b8cd18fe",
         "type": "github"
       },
       "original": {
@@ -166,11 +166,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1783008725,
-        "narHash": "sha256-jGiy6+sxjNWXSjp25uoJuNfyH9zBK1PEDY0lVoL4ibQ=",
+        "lastModified": 1784288435,
+        "narHash": "sha256-ReRHaLgr/uVqdD8afFSn+myXIfpHeOhP0yYe0TJqAA8=",
         "owner": "cachix",
         "repo": "git-hooks.nix",
-        "rev": "bca82caa46d5ec0f5d422c61fb1e30bc51313cbe",
+        "rev": "43b3c1ab9d40fb1dbb008f451988a91e375825e9",
         "type": "github"
       },
       "original": {
@@ -324,11 +324,11 @@
         "solc": "solc"
       },
       "locked": {
-        "lastModified": 1778676154,
-        "narHash": "sha256-jEU9kpRvyPzF01ra+27/uzb/qz5pvx02NudjKwF9pw8=",
+        "lastModified": 1785433562,
+        "narHash": "sha256-vqaBnB1/TSR/zrBtZLSy+H2OjUgl2zwxXKeRE0F3Ccw=",
         "owner": "rainprotocol",
         "repo": "rainix",
-        "rev": "49fb732e4837dcdaed415a9dad51a0375096e2fe",
+        "rev": "0f0b4b9c800ea42ef63c8f93c7aee514a06841e7",
         "type": "github"
       },
       "original": {
