@@ -1055,12 +1055,20 @@ fn parse_sqlite_options(path: &str) -> Result<ParsedSqliteOptions, AbiError> {
     let (in_memory, cache_mode) = form_urlencoded::parse(parameters.as_bytes()).fold(
         (database_is_memory, initial_cache),
         |(in_memory, cache_mode), (key, value)| match (key.as_ref(), value.as_ref()) {
-            ("mode", "memory") => (true, SqliteCacheMode::Shared),
+            ("mode", "memory") => (true, cache_mode),
             ("cache", "private") => (in_memory, SqliteCacheMode::Private),
             ("cache", "shared") => (in_memory, SqliteCacheMode::Shared),
             _ => (in_memory, cache_mode),
         },
     );
+    // An in-memory database with no name (nothing before `?`) gets a fresh, unshared
+    // database for every pooled connection, no matter what `cache=` claims -- only a
+    // named in-memory database (":memory:" or a "file:" URI) can be shared.
+    let cache_mode = if in_memory && database.is_empty() {
+        SqliteCacheMode::Private
+    } else {
+        cache_mode
+    };
 
     Ok(ParsedSqliteOptions {
         connect_options,
@@ -1340,10 +1348,9 @@ mod tests {
     fn open_options_accept_supported_shared_cache_in_memory_urls() {
         for path in [
             "sqlite::memory:",
-            "sqlite://?mode=memory",
             "sqlite://:memory:",
-            "sqlite://?mode=memory&cache=shared",
-            "sqlite://?cache=private&mode=memory",
+            "sqlite://:memory:?cache=shared",
+            "sqlite://file:probe?mode=memory&cache=shared",
         ] {
             let mut encoded = encode_request(&(1_u8, path, 5_000_u64, 2_u32, 1_u32));
             let buffer = caller_buffer(&mut encoded);
@@ -1355,11 +1362,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn pooled_connections_share_writes_over_a_shared_cache_in_memory_url() {
+        let mut encoded = encode_request(&(
+            1_u8,
+            "sqlite://file:shared_cache_probe?mode=memory&cache=shared",
+            5_000_u64,
+            2_u32,
+            1_u32,
+        ));
+        let buffer = caller_buffer(&mut encoded);
+        let options = decode_open_options(&raw const buffer).unwrap();
+
+        // Mirrors the es_open builder chain exactly: an in-memory URL without shared
+        // cache gives every pooled connection its own private database, so this test
+        // must exercise the same connect_options/pool construction production uses.
+        let connect = options
+            .connect_options
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full)
+            .busy_timeout(options.busy_timeout);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(options.pool_size)
+            .connect_with(connect)
+            .await
+            .unwrap();
+
+        let mut writer_connection = pool.acquire().await.unwrap();
+        let mut reader_connection = pool.acquire().await.unwrap();
+
+        sqlx::query("CREATE TABLE shared_cache_probe (id INTEGER PRIMARY KEY, value TEXT)")
+            .execute(&mut *writer_connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO shared_cache_probe (id, value) VALUES (1, 'observed')")
+            .execute(&mut *writer_connection)
+            .await
+            .unwrap();
+
+        let observed_value: String =
+            sqlx::query_scalar("SELECT value FROM shared_cache_probe WHERE id = 1")
+                .fetch_one(&mut *reader_connection)
+                .await
+                .unwrap();
+
+        assert_eq!(observed_value, "observed");
+    }
+
     #[test]
     fn open_options_reject_private_cache_in_memory_urls_for_any_pool_size() {
         for path in [
             "sqlite://?mode=memory&cache=private",
             "sqlite://:memory:?cache=private",
+            "sqlite://?mode=memory",
+            "sqlite://?mode=memory&cache=shared",
+            "sqlite://?cache=private&mode=memory",
         ] {
             for pool_size in [1_u32, 2_u32] {
                 let mut encoded = encode_request(&(1_u8, path, 5_000_u64, pool_size, 1_u32));
