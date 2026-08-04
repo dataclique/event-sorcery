@@ -7,12 +7,16 @@ use std::num::NonZeroUsize;
 
 use cqrs_es::persist::{PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot};
 use futures_util::TryStreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::job::EnqueueRequest;
 use crate::job_sqlite::SqliteJobError;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
+
+const ENGINE_PAYLOAD_PROVENANCE_KEY: &str = "$event-sorcery-engine-owned";
+const ENGINE_PAYLOAD_PROVENANCE: &str = "opaque-v1";
 
 /// Identifies one serialized aggregate event stream at the storage boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +44,87 @@ impl StreamIdentity {
     }
 }
 
+/// One binding-owned event payload proposed at the erased engine boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueProposedEvent {
+    event_type: String,
+    event_version: String,
+    payload: Vec<u8>,
+}
+
+impl OpaqueProposedEvent {
+    /// Creates an event whose payload remains opaque to the engine.
+    pub fn new(
+        event_type: impl Into<String>,
+        event_version: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            event_type: event_type.into(),
+            event_version: event_version.into(),
+            payload,
+        }
+    }
+}
+
+/// One stored event returned through the erased opaque-payload facade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueStoredEvent {
+    sequence: usize,
+    event_type: String,
+    event_version: String,
+    payload: Vec<u8>,
+}
+
+impl OpaqueStoredEvent {
+    /// Creates a stored-event value for adapters and conformance fixtures.
+    pub fn new(
+        sequence: usize,
+        event_type: impl Into<String>,
+        event_version: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            sequence,
+            event_type: event_type.into(),
+            event_version: event_version.into(),
+            payload,
+        }
+    }
+
+    /// Consumes the event into its stable storage-boundary fields.
+    pub fn into_parts(self) -> (usize, String, String, Vec<u8>) {
+        (
+            self.sequence,
+            self.event_type,
+            self.event_version,
+            self.payload,
+        )
+    }
+}
+
+/// One atomic opaque-payload commit for a single stream version.
+pub struct OpaqueCommitRequest<'events> {
+    stream: StreamIdentity,
+    expected_version: usize,
+    events: &'events [OpaqueProposedEvent],
+}
+
+impl<'events> OpaqueCommitRequest<'events> {
+    /// Creates an opaque commit guarded by the exact current stream version.
+    pub fn new(
+        stream: StreamIdentity,
+        expected_version: usize,
+        events: &'events [OpaqueProposedEvent],
+    ) -> Self {
+        Self {
+            stream,
+            expected_version,
+            events,
+        }
+    }
+}
+
 /// Snapshot payload written atomically with the events it covers.
 pub struct SnapshotUpdate {
     aggregate: Value,
@@ -59,6 +144,7 @@ impl SnapshotUpdate {
 /// One atomic event-store commit, including optional snapshot and job intent.
 pub struct CommitRequest<'events> {
     stream: StreamIdentity,
+    expected_version: Option<usize>,
     events: &'events [SerializedEvent],
     snapshot: Option<SnapshotUpdate>,
     jobs: Vec<EnqueueRequest>,
@@ -83,6 +169,12 @@ pub enum EngineError {
         expected: StreamIdentity,
         actual: StreamIdentity,
     },
+    #[error("event page storage bytes {observed} exceed limit {limit}")]
+    EventPageTooLarge { observed: usize, limit: usize },
+    #[error("event metadata uses reserved engine key {key}")]
+    ReservedMetadata { key: &'static str },
+    #[error("unsupported opaque payload envelope version {actual}")]
+    OpaquePayloadVersion { actual: u8 },
     #[error(transparent)]
     Sql(#[from] sqlx::Error),
     #[error(transparent)]
@@ -98,10 +190,18 @@ impl<'events> CommitRequest<'events> {
     pub fn new(stream: StreamIdentity, events: &'events [SerializedEvent]) -> Self {
         Self {
             stream,
+            expected_version: None,
             events,
             snapshot: None,
             jobs: vec![],
         }
+    }
+
+    /// Requires this version to still be current when the commit is written.
+    #[must_use]
+    pub fn at_expected_version(mut self, expected_version: usize) -> Self {
+        self.expected_version = Some(expected_version);
+        self
     }
 
     /// Attaches the snapshot covered by this commit's events.
@@ -345,6 +445,166 @@ impl Engine {
         rows.into_iter().map(SerializedEvent::try_from).collect()
     }
 
+    /// Loads an item- and storage-byte-bounded event page.
+    pub async fn load_events_page_bounded(
+        &self,
+        stream: &StreamIdentity,
+        after_sequence: Option<usize>,
+        item_limit: NonZeroUsize,
+        byte_limit: NonZeroUsize,
+    ) -> Result<Vec<SerializedEvent>, EngineError> {
+        let item_limit = i64::try_from(item_limit.get())?;
+        let mut transaction = self.pool.begin().await?;
+        let storage_bytes = match after_sequence {
+            None => {
+                sqlx::query_scalar::<_, i64>(
+                    r"
+                    SELECT COALESCE(SUM(
+                        length(CAST(aggregate_type AS BLOB))
+                        + length(CAST(aggregate_id AS BLOB))
+                        + 8
+                        + length(CAST(event_type AS BLOB))
+                        + length(CAST(event_version AS BLOB))
+                        + length(CAST(payload AS BLOB))
+                        + length(CAST(metadata AS BLOB))
+                    ), 0)
+                    FROM (
+                        SELECT aggregate_type,
+                               aggregate_id,
+                               sequence,
+                               event_type,
+                               event_version,
+                               payload,
+                               metadata
+                        FROM events
+                        WHERE aggregate_type = ?1 AND aggregate_id = ?2
+                        ORDER BY sequence
+                        LIMIT ?3
+                    )
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(item_limit)
+                .fetch_one(&mut *transaction)
+                .await?
+            }
+            Some(after_sequence) => {
+                let after_sequence = i64::try_from(after_sequence)?;
+                sqlx::query_scalar::<_, i64>(
+                    r"
+                    SELECT COALESCE(SUM(
+                        length(CAST(aggregate_type AS BLOB))
+                        + length(CAST(aggregate_id AS BLOB))
+                        + 8
+                        + length(CAST(event_type AS BLOB))
+                        + length(CAST(event_version AS BLOB))
+                        + length(CAST(payload AS BLOB))
+                        + length(CAST(metadata AS BLOB))
+                    ), 0)
+                    FROM (
+                        SELECT aggregate_type,
+                               aggregate_id,
+                               sequence,
+                               event_type,
+                               event_version,
+                               payload,
+                               metadata
+                        FROM events
+                        WHERE aggregate_type = ?1
+                          AND aggregate_id = ?2
+                          AND sequence > ?3
+                        ORDER BY sequence
+                        LIMIT ?4
+                    )
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(after_sequence)
+                .bind(item_limit)
+                .fetch_one(&mut *transaction)
+                .await?
+            }
+        };
+        let observed = usize::try_from(storage_bytes)?;
+        if observed > byte_limit.get() {
+            return Err(EngineError::EventPageTooLarge {
+                observed,
+                limit: byte_limit.get(),
+            });
+        }
+
+        let rows = match after_sequence {
+            None => {
+                sqlx::query_as::<_, StoredEventRow>(
+                    r"
+                    SELECT aggregate_type,
+                           aggregate_id,
+                           sequence,
+                           event_type,
+                           event_version,
+                           payload,
+                           metadata
+                    FROM events
+                    WHERE aggregate_type = ?1 AND aggregate_id = ?2
+                    ORDER BY sequence
+                    LIMIT ?3
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(item_limit)
+                .fetch_all(&mut *transaction)
+                .await?
+            }
+            Some(after_sequence) => {
+                let after_sequence = i64::try_from(after_sequence)?;
+                sqlx::query_as::<_, StoredEventRow>(
+                    r"
+                    SELECT aggregate_type,
+                           aggregate_id,
+                           sequence,
+                           event_type,
+                           event_version,
+                           payload,
+                           metadata
+                    FROM events
+                    WHERE aggregate_type = ?1
+                      AND aggregate_id = ?2
+                      AND sequence > ?3
+                    ORDER BY sequence
+                    LIMIT ?4
+                    ",
+                )
+                .bind(&stream.aggregate_type)
+                .bind(&stream.aggregate_id)
+                .bind(after_sequence)
+                .bind(item_limit)
+                .fetch_all(&mut *transaction)
+                .await?
+            }
+        };
+        transaction.commit().await?;
+
+        rows.into_iter().map(SerializedEvent::try_from).collect()
+    }
+
+    /// Loads an opaque event page while preserving legacy JSON event semantics.
+    pub async fn load_opaque_events_page_bounded(
+        &self,
+        stream: &StreamIdentity,
+        after_sequence: Option<usize>,
+        item_limit: NonZeroUsize,
+        byte_limit: NonZeroUsize,
+    ) -> Result<Vec<OpaqueStoredEvent>, EngineError> {
+        self.load_events_page_bounded(stream, after_sequence, item_limit, byte_limit)
+            .await?
+            .into_iter()
+            .map(decode_opaque_event)
+            .collect()
+    }
+
     /// Reads the current stream version, where zero means no events.
     pub async fn current_version(&self, stream: &StreamIdentity) -> Result<usize, EngineError> {
         let version = sqlx::query_scalar::<_, Option<i64>>(
@@ -469,14 +729,84 @@ impl Engine {
 
     /// Atomically persists a validated event, snapshot, and durable-job batch.
     pub async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
+        if request
+            .events
+            .iter()
+            .any(|event| reserves_engine_payload(&event.metadata))
+        {
+            return Err(EngineError::ReservedMetadata {
+                key: ENGINE_PAYLOAD_PROVENANCE_KEY,
+            });
+        }
+
+        self.commit_serialized(request).await
+    }
+
+    /// Atomically persists binding-owned payload bytes through the shared writer.
+    pub async fn commit_opaque(&self, request: OpaqueCommitRequest<'_>) -> Result<(), EngineError> {
+        let OpaqueCommitRequest {
+            stream,
+            expected_version,
+            events,
+        } = request;
+        let serialized = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let sequence = expected_version
+                    .checked_add(index)
+                    .and_then(|sequence| sequence.checked_add(1))
+                    .ok_or(EngineError::OptimisticLock)?;
+                Ok(SerializedEvent {
+                    aggregate_type: stream.aggregate_type.clone(),
+                    aggregate_id: stream.aggregate_id.clone(),
+                    sequence,
+                    event_type: event.event_type.clone(),
+                    event_version: event.event_version.clone(),
+                    payload: encode_opaque_payload(event.payload.clone())?,
+                    metadata: engine_payload_metadata(),
+                })
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+
+        self.commit_serialized(
+            CommitRequest::new(stream, &serialized).at_expected_version(expected_version),
+        )
+        .await
+    }
+
+    async fn commit_serialized(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
         let CommitRequest {
             stream,
+            expected_version,
             events,
             snapshot,
             jobs,
         } = request;
         validate_event_stream(&stream, events)?;
-        let mut tx = self.pool.begin().await?;
+        if expected_version.is_some_and(|expected| !events_follow_version(events, expected)) {
+            return Err(EngineError::OptimisticLock);
+        }
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(expected) = expected_version {
+            let current = sqlx::query!(
+                r#"
+                SELECT MAX(sequence) AS "sequence?: i64"
+                FROM events
+                WHERE aggregate_type = ?1
+                  AND aggregate_id = ?2
+                "#,
+                stream.aggregate_type,
+                stream.aggregate_id,
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let actual = current.sequence.map_or(Ok(0), usize::try_from)?;
+            if actual != expected {
+                return Err(EngineError::OptimisticLock);
+            }
+        }
 
         sqlite_es::insert_serialized_events_batch(&mut tx, "events", events).await?;
 
@@ -689,9 +1019,11 @@ impl From<EngineError> for PersistenceError {
         use EngineError::*;
         match error {
             OptimisticLock => Self::OptimisticLockError,
-            EmptySnapshotUpdate | StreamIdentityMismatch { .. } => {
-                Self::UnknownError(Box::new(error))
-            }
+            EmptySnapshotUpdate
+            | StreamIdentityMismatch { .. }
+            | EventPageTooLarge { .. }
+            | ReservedMetadata { .. }
+            | OpaquePayloadVersion { .. } => Self::UnknownError(Box::new(error)),
             Sql(source) => Self::ConnectionError(Box::new(source)),
             Json(source) => Self::DeserializationError(Box::new(source)),
             Integer(source) => Self::UnknownError(Box::new(source)),
@@ -728,6 +1060,107 @@ fn validate_event_stream(
                 })
             },
         )
+}
+
+fn events_follow_version(events: &[SerializedEvent], expected: usize) -> bool {
+    events.iter().enumerate().all(|(index, event)| {
+        expected
+            .checked_add(index)
+            .and_then(|sequence| sequence.checked_add(1))
+            == Some(event.sequence)
+    })
+}
+
+#[derive(Deserialize, Serialize)]
+struct EnginePayloadEnvelope {
+    #[serde(rename = "$event-sorcery-engine-payload")]
+    opaque: EngineOpaquePayload,
+}
+
+#[derive(Deserialize, Serialize)]
+struct EngineOpaquePayload {
+    version: u8,
+    bytes: Vec<u8>,
+}
+
+fn encode_opaque_payload(payload: Vec<u8>) -> Result<Value, EngineError> {
+    Ok(serde_json::to_value(EnginePayloadEnvelope {
+        opaque: EngineOpaquePayload {
+            version: 1,
+            bytes: payload,
+        },
+    })?)
+}
+
+fn engine_payload_metadata() -> Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        ENGINE_PAYLOAD_PROVENANCE_KEY.to_string(),
+        Value::String(ENGINE_PAYLOAD_PROVENANCE.to_string()),
+    );
+    Value::Object(metadata)
+}
+
+fn reserves_engine_payload(metadata: &Value) -> bool {
+    match metadata {
+        Value::Object(object) => object.contains_key(ENGINE_PAYLOAD_PROVENANCE_KEY),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
+            false
+        }
+    }
+}
+
+fn has_engine_payload_provenance(metadata: &Value) -> bool {
+    match metadata {
+        Value::Object(object) if object.len() == 1 => {
+            match object.get(ENGINE_PAYLOAD_PROVENANCE_KEY) {
+                Some(Value::String(provenance)) => provenance == ENGINE_PAYLOAD_PROVENANCE,
+                None
+                | Some(
+                    Value::Null
+                    | Value::Bool(_)
+                    | Value::Number(_)
+                    | Value::Array(_)
+                    | Value::Object(_),
+                ) => false,
+            }
+        }
+        Value::Object(_)
+        | Value::Null
+        | Value::Bool(_)
+        | Value::Number(_)
+        | Value::String(_)
+        | Value::Array(_) => false,
+    }
+}
+
+fn decode_opaque_event(event: SerializedEvent) -> Result<OpaqueStoredEvent, EngineError> {
+    let SerializedEvent {
+        sequence,
+        event_type,
+        event_version,
+        payload,
+        metadata,
+        ..
+    } = event;
+    let payload = if has_engine_payload_provenance(&metadata) {
+        let envelope: EnginePayloadEnvelope = serde_json::from_value(payload)?;
+        if envelope.opaque.version != 1 {
+            return Err(EngineError::OpaquePayloadVersion {
+                actual: envelope.opaque.version,
+            });
+        }
+        envelope.opaque.bytes
+    } else {
+        serde_json::to_vec(&payload)?
+    };
+
+    Ok(OpaqueStoredEvent {
+        sequence,
+        event_type,
+        event_version,
+        payload,
+    })
 }
 
 #[derive(sqlx::FromRow)]
@@ -871,6 +1304,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_stream_reads_reject_storage_bytes_before_loading_the_page() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-byte-page-test", "one");
+        let event = SerializedEvent {
+            payload: serde_json::Value::String("x".repeat(256)),
+            ..serialized_event(&stream, 1)
+        };
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+
+        let result = engine
+            .load_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(64).unwrap(),
+            )
+            .await;
+
+        let Err(EngineError::EventPageTooLarge { observed, limit }) = result else {
+            panic!("oversized stored page must report its exact accounting");
+        };
+        assert_eq!((observed, limit), (302, 64));
+    }
+
+    #[tokio::test]
     async fn commit_and_load_use_the_existing_serialized_event_contract() {
         let engine = Engine::new(create_test_pool().await.unwrap());
         let stream = StreamIdentity::new("engine-test", "one");
@@ -887,6 +1351,70 @@ mod tests {
         let loaded = engine.load_events(&stream, None).await.unwrap();
         assert_eq!(loaded, vec![event]);
     }
+
+    #[tokio::test]
+    async fn expected_version_rejects_a_gap_without_writing() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-expected-test", "one");
+        let event = serialized_event(&stream, 2);
+
+        let result = engine
+            .commit(
+                CommitRequest::new(stream.clone(), std::slice::from_ref(&event))
+                    .at_expected_version(1),
+            )
+            .await;
+
+        assert!(matches!(result, Err(EngineError::OptimisticLock)));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn noncontiguous_sequence_rejects_without_writing() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-sequence-test", "one");
+        let event = serialized_event(&stream, 2);
+
+        let result = engine
+            .commit(
+                CommitRequest::new(stream.clone(), std::slice::from_ref(&event))
+                    .at_expected_version(0),
+            )
+            .await;
+
+        assert!(matches!(result, Err(EngineError::OptimisticLock)));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_commits_cannot_forge_opaque_payload_provenance() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("engine-reserved-metadata-test", "one");
+        let event = SerializedEvent {
+            metadata: serde_json::json!({
+                "$event-sorcery-engine-owned": "opaque-v1"
+            }),
+            ..serialized_event(&stream, 1)
+        };
+
+        let result = engine
+            .commit(CommitRequest::new(stream, std::slice::from_ref(&event)))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::ReservedMetadata {
+                key: "$event-sorcery-engine-owned"
+            })
+        ));
+        let event_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(event_count, 0);
+    }
+
     #[tokio::test]
     async fn load_events_returns_only_sequences_after_the_checkpoint() {
         let engine = Engine::new(create_test_pool().await.unwrap());
