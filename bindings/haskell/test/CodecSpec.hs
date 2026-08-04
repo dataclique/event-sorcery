@@ -4,18 +4,23 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.Either (Either (Right), isLeft)
 import EventSorcery.Engine.Codec (
+  decodeEngineError,
   decodeStoredEvents,
   encodeCommit,
+  encodeCurrentVersion,
   encodeLoadStream,
   encodeOpenOptions,
  )
 import EventSorcery.Engine.Protocol (
   AggregateId (..),
   AggregateType (..),
+  ConflictDetail (..),
+  EngineError (..),
   EventType (..),
   EventVersion (..),
   OpenOptions (..),
   ProposedEvent (..),
+  ResourceLimitDetail (..),
   StoredEvent (..),
   StreamIdentity (..),
  )
@@ -40,6 +45,8 @@ tests =
             encodeLoadStream stream Nothing @?= expectedLoadWithoutCursor
         , testCase "load stream after a cursor" $
             encodeLoadStream stream (Just 256) @?= expectedLoadAfterCursor
+        , testCase "current version" $
+            encodeCurrentVersion stream @?= expectedCurrentVersion
         , testCase "commit" $
             encodeCommit stream 0 [proposed] @?= expectedCommit
         ]
@@ -47,6 +54,29 @@ tests =
         "decoding"
         [ testCase "stored event" $
             decodeStoredEvents stored @?= Right [expectedStored]
+        , testCase "conflict detail" $
+            decodeEngineError 2 conflict
+              @?= Right
+                ( OptimisticConflict
+                    ( ConflictDetail
+                        (AggregateType "account")
+                        (AggregateId "one")
+                        0
+                        1
+                    )
+                )
+        , testCase "resource-limit detail" $
+            decodeEngineError 6 resourceLimit
+              @?= Right
+                ( ResourceLimitExceeded
+                    (ResourceLimitDetail "payload" 65 64)
+                )
+        , testCase "panic detail" $
+            decodeEngineError 100 enginePanic @?= Right EnginePanic
+        , testCase "rejects disagreement between status and encoded code" $
+            assertBool
+              "status mismatch must fail"
+              (isLeft (decodeEngineError 4 conflict))
         , testCase "rejects trailing bytes" $
             assertBool
               "trailing byte must fail"
@@ -168,6 +198,26 @@ expectedLoadAfterCursor =
     , 25
     , 1
     , 0 -- uint16(256) cursor
+    ]
+
+
+expectedCurrentVersion :: ByteString
+expectedCurrentVersion =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 103
+    , 97
+    , 99
+    , 99
+    , 111
+    , 117
+    , 110
+    , 116 -- text(7) account
+    , 99
+    , 111
+    , 110
+    , 101 -- text(3) one
     ]
 
 
@@ -298,4 +348,61 @@ arrayPayload =
     , 130
     , 0
     , 1 -- array(2), not bytes(2)
+    ]
+
+
+conflict :: ByteString
+conflict =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 2 -- conflict error
+    , 132 -- array(4) conflict detail
+    , 103
+    , 97
+    , 99
+    , 99
+    , 111
+    , 117
+    , 110
+    , 116 -- text(7) account
+    , 99
+    , 111
+    , 110
+    , 101 -- text(3) one
+    , 0 -- expected version 0
+    , 1 -- actual version 1
+    ]
+
+
+resourceLimit :: ByteString
+resourceLimit =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 6 -- resource-limit error
+    , 131 -- array(3) resource detail
+    , 103
+    , 112
+    , 97
+    , 121
+    , 108
+    , 111
+    , 97
+    , 100 -- text(7) payload
+    , 24
+    , 65 -- observed 65
+    , 24
+    , 64 -- limit 64
+    ]
+
+
+enginePanic :: ByteString
+enginePanic =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 24
+    , 100 -- panic error
+    , 246 -- null detail
     ]

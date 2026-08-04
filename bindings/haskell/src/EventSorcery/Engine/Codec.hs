@@ -1,6 +1,8 @@
 module EventSorcery.Engine.Codec (
+  decodeEngineError,
   decodeStoredEvents,
   encodeCommit,
+  encodeCurrentVersion,
   encodeLoadStream,
   encodeOpenOptions,
 ) where
@@ -9,8 +11,10 @@ import Codec.CBOR.Decoding (
   Decoder,
   decodeBytes,
   decodeListLen,
+  decodeNull,
   decodeString,
   decodeWord,
+  decodeWord32,
   decodeWord64,
  )
 import Codec.CBOR.Encoding (
@@ -30,14 +34,17 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Foldable (foldMap)
 import Data.Maybe (maybe)
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import EventSorcery.Engine.Protocol (
   AggregateId (..),
   AggregateType (..),
+  ConflictDetail (..),
+  EngineError (..),
   EventType (..),
   EventVersion (..),
   OpenOptions (..),
   ProposedEvent (..),
+  ResourceLimitDetail (..),
   StoredEvent (..),
   StreamIdentity (..),
  )
@@ -80,6 +87,15 @@ encodeLoadStream stream after =
       <> maybe encodeNull encodeWord64 after
 
 
+encodeCurrentVersion :: StreamIdentity -> ByteString
+encodeCurrentVersion stream =
+  toStrictByteString $
+    encodeListLen 3
+      <> encodeWord 1
+      <> encodeAggregateType stream.aggregateType
+      <> encodeAggregateId stream.aggregateId
+
+
 encodeCommit :: StreamIdentity -> Word64 -> [ProposedEvent] -> ByteString
 encodeCommit stream expected events =
   toStrictByteString $
@@ -107,6 +123,59 @@ decodeStoredEvents bytes =
     Right (remaining, events)
       | LazyByteString.null remaining -> Right events
       | otherwise -> Left "trailing bytes after stored events"
+
+
+decodeEngineError :: Word32 -> ByteString -> Either String EngineError
+decodeEngineError expectedCode bytes =
+  case deserialiseFromBytes
+    (decodeEngineErrorWire expectedCode)
+    (LazyByteString.fromStrict bytes) of
+    Left failure -> Left (show failure)
+    Right (remaining, engineError)
+      | LazyByteString.null remaining -> Right engineError
+      | otherwise -> Left "trailing bytes after engine error"
+
+
+decodeEngineErrorWire :: Word32 -> Decoder s EngineError
+decodeEngineErrorWire expectedCode = do
+  expectListLength 3
+  version <- decodeWord
+  if version == 1
+    then do
+      encodedCode <- decodeWord32
+      if encodedCode == expectedCode
+        then decodeEngineErrorDetail encodedCode
+        else fail "engine status does not match encoded error code"
+    else fail "unsupported engine-error format version"
+
+
+decodeEngineErrorDetail :: Word32 -> Decoder s EngineError
+decodeEngineErrorDetail 1 = do
+  _ <- decodeString
+  pure MalformedInput
+decodeEngineErrorDetail 2 = do
+  expectListLength 4
+  aggregateType <- AggregateType <$> decodeString
+  aggregateId <- AggregateId <$> decodeString
+  expectedVersion <- decodeWord64
+  actualVersion <- decodeWord64
+  pure
+    ( OptimisticConflict
+        (ConflictDetail {aggregateType, aggregateId, expectedVersion, actualVersion})
+    )
+decodeEngineErrorDetail 4 = StorageFailure <$> decodeString
+decodeEngineErrorDetail 5 = InvalidState <$> decodeString
+decodeEngineErrorDetail 6 = do
+  expectListLength 3
+  resource <- decodeString
+  observed <- decodeWord64
+  limit <- decodeWord64
+  pure (ResourceLimitExceeded (ResourceLimitDetail {resource, observed, limit}))
+decodeEngineErrorDetail 100 = do
+  decodeNull
+  pure EnginePanic
+decodeEngineErrorDetail value =
+  fail ("unsupported engine error code " <> show value)
 
 
 decodeStoredEventsWire :: Decoder s [StoredEvent]
