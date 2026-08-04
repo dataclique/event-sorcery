@@ -83,6 +83,7 @@
         apps.check-examples = {
           type = "app";
           program = pkgs.lib.getExe checkExamples;
+          meta = checkExamples.meta;
         };
 
         checks = {
