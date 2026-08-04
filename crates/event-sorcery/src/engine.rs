@@ -453,6 +453,20 @@ impl Engine {
         item_limit: NonZeroUsize,
         byte_limit: NonZeroUsize,
     ) -> Result<Vec<SerializedEvent>, EngineError> {
+        self.load_event_rows_page_bounded(stream, after_sequence, item_limit, byte_limit)
+            .await?
+            .into_iter()
+            .map(SerializedEvent::try_from)
+            .collect()
+    }
+
+    async fn load_event_rows_page_bounded(
+        &self,
+        stream: &StreamIdentity,
+        after_sequence: Option<usize>,
+        item_limit: NonZeroUsize,
+        byte_limit: NonZeroUsize,
+    ) -> Result<Vec<StoredEventRow>, EngineError> {
         let item_limit = i64::try_from(item_limit.get())?;
         let mut transaction = self.pool.begin().await?;
         let storage_bytes = match after_sequence {
@@ -587,7 +601,7 @@ impl Engine {
         };
         transaction.commit().await?;
 
-        rows.into_iter().map(SerializedEvent::try_from).collect()
+        Ok(rows)
     }
 
     /// Loads an opaque event page while preserving legacy JSON event semantics.
@@ -598,7 +612,7 @@ impl Engine {
         item_limit: NonZeroUsize,
         byte_limit: NonZeroUsize,
     ) -> Result<Vec<OpaqueStoredEvent>, EngineError> {
-        self.load_events_page_bounded(stream, after_sequence, item_limit, byte_limit)
+        self.load_event_rows_page_bounded(stream, after_sequence, item_limit, byte_limit)
             .await?
             .into_iter()
             .map(decode_opaque_event)
@@ -1134,17 +1148,25 @@ fn has_engine_payload_provenance(metadata: &Value) -> bool {
     }
 }
 
-fn decode_opaque_event(event: SerializedEvent) -> Result<OpaqueStoredEvent, EngineError> {
-    let SerializedEvent {
+/// Decodes a stored row into opaque bytes without inflating engine-owned envelopes.
+///
+/// Engine-owned payloads deserialize straight from the stored JSON text into their byte
+/// vector. Routing them through `Value` first would allocate a boxed number per stored
+/// byte, so a page inside the storage-byte limit could still exhaust memory by an order
+/// of magnitude. Legacy JSON keeps the `Value` round-trip, which is what defines its
+/// canonical byte form.
+fn decode_opaque_event(row: StoredEventRow) -> Result<OpaqueStoredEvent, EngineError> {
+    let StoredEventRow {
         sequence,
         event_type,
         event_version,
         payload,
         metadata,
         ..
-    } = event;
+    } = row;
+    let metadata: Value = serde_json::from_str(&metadata)?;
     let payload = if has_engine_payload_provenance(&metadata) {
-        let envelope: EnginePayloadEnvelope = serde_json::from_value(payload)?;
+        let envelope: EnginePayloadEnvelope = serde_json::from_str(&payload)?;
         if envelope.opaque.version != 1 {
             return Err(EngineError::OpaquePayloadVersion {
                 actual: envelope.opaque.version,
@@ -1152,11 +1174,11 @@ fn decode_opaque_event(event: SerializedEvent) -> Result<OpaqueStoredEvent, Engi
         }
         envelope.opaque.bytes
     } else {
-        serde_json::to_vec(&payload)?
+        serde_json::to_vec(&serde_json::from_str::<Value>(&payload)?)?
     };
 
     Ok(OpaqueStoredEvent {
-        sequence,
+        sequence: usize::try_from(sequence)?,
         event_type,
         event_version,
         payload,
@@ -1332,6 +1354,92 @@ mod tests {
             panic!("oversized stored page must report its exact accounting");
         };
         assert_eq!((observed, limit), (302, 64));
+    }
+
+    #[tokio::test]
+    async fn opaque_page_returns_engine_owned_bytes_verbatim() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-opaque-page-test", "one");
+        let payload = vec![0x00, 0xff, 0x80, 0x7f];
+        let events = vec![OpaqueProposedEvent::new("Created", "1.0", payload.clone())];
+        engine
+            .commit_opaque(OpaqueCommitRequest::new(stream.clone(), 0, &events))
+            .await
+            .unwrap();
+
+        let page = engine
+            .load_opaque_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(4096).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            page,
+            vec![OpaqueStoredEvent::new(1, "Created", "1.0", payload)]
+        );
+    }
+
+    #[tokio::test]
+    async fn opaque_page_returns_legacy_json_payloads_as_canonical_bytes() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-opaque-legacy-test", "one");
+        let event = serialized_event(&stream, 1);
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+
+        let page = engine
+            .load_opaque_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(4096).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            page,
+            vec![OpaqueStoredEvent::new(
+                1,
+                "Created",
+                "1.0",
+                br#"{"sequence":1}"#.to_vec()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn opaque_page_rejects_storage_bytes_before_decoding_envelopes() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-opaque-byte-page-test", "one");
+        let events = vec![OpaqueProposedEvent::new("Created", "1.0", vec![0x41; 256])];
+        engine
+            .commit_opaque(OpaqueCommitRequest::new(stream.clone(), 0, &events))
+            .await
+            .unwrap();
+
+        let result = engine
+            .load_opaque_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(64).unwrap(),
+            )
+            .await;
+
+        let Err(EngineError::EventPageTooLarge { limit, .. }) = result else {
+            panic!("the opaque page must enforce the storage-byte limit before decoding");
+        };
+        assert_eq!(limit, 64);
     }
 
     #[tokio::test]
