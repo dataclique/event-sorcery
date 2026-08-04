@@ -610,6 +610,9 @@ pub enum JobStoreError {
     /// A requested delay exceeds the representable range.
     #[error("job delay exceeds the representable range")]
     DelayOverflow,
+    /// A millisecond instant cannot be represented by the durable job event.
+    #[error("job instant is out of range: {0}")]
+    InvalidInstant(i64),
 }
 
 /// Decides what a claim transaction should do, given the row it re-read in-txn.
@@ -681,12 +684,19 @@ pub(crate) fn plan_claim(
         return plan_abandon(job_id, claim_seq_usize);
     }
 
+    let Some(lease_until_ms) = now_ms.checked_add(lease_ms) else {
+        error!(target: "cqrs", job_id, now_ms, lease_ms, "job lease instant out of range");
+        return ClaimDecision::Skip;
+    };
+    let Ok(lease_until) = instant_from_millis(lease_until_ms) else {
+        error!(target: "cqrs", job_id, lease_until_ms, "job lease instant out of range");
+        return ClaimDecision::Skip;
+    };
     let claim_id = ClaimId::new();
-    let lease_until_ms = now_ms + lease_ms;
     let claimed = JobEvent::Claimed {
         worker: worker.clone(),
         claim_id: claim_id.clone(),
-        lease_until: from_millis(lease_until_ms),
+        lease_until,
     };
     let new_state = JobState::Claimed {
         kind,
@@ -738,8 +748,8 @@ fn plan_abandon(job_id: &str, claim_seq_usize: usize) -> ClaimDecision<WonClaim>
     }
 }
 
-fn from_millis(millis: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
+fn instant_from_millis(millis: i64) -> Result<DateTime<Utc>, JobStoreError> {
+    DateTime::from_timestamp_millis(millis).ok_or(JobStoreError::InvalidInstant(millis))
 }
 
 /// Builds the `Enqueued` event (sequence 1) for an [`EnqueueRequest`].
@@ -747,7 +757,7 @@ pub(crate) fn enqueued_event(request: &EnqueueRequest) -> Result<SerializedEvent
     Ok(JobEvent::Enqueued {
         kind: request.kind.clone(),
         payload: request.payload.clone(),
-        run_at: from_millis(request.run_at_ms),
+        run_at: instant_from_millis(request.run_at_ms)?,
     }
     .serialized(&request.job_id.to_string(), 1)?)
 }
@@ -759,7 +769,7 @@ pub(crate) fn pending_seed_payload(request: &EnqueueRequest) -> Result<String, J
         JobState::Pending {
             kind: request.kind.clone(),
             payload: request.payload.clone(),
-            run_at: from_millis(request.run_at_ms),
+            run_at: instant_from_millis(request.run_at_ms)?,
             attempt: 0,
             claims: 0,
         },

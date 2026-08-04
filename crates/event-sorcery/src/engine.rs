@@ -185,6 +185,27 @@ pub enum EngineError {
     JobFlush(#[from] crate::job::JobStoreError),
 }
 
+/// An erased durable-job intent committed atomically with domain events.
+pub struct JobSeed(EnqueueRequest);
+
+impl JobSeed {
+    /// Builds a language-neutral seed for the existing event-sourced job aggregate.
+    #[must_use]
+    pub fn new(
+        job_id: crate::JobId,
+        kind: impl Into<String>,
+        payload: Value,
+        run_at_ms: i64,
+    ) -> Self {
+        Self(EnqueueRequest {
+            job_id,
+            kind: crate::job::JobKind::new(kind),
+            payload,
+            run_at_ms,
+        })
+    }
+}
+
 impl<'events> CommitRequest<'events> {
     /// Starts a commit for one stream and its proposed events.
     pub fn new(stream: StreamIdentity, events: &'events [SerializedEvent]) -> Self {
@@ -222,6 +243,14 @@ impl<'events> CommitRequest<'events> {
     /// Attaches durable jobs that must commit atomically with the events.
     pub(crate) fn with_jobs(mut self, jobs: Vec<EnqueueRequest>) -> Self {
         self.jobs = jobs;
+        self
+    }
+
+    /// Includes one durable job intent in the same event-store transaction.
+    #[must_use]
+    pub fn with_job(mut self, job: JobSeed) -> Self {
+        let JobSeed(request) = job;
+        self.jobs.push(request);
         self
     }
 }
@@ -1223,7 +1252,9 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::job::{JobId, JobKind, WorkerId, enqueued_event, pending_seed_payload, plan_claim};
+    use crate::job::{
+        JobId, JobKind, JobStoreError, WorkerId, enqueued_event, pending_seed_payload, plan_claim,
+    };
 
     #[tokio::test]
     async fn migrate_initializes_the_existing_sqlite_schema() {
@@ -1262,6 +1293,22 @@ mod tests {
             payload: serde_json::json!({ "sequence": sequence }),
             metadata: serde_json::json!({}),
         }
+    }
+
+    async fn queue_row_count(engine: &Engine, job_id: &JobId) -> i64 {
+        let job_id = job_id.to_string();
+
+        sqlx::query_scalar!(
+            r"
+            SELECT COUNT(*)
+            FROM job_queue
+            WHERE view_id = ?1
+            ",
+            job_id,
+        )
+        .fetch_one(engine.pool())
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1588,5 +1635,83 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(SqliteJobError::Sql(_))));
+    }
+
+    #[tokio::test]
+    async fn language_neutral_job_seed_commits_with_domain_events() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool);
+        let stream = StreamIdentity::new("engine-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "engine-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        let job_id = JobId::new();
+        let request = CommitRequest::new(stream.clone(), std::slice::from_ref(&event)).with_job(
+            JobSeed::new(
+                job_id,
+                "haskell-test",
+                serde_json::json!([0, 1, 255]),
+                1_000,
+            ),
+        );
+
+        engine.commit(request).await.unwrap();
+
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), [event]);
+        assert_eq!(queue_row_count(&engine, &job_id).await, 1);
+        let job_stream = StreamIdentity::new("job", job_id.to_string());
+        assert_eq!(
+            engine
+                .load_events(&job_stream, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            ["JobEnqueued"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_job_seed_instant_rolls_back_the_domain_event() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool);
+        let stream = StreamIdentity::new("engine-test", "invalid-job-instant");
+        let event = SerializedEvent {
+            aggregate_type: "engine-test".to_string(),
+            aggregate_id: "invalid-job-instant".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        let job_id = JobId::new();
+        let request = CommitRequest::new(stream.clone(), std::slice::from_ref(&event)).with_job(
+            JobSeed::new(job_id, "haskell-test", serde_json::json!([]), i64::MAX),
+        );
+
+        let error = engine.commit(request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::JobFlush(JobStoreError::InvalidInstant(i64::MAX))
+        ));
+        assert!(engine.load_events(&stream, None).await.unwrap().is_empty());
+        assert_eq!(queue_row_count(&engine, &job_id).await, 0);
+        let job_stream = StreamIdentity::new("job", job_id.to_string());
+        assert!(
+            engine
+                .load_events(&job_stream, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

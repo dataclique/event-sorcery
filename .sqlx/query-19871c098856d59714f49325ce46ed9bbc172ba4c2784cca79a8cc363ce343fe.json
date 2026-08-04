@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT COUNT(*)\n            FROM job_queue\n            WHERE view_id = ?1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "COUNT(*)",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "19871c098856d59714f49325ce46ed9bbc172ba4c2784cca79a8cc363ce343fe"
+}
