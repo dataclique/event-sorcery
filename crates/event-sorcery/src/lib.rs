@@ -932,6 +932,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commands_still_commit_after_events_are_compacted() {
+        let pool = test_pool().await;
+        let store = testing::test_store::<Widget>(pool.clone());
+
+        store
+            .send(
+                &NumericId(42),
+                WidgetCommand::Create {
+                    name: "first".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Compaction leaves the events table reporting a lower maximum sequence
+        // than the aggregate's real version; a write must not read that as a
+        // concurrency conflict.
+        let deleted = compact_events::<Widget>(&pool).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        store
+            .send(
+                &NumericId(42),
+                WidgetCommand::Rename {
+                    name: "second".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = load_entity::<Widget>(&pool, &NumericId(42)).await.unwrap();
+        let widget = entity.expect("entity should exist after a post-compaction command");
+        assert_eq!(widget.name, "second");
+    }
+
+    #[tokio::test]
     async fn snapshot_version_advances_across_loads() {
         let pool = test_pool().await;
         let store = testing::test_store::<Widget>(pool.clone());

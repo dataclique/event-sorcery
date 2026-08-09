@@ -16,6 +16,46 @@ use crate::job_sqlite::SqliteJobError;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 
 const ENGINE_PAYLOAD_KEY: &str = "$event-sorcery-engine";
+const ENGINE_PAYLOAD_VERSION: u8 = 1;
+
+/// Derives the two bounded-page queries from one column list and one window.
+///
+/// `load_events_page_bounded` only bounds what it returns if the bytes it
+/// measures describe exactly the rows it fetches, so neither the columns nor
+/// the window may be restated per query.
+macro_rules! event_page_queries {
+    (window: $window:literal, blob_columns: [$($column:literal),+ $(,)?]) => {
+        /// Rows of one bounded page window, ordered by sequence.
+        const EVENT_PAGE_ROWS_SQL: &str =
+            concat!("SELECT sequence", $(", ", $column,)+ $window);
+
+        /// Storage bytes of every row in that same window, ordered by sequence.
+        ///
+        /// The leading `8` accounts for the stored sequence, which SQLite keeps
+        /// as an integer rather than a measurable blob.
+        const EVENT_PAGE_STORAGE_BYTES_SQL: &str =
+            concat!("SELECT 8", $(" + length(CAST(", $column, " AS BLOB))",)+ $window);
+    };
+}
+
+event_page_queries!(
+    window: r"
+    FROM events
+    WHERE aggregate_type = ?1
+      AND aggregate_id = ?2
+      AND (?3 IS NULL OR sequence > ?3)
+    ORDER BY sequence
+    LIMIT ?4
+    ",
+    blob_columns: [
+        "aggregate_type",
+        "aggregate_id",
+        "event_type",
+        "event_version",
+        "payload",
+        "metadata",
+    ]
+);
 
 /// Identifies one serialized aggregate event stream at the storage boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,8 +159,21 @@ pub struct Engine {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EngineError {
-    #[error("optimistic lock error: aggregate has been modified concurrently")]
-    OptimisticLock,
+    #[error(
+        "optimistic lock error: stream is at version {actual_version}, \
+         not the expected {expected_version}"
+    )]
+    OptimisticLock {
+        expected_version: usize,
+        actual_version: usize,
+    },
+    #[error("commit event sequence {offending} does not follow stream version {expected_version}")]
+    NonContiguousSequences {
+        expected_version: usize,
+        offending: usize,
+    },
+    #[error("stored engine payload envelope version {version} is not supported")]
+    UnsupportedPayloadVersion { version: u8 },
     #[error("snapshot update was requested without persisted events")]
     EmptySnapshotUpdate,
     #[error("commit event stream {actual:?} does not match requested stream {expected:?}")]
@@ -433,7 +486,13 @@ impl Engine {
         rows.into_iter().map(SerializedEvent::try_from).collect()
     }
 
-    /// Loads an item- and storage-byte-bounded event page.
+    /// Loads an event page bounded by item count and stored payload bytes.
+    ///
+    /// The byte budget shrinks the page instead of rejecting it: the returned
+    /// prefix is the longest run of events whose stored bytes fit `byte_limit`,
+    /// so a caller advances through an oversized stream by paging on the last
+    /// returned sequence. A single event larger than the whole budget cannot be
+    /// paged around and is reported as [`EngineError::EventPageTooLarge`].
     pub async fn load_events_page_bounded(
         &self,
         stream: &StreamIdentity,
@@ -442,158 +501,38 @@ impl Engine {
         byte_limit: NonZeroUsize,
     ) -> Result<Vec<LoadedEvent>, EngineError> {
         let item_limit = i64::try_from(item_limit.get())?;
+        let after_sequence = after_sequence.map(i64::try_from).transpose()?;
         let mut transaction = self.pool.begin().await?;
-        let storage_bytes = match after_sequence {
-            None => {
-                sqlx::query_scalar::<_, i64>(
-                    r"
-                    SELECT COALESCE(SUM(
-                        length(CAST(aggregate_type AS BLOB))
-                        + length(CAST(aggregate_id AS BLOB))
-                        + 8
-                        + length(CAST(event_type AS BLOB))
-                        + length(CAST(event_version AS BLOB))
-                        + length(CAST(payload AS BLOB))
-                        + length(CAST(metadata AS BLOB))
-                    ), 0)
-                    FROM (
-                        SELECT aggregate_type,
-                               aggregate_id,
-                               sequence,
-                               event_type,
-                               event_version,
-                               payload,
-                               metadata
-                        FROM events
-                        WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                        ORDER BY sequence
-                        LIMIT ?3
-                    )
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(item_limit)
-                .fetch_one(&mut *transaction)
-                .await?
-            }
-            Some(after_sequence) => {
-                let after_sequence = i64::try_from(after_sequence)?;
-                sqlx::query_scalar::<_, i64>(
-                    r"
-                    SELECT COALESCE(SUM(
-                        length(CAST(aggregate_type AS BLOB))
-                        + length(CAST(aggregate_id AS BLOB))
-                        + 8
-                        + length(CAST(event_type AS BLOB))
-                        + length(CAST(event_version AS BLOB))
-                        + length(CAST(payload AS BLOB))
-                        + length(CAST(metadata AS BLOB))
-                    ), 0)
-                    FROM (
-                        SELECT aggregate_type,
-                               aggregate_id,
-                               sequence,
-                               event_type,
-                               event_version,
-                               payload,
-                               metadata
-                        FROM events
-                        WHERE aggregate_type = ?1
-                          AND aggregate_id = ?2
-                          AND sequence > ?3
-                        ORDER BY sequence
-                        LIMIT ?4
-                    )
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(after_sequence)
-                .bind(item_limit)
-                .fetch_one(&mut *transaction)
-                .await?
-            }
-        };
-        let observed = usize::try_from(storage_bytes)?;
-        if observed > byte_limit.get() {
-            return Err(EngineError::EventPageTooLarge {
-                observed,
-                limit: byte_limit.get(),
-            });
-        }
+        let storage_bytes = sqlx::query_scalar::<_, i64>(EVENT_PAGE_STORAGE_BYTES_SQL)
+            .bind(&stream.aggregate_type)
+            .bind(&stream.aggregate_id)
+            .bind(after_sequence)
+            .bind(item_limit)
+            .fetch_all(&mut *transaction)
+            .await?;
+        let page_limit = fitting_page_limit(storage_bytes, byte_limit)?;
 
-        let rows = match after_sequence {
-            None => {
-                sqlx::query_as::<_, StoredEventRow>(
-                    r"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload,
-                           metadata
-                    FROM events
-                    WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                    ORDER BY sequence
-                    LIMIT ?3
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(item_limit)
-                .fetch_all(&mut *transaction)
-                .await?
-            }
-            Some(after_sequence) => {
-                let after_sequence = i64::try_from(after_sequence)?;
-                sqlx::query_as::<_, StoredEventRow>(
-                    r"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload,
-                           metadata
-                    FROM events
-                    WHERE aggregate_type = ?1
-                      AND aggregate_id = ?2
-                      AND sequence > ?3
-                    ORDER BY sequence
-                    LIMIT ?4
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(after_sequence)
-                .bind(item_limit)
-                .fetch_all(&mut *transaction)
-                .await?
-            }
-        };
+        let rows = sqlx::query_as::<_, StoredEventRow>(EVENT_PAGE_ROWS_SQL)
+            .bind(&stream.aggregate_type)
+            .bind(&stream.aggregate_id)
+            .bind(after_sequence)
+            .bind(page_limit)
+            .fetch_all(&mut *transaction)
+            .await?;
         transaction.commit().await?;
 
         rows.into_iter().map(LoadedEvent::try_from).collect()
     }
 
-    /// Reads the current stream version, where zero means no events.
+    /// Reads the current stream version, where zero means the stream holds no
+    /// events and no snapshot covers any.
+    ///
+    /// This is the same oracle [`Engine::commit`] validates against, so a
+    /// compacted stream reports the version its snapshot still covers rather
+    /// than the lower maximum sequence its surviving events show.
     pub async fn current_version(&self, stream: &StreamIdentity) -> Result<usize, EngineError> {
-        let version = sqlx::query_scalar::<_, Option<i64>>(
-            r"
-            SELECT MAX(sequence)
-            FROM events
-            WHERE aggregate_type = ?1 AND aggregate_id = ?2
-            ",
-        )
-        .bind(&stream.aggregate_type)
-        .bind(&stream.aggregate_id)
-        .fetch_one(&self.pool)
-        .await?;
-        version.map_or(Ok(0), |version| {
-            usize::try_from(version).map_err(Into::into)
-        })
+        let mut connection = self.pool.acquire().await?;
+        committed_stream_version(&mut connection, stream).await
     }
 
     /// Loads the current snapshot for one stream when present.
@@ -715,27 +654,24 @@ impl Engine {
         let expected_version = validate_event_sequences(events)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
+        // An empty batch has no sequence to conflict with and nothing to append;
+        // such a commit carries only durable job intent.
         if let Some(expected_version) = expected_version {
-            let actual_version = sqlx::query_scalar::<_, Option<i64>>(
-                r"
-                SELECT MAX(sequence)
-                FROM events
-                WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                ",
-            )
-            .bind(&stream.aggregate_type)
-            .bind(&stream.aggregate_id)
-            .fetch_one(&mut *tx)
-            .await?
-            .map_or(Ok(0), |version| {
-                usize::try_from(version).map_err(EngineError::from)
-            })?;
-            if actual_version != expected_version {
-                return Err(EngineError::OptimisticLock);
+            let actual_version = committed_stream_version(&mut tx, &stream).await?;
+            // Only a durable version *ahead* of the batch is a conflict. A
+            // compacted stream legally reports a lower maximum event sequence
+            // than the aggregate's real version (see ADR-0003), so the snapshot's
+            // covered sequence has to bound the check too: without it a stale
+            // writer would silently reuse a sequence compaction erased.
+            if actual_version > expected_version {
+                return Err(EngineError::OptimisticLock {
+                    expected_version,
+                    actual_version,
+                });
             }
-        }
 
-        sqlite_es::insert_serialized_events_batch(&mut tx, "events", events).await?;
+            append_events(&mut tx, &stream, expected_version, events).await?;
+        }
 
         if let Some(snapshot) = snapshot {
             let last_sequence = events
@@ -777,12 +713,8 @@ impl Engine {
 
         for request in jobs {
             let event = crate::job::enqueued_event(&request)?;
-            sqlite_es::insert_serialized_events_batch(
-                &mut tx,
-                "events",
-                std::slice::from_ref(&event),
-            )
-            .await?;
+            let job_stream = StreamIdentity::from_event(&event);
+            append_events(&mut tx, &job_stream, 0, std::slice::from_ref(&event)).await?;
 
             let payload = crate::job::pending_seed_payload(&request)?;
             let job_id = request.job_id.to_string();
@@ -800,6 +732,79 @@ impl Engine {
 
         tx.commit().await?;
         Ok(())
+    }
+}
+
+/// Reads one stream's durable version, where zero means nothing was ever
+/// committed.
+///
+/// Compaction deletes every event a snapshot already covers, so
+/// `MAX(events.sequence)` alone can fall back below the aggregate's real version
+/// and stop reporting stale writers. `snapshots.last_sequence` is the durable
+/// record of how far the erased prefix reached, so the greater of the two is the
+/// only sound conflict oracle. Reads on the caller's connection, so a commit
+/// sees the two records under the write lock it already holds and appends
+/// against exactly what it observed.
+async fn committed_stream_version(
+    connection: &mut SqliteConnection,
+    stream: &StreamIdentity,
+) -> Result<usize, EngineError> {
+    let version = sqlx::query_scalar::<_, i64>(
+        r"
+        SELECT MAX(
+            COALESCE(
+                (SELECT MAX(sequence) FROM events
+                 WHERE aggregate_type = ?1 AND aggregate_id = ?2),
+                0
+            ),
+            COALESCE(
+                (SELECT last_sequence FROM snapshots
+                 WHERE aggregate_type = ?1 AND aggregate_id = ?2),
+                0
+            )
+        )
+        ",
+    )
+    .bind(&stream.aggregate_type)
+    .bind(&stream.aggregate_id)
+    .fetch_one(connection)
+    .await?;
+    usize::try_from(version).map_err(EngineError::from)
+}
+
+/// Appends one validated batch, reporting a sequence collision as the conflict
+/// it is.
+///
+/// The durable version is re-read on the caller's connection, which still holds
+/// the commit's write lock, so the reported versions are the ones that produced
+/// the collision rather than whatever a later unlocked read would observe.
+async fn append_events(
+    connection: &mut SqliteConnection,
+    stream: &StreamIdentity,
+    expected_version: usize,
+    events: &[SerializedEvent],
+) -> Result<(), EngineError> {
+    let inserted = sqlite_es::insert_serialized_events_batch(connection, "events", events).await;
+
+    match inserted {
+        Ok(()) => Ok(()),
+        Err(sqlite_es::SqliteAggregateError::OptimisticLock) => {
+            let actual_version = committed_stream_version(connection, stream).await?;
+            Err(EngineError::OptimisticLock {
+                expected_version,
+                actual_version,
+            })
+        }
+        Err(sqlite_es::SqliteAggregateError::Connection(source)) => Err(EngineError::Sql(source)),
+        Err(sqlite_es::SqliteAggregateError::Deserialization(source)) => {
+            Err(EngineError::Json(source))
+        }
+        Err(sqlite_es::SqliteAggregateError::TryFromInt(source)) => {
+            Err(EngineError::Integer(source))
+        }
+        Err(sqlite_es::SqliteAggregateError::EmptySnapshotUpdate) => {
+            Err(EngineError::EmptySnapshotUpdate)
+        }
     }
 }
 
@@ -945,26 +950,16 @@ impl From<EngineError> for PersistenceError {
     fn from(error: EngineError) -> Self {
         use EngineError::*;
         match error {
-            OptimisticLock => Self::OptimisticLockError,
-            EmptySnapshotUpdate | StreamIdentityMismatch { .. } | EventPageTooLarge { .. } => {
-                Self::UnknownError(Box::new(error))
-            }
+            OptimisticLock { .. } => Self::OptimisticLockError,
+            EmptySnapshotUpdate
+            | StreamIdentityMismatch { .. }
+            | EventPageTooLarge { .. }
+            | NonContiguousSequences { .. }
+            | UnsupportedPayloadVersion { .. } => Self::UnknownError(Box::new(error)),
             Sql(source) => Self::ConnectionError(Box::new(source)),
             Json(source) => Self::DeserializationError(Box::new(source)),
             Integer(source) => Self::UnknownError(Box::new(source)),
             JobFlush(source) => Self::UnknownError(Box::new(source)),
-        }
-    }
-}
-
-impl From<sqlite_es::SqliteAggregateError> for EngineError {
-    fn from(error: sqlite_es::SqliteAggregateError) -> Self {
-        match error {
-            sqlite_es::SqliteAggregateError::OptimisticLock => Self::OptimisticLock,
-            sqlite_es::SqliteAggregateError::Connection(source) => Self::Sql(source),
-            sqlite_es::SqliteAggregateError::Deserialization(source) => Self::Json(source),
-            sqlite_es::SqliteAggregateError::TryFromInt(source) => Self::Integer(source),
-            sqlite_es::SqliteAggregateError::EmptySnapshotUpdate => Self::EmptySnapshotUpdate,
         }
     }
 }
@@ -991,22 +986,57 @@ fn validate_event_sequences(events: &[SerializedEvent]) -> Result<Option<usize>,
     let Some(first) = events.first() else {
         return Ok(None);
     };
-    let expected_version = first
-        .sequence
-        .checked_sub(1)
-        .ok_or(EngineError::OptimisticLock)?;
+    let Some(expected_version) = first.sequence.checked_sub(1) else {
+        return Err(EngineError::NonContiguousSequences {
+            expected_version: 0,
+            offending: first.sequence,
+        });
+    };
     events.iter().enumerate().try_for_each(|(index, event)| {
         let expected_sequence = expected_version
             .checked_add(index)
-            .and_then(|sequence| sequence.checked_add(1))
-            .ok_or(EngineError::OptimisticLock)?;
-        if event.sequence == expected_sequence {
-            Ok(())
-        } else {
-            Err(EngineError::OptimisticLock)
+            .and_then(|sequence| sequence.checked_add(1));
+        match expected_sequence {
+            Some(expected_sequence) if event.sequence == expected_sequence => Ok(()),
+            Some(_) | None => Err(EngineError::NonContiguousSequences {
+                expected_version,
+                offending: event.sequence,
+            }),
         }
     })?;
     Ok(Some(expected_version))
+}
+
+/// How many leading events of a measured page window fit the storage-byte budget.
+///
+/// Returning a shorter page keeps an oversized stream readable: the caller
+/// continues from the last returned sequence. Only a first event that alone
+/// exceeds the whole budget leaves no prefix to return.
+fn fitting_page_limit(
+    storage_bytes: Vec<i64>,
+    byte_limit: NonZeroUsize,
+) -> Result<i64, EngineError> {
+    let storage_bytes = storage_bytes
+        .into_iter()
+        .map(usize::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let fitting = storage_bytes
+        .iter()
+        .scan(0_usize, |total, bytes| {
+            *total = total.checked_add(*bytes)?;
+            Some(*total)
+        })
+        .take_while(|total| *total <= byte_limit.get())
+        .count();
+
+    if let (0, Some(observed)) = (fitting, storage_bytes.first()) {
+        return Err(EngineError::EventPageTooLarge {
+            observed: *observed,
+            limit: byte_limit.get(),
+        });
+    }
+
+    i64::try_from(fitting).map_err(EngineError::from)
 }
 
 fn prepare_event_payloads(
@@ -1054,33 +1084,47 @@ fn encode_engine_payload(payload: EnginePayload) -> Result<Value, EngineError> {
     object.insert(
         ENGINE_PAYLOAD_KEY.to_string(),
         serde_json::to_value(EnginePayloadEnvelope {
-            version: 1,
+            version: ENGINE_PAYLOAD_VERSION,
             payload,
         })?,
     );
     Ok(Value::Object(object))
 }
 
-fn decode_engine_payload(payload: Value) -> LoadedPayload {
-    let Value::Object(object) = &payload else {
-        return LoadedPayload::Json(payload);
+/// Reads the engine envelope out of a stored payload, if it carries one.
+///
+/// A stored object whose single key is the engine-reserved one can only have
+/// been written by the engine, because [`prepare_event_payloads`] escapes any
+/// domain payload that would collide with it. Such an object failing to parse
+/// as an envelope, or carrying an unknown envelope version, is therefore
+/// corruption or a newer writer -- never domain data -- and must not be handed
+/// back to the caller as an ordinary JSON payload.
+fn engine_envelope(payload: &Value) -> Result<Option<EnginePayload>, EngineError> {
+    let Value::Object(object) = payload else {
+        return Ok(None);
     };
     if object.len() != 1 {
-        return LoadedPayload::Json(payload);
+        return Ok(None);
     }
     let Some(envelope) = object.get(ENGINE_PAYLOAD_KEY) else {
-        return LoadedPayload::Json(payload);
+        return Ok(None);
     };
-    let Ok(envelope) = serde_json::from_value::<EnginePayloadEnvelope>(envelope.clone()) else {
-        return LoadedPayload::Json(payload);
-    };
-    if envelope.version != 1 {
-        return LoadedPayload::Json(payload);
+    let envelope = serde_json::from_value::<EnginePayloadEnvelope>(envelope.clone())?;
+    if envelope.version != ENGINE_PAYLOAD_VERSION {
+        return Err(EngineError::UnsupportedPayloadVersion {
+            version: envelope.version,
+        });
     }
-    match envelope.payload {
-        EnginePayload::OpaqueBytes(bytes) => LoadedPayload::OpaqueBytes(bytes),
-        EnginePayload::EscapedJson(payload) => LoadedPayload::Json(payload),
-    }
+    Ok(Some(envelope.payload))
+}
+
+/// Recovers a stored payload's representation.
+fn decode_engine_payload(payload: Value) -> Result<LoadedPayload, EngineError> {
+    Ok(match engine_envelope(&payload)? {
+        None => LoadedPayload::Json(payload),
+        Some(EnginePayload::OpaqueBytes(bytes)) => LoadedPayload::OpaqueBytes(bytes),
+        Some(EnginePayload::EscapedJson(escaped)) => LoadedPayload::Json(escaped),
+    })
 }
 
 fn clone_event_with_payload(event: &SerializedEvent, payload: Value) -> SerializedEvent {
@@ -1110,11 +1154,13 @@ impl TryFrom<StoredEventRow> for SerializedEvent {
     type Error = EngineError;
 
     fn try_from(row: StoredEventRow) -> Result<Self, Self::Error> {
-        let payload = match decode_engine_payload(serde_json::from_str(&row.payload)?) {
-            LoadedPayload::Json(payload) => payload,
-            LoadedPayload::OpaqueBytes(bytes) => {
-                encode_engine_payload(EnginePayload::OpaqueBytes(bytes))?
-            }
+        let stored: Value = serde_json::from_str(&row.payload)?;
+        // Opaque bytes have no native representation, so they stay in the
+        // envelope they were stored in: decoding and re-encoding would only
+        // rebuild the value already in hand.
+        let payload = match engine_envelope(&stored)? {
+            None | Some(EnginePayload::OpaqueBytes(_)) => stored,
+            Some(EnginePayload::EscapedJson(escaped)) => escaped,
         };
         Ok(Self {
             aggregate_type: row.aggregate_type,
@@ -1146,7 +1192,7 @@ impl TryFrom<StoredEventRow> for LoadedEvent {
             sequence: usize::try_from(sequence)?,
             event_type,
             event_version,
-            payload: decode_engine_payload(serde_json::from_str(&payload)?),
+            payload: decode_engine_payload(serde_json::from_str(&payload)?)?,
         })
     }
 }
@@ -1281,7 +1327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_stream_reads_reject_storage_bytes_before_loading_the_page() {
+    async fn bounded_stream_reads_reject_a_lone_event_larger_than_the_whole_budget() {
         let engine = Engine::new(create_test_pool().await.unwrap());
         let stream = StreamIdentity::new("engine-byte-page-test", "one");
         let event = SerializedEvent {
@@ -1315,6 +1361,349 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_stream_reads_truncate_at_the_storage_byte_boundary() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-truncate-test", "one");
+        let events = [
+            serialized_event(&stream, 1),
+            serialized_event(&stream, 2),
+            SerializedEvent {
+                payload: serde_json::Value::String("x".repeat(4096)),
+                ..serialized_event(&stream, 3)
+            },
+        ];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await
+            .unwrap();
+
+        // The two small events fit the budget; the fat third one does not, so
+        // the page stops short instead of failing the whole read.
+        let page = engine
+            .load_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(10).unwrap(),
+                NonZeroUsize::new(1_024).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // Paging on the last returned sequence reaches the fat event under a
+        // budget that can hold it, so the stream stays fully readable.
+        let page = engine
+            .load_events_page_bounded(
+                &stream,
+                Some(2),
+                NonZeroUsize::new(10).unwrap(),
+                NonZeroUsize::new(8_192).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_reads_return_an_empty_page_for_an_unknown_stream() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-truncate-test", "missing");
+
+        let page = engine
+            .load_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(10).unwrap(),
+                NonZeroUsize::new(1_024).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page, Vec::<LoadedEvent>::new());
+    }
+
+    #[test]
+    fn stored_payloads_under_an_unknown_envelope_version_are_rejected() {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            ENGINE_PAYLOAD_KEY.to_string(),
+            serde_json::json!({
+                "version": 2,
+                "payload": { "opaque_bytes": [1, 2, 3] },
+            }),
+        );
+
+        let error = decode_engine_payload(Value::Object(object)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::UnsupportedPayloadVersion { version: 2 }
+        ));
+    }
+
+    #[test]
+    fn stored_payloads_under_a_corrupt_envelope_are_rejected() {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            ENGINE_PAYLOAD_KEY.to_string(),
+            serde_json::json!({ "version": 1 }),
+        );
+
+        let error = decode_engine_payload(Value::Object(object)).unwrap_err();
+
+        assert!(matches!(error, EngineError::Json(_)));
+    }
+
+    #[test]
+    fn stored_payloads_without_the_reserved_key_stay_domain_json() {
+        let payload = serde_json::json!({ "sequence": 1 });
+
+        let decoded = decode_engine_payload(payload.clone()).unwrap();
+
+        assert_eq!(decoded, LoadedPayload::Json(payload));
+    }
+
+    fn payload_reserving_the_engine_key(extra: Option<(&str, Value)>) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            ENGINE_PAYLOAD_KEY.to_string(),
+            serde_json::json!({ "domain": true }),
+        );
+        if let Some((key, value)) = extra {
+            object.insert(key.to_string(), value);
+        }
+        Value::Object(object)
+    }
+
+    #[tokio::test]
+    async fn committed_payloads_that_collide_with_the_reserved_key_load_back_unchanged() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-reserved-key-test", "one");
+        // Both the lone reserved key and the reserved key beside a sibling must
+        // be escaped on write; otherwise the reader would reject them as a
+        // corrupt engine envelope.
+        let lone = payload_reserving_the_engine_key(None);
+        let beside_sibling =
+            payload_reserving_the_engine_key(Some(("sequence", serde_json::json!(2))));
+        let events = [
+            SerializedEvent {
+                payload: lone.clone(),
+                ..serialized_event(&stream, 1)
+            },
+            SerializedEvent {
+                payload: beside_sibling.clone(),
+                ..serialized_event(&stream, 2)
+            },
+        ];
+
+        engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), events);
+        let page = engine
+            .load_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(10).unwrap(),
+                NonZeroUsize::new(8_192).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.into_iter()
+                .map(|event| event.payload)
+                .collect::<Vec<_>>(),
+            vec![
+                LoadedPayload::Json(lone),
+                LoadedPayload::Json(beside_sibling)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn opaque_payload_commits_load_back_as_the_bytes_they_stored() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-opaque-test", "one");
+        // Not valid UTF-8, so only the byte-preserving envelope can carry it.
+        let bytes = vec![0_u8, 1, 0xff, 0xfe, 0x80];
+        let event = SerializedEvent {
+            payload: serde_json::json!(bytes.clone()),
+            ..serialized_event(&stream, 1)
+        };
+
+        engine
+            .commit(
+                CommitRequest::new(stream.clone(), std::slice::from_ref(&event))
+                    .with_opaque_payloads(),
+            )
+            .await
+            .unwrap();
+
+        let page = engine
+            .load_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(10).unwrap(),
+                NonZeroUsize::new(8_192).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.into_iter()
+                .map(|event| event.payload)
+                .collect::<Vec<_>>(),
+            vec![LoadedPayload::OpaqueBytes(bytes.clone())]
+        );
+
+        // The native contract has no opaque representation, so a native read
+        // hands back the stored envelope, which still decodes to the same bytes.
+        let stored_events = engine.load_events(&stream, None).await.unwrap();
+        let [stored] = stored_events.as_slice() else {
+            panic!("expected exactly one stored event");
+        };
+        assert_eq!(
+            decode_engine_payload(stored.payload.clone()).unwrap(),
+            LoadedPayload::OpaqueBytes(bytes)
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_accepts_a_stream_whose_compacted_prefix_lowered_its_max_sequence() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("engine-compaction-test", "one");
+        let persisted = (1..=2)
+            .map(|sequence| serialized_event(&stream, sequence))
+            .collect::<Vec<_>>();
+        engine
+            .commit(CommitRequest::new(stream.clone(), &persisted))
+            .await
+            .unwrap();
+
+        // Compaction of a snapshot-backed aggregate deletes the covered prefix,
+        // so the events table no longer holds the stream's real version.
+        sqlx::query("DELETE FROM events WHERE aggregate_type = ?1 AND aggregate_id = ?2")
+            .bind("engine-compaction-test")
+            .bind("one")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 0);
+
+        let next = [serialized_event(&stream, 3)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &next))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn current_version_reports_the_sequence_a_snapshot_covers_after_compaction() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("engine-compacted-version-test", "one");
+        let persisted = (1..=2)
+            .map(|sequence| serialized_event(&stream, sequence))
+            .collect::<Vec<_>>();
+        engine
+            .commit(
+                CommitRequest::new(stream.clone(), &persisted)
+                    .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 2 }), 1))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "DELETE FROM events \
+             WHERE aggregate_type = ?1 \
+               AND aggregate_id = ?2 \
+               AND sequence <= (SELECT last_sequence FROM snapshots \
+                                WHERE aggregate_type = ?1 AND aggregate_id = ?2)",
+        )
+        .bind("engine-compacted-version-test")
+        .bind("one")
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), vec![]);
+
+        // The events table forgot every sequence, so only the snapshot still
+        // records how far the stream reached. A reader that trusted the events
+        // alone would restart a live aggregate from version zero.
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_a_stale_writer_whose_sequence_a_snapshot_already_covers() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("engine-compaction-conflict-test", "one");
+        let persisted = [serialized_event(&stream, 1)];
+        engine
+            .commit(
+                CommitRequest::new(stream.clone(), &persisted)
+                    .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 1 }), 1))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Compaction deletes exactly the prefix the snapshot covers, so the
+        // events table no longer remembers that sequence 1 was ever written.
+        sqlx::query(
+            "DELETE FROM events \
+             WHERE aggregate_type = ?1 \
+               AND aggregate_id = ?2 \
+               AND sequence <= (SELECT last_sequence FROM snapshots \
+                                WHERE aggregate_type = ?1 AND aggregate_id = ?2)",
+        )
+        .bind("engine-compaction-conflict-test")
+        .bind("one")
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 1);
+
+        // A writer that loaded before the first commit proposes sequence 1
+        // again. Replay would never reach it behind the snapshot, so accepting
+        // it would lose the update silently.
+        let stale = [serialized_event(&stream, 1)];
+        let result = engine
+            .commit(CommitRequest::new(stream.clone(), &stale))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::OptimisticLock {
+                expected_version: 0,
+                actual_version: 1,
+            })
+        ));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 1);
+
+        // A writer that loaded the snapshot proposes the sequence after it and
+        // still commits.
+        let next = [serialized_event(&stream, 2)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &next))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
     async fn commit_and_load_use_the_existing_serialized_event_contract() {
         let engine = Engine::new(create_test_pool().await.unwrap());
         let stream = StreamIdentity::new("engine-test", "one");
@@ -1342,8 +1731,63 @@ mod tests {
             .commit(CommitRequest::new(stream.clone(), &events))
             .await;
 
-        assert!(matches!(result, Err(EngineError::OptimisticLock)));
+        assert!(matches!(
+            result,
+            Err(EngineError::NonContiguousSequences {
+                expected_version: 0,
+                offending: 3,
+            })
+        ));
         assert_eq!(engine.current_version(&stream).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_a_batch_starting_below_the_first_sequence() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-test", "zero-sequence");
+        let events = [serialized_event(&stream, 0)];
+
+        let result = engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::NonContiguousSequences {
+                expected_version: 0,
+                offending: 0,
+            })
+        ));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_a_writer_whose_expected_version_trails_the_stream() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-test", "stale-writer");
+        let persisted = (1..=3)
+            .map(|sequence| serialized_event(&stream, sequence))
+            .collect::<Vec<_>>();
+        engine
+            .commit(CommitRequest::new(stream.clone(), &persisted))
+            .await
+            .unwrap();
+
+        // A writer that loaded the stream at version 1 proposes sequence 2,
+        // which two committed events already passed.
+        let stale = [serialized_event(&stream, 2)];
+        let result = engine
+            .commit(CommitRequest::new(stream.clone(), &stale))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::OptimisticLock {
+                expected_version: 1,
+                actual_version: 3,
+            })
+        ));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 3);
     }
 
     #[tokio::test]

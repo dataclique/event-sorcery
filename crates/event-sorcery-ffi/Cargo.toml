@@ -13,6 +13,7 @@ crate-type = ["rlib", "staticlib"]
 ciborium.workspace = true
 cqrs-es.workspace = true
 event-sorcery.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -22,6 +23,10 @@ tokio.workspace = true
 [build-dependencies]
 cbindgen.workspace = true
 
+# Cargo lint inheritance is per-table and all-or-nothing, so these tables exist
+# only to relax the workspace's `unsafe_code = "forbid"` for the C entry points.
+# Everything else mirrors `[workspace.lints]`: a panic here is a correctness bug,
+# because the ABI converts unwinds into an error code instead of a stack trace.
 [lints.rust]
 unsafe_code = "allow"
 warnings = "deny"
@@ -30,6 +35,14 @@ warnings = "deny"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+enum_glob_use = "allow"
+doc_markdown = "allow"
+items_after_statements = "allow"
+missing_const_for_fn = "allow"
+missing_docs_in_private_items = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+redundant_pub_crate = "allow"

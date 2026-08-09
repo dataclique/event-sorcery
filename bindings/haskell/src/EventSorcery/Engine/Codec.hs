@@ -1,4 +1,5 @@
 module EventSorcery.Engine.Codec (
+  decodeCloseStatus,
   decodeEngineError,
   decodeStoredEvents,
   encodeCommit,
@@ -28,6 +29,7 @@ import Codec.CBOR.Encoding (
   encodeWord64,
  )
 import Codec.CBOR.Read (deserialiseFromBytes)
+import Codec.CBOR.Term (decodeTerm)
 import Codec.CBOR.Write (toStrictByteString)
 import Control.Monad (replicateM)
 import Data.ByteString (ByteString)
@@ -136,6 +138,17 @@ decodeEngineError expectedCode bytes =
       | otherwise -> Left "trailing bytes after engine error"
 
 
+-- | Interprets the status of a call that carries no error buffer.
+--
+-- Only @es_close@ answers this way, so the numeric code is the whole error and
+-- the invalid-state text names the one condition the engine reports there.
+decodeCloseStatus :: Word32 -> Either EngineError ()
+decodeCloseStatus 0 = Right ()
+decodeCloseStatus 5 = Left (InvalidState "store close rejected the owner handle")
+decodeCloseStatus 100 = Left EnginePanic
+decodeCloseStatus status = Left (UnknownEngineError status)
+
+
 decodeEngineErrorWire :: Word32 -> Decoder s EngineError
 decodeEngineErrorWire expectedCode = do
   expectListLength 3
@@ -174,8 +187,15 @@ decodeEngineErrorDetail 6 = do
 decodeEngineErrorDetail 100 = do
   decodeNull
   pure EnginePanic
-decodeEngineErrorDetail value =
-  fail ("unsupported engine error code " <> show value)
+
+-- The engine may be newer than this binding, so a code it does not model keeps
+-- its numeric identity instead of collapsing into a binding protocol failure.
+-- The clauses above are exactly the classes the engine can return today; an
+-- ABI-version mismatch is not among them, because the binding raises that one
+-- itself and there is no encoded detail shape to agree on.
+decodeEngineErrorDetail code = do
+  _ <- decodeTerm
+  pure (UnknownEngineError code)
 
 
 decodeStoredEventsWire :: Decoder s [StoredEvent]
