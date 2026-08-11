@@ -8,6 +8,8 @@ use std::num::TryFromIntError;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::str::FromStr;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
@@ -219,6 +221,8 @@ pub struct EsStore {
     poisoned: AtomicBool,
     #[cfg(test)]
     panic_on_close: AtomicBool,
+    #[cfg(test)]
+    joiners_waiting: AtomicU64,
 }
 
 #[unsafe(no_mangle)]
@@ -287,6 +291,8 @@ pub unsafe extern "C" fn es_open(
             poisoned: AtomicBool::new(false),
             #[cfg(test)]
             panic_on_close: AtomicBool::new(false),
+            #[cfg(test)]
+            joiners_waiting: AtomicU64::new(0),
         });
         publish_store(out_store, store)
     })
@@ -1441,6 +1447,8 @@ impl EsStore {
 
     fn close(&self, role: CloseRole) -> Result<(), AbiError> {
         if matches!(role, CloseRole::Join) {
+            #[cfg(test)]
+            self.joiners_waiting.fetch_add(1, Ordering::AcqRel);
             let mut state = self
                 .state
                 .lock()
@@ -3379,11 +3387,19 @@ mod tests {
                 first_tx.send(result).unwrap();
             });
             lease.wait_until_closing();
+            let store_for_join = Arc::clone(&lease.store);
             scope.spawn(move || {
                 let result = unsafe { es_close(owner_address as *mut *mut EsStore) };
                 closed_tx.send(result).unwrap();
             });
 
+            // The destroyer stays parked on the held lease until the
+            // joiner is provably inside its wait, so the joiner can
+            // never race past a completed teardown into the idempotent
+            // ES_OK path instead of observing the close outcome.
+            while store_for_join.joiners_waiting.load(Ordering::Acquire) == 0 {
+                std::thread::yield_now();
+            }
             assert!(matches!(
                 closed_rx.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
@@ -3421,11 +3437,19 @@ mod tests {
                 first_tx.send(result).unwrap();
             });
             lease.wait_until_closing();
+            let store_for_join = Arc::clone(&lease.store);
             scope.spawn(move || {
                 let result = unsafe { es_close(owner_address as *mut *mut EsStore) };
                 closed_tx.send(result).unwrap();
             });
 
+            // The destroyer stays parked on the held lease until the
+            // joiner is provably inside its wait, so the joiner can
+            // never race past a completed teardown into the idempotent
+            // ES_OK path instead of observing the close outcome.
+            while store_for_join.joiners_waiting.load(Ordering::Acquire) == 0 {
+                std::thread::yield_now();
+            }
             assert!(matches!(
                 closed_rx.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
