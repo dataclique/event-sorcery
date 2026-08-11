@@ -41,13 +41,13 @@ use sqlite_es::{Cmp, Order, Predicate, Term, Value};
 use crate::dispatch::DeliveryPolicy;
 use crate::job::{
     DeadReason, EnqueueRequest, JobCommand, JobContext, JobError, JobFailure, JobId, JobKind,
-    JobOutcome, JobState, JobStoreError, StandaloneJob, WonClaim, WorkerId, enqueue_request,
-    enqueued_event, pending_seed_payload, plan_claim,
+    JobOutcome, JobState, JobStoreError, StandaloneJob, WorkerId, enqueue_request, enqueued_event,
+    pending_seed_payload, plan_claim,
 };
 use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
 use crate::projection::Projection;
-use crate::{LifecycleError, ReconcileError, Store, StoreBuilder};
+use crate::{LifecycleError, ReconcileError, SendError, Store, StoreBuilder};
 
 /// The durable-jobs runtime over one [`EventBackend`].
 ///
@@ -60,13 +60,14 @@ pub struct JobRuntime<Backend: EventBackend = SqliteBackend> {
     queue: Arc<Projection<JobState>>,
 }
 
-/// A won claim that can be consumed exactly once by a worker adapter.
+/// A won claim capability used by a worker adapter to renew or settle execution.
 ///
 /// Its fields are intentionally private and the capability is deliberately not
 /// serializable: accepting caller-produced claim state would allow attempts to
 /// forge its fencing identity. Foreign bindings must retain it in trusted
-/// process memory and expose only a binding-owned opaque token.
-#[derive(Debug)]
+/// process memory and expose only a binding-owned opaque token. The claim id
+/// and event sequence remain the event-sourced fencing identity.
+#[derive(Debug, Clone)]
 pub struct JobClaimHandle {
     job_id: JobId,
     claim_seq: i64,
@@ -147,6 +148,19 @@ pub enum JobRuntimeError<BackendError> {
     /// cqrs-es could not load or persist the job aggregate.
     #[error("job aggregate operation failed: {0}")]
     Aggregate(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The job aggregate refused the settlement, so resending it cannot help.
+    ///
+    /// Distinct from [`Self::Aggregate`], which carries the infrastructure
+    /// failures a caller may retry. A refusal is terminal for this claim: the
+    /// caller must stop settling and surface the job as unsettleable.
+    #[error("job {job_id} refused the settlement: {source}")]
+    SettlementRefused {
+        /// Identity of the job whose settlement the aggregate refused.
+        job_id: JobId,
+        /// Why the aggregate refused the command.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// A millisecond instant was outside chrono's supported range.
     #[error("job instant is out of range: {0}")]
     InvalidInstant(i64),
@@ -216,26 +230,47 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
     }
 
     /// Claims one existing queue candidate through the canonical claim planner.
+    ///
+    /// Each call records a fresh worker identity derived from `worker_name`.
     pub async fn claim_job(
         &self,
-        job_id: &str,
+        job_id: JobId,
         worker_name: &str,
         now_ms: i64,
         lease_ms: i64,
         max_claims: u32,
     ) -> Result<JobClaimResult, JobRuntimeError<Backend::Error>> {
-        if lease_ms <= 0 || max_claims == 0 || now_ms.checked_add(lease_ms).is_none() {
+        let worker = WorkerId::new(worker_name);
+        self.claim_job_as(job_id, &worker, now_ms, lease_ms, max_claims)
+            .await
+    }
+
+    /// The single claim implementation, shared by the language-neutral facade
+    /// and by the native worker adapter (which reuses one worker identity for
+    /// the lifetime of its worker instead of minting one per claim).
+    async fn claim_job_as(
+        &self,
+        job_id: JobId,
+        worker: &WorkerId,
+        now_ms: i64,
+        lease_ms: i64,
+        max_claims: u32,
+    ) -> Result<JobClaimResult, JobRuntimeError<Backend::Error>> {
+        // The lease instant must also be representable as a chrono timestamp:
+        // the claim planner cannot build a `Claimed` event without it and would
+        // otherwise skip a still-runnable candidate, which a caller cannot tell
+        // apart from ordinary contention.
+        let lease_is_representable = now_ms
+            .checked_add(lease_ms)
+            .is_some_and(|millis| DateTime::from_timestamp_millis(millis).is_some());
+        if lease_ms <= 0 || max_claims == 0 || !lease_is_representable {
             return Err(JobRuntimeError::InvalidClaimPolicy);
         }
-        let job_id = job_id
-            .parse::<JobId>()
-            .map_err(|error| JobRuntimeError::Aggregate(Box::new(error)))?;
         let job_id_text = job_id.to_string();
-        let worker = WorkerId::new(worker_name);
         let outcome = self
             .backend
             .claim(&job_id_text, |read| {
-                plan_claim(&job_id_text, read, &worker, now_ms, lease_ms, max_claims)
+                plan_claim(&job_id_text, read, worker, now_ms, lease_ms, max_claims)
             })
             .await
             .map_err(JobRuntimeError::Backend)?;
@@ -356,13 +391,18 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
         job_id: &JobId,
         command: JobCommand,
     ) -> Result<JobSettlementResult, JobRuntimeError<Backend::Error>> {
-        match self.jobs.send(job_id, command).await {
-            Ok(()) => Ok(JobSettlementResult::Applied),
-            Err(
-                AggregateError::UserError(LifecycleError::Apply(JobError::Fenced))
-                | AggregateError::AggregateConflict,
-            ) => Ok(JobSettlementResult::Fenced),
-            Err(error) => Err(JobRuntimeError::Aggregate(Box::new(error))),
+        let settled = settled_outcome(&command);
+        match classify_settlement(self.jobs.send(job_id, command).await) {
+            SettlementVerdict::Applied => Ok(JobSettlementResult::Applied),
+            SettlementVerdict::Fenced => {
+                report_fenced_settlement(*job_id, settled);
+                Ok(JobSettlementResult::Fenced)
+            }
+            SettlementVerdict::Transient(error) => Err(JobRuntimeError::Aggregate(error)),
+            SettlementVerdict::Rejected(error) => Err(JobRuntimeError::SettlementRefused {
+                job_id: *job_id,
+                source: Box::new(error),
+            }),
         }
     }
 
@@ -471,39 +511,34 @@ impl<J: StandaloneJob, Backend: EventBackend> EventStoreBackend<J, Backend> {
         }
     }
 
+    /// Claims one candidate through the shared facade claim, reusing this
+    /// worker's stable identity rather than minting one per attempt.
     async fn claim_one(
         &self,
-        job_id: &str,
+        job_id: JobId,
         now_ms: i64,
-    ) -> Result<ClaimOutcome<WonClaim>, Backend::Error> {
-        let worker = &self.worker_id;
-        let lease_ms = lease_millis(self.config.lease_duration);
-        let max_claims = self.config.max_claims;
+    ) -> Result<JobClaimResult, JobRuntimeError<Backend::Error>> {
         self.runtime
-            .backend
-            .claim(job_id, |read| {
-                plan_claim(job_id, read, worker, now_ms, lease_ms, max_claims)
-            })
+            .claim_job_as(
+                job_id,
+                &self.worker_id,
+                now_ms,
+                lease_millis(self.config.lease_duration),
+                self.config.max_claims,
+            )
             .await
     }
 }
 
-/// Decodes a won claim into an apalis task, or `None` if the stored args no
-/// longer deserialize into `J` or the view id is not a valid [`JobId`] (a
-/// poison row the worker skips).
+/// Decodes a claimed job into an apalis task, or `None` if the stored args no
+/// longer deserialize into `J` (a poison row the worker skips).
 fn build_task<J: StandaloneJob>(
-    view_id: String,
-    won: WonClaim,
+    claimed: ClaimedJob,
     config: &JobWorkerConfig,
 ) -> Option<Task<J, JobContext, String>> {
-    let job_id: JobId = match view_id.parse() {
-        Ok(job_id) => job_id,
-        Err(error) => {
-            error!(target: "cqrs", ?error, view_id, "claimed job has a malformed id; skipping");
-            return None;
-        }
-    };
-    let job: J = match serde_json::from_value(won.args) {
+    let ClaimedJob { handle, payload } = claimed;
+    let job_id = handle.job_id;
+    let job: J = match serde_json::from_value(payload) {
         Ok(job) => job,
         Err(error) => {
             error!(target: "cqrs", ?error, %job_id, "claimed job failed to decode; skipping");
@@ -514,14 +549,14 @@ fn build_task<J: StandaloneJob>(
         job,
         JobContext {
             job_id,
-            claim_seq: won.claim_seq,
-            claim_id: won.claim_id,
-            attempt: won.attempt,
+            claim_seq: handle.claim_seq,
+            claim_id: handle.claim_id,
+            attempt: handle.attempt,
             max_attempts: config.max_attempts,
             delivery: config.delivery,
         },
     );
-    task.parts.task_id = Some(TaskId::new(view_id));
+    task.parts.task_id = Some(TaskId::new(job_id.to_string()));
     Some(task)
 }
 
@@ -598,15 +633,26 @@ impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBacken
                 }
             };
 
-            for job_id in candidates {
-                match backend.claim_one(&job_id, now_ms).await {
-                    Ok(ClaimOutcome::Won(won)) => {
-                        if let Some(task) = build_task::<J>(job_id, won, &backend.config) {
+            for view_id in candidates {
+                let job_id = match view_id.parse::<JobId>() {
+                    Ok(job_id) => job_id,
+                    Err(error) => {
+                        error!(target: "cqrs", ?error, view_id, "queue candidate has a malformed id; skipping");
+                        continue;
+                    }
+                };
+                match backend.claim_one(job_id, now_ms).await {
+                    Ok(JobClaimResult::Claimed(claimed)) => {
+                        if let Some(task) = build_task::<J>(claimed, &backend.config) {
                             return Some((Ok(Some(task)), backend));
                         }
                     }
                     // An abandoned dead-letter freed the slot; contended/skip move on.
-                    Ok(ClaimOutcome::Abandoned | ClaimOutcome::Contended | ClaimOutcome::Skip) => {}
+                    Ok(
+                        JobClaimResult::Abandoned
+                        | JobClaimResult::Contended
+                        | JobClaimResult::Skipped,
+                    ) => {}
                     Err(error) => {
                         warn!(target: "cqrs", ?error, "job claim error; idling");
                         break;
@@ -963,38 +1009,81 @@ async fn ack<Backend: EventBackend>(
     plan: AckPlan,
 ) {
     let command = ack_command(config, clock, ctx, plan);
-    let succeeded = matches!(command, JobCommand::Succeed { .. });
+    let settled = settled_outcome(&command);
 
     loop {
-        match jobs.send(&ctx.job_id, command.clone()).await {
-            Ok(()) => return,
-            Err(
-                AggregateError::UserError(LifecycleError::Apply(JobError::Fenced))
-                | AggregateError::AggregateConflict,
-            ) => {
-                if succeeded {
-                    error!(target: "cqrs", job_id = %ctx.job_id, "DOUBLE-EXECUTION RISK: job succeeded but a re-claimer owns the outcome");
-                } else {
-                    warn!(target: "cqrs", job_id = %ctx.job_id, "ack fenced; a re-claimer owns the outcome");
-                }
+        match classify_settlement(jobs.send(&ctx.job_id, command.clone()).await) {
+            SettlementVerdict::Applied => return,
+            SettlementVerdict::Fenced => {
+                report_fenced_settlement(ctx.job_id, settled);
                 return;
             }
-            Err(AggregateError::UserError(domain_error)) => {
-                error!(target: "cqrs", job_id = %ctx.job_id, ?domain_error, "ack hit a non-fence lifecycle error; the aggregate is failed");
-                return;
-            }
-            Err(AggregateError::DatabaseConnectionError(error)) => {
+            SettlementVerdict::Transient(error) => {
                 warn!(target: "cqrs", ?error, job_id = %ctx.job_id, "ack transient error; retrying within lease");
                 sleep(Duration::from_millis(50)).await;
             }
-            Err(AggregateError::DeserializationError(error)) => {
-                error!(target: "cqrs", ?error, job_id = %ctx.job_id, "ack deserialization error; giving up");
+            SettlementVerdict::Rejected(error) => {
+                error!(target: "cqrs", ?error, job_id = %ctx.job_id, "ack rejected by the job aggregate; giving up");
                 return;
             }
-            Err(AggregateError::UnexpectedError(error)) => {
-                error!(target: "cqrs", ?error, job_id = %ctx.job_id, "ack unexpected error; giving up");
-                return;
-            }
+        }
+    }
+}
+
+/// How one settlement attempt against the job aggregate resolved.
+///
+/// Both the native worker's ack and the language-neutral facade classify their
+/// settlement through this single mapping, so the fence -- the event-sourced
+/// evidence that a re-claimer owns the outcome -- can never mean one thing on
+/// one path and something else on the other.
+enum SettlementVerdict {
+    /// The outcome event was persisted.
+    Applied,
+    /// A newer claim owns the job, so no outcome event was persisted.
+    Fenced,
+    /// The transaction failed for a reason that resending can still resolve.
+    Transient(Box<dyn std::error::Error + Send + Sync>),
+    /// The aggregate refused the command; resending cannot help.
+    Rejected(SendError<JobState>),
+}
+
+/// Whether the settlement being fenced would mean the job ran twice.
+#[derive(Clone, Copy)]
+enum SettledOutcome {
+    /// The job ran to success, so a re-claimer will execute it again.
+    Succeeded,
+    /// The job did not succeed, so a re-claimer repeating it is expected.
+    Unsuccessful,
+}
+
+fn classify_settlement(result: Result<(), SendError<JobState>>) -> SettlementVerdict {
+    match result {
+        Ok(()) => SettlementVerdict::Applied,
+        Err(
+            AggregateError::UserError(LifecycleError::Apply(JobError::Fenced))
+            | AggregateError::AggregateConflict,
+        ) => SettlementVerdict::Fenced,
+        Err(AggregateError::DatabaseConnectionError(error)) => SettlementVerdict::Transient(error),
+        Err(error) => SettlementVerdict::Rejected(error),
+    }
+}
+
+fn settled_outcome(command: &JobCommand) -> SettledOutcome {
+    match command {
+        JobCommand::Succeed { .. } => SettledOutcome::Succeeded,
+        JobCommand::RetrySchedule { .. }
+        | JobCommand::Reschedule { .. }
+        | JobCommand::Kill { .. } => SettledOutcome::Unsuccessful,
+    }
+}
+
+fn report_fenced_settlement(job_id: JobId, settled: SettledOutcome) {
+    match settled {
+        SettledOutcome::Succeeded => {
+            error!(target: "cqrs", %job_id, "DOUBLE-EXECUTION RISK: job succeeded but a re-claimer owns the outcome");
+        }
+        SettledOutcome::Unsuccessful => {
+            warn!(target: "cqrs", %job_id, "settlement fenced; a re-claimer owns the outcome");
         }
     }
 }
@@ -1110,7 +1199,9 @@ mod tests {
     use sqlite_es::testing::create_test_pool;
     use sqlx::SqlitePool;
 
-    use crate::job::{EnqueueRequest, JobKind, Label, enqueued_event, pending_seed_payload};
+    use crate::job::{
+        EnqueueRequest, JobEvent, JobKind, Label, WonClaim, enqueued_event, pending_seed_payload,
+    };
 
     use super::*;
 
@@ -1239,7 +1330,7 @@ mod tests {
         assert_eq!(candidates, vec![job_id.to_string()]);
 
         let JobClaimResult::Claimed(claim) = runtime
-            .claim_job(&job_id.to_string(), "ffi-worker", 1_000, 30_000, 50)
+            .claim_job(job_id, "ffi-worker", 1_000, 30_000, 50)
             .await
             .unwrap()
         else {
@@ -1315,18 +1406,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_facade_skips_a_lease_instant_outside_chronos_range() {
+    async fn runtime_facade_rejects_a_lease_instant_outside_chronos_range() {
         let pool = create_test_pool().await.unwrap();
         let runtime = JobRuntime::build(pool.clone()).await.unwrap();
         let job_id = enqueue(&pool, 1_000).await;
 
-        let result = runtime
-            .claim_job(&job_id.to_string(), "ffi-worker", i64::MAX - 1, 1, 50)
+        // The sum stays inside i64 but far outside chrono's range, so only the
+        // representability check catches it.
+        let error = runtime
+            .claim_job(job_id, "ffi-worker", i64::MAX - 1, 1, 50)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, JobRuntimeError::InvalidClaimPolicy));
+        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
+        // The candidate is untouched and still runnable, which is exactly why
+        // reporting this as an ordinary skip would strand the caller.
+        assert_eq!(
+            runtime.poll_jobs(TestJob::KIND, 1_000, 10).await.unwrap(),
+            [job_id.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_facade_reports_a_refused_settlement_as_terminal() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = enqueue(&pool, 1_000).await;
+
+        let JobClaimResult::Claimed(claimed) = runtime
+            .claim_job(job_id, "ffi-worker", 1_000, 30_000, 50)
+            .await
+            .unwrap()
+        else {
+            panic!("expected the facade to win the claim");
+        };
+
+        // A stray `Enqueued` on an already-claimed stream is an event the job
+        // entity cannot evolve, so replay lands the lifecycle in `Failed` and
+        // the aggregate refuses every later command.
+        let stray = JobEvent::Enqueued {
+            kind: JobKind::new(TestJob::KIND),
+            payload: serde_json::json!({ "n": 1 }),
+            run_at: from_millis(1_000),
+        }
+        .serialized(&job_id.to_string(), 3)
+        .unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        insert_serialized_events_batch(&mut connection, "events", std::slice::from_ref(&stray))
             .await
             .unwrap();
+        drop(connection);
 
-        assert!(matches!(result, JobClaimResult::Skipped));
-        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
+        let error = runtime.acknowledge_job(claimed.handle).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            JobRuntimeError::SettlementRefused { job_id: refused, .. } if refused == job_id
+        ));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobEnqueued"]
+        );
     }
 
     #[tokio::test]
@@ -1336,7 +1477,7 @@ mod tests {
         let job_id = enqueue(&pool, 1_000).await;
 
         let JobClaimResult::Claimed(first) = runtime
-            .claim_job(&job_id.to_string(), "ffi-worker", 1_000, 30_000, 50)
+            .claim_job(job_id, "ffi-worker", 1_000, 30_000, 50)
             .await
             .unwrap()
         else {
@@ -1351,7 +1492,7 @@ mod tests {
         );
 
         let JobClaimResult::Claimed(second) = runtime
-            .claim_job(&job_id.to_string(), "ffi-worker", 2_000, 30_000, 50)
+            .claim_job(job_id, "ffi-worker", 2_000, 30_000, 50)
             .await
             .unwrap()
         else {
@@ -1364,7 +1505,7 @@ mod tests {
         );
 
         let JobClaimResult::Claimed(third) = runtime
-            .claim_job(&job_id.to_string(), "ffi-worker", 3_000, 30_000, 50)
+            .claim_job(job_id, "ffi-worker", 3_000, 30_000, 50)
             .await
             .unwrap()
         else {
@@ -1397,15 +1538,18 @@ mod tests {
     async fn perform_receives_the_claimed_jobs_identity() {
         let pool = create_test_pool().await.unwrap();
         let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let backend = SqliteBackend::new(pool.clone());
         let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
         let now_ms = Utc::now().timestamp_millis() + 1_000;
 
-        let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
+        let outcome = runtime
+            .claim_job(job_id, "w1", now_ms, 30_000, 50)
+            .await
+            .unwrap();
+        let JobClaimResult::Claimed(claimed) = outcome else {
             panic!("expected to win the claim");
         };
-        let task = build_task::<TestJob>(job_id.to_string(), won, &JobWorkerConfig::default())
-            .expect("payload decodes");
+        let task =
+            build_task::<TestJob>(claimed, &JobWorkerConfig::default()).expect("payload decodes");
 
         // The context the handler extracts carries the claimed job's durable
         // identity: the stable job id and a zero attempt on the first run.
@@ -1425,12 +1569,15 @@ mod tests {
         .await;
 
         let retry_ms = now_ms + 3_600_000;
-        let ClaimOutcome::Won(rewon) = claim(&backend, &job_id, "w2", retry_ms, 50).await else {
+        let JobClaimResult::Claimed(reclaimed) = runtime
+            .claim_job(job_id, "w2", retry_ms, 30_000, 50)
+            .await
+            .unwrap()
+        else {
             panic!("expected to win the retry claim");
         };
         let retry_task =
-            build_task::<TestJob>(job_id.to_string(), rewon, &JobWorkerConfig::default())
-                .expect("payload decodes");
+            build_task::<TestJob>(reclaimed, &JobWorkerConfig::default()).expect("payload decodes");
         let retry_ctx = JobContext::from_request(&retry_task).await.unwrap();
         assert_eq!(retry_ctx.job_id(), job_id);
         assert_eq!(retry_ctx.attempt(), 1);
@@ -1869,6 +2016,63 @@ mod tests {
         assert_eq!(
             event_types(&pool, &job_id).await,
             ["JobEnqueued", "JobClaimed", "JobClaimed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn facade_settlement_is_fenced_when_a_reclaimer_holds_the_job() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = enqueue(&pool, 1_000).await;
+
+        let outcome = runtime
+            .claim_job(job_id, "w1", 1_000, 30_000, 50)
+            .await
+            .unwrap();
+        let JobClaimResult::Claimed(stale) = outcome else {
+            panic!("expected the first claim to win");
+        };
+        let JobClaimResult::Claimed(_) = runtime
+            .claim_job(job_id, "w2", 1_000 + 31_000, 30_000, 50)
+            .await
+            .unwrap()
+        else {
+            panic!("expected the expired lease to be re-claimable");
+        };
+
+        assert_eq!(
+            runtime.acknowledge_job(stale.handle).await.unwrap(),
+            JobSettlementResult::Fenced
+        );
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobClaimed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_native_worker_adapter_claims_through_the_shared_facade() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = enqueue(&pool, 1_000).await;
+        let worker = EventStoreBackend::<TestJob>::new(
+            runtime,
+            "native-worker",
+            JobWorkerConfig::default(),
+            Clock::system(),
+        );
+
+        let outcome = worker.claim_one(job_id, 1_000).await.unwrap();
+
+        let JobClaimResult::Claimed(claimed) = outcome else {
+            panic!("expected the native adapter to win the claim");
+        };
+
+        assert_eq!(claimed.handle.job_id(), job_id);
+        assert_eq!(claimed.handle.attempt(), 0);
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed"]
         );
     }
 

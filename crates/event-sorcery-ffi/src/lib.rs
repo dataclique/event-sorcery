@@ -22,15 +22,17 @@ use url::form_urlencoded;
 #[cfg(test)]
 use event_sorcery::CommitRequest;
 use event_sorcery::{
-    Engine, EngineError, OpaqueCommitRequest, OpaqueProposedEvent, OpaqueStoredEvent,
-    SqliteJobError, StreamIdentity,
+    DeadReason, Engine, EngineError, JobClaimHandle, JobClaimResult, JobId, JobLeaseResult,
+    JobRuntime, JobRuntimeError, JobSeed, JobSettlementResult, JobStoreError, OpaqueCommitRequest,
+    OpaqueProposedEvent, OpaqueStoredEvent, SqliteJobError, StreamIdentity,
 };
 
 const ABI_MAJOR: u32 = 0;
-const ABI_MINOR: u32 = 2;
+const ABI_MINOR: u32 = 3;
 const ES_OK: i32 = 0;
 const ES_ERR_DECODE: i32 = 1;
 const ES_ERR_CONFLICT: i32 = 2;
+const ES_ERR_JOB_REFUSAL: i32 = 3;
 const ES_ERR_STORAGE: i32 = 4;
 const ES_ERR_STATE: i32 = 5;
 const ES_ERR_RESOURCE_LIMIT: i32 = 6;
@@ -44,16 +46,54 @@ const MAX_CBOR_DEPTH: usize = 32;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_COMMIT_EVENTS: usize = 1024;
 const MAX_LIST_ITEMS: usize = 4096;
+/// Claim tokens one store retains at once, before lapsed ones are evicted.
+const MAX_ACTIVE_CLAIMS: usize = MAX_LIST_ITEMS;
 const MAX_ERROR_TEXT_BYTES: usize = 4 * 1024;
+/// Bound on every caller-supplied identifier the ABI stores or matches on:
+/// aggregate type and id, job id, job kind, and worker name.
+const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 /// Maximum worker threads accepted from the fixed-width C ABI options product.
 const MAX_RUNTIME_THREADS: u32 = 256;
+/// Largest busy timeout the SQLite driver accepts.
+///
+/// `sqlx_sqlite` converts the configured duration with `i32::try_from(..)` and
+/// panics above that bound on the connection's own worker thread, where the
+/// unwind escapes [`ffi_call`]'s `catch_unwind` and surfaces to the caller as a
+/// retryable storage failure. A timeout past the bound is refused up front.
+const MAX_BUSY_TIMEOUT_MS: u32 = i32::MAX.unsigned_abs();
 static STORE_REGISTRY: OnceLock<Mutex<HashMap<usize, StoreEntry>>> = OnceLock::new();
 
 type ProposedEventWire = (String, String, OpaqueBytes);
 type CommitWire = (u8, String, String, u64, CommitEvents);
+/// The durable job intent a commit carries: `[job_id, kind, payload, run_at_ms]`.
+type JobSeedWire = (String, String, OpaqueBytes, i64);
+/// [`CommitWire`] extended with the job intent committed in the same transaction.
+type CommitWithJobWire = (u8, String, String, u64, CommitEvents, JobSeedWire);
 type StoredEventWire = (u64, String, String, OpaqueBytes);
 #[cfg(test)]
 type StoredEventsWire = (u8, Vec<StoredEventWire>);
+/// A claim outcome: `[response_version, outcome_tag, token, attempt,
+/// has_prior_execution, payload]`, where every option is present only for a won
+/// claim.
+type JobClaimWire = (
+    u8,
+    u8,
+    Option<OpaqueBytes>,
+    Option<u32>,
+    Option<u8>,
+    Option<OpaqueBytes>,
+);
+/// `[version, claim_token]`.
+type JobAckWire = (u8, OpaqueBytes);
+/// `[version, claim_token, run_at_ms, error]`.
+type JobRetryWire = (u8, OpaqueBytes, i64, String);
+/// `[version, claim_token, run_at_ms]`.
+type JobDeferWire = (u8, OpaqueBytes, i64);
+/// `[version, claim_token, reason_tag, error]`.
+type JobDeadLetterWire = (u8, OpaqueBytes, u8, String);
+
+/// The opaque handle a binding holds to settle exactly one claim.
+type ClaimToken = [u8; 16];
 
 #[derive(Debug, PartialEq, Eq)]
 struct OpaqueBytes(Vec<u8>);
@@ -228,14 +268,22 @@ pub unsafe extern "C" fn es_open(
                     .connect_with(connect),
             )
             .map_err(AbiError::Sql)?;
-        let engine = Engine::new(pool);
+        let engine = Engine::new(pool.clone());
         runtime
             .block_on(engine.migrate())
             .map_err(AbiError::Migration)?;
+        let jobs = runtime
+            .block_on(JobRuntime::build(pool))
+            .map_err(|error| AbiError::JobRuntime(Box::new(error)))?;
         let store = Arc::new(EsStore {
             state: Mutex::new(StoreState::Open { active_calls: 0 }),
             state_changed: Condvar::new(),
-            inner: Mutex::new(Some(Arc::new(StoreInner { runtime, engine }))),
+            inner: Mutex::new(Some(Arc::new(StoreInner {
+                runtime,
+                engine,
+                jobs,
+                claims: Mutex::new(ClaimRegistry::default()),
+            }))),
             poisoned: AtomicBool::new(false),
             #[cfg(test)]
             panic_on_close: AtomicBool::new(false),
@@ -271,6 +319,8 @@ pub unsafe extern "C" fn es_load_stream(
         }
         let (version, aggregate_type, aggregate_id, after) = request?;
         require_version(version)?;
+        require_identifier_limit(aggregate_type.len())?;
+        require_identifier_limit(aggregate_id.len())?;
         let after = after
             .map(usize::try_from)
             .transpose()
@@ -332,6 +382,8 @@ pub unsafe extern "C" fn es_current_version(
         }
         let (version, aggregate_type, aggregate_id) = request?;
         require_version(version)?;
+        require_identifier_limit(aggregate_type.len())?;
+        require_identifier_limit(aggregate_id.len())?;
         let stream = StreamIdentity::new(aggregate_type, aggregate_id);
         let version = lease
             .inner
@@ -365,63 +417,425 @@ pub unsafe extern "C" fn es_commit(
     ffi_call(Some(&lease.store), out_error, || {
         let (version, aggregate_type, aggregate_id, expected, events): CommitWire =
             decode_validated(request, |wire: &CommitWire| {
-                if wire.4.observed <= MAX_COMMIT_EVENTS {
-                    return Ok(());
-                }
-                Err(AbiError::ResourceLimit {
-                    resource: "commit_events",
-                    observed: wire.4.observed,
-                    limit: MAX_COMMIT_EVENTS,
-                })
+                require_commit_event_count(wire.4.observed)
             })?;
+        let parts = commit_parts(version, aggregate_type, aggregate_id, expected, events)?;
+        commit_result(&lease.inner, parts, expected, None)
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Atomically appends events and one durable job intent at the expected version.
+///
+/// # Safety
+///
+/// `store` must be the original owner cell passed to [`es_open`]. `request`
+/// must reference a readable buffer. `out_error` must be null or writable. The
+/// owner cell and `out_error` must be distinct. The request buffer may alias
+/// `out_error`; it is decoded before the output is written.
+pub unsafe extern "C" fn es_commit_with_job(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let lease = match EsStore::acquire(store) {
+        Ok(lease) => lease,
+        Err(error) => return write_error(out_error, error),
+    };
+    ffi_call(Some(&lease.store), out_error, || {
+        let (version, aggregate_type, aggregate_id, expected, events, job): CommitWithJobWire =
+            decode_validated(request, |wire: &CommitWithJobWire| {
+                require_commit_event_count(wire.4.observed)
+            })?;
+        let parts = commit_parts(version, aggregate_type, aggregate_id, expected, events)?;
+        let (job_id, kind, OpaqueBytes(payload), run_at_ms) = job;
+        require_identifier_limit(job_id.len())?;
+        require_identifier_limit(kind.len())?;
+        require_payload_limit(payload.len())?;
+        let job_id = job_id
+            .parse::<JobId>()
+            .map_err(|error| AbiError::JobIdentifier(Box::new(error)))?;
+        let payload = serde_json::to_value(payload).map_err(AbiError::JobPayload)?;
+        commit_result(
+            &lease.inner,
+            parts,
+            expected,
+            Some(JobSeed::new(job_id, kind, payload, run_at_ms)),
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Enqueues an erased payload through the retained event-sourced job runtime.
+///
+/// # Safety
+///
+/// `store` must be the original owner cell passed to [`es_open`]. `request`
+/// must reference a readable buffer. `out_error` must be null or writable. The
+/// owner cell and `out_error` must be distinct.
+pub unsafe extern "C" fn es_job_enqueue(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let lease = match EsStore::acquire(store) {
+        Ok(lease) => lease,
+        Err(error) => return write_error(out_error, error),
+    };
+    ffi_call(Some(&lease.store), out_error, || {
+        let (version, job_id, kind, OpaqueBytes(payload), run_at_ms): (
+            u8,
+            String,
+            String,
+            OpaqueBytes,
+            i64,
+        ) = decode(request)?;
         require_version(version)?;
-        require_error_text_limit(aggregate_type.len())?;
-        require_error_text_limit(aggregate_id.len())?;
-        let CommitEvents {
-            values: events,
-            observed: _,
-        } = events;
-        if events.is_empty() {
-            return Err(AbiError::MalformedInput);
-        }
-        let expected_sequence = usize::try_from(expected).map_err(AbiError::InputInteger)?;
-        expected_sequence
-            .checked_add(events.len())
-            .ok_or(AbiError::MalformedInput)?;
-        let proposed = events
-            .into_iter()
-            .map(|(event_type, event_version, OpaqueBytes(payload))| {
-                require_payload_limit(payload.len())?;
-                Ok(OpaqueProposedEvent::new(event_type, event_version, payload))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
-        let stream = StreamIdentity::new(aggregate_type.clone(), aggregate_id.clone());
-        match lease
+        require_identifier_limit(job_id.len())?;
+        require_identifier_limit(kind.len())?;
+        require_payload_limit(payload.len())?;
+        let job_id = job_id
+            .parse::<JobId>()
+            .map_err(|error| AbiError::JobIdentifier(Box::new(error)))?;
+        let payload = serde_json::to_value(payload).map_err(AbiError::JobPayload)?;
+        lease
             .inner
             .runtime
-            .block_on(lease.inner.engine.commit_opaque(OpaqueCommitRequest::new(
-                stream.clone(),
-                expected_sequence,
-                &proposed,
-            ))) {
-            Ok(()) => Ok(()),
-            Err(EngineError::OptimisticLock) => {
-                let actual = lease
+            .block_on(
+                lease
                     .inner
-                    .runtime
-                    .block_on(lease.inner.engine.current_version(&stream))
-                    .map_err(AbiError::from)?;
-                let actual = u64::try_from(actual).map_err(AbiError::StorageInteger)?;
-                Err(AbiError::Conflict {
-                    aggregate_type,
-                    aggregate_id,
-                    expected,
-                    actual,
-                })
-            }
-            Err(error) => Err(AbiError::from(error)),
-        }
+                    .jobs
+                    .enqueue_job_payload(job_id, kind, payload, run_at_ms),
+            )
+            .map_err(|error| job_runtime_error(job_id, error))
     })
+}
+
+#[unsafe(no_mangle)]
+/// Polls the rebuildable job queue projection for runnable candidates.
+///
+/// # Safety
+///
+/// `store` must be the original owner cell passed to [`es_open`]. `request`
+/// must reference a readable buffer. `out_jobs` must be writable, and
+/// `out_error` must be null or writable. The request buffer may alias either
+/// output. `store`, `out_jobs`, and `out_error` must all be distinct.
+pub unsafe extern "C" fn es_job_poll(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_jobs: *mut EsBuf,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let request: Result<(u8, String, i64, u32), AbiError> = decode(request);
+    clear_buffer_output(out_jobs);
+    let lease = match EsStore::acquire(store) {
+        Ok(lease) => lease,
+        Err(error) => return write_error(out_error, error),
+    };
+    ffi_call(Some(&lease.store), out_error, || {
+        if out_jobs.is_null() {
+            return Err(AbiError::State("out_jobs is null"));
+        }
+        let (version, kind, now_ms, limit) = request?;
+        require_version(version)?;
+        require_identifier_limit(kind.len())?;
+        let observed = usize::try_from(limit).map_err(AbiError::InputInteger)?;
+        if observed > MAX_LIST_ITEMS {
+            return Err(AbiError::ResourceLimit {
+                resource: "job_poll_limit",
+                observed,
+                limit: MAX_LIST_ITEMS,
+            });
+        }
+        // A poll names no single job, so it has no identity to attribute a
+        // refusal to. It also cannot produce one: the queue projection is the
+        // only thing it consults, and a projection failure is infrastructure.
+        let jobs = lease
+            .inner
+            .runtime
+            .block_on(lease.inner.jobs.poll_jobs(&kind, now_ms, limit))
+            .map_err(|error| AbiError::JobRuntime(Box::new(error)))?;
+        unsafe { out_jobs.write(encode_response(&(1_u8, jobs))?) };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Claims one queue candidate and returns an opaque store-owned claim token.
+///
+/// # Safety
+///
+/// `store` must be the original owner cell passed to [`es_open`]. `request`
+/// must reference a readable buffer. `out_claim` must be writable, and
+/// `out_error` must be null or writable. The request buffer may alias either
+/// output. `store`, `out_claim`, and `out_error` must all be distinct.
+pub unsafe extern "C" fn es_job_claim(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_claim: *mut EsBuf,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let request: Result<(u8, String, String, i64, i64, u32), AbiError> = decode(request);
+    clear_buffer_output(out_claim);
+    let lease = match EsStore::acquire(store) {
+        Ok(lease) => lease,
+        Err(error) => return write_error(out_error, error),
+    };
+    ffi_call(Some(&lease.store), out_error, || {
+        if out_claim.is_null() {
+            return Err(AbiError::State("out_claim is null"));
+        }
+        let (version, job_id, worker_name, now_ms, lease_ms, max_claims) = request?;
+        require_version(version)?;
+        require_identifier_limit(job_id.len())?;
+        require_identifier_limit(worker_name.len())?;
+        if lease_ms <= 0 || max_claims == 0 {
+            return Err(AbiError::MalformedInput);
+        }
+        let job_id = job_id
+            .parse::<JobId>()
+            .map_err(|error| AbiError::JobIdentifier(Box::new(error)))?;
+        let lease_until_ms = now_ms
+            .checked_add(lease_ms)
+            .ok_or(AbiError::State("claim lease instant overflowed"))?;
+        // Minted before the durable claim: a CSPRNG failure afterwards would
+        // leave the job claimed with no token in existence to settle it, which
+        // is the state `dead_letter_unusable_claim` exists to avoid.
+        let token = claim_token()?;
+        let reservation = lease.inner.prepare_claim(now_ms)?;
+        let result = lease
+            .inner
+            .runtime
+            .block_on(lease.inner.jobs.claim_job(
+                job_id,
+                &worker_name,
+                now_ms,
+                lease_ms,
+                max_claims,
+            ))
+            .map_err(|error| job_runtime_error(job_id, error))?;
+        let wire: JobClaimWire = match result {
+            JobClaimResult::Claimed(claimed) => {
+                let attempt = claimed.handle.attempt();
+                let has_prior_execution = u8::from(!claimed.handle.is_first_execution());
+                let payload = match claimed_payload_bytes(claimed.payload) {
+                    Ok(payload) => payload,
+                    Err(refusal) => {
+                        return Err(dead_letter_unusable_claim(
+                            &lease.inner,
+                            claimed.handle,
+                            refusal,
+                        ));
+                    }
+                };
+                reservation.issue(token, claimed.handle, lease_until_ms);
+                (
+                    1,
+                    0,
+                    Some(OpaqueBytes(token.to_vec())),
+                    Some(attempt),
+                    Some(has_prior_execution),
+                    Some(OpaqueBytes(payload)),
+                )
+            }
+            JobClaimResult::Abandoned => {
+                lease.inner.retire_expired_claims(job_id, now_ms);
+                (1, 1, None, None, None, None)
+            }
+            JobClaimResult::Contended => (1, 2, None, None, None, None),
+            JobClaimResult::Skipped => {
+                lease.inner.retire_expired_claims(job_id, now_ms);
+                (1, 3, None, None, None, None)
+            }
+        };
+        unsafe { out_claim.write(encode_response(&wire)?) };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Extends the lease represented by an opaque claim token.
+///
+/// # Safety
+///
+/// `store` must be the original owner cell passed to [`es_open`]. `request`
+/// must reference a readable buffer. `out_renewal` must be writable, and
+/// `out_error` must be null or writable. The request storage may alias either
+/// output. `store`, `out_renewal`, and `out_error` must all be distinct.
+pub unsafe extern "C" fn es_job_renew(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_renewal: *mut u8,
+    out_error: *mut EsBuf,
+) -> i32 {
+    let request: Result<(u8, OpaqueBytes, i64), AbiError> = decode(request);
+    clear_tag_output(out_renewal);
+    let lease = match EsStore::acquire(store) {
+        Ok(lease) => lease,
+        Err(error) => return write_error(out_error, error),
+    };
+    ffi_call(Some(&lease.store), out_error, || {
+        if out_renewal.is_null() {
+            return Err(AbiError::State("out_renewal is null"));
+        }
+        let (version, OpaqueBytes(encoded), new_lease_until_ms) = request?;
+        require_version(version)?;
+        let renewal = lease.inner.begin_renewal(decode_claim_token(&encoded)?)?;
+        let handle = renewal.handle();
+        let job_id = handle.job_id();
+        let result = lease
+            .inner
+            .runtime
+            .block_on(lease.inner.jobs.renew_job(&handle, new_lease_until_ms))
+            .map_err(|error| job_runtime_error(job_id, error))?;
+        let tag = match result {
+            JobLeaseResult::Held => {
+                renewal.complete(new_lease_until_ms)?;
+                0
+            }
+            JobLeaseResult::Lost => {
+                renewal.retire();
+                1
+            }
+        };
+        unsafe { out_renewal.write(tag) };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// Records successful completion for an opaque claim token.
+///
+/// # Safety
+///
+/// `store` must be the original owner cell passed to [`es_open`]. `request`
+/// must reference a readable buffer. `out_settlement` must be writable, and
+/// `out_error` must be null or writable. The request storage may alias either
+/// output. `store`, `out_settlement`, and `out_error` must all be distinct.
+pub unsafe extern "C" fn es_job_ack(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_settlement: *mut u8,
+    out_error: *mut EsBuf,
+) -> i32 {
+    settle_claim_with::<JobAckWire>(
+        store,
+        request,
+        out_settlement,
+        out_error,
+        |(version, _)| require_version(*version),
+        |(_, OpaqueBytes(encoded))| decode_claim_token(encoded),
+        |inner, claim, _| {
+            let job_id = claim.job_id();
+            inner
+                .runtime
+                .block_on(inner.jobs.acknowledge_job(claim))
+                .map_err(|error| job_runtime_error(job_id, error))
+        },
+    )
+}
+
+#[unsafe(no_mangle)]
+/// Records a failed attempt and schedules another execution.
+///
+/// # Safety
+///
+/// `store` must be the original owner cell passed to [`es_open`]. `request`
+/// must reference a readable buffer. `out_settlement` must be writable, and
+/// `out_error` must be null or writable. The request storage may alias either
+/// output. `store`, `out_settlement`, and `out_error` must all be distinct.
+pub unsafe extern "C" fn es_job_retry(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_settlement: *mut u8,
+    out_error: *mut EsBuf,
+) -> i32 {
+    settle_claim_with::<JobRetryWire>(
+        store,
+        request,
+        out_settlement,
+        out_error,
+        |(version, _, _, error)| {
+            require_version(*version).and_then(|()| require_error_text_limit(error.len()))
+        },
+        |(_, OpaqueBytes(encoded), _, _)| decode_claim_token(encoded),
+        |inner, claim, (_, _, run_at_ms, error)| {
+            let job_id = claim.job_id();
+            inner
+                .runtime
+                .block_on(inner.jobs.retry_job(claim, run_at_ms, error))
+                .map_err(|failure| job_runtime_error(job_id, failure))
+        },
+    )
+}
+
+#[unsafe(no_mangle)]
+/// Reschedules a claim without advancing its attempt counter.
+///
+/// # Safety
+///
+/// `store` must be the original owner cell passed to [`es_open`]. `request`
+/// must reference a readable buffer. `out_settlement` must be writable, and
+/// `out_error` must be null or writable. The request storage may alias either
+/// output. `store`, `out_settlement`, and `out_error` must all be distinct.
+pub unsafe extern "C" fn es_job_defer(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_settlement: *mut u8,
+    out_error: *mut EsBuf,
+) -> i32 {
+    settle_claim_with::<JobDeferWire>(
+        store,
+        request,
+        out_settlement,
+        out_error,
+        |(version, _, _)| require_version(*version),
+        |(_, OpaqueBytes(encoded), _)| decode_claim_token(encoded),
+        |inner, claim, (_, _, run_at_ms)| {
+            let job_id = claim.job_id();
+            inner
+                .runtime
+                .block_on(inner.jobs.defer_job(claim, run_at_ms))
+                .map_err(|error| job_runtime_error(job_id, error))
+        },
+    )
+}
+
+#[unsafe(no_mangle)]
+/// Records terminal failure for an opaque claim token.
+///
+/// # Safety
+///
+/// `store` must be the original owner cell passed to [`es_open`]. `request`
+/// must reference a readable buffer. `out_settlement` must be writable, and
+/// `out_error` must be null or writable. The request storage may alias either
+/// output. `store`, `out_settlement`, and `out_error` must all be distinct.
+pub unsafe extern "C" fn es_job_dead_letter(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_settlement: *mut u8,
+    out_error: *mut EsBuf,
+) -> i32 {
+    settle_claim_with::<JobDeadLetterWire>(
+        store,
+        request,
+        out_settlement,
+        out_error,
+        |(version, _, reason, error)| {
+            require_version(*version)
+                .and_then(|()| require_error_text_limit(error.len()))
+                .and_then(|()| dead_reason(*reason).map(drop))
+        },
+        |(_, OpaqueBytes(encoded), _, _)| decode_claim_token(encoded),
+        |inner, claim, (_, _, reason, error)| {
+            let reason = dead_reason(reason)?;
+            let job_id = claim.job_id();
+            inner
+                .runtime
+                .block_on(inner.jobs.dead_letter_job(claim, reason, error))
+                .map_err(|failure| job_runtime_error(job_id, failure))
+        },
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -493,6 +907,313 @@ enum SqliteCacheMode {
 struct StoreInner {
     runtime: tokio::runtime::Runtime,
     engine: Engine,
+    jobs: JobRuntime,
+    claims: Mutex<ClaimRegistry>,
+}
+
+impl StoreInner {
+    /// Reserves one of the store's active-claim slots for an in-flight claim.
+    ///
+    /// A lapsed local lease is not evidence that a claim was lost -- only the
+    /// durable job decides that -- so retained tokens are never dropped merely
+    /// because `now_ms` moved past them. Expired tokens are evicted only to
+    /// make room, oldest first, when the registry is otherwise at capacity.
+    fn prepare_claim(&self, now_ms: i64) -> Result<ClaimReservation<'_>, AbiError> {
+        let mut registry = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let observed = registry
+            .retained
+            .len()
+            .checked_add(registry.reservations)
+            .and_then(|used| used.checked_add(1))
+            .ok_or(AbiError::State("active claim capacity overflowed"))?;
+        if observed > MAX_ACTIVE_CLAIMS && registry.evict_oldest_expired(now_ms).is_none() {
+            return Err(AbiError::ResourceLimit {
+                resource: "active_claims",
+                observed,
+                limit: MAX_ACTIVE_CLAIMS,
+            });
+        }
+        registry.reservations = registry
+            .reservations
+            .checked_add(1)
+            .ok_or(AbiError::State("active claim capacity overflowed"))?;
+        drop(registry);
+
+        Ok(ClaimReservation {
+            inner: self,
+            state: ClaimOperationState::Pending,
+        })
+    }
+
+    /// Takes a retained token out of circulation for the duration of a renewal.
+    fn begin_renewal(&self, token: ClaimToken) -> Result<ClaimRenewal<'_>, AbiError> {
+        let mut registry = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retained = registry
+            .retained
+            .get_mut(&token)
+            .filter(|claim| claim.state == ClaimState::Available)
+            .ok_or(AbiError::State("claim handle is invalid"))?;
+        retained.state = ClaimState::Renewing;
+        let handle = retained.handle.clone();
+        drop(registry);
+
+        Ok(ClaimRenewal {
+            inner: self,
+            token,
+            handle,
+            state: ClaimOperationState::Pending,
+        })
+    }
+
+    /// Takes a retained token out of circulation for the duration of a settlement.
+    fn begin_settlement(&self, token: ClaimToken) -> Result<ClaimSettlement<'_>, AbiError> {
+        let mut registry = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retained = registry
+            .retained
+            .get_mut(&token)
+            .filter(|claim| claim.state == ClaimState::Available)
+            .ok_or(AbiError::State("claim handle is invalid"))?;
+        retained.state = ClaimState::Settling;
+        let handle = retained.handle.clone();
+        drop(registry);
+
+        Ok(ClaimSettlement {
+            inner: self,
+            token,
+            handle,
+            state: ClaimOperationState::Pending,
+        })
+    }
+
+    /// Drops this job's lapsed tokens once the durable queue has shown that
+    /// nothing is executing under them, which a re-claim answering `Abandoned`
+    /// or `Skipped` establishes.
+    fn retire_expired_claims(&self, job_id: JobId, now_ms: i64) {
+        self.claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained
+            .retain(|_, claim| claim.handle.job_id() != job_id || !claim.is_expired(now_ms));
+    }
+
+    fn retire_claim(&self, token: ClaimToken) {
+        self.claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained
+            .remove(&token);
+    }
+}
+
+/// Whether a retained claim is free to be renewed or settled right now.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimState {
+    Available,
+    Renewing,
+    Settling,
+}
+
+#[derive(Default)]
+struct ClaimRegistry {
+    retained: HashMap<ClaimToken, RetainedClaim>,
+    reservations: usize,
+}
+
+impl ClaimRegistry {
+    /// Frees the longest-lapsed retained slot, reporting which token went.
+    ///
+    /// Returns [`None`] when nothing has lapsed, which leaves the caller to
+    /// report the capacity limit rather than evicting a live claim.
+    fn evict_oldest_expired(&mut self, now_ms: i64) -> Option<ClaimToken> {
+        let token = self
+            .retained
+            .iter()
+            .filter(|(_, retained)| retained.is_expired(now_ms))
+            .min_by_key(|(_, retained)| retained.lease_until_ms)
+            .map(|(token, _)| *token)?;
+
+        self.retained.remove(&token).map(|_| token)
+    }
+
+    /// Saturates instead of asserting: this runs from [`ClaimReservation`]'s
+    /// destructor, where a panic during an unwind would abort the host process
+    /// past the ABI's `catch_unwind` boundary.
+    fn release_reservation(&mut self) {
+        self.reservations = self.reservations.saturating_sub(1);
+    }
+}
+
+struct RetainedClaim {
+    handle: JobClaimHandle,
+    lease_until_ms: i64,
+    state: ClaimState,
+}
+
+impl RetainedClaim {
+    fn is_expired(&self, now_ms: i64) -> bool {
+        self.state == ClaimState::Available && self.lease_until_ms < now_ms
+    }
+}
+
+/// Whether a claim operation reached its terminal step before being dropped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimOperationState {
+    Pending,
+    Completed,
+}
+
+struct ClaimReservation<'store> {
+    inner: &'store StoreInner,
+    state: ClaimOperationState,
+}
+
+impl ClaimReservation<'_> {
+    /// Retains `token` as the job's only settleable claim and consumes the
+    /// reservation.
+    ///
+    /// Infallible by construction: the token is minted before the durable claim
+    /// is taken, so nothing between winning a claim and handing out its token
+    /// can fail and strand the claim.
+    fn issue(mut self, token: ClaimToken, handle: JobClaimHandle, lease_until_ms: i64) {
+        let job_id = handle.job_id();
+        let mut registry = self
+            .inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.retained.retain(|_, existing| {
+            existing.state != ClaimState::Available || existing.handle.job_id() != job_id
+        });
+        registry.retained.insert(
+            token,
+            RetainedClaim {
+                handle,
+                lease_until_ms,
+                state: ClaimState::Available,
+            },
+        );
+        registry.release_reservation();
+        drop(registry);
+        self.state = ClaimOperationState::Completed;
+    }
+}
+
+impl Drop for ClaimReservation<'_> {
+    fn drop(&mut self) {
+        if self.state == ClaimOperationState::Completed {
+            return;
+        }
+        self.inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release_reservation();
+    }
+}
+
+struct ClaimRenewal<'store> {
+    inner: &'store StoreInner,
+    token: ClaimToken,
+    handle: JobClaimHandle,
+    state: ClaimOperationState,
+}
+
+impl ClaimRenewal<'_> {
+    fn handle(&self) -> JobClaimHandle {
+        self.handle.clone()
+    }
+
+    fn complete(mut self, lease_until_ms: i64) -> Result<(), AbiError> {
+        let mut registry = self
+            .inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(retained) = registry
+            .retained
+            .get_mut(&self.token)
+            .filter(|retained| retained.state == ClaimState::Renewing)
+        else {
+            drop(registry);
+            return Err(AbiError::State("renewing claim is no longer retained"));
+        };
+        retained.lease_until_ms = lease_until_ms;
+        retained.state = ClaimState::Available;
+        drop(registry);
+        self.state = ClaimOperationState::Completed;
+
+        Ok(())
+    }
+
+    fn retire(mut self) {
+        self.inner.retire_claim(self.token);
+        self.state = ClaimOperationState::Completed;
+    }
+}
+
+impl Drop for ClaimRenewal<'_> {
+    fn drop(&mut self) {
+        if self.state == ClaimOperationState::Completed {
+            return;
+        }
+        if let Some(claim) = self
+            .inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained
+            .get_mut(&self.token)
+            .filter(|claim| claim.state == ClaimState::Renewing)
+        {
+            claim.state = ClaimState::Available;
+        }
+    }
+}
+
+struct ClaimSettlement<'store> {
+    inner: &'store StoreInner,
+    token: ClaimToken,
+    handle: JobClaimHandle,
+    state: ClaimOperationState,
+}
+
+impl ClaimSettlement<'_> {
+    fn handle(&self) -> JobClaimHandle {
+        self.handle.clone()
+    }
+
+    fn complete(mut self) {
+        self.inner.retire_claim(self.token);
+        self.state = ClaimOperationState::Completed;
+    }
+}
+
+impl Drop for ClaimSettlement<'_> {
+    fn drop(&mut self) {
+        if self.state == ClaimOperationState::Completed {
+            return;
+        }
+        if let Some(claim) = self
+            .inner
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained
+            .get_mut(&self.token)
+            .filter(|claim| claim.state == ClaimState::Settling)
+        {
+            claim.state = ClaimState::Available;
+        }
+    }
 }
 
 struct StoreEntry {
@@ -542,6 +1263,14 @@ enum AbiError {
         expected: u64,
         actual: u64,
     },
+    #[error("malformed job id")]
+    JobIdentifier(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("job {job_id} refused the request: {refusal}")]
+    JobRefusal { job_id: JobId, refusal: JobRefusal },
+    #[error("job runtime failure")]
+    JobRuntime(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("job payload encoding failure")]
+    JobPayload(#[source] serde_json::Error),
     #[error("engine storage failure")]
     Engine(#[source] EngineError),
     #[error("SQLite storage failure")]
@@ -566,6 +1295,31 @@ enum AbiError {
     },
     #[error("engine panic")]
     Panic,
+}
+
+/// Why one job refused the request made of it, behind [`ES_ERR_JOB_REFUSAL`].
+///
+/// SPEC pins the `JOB_REFUSAL` detail to `[job_id, reason]`, so the rendered
+/// text of each leaf is the discriminant a binding matches on. Both the set of
+/// leaves and their rendered text are part of the ABI: add a leaf rather than
+/// rewording an existing one.
+///
+/// A refusal is terminal for the job it names: unlike [`ES_ERR_STORAGE`], no
+/// amount of retrying the same request can turn it into a success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum JobRefusal {
+    #[error("job attempt counter exhausted")]
+    AttemptExhausted,
+    #[error("invalid job claim policy")]
+    InvalidClaimPolicy,
+    #[error("job aggregate refused the settlement")]
+    SettlementRefused,
+    #[error("claimed job payload is not opaque bytes")]
+    PayloadNotOpaqueBytes,
+    #[error("claimed job payload contains an invalid byte")]
+    PayloadByteOutOfRange,
+    #[error("claimed job payload exceeds the ABI payload limit")]
+    PayloadAboveAbiLimit,
 }
 
 fn store_registry() -> &'static Mutex<HashMap<usize, StoreEntry>> {
@@ -804,6 +1558,10 @@ impl From<EngineError> for AbiError {
                 observed,
                 limit,
             },
+            // The same permanently unfixable instant `es_job_enqueue` reports
+            // as malformed input: which entry point the job intent arrived
+            // through must not change how the caller is told to react.
+            EngineError::JobFlush(JobStoreError::InvalidInstant(_)) => Self::MalformedInput,
             other => Self::Engine(other),
         }
     }
@@ -816,11 +1574,16 @@ impl AbiError {
             | Self::CborDecode(_)
             | Self::SqliteOptions(_)
             | Self::InputInteger(_)
-            | Self::CanonicalCbor(_) => ES_ERR_DECODE,
+            | Self::CanonicalCbor(_)
+            | Self::JobIdentifier(_) => ES_ERR_DECODE,
             Self::Conflict { .. } => ES_ERR_CONFLICT,
-            Self::Engine(_) | Self::Sql(_) | Self::Migration(_) | Self::StorageInteger(_) => {
-                ES_ERR_STORAGE
-            }
+            Self::JobRefusal { .. } => ES_ERR_JOB_REFUSAL,
+            Self::Engine(_)
+            | Self::Sql(_)
+            | Self::Migration(_)
+            | Self::StorageInteger(_)
+            | Self::JobRuntime(_)
+            | Self::JobPayload(_) => ES_ERR_STORAGE,
             Self::CborEncode(_) | Self::ResponseIo(_) | Self::Runtime(_) | Self::State(_) => {
                 ES_ERR_STATE
             }
@@ -959,6 +1722,143 @@ fn write_array_header(writer: &mut BoundedResponseWriter, length: usize) -> Resu
         .map_err(|source| writer.io_error(source))
 }
 
+fn encode_response(value: &impl Serialize) -> Result<EsBuf, AbiError> {
+    let mut writer = BoundedResponseWriter::new();
+    if let Err(source) = ciborium::into_writer(value, &mut writer) {
+        return Err(writer.cbor_error(source));
+    }
+
+    Ok(writer.into_buffer())
+}
+
+/// Mints the opaque handle that fences one claim's settlement.
+///
+/// The token is the only thing standing between a caller and settling a claim
+/// it does not own, so it comes from the operating system's CSPRNG rather than
+/// from any in-process sequence a holder of one token could extrapolate.
+fn claim_token() -> Result<ClaimToken, AbiError> {
+    let mut token = [0_u8; 16];
+    getrandom::fill(&mut token).map_err(|_| AbiError::State("claim token generation failed"))?;
+
+    Ok(token)
+}
+
+fn decode_claim_token(encoded: &[u8]) -> Result<ClaimToken, AbiError> {
+    ClaimToken::try_from(encoded).map_err(|_| AbiError::MalformedInput)
+}
+
+/// Renders a claimed job's stored payload as the opaque bytes the ABI returns.
+///
+/// Payloads written outside this ABI need not have the opaque-bytes shape, so
+/// this is a real failure path on a claim that already succeeded durably. The
+/// shape of a stored payload never changes, so every failure here is the job
+/// refusing this ABI for good; see [`dead_letter_unusable_claim`] for how the
+/// claim is settled.
+fn claimed_payload_bytes(payload: serde_json::Value) -> Result<Vec<u8>, JobRefusal> {
+    let serde_json::Value::Array(bytes) = payload else {
+        return Err(JobRefusal::PayloadNotOpaqueBytes);
+    };
+    let bytes = bytes
+        .into_iter()
+        .map(|byte| {
+            byte.as_u64()
+                .and_then(|byte| u8::try_from(byte).ok())
+                .ok_or(JobRefusal::PayloadByteOutOfRange)
+        })
+        .collect::<Result<Vec<u8>, JobRefusal>>()?;
+    if bytes.len() > MAX_PAYLOAD_BYTES {
+        return Err(JobRefusal::PayloadAboveAbiLimit);
+    }
+
+    Ok(bytes)
+}
+
+/// Settles a durably-won claim the caller can never be handed.
+///
+/// The claim is committed before the payload can be inspected, so failing
+/// without compensation would leave the job claimed with no token in existence
+/// to settle it. Deferring it back would re-arm a claim that can only fail the
+/// same way -- and a defer resets the claim budget, so the abandon path could
+/// never catch the loop either. The stored payload is what the ABI cannot read,
+/// which is exactly [`DeadReason::Undecodable`], so the job is settled
+/// terminally and the caller is told the job refused the claim rather than that
+/// the ABI is in a bad state. A failure to settle replaces the refusal, because
+/// that is the condition the caller has to act on.
+///
+/// The recorded reason is one of [`JobRefusal`]'s fixed leaves, so it carries no
+/// caller data and is far inside the ABI's error-text bound.
+fn dead_letter_unusable_claim(
+    inner: &StoreInner,
+    handle: JobClaimHandle,
+    refusal: JobRefusal,
+) -> AbiError {
+    let job_id = handle.job_id();
+    let settled = inner.runtime.block_on(inner.jobs.dead_letter_job(
+        handle,
+        DeadReason::Undecodable,
+        refusal.to_string(),
+    ));
+
+    match settled {
+        Ok(JobSettlementResult::Applied | JobSettlementResult::Fenced) => {
+            AbiError::JobRefusal { job_id, refusal }
+        }
+        Err(error) => job_runtime_error(job_id, error),
+    }
+}
+
+/// Separates the three retry answers a job-runtime fault can carry.
+///
+/// Only the infrastructure variants become `STORAGE_FAILURE`, the one class a
+/// binding is expected to retry. An out-of-range instant is a caller-supplied
+/// value that can never become valid, so it is malformed input. The rest are
+/// `job_id`'s own refusals: the request was well formed and the infrastructure
+/// is healthy, but this job cannot serve it, so the caller must stop settling
+/// and surface the job instead of retrying it.
+fn job_runtime_error<BackendError>(job_id: JobId, error: JobRuntimeError<BackendError>) -> AbiError
+where
+    BackendError: std::error::Error + Send + Sync + 'static,
+{
+    match error {
+        JobRuntimeError::InvalidInstant(_) => AbiError::MalformedInput,
+        JobRuntimeError::AttemptExhausted => AbiError::JobRefusal {
+            job_id,
+            refusal: JobRefusal::AttemptExhausted,
+        },
+        JobRuntimeError::InvalidClaimPolicy => AbiError::JobRefusal {
+            job_id,
+            refusal: JobRefusal::InvalidClaimPolicy,
+        },
+        JobRuntimeError::SettlementRefused {
+            job_id: refused,
+            source: _,
+        } => AbiError::JobRefusal {
+            job_id: refused,
+            refusal: JobRefusal::SettlementRefused,
+        },
+        infrastructure @ (JobRuntimeError::Backend(_)
+        | JobRuntimeError::Projection(_)
+        | JobRuntimeError::Aggregate(_)) => AbiError::JobRuntime(Box::new(infrastructure)),
+    }
+}
+
+const fn settlement_tag(result: JobSettlementResult) -> u8 {
+    match result {
+        JobSettlementResult::Applied => 0,
+        JobSettlementResult::Fenced => 1,
+    }
+}
+
+const fn dead_reason(tag: u8) -> Result<DeadReason, AbiError> {
+    match tag {
+        0 => Ok(DeadReason::RetriesExhausted),
+        1 => Ok(DeadReason::Rejected),
+        2 => Ok(DeadReason::Undecodable),
+        3 => Ok(DeadReason::Abandoned),
+        _ => Err(AbiError::MalformedInput),
+    }
+}
+
 fn owned_buffer(bytes: Vec<u8>) -> EsBuf {
     let boxed = bytes.into_boxed_slice();
     EsBuf {
@@ -1008,11 +1908,180 @@ const fn require_error_text_limit(observed: usize) -> Result<(), AbiError> {
     })
 }
 
+/// One decoded commit request, shared by the plain and job-carrying entry points.
+struct CommitParts {
+    aggregate_type: String,
+    aggregate_id: String,
+    expected_sequence: usize,
+    events: Vec<OpaqueProposedEvent>,
+}
+
+/// Validates a decoded commit wire and turns it into proposed opaque events.
+fn commit_parts(
+    version: u8,
+    aggregate_type: String,
+    aggregate_id: String,
+    expected: u64,
+    events: CommitEvents,
+) -> Result<CommitParts, AbiError> {
+    require_version(version)?;
+    require_identifier_limit(aggregate_type.len())?;
+    require_identifier_limit(aggregate_id.len())?;
+    require_commit_event_count(events.observed)?;
+    let CommitEvents {
+        values: events,
+        observed: _,
+    } = events;
+    if events.is_empty() {
+        return Err(AbiError::MalformedInput);
+    }
+    let expected_sequence = usize::try_from(expected).map_err(AbiError::InputInteger)?;
+    expected_sequence
+        .checked_add(events.len())
+        .ok_or(AbiError::MalformedInput)?;
+    let events = events
+        .into_iter()
+        .map(|(event_type, event_version, OpaqueBytes(payload))| {
+            require_payload_limit(payload.len())?;
+            Ok(OpaqueProposedEvent::new(event_type, event_version, payload))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(CommitParts {
+        aggregate_type,
+        aggregate_id,
+        expected_sequence,
+        events,
+    })
+}
+
+/// Commits the validated batch, rendering a conflict with both stream versions.
+///
+/// The engine reports a conflict without the versions that produced it, so the
+/// durable version is read back to fill the detail SPEC pins the `CONFLICT`
+/// class to. Losing a race to another writer between the two calls can only
+/// report a version further ahead than the one that rejected this commit, which
+/// is still evidence the caller's expected version is stale.
+fn commit_result(
+    inner: &StoreInner,
+    parts: CommitParts,
+    expected: u64,
+    job: Option<JobSeed>,
+) -> Result<(), AbiError> {
+    let CommitParts {
+        aggregate_type,
+        aggregate_id,
+        expected_sequence,
+        events,
+    } = parts;
+    let stream = StreamIdentity::new(aggregate_type.clone(), aggregate_id.clone());
+    let request = OpaqueCommitRequest::new(stream.clone(), expected_sequence, &events);
+    let request = match job {
+        Some(job) => request.with_job(job),
+        None => request,
+    };
+
+    match inner.runtime.block_on(inner.engine.commit_opaque(request)) {
+        Ok(()) => Ok(()),
+        Err(EngineError::OptimisticLock) => {
+            let actual = inner
+                .runtime
+                .block_on(inner.engine.current_version(&stream))
+                .map_err(AbiError::from)?;
+            let actual = u64::try_from(actual).map_err(AbiError::StorageInteger)?;
+            Err(AbiError::Conflict {
+                aggregate_type,
+                aggregate_id,
+                expected,
+                actual,
+            })
+        }
+        Err(error) => Err(AbiError::from(error)),
+    }
+}
+
+/// Drives one token-fenced settlement entry point end to end.
+///
+/// The token is taken out of circulation before the durable settlement runs and
+/// retired only once it lands, so a second caller holding the same token cannot
+/// settle the claim underneath the first. A settlement that fails leaves the
+/// token available again through [`ClaimSettlement`]'s destructor.
+fn settle_claim_with<Decoded: DeserializeOwned + Serialize>(
+    store: *mut *mut EsStore,
+    request: *const EsBuf,
+    out_settlement: *mut u8,
+    out_error: *mut EsBuf,
+    validate: impl FnOnce(&Decoded) -> Result<(), AbiError>,
+    claim_token: impl FnOnce(&Decoded) -> Result<ClaimToken, AbiError>,
+    operation: impl FnOnce(
+        &StoreInner,
+        JobClaimHandle,
+        Decoded,
+    ) -> Result<JobSettlementResult, AbiError>,
+) -> i32 {
+    let request: Result<Decoded, AbiError> = decode(request);
+    clear_tag_output(out_settlement);
+    let lease = match EsStore::acquire(store) {
+        Ok(lease) => lease,
+        Err(error) => return write_error(out_error, error),
+    };
+    ffi_call(Some(&lease.store), out_error, || {
+        if out_settlement.is_null() {
+            return Err(AbiError::State("out_settlement is null"));
+        }
+        let decoded = request?;
+        validate(&decoded)?;
+        let token = claim_token(&decoded)?;
+        let settlement = lease.inner.begin_settlement(token)?;
+        let result = operation(&lease.inner, settlement.handle(), decoded)?;
+        settlement.complete();
+        unsafe { out_settlement.write(settlement_tag(result)) };
+        Ok(())
+    })
+}
+
+const fn require_commit_event_count(observed: usize) -> Result<(), AbiError> {
+    if observed <= MAX_COMMIT_EVENTS {
+        return Ok(());
+    }
+    Err(AbiError::ResourceLimit {
+        resource: "commit_events",
+        observed,
+        limit: MAX_COMMIT_EVENTS,
+    })
+}
+
+/// Bounds an identifier, reported under its own resource name.
+///
+/// The identifier and error-text limits happen to coincide, but the
+/// `RESOURCE_LIMIT` detail names which of the two a request exceeded. A caller
+/// whose aggregate id was too long, and is told its error text was, goes
+/// looking in the wrong place.
+const fn require_identifier_limit(observed: usize) -> Result<(), AbiError> {
+    if observed <= MAX_IDENTIFIER_BYTES {
+        return Ok(());
+    }
+    Err(AbiError::ResourceLimit {
+        resource: "identifier_text",
+        observed,
+        limit: MAX_IDENTIFIER_BYTES,
+    })
+}
+
 fn decode_open_options(buffer: *const EsBuf) -> Result<OpenOptions, AbiError> {
     let (version, path, busy_timeout_ms, pool_size, runtime_threads): (u8, String, u64, u32, u32) =
         decode(buffer)?;
     if version != 1 || pool_size == 0 || runtime_threads == 0 {
         return Err(AbiError::MalformedInput);
+    }
+    require_identifier_limit(path.len())?;
+    let busy_timeout_limit = u64::from(MAX_BUSY_TIMEOUT_MS);
+    if busy_timeout_ms > busy_timeout_limit {
+        return Err(AbiError::ResourceLimit {
+            resource: "busy_timeout_ms",
+            observed: usize::try_from(busy_timeout_ms).map_err(AbiError::InputInteger)?,
+            limit: usize::try_from(busy_timeout_limit).map_err(AbiError::InputInteger)?,
+        });
     }
 
     let parsed_sqlite = parse_sqlite_options(&path)?;
@@ -1099,7 +2168,12 @@ fn write_error(out_error: *mut EsBuf, error: AbiError) -> i32 {
         | AbiError::CborDecode(_)
         | AbiError::SqliteOptions(_)
         | AbiError::InputInteger(_)
-        | AbiError::CanonicalCbor(_) => ciborium::Value::Text("malformed input".to_string()),
+        | AbiError::CanonicalCbor(_)
+        | AbiError::JobIdentifier(_) => ciborium::Value::Text("malformed input".to_string()),
+        AbiError::JobRefusal { job_id, refusal } => ciborium::Value::Array(vec![
+            ciborium::Value::Text(job_id.to_string()),
+            ciborium::Value::Text(refusal.to_string()),
+        ]),
         AbiError::Conflict {
             aggregate_type,
             aggregate_id,
@@ -1114,7 +2188,9 @@ fn write_error(out_error: *mut EsBuf, error: AbiError) -> i32 {
         AbiError::Engine(_)
         | AbiError::Sql(_)
         | AbiError::Migration(_)
-        | AbiError::StorageInteger(_) => ciborium::Value::Text("storage failure".to_string()),
+        | AbiError::StorageInteger(_)
+        | AbiError::JobRuntime(_)
+        | AbiError::JobPayload(_) => ciborium::Value::Text("storage failure".to_string()),
         AbiError::CborEncode(_) | AbiError::ResponseIo(_) => {
             ciborium::Value::Text("response encoding failed".to_string())
         }
@@ -1150,6 +2226,12 @@ const fn clear_buffer_output(output: *mut EsBuf) {
                 len: 0,
             });
         }
+    }
+}
+
+const fn clear_tag_output(output: *mut u8) {
+    if !output.is_null() {
+        unsafe { output.write(0) };
     }
 }
 
@@ -1254,14 +2336,131 @@ mod tests {
                 1,
                 ES_ERR_RESOURCE_LIMIT,
                 Value::Array(vec![
-                    Value::Text("error_detail_text".to_string()),
+                    Value::Text("identifier_text".to_string()),
                     Value::Integer((MAX_ERROR_TEXT_BYTES + 1).into()),
                     Value::Integer(MAX_ERROR_TEXT_BYTES.into()),
                 ]),
             )
         );
         unsafe { es_buf_free(&raw mut error) };
-        assert_stream_version(store, aggregate_type, aggregate_id, 0);
+        assert_identifier_rejected_on_read(store, aggregate_type, aggregate_id);
+    }
+
+    /// The read paths enforce the same identifier limit as the write
+    /// paths, so an identifier a commit refused cannot be probed for a
+    /// version either -- the rejection is symmetric by contract.
+    fn assert_identifier_rejected_on_read(
+        store: &mut *mut EsStore,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) {
+        let mut request = encode_request(&(1_u8, aggregate_type, aggregate_id));
+        let request_buffer = caller_buffer(&mut request);
+        let mut actual = u64::MAX;
+        let mut error = empty_buffer();
+
+        assert_eq!(
+            unsafe {
+                es_current_version(
+                    store,
+                    &raw const request_buffer,
+                    &raw mut actual,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_RESOURCE_LIMIT
+        );
+        assert_eq!(actual, 0);
+        unsafe { es_buf_free(&raw mut error) };
+    }
+
+    fn decode_output<Response: DeserializeOwned>(buffer: &EsBuf) -> Response {
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.len) };
+        ciborium::from_reader(Cursor::new(bytes)).unwrap()
+    }
+
+    fn load_page(
+        store: &mut *mut EsStore,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        after: Option<u64>,
+    ) -> Vec<StoredEventWire> {
+        let mut encoded = encode_request(&(1_u8, aggregate_type, aggregate_id, after));
+        let request = caller_buffer(&mut encoded);
+        let mut output = empty_buffer();
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe { es_load_stream(store, &raw const request, &raw mut output, &raw mut error) },
+            ES_OK
+        );
+        assert!(error.ptr.is_null());
+        let (1, events) = decode_output::<StoredEventsWire>(&output) else {
+            panic!("event page must carry the response version");
+        };
+        unsafe { es_buf_free(&raw mut output) };
+        events
+    }
+
+    fn enqueue_test_job(store: &mut *mut EsStore, job_id: &str, run_at_ms: i64) {
+        let mut encoded = encode_request(&(
+            1_u8,
+            job_id,
+            "ffi-test",
+            OpaqueBytes(vec![0, 1, 255]),
+            run_at_ms,
+        ));
+        let request = caller_buffer(&mut encoded);
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe { es_job_enqueue(store, &raw const request, &raw mut error) },
+            ES_OK
+        );
+        assert!(error.ptr.is_null());
+    }
+
+    fn poll_test_jobs(store: &mut *mut EsStore, now_ms: i64) -> Vec<String> {
+        let mut encoded = encode_request(&(1_u8, "ffi-test", now_ms, 10_u32));
+        let request = caller_buffer(&mut encoded);
+        let mut jobs = empty_buffer();
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe { es_job_poll(store, &raw const request, &raw mut jobs, &raw mut error) },
+            ES_OK
+        );
+        assert!(error.ptr.is_null());
+        let (1, runnable) = decode_output::<(u8, Vec<String>)>(&jobs) else {
+            panic!("a job page must carry the response version");
+        };
+        unsafe { es_buf_free(&raw mut jobs) };
+        runnable
+    }
+
+    fn claim_test_job(
+        store: &mut *mut EsStore,
+        job_id: &str,
+        now_ms: i64,
+        expected_attempt: u32,
+        expected_execution: u8,
+    ) -> Vec<u8> {
+        let mut encoded = encode_request(&(1_u8, job_id, "ffi-worker", now_ms, 30_000_i64, 50_u32));
+        let request = caller_buffer(&mut encoded);
+        let mut claim = empty_buffer();
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe { es_job_claim(store, &raw const request, &raw mut claim, &raw mut error) },
+            ES_OK
+        );
+        let (1, 0, Some(OpaqueBytes(token)), Some(attempt), Some(execution), Some(payload)) =
+            decode_output::<JobClaimWire>(&claim)
+        else {
+            panic!("expected a won claim");
+        };
+        assert_eq!(attempt, expected_attempt);
+        assert_eq!(execution, expected_execution);
+        assert_eq!(payload, OpaqueBytes(vec![0, 1, 255]));
+        assert_eq!(token.len(), 16);
+        unsafe { es_buf_free(&raw mut claim) };
+        token
     }
 
     #[test]
@@ -1374,6 +2573,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn open_options_bound_the_busy_timeout_at_what_the_driver_accepts() {
+        let mut accepted = encode_request(&(
+            1_u8,
+            "sqlite::memory:",
+            u64::from(MAX_BUSY_TIMEOUT_MS),
+            1_u32,
+            1_u32,
+        ));
+        let accepted_buffer = caller_buffer(&mut accepted);
+
+        let Ok(options) = decode_open_options(&raw const accepted_buffer) else {
+            panic!("the largest timeout the driver accepts must open a store");
+        };
+
+        assert_eq!(
+            options.busy_timeout,
+            Duration::from_millis(u64::from(MAX_BUSY_TIMEOUT_MS))
+        );
+
+        let mut refused = encode_request(&(
+            1_u8,
+            "sqlite::memory:",
+            u64::from(MAX_BUSY_TIMEOUT_MS) + 1,
+            1_u32,
+            1_u32,
+        ));
+        let refused_buffer = caller_buffer(&mut refused);
+
+        assert!(matches!(
+            decode_open_options(&raw const refused_buffer),
+            Err(AbiError::ResourceLimit {
+                resource: "busy_timeout_ms",
+                observed,
+                limit,
+            }) if observed == usize::try_from(u64::from(MAX_BUSY_TIMEOUT_MS) + 1).unwrap()
+                && limit == usize::try_from(MAX_BUSY_TIMEOUT_MS).unwrap()
+        ));
     }
 
     #[test]
@@ -1883,7 +3122,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_rejects_aggregate_type_above_the_error_detail_limit_without_writing() {
+    fn commit_rejects_aggregate_type_above_the_identifier_limit_without_writing() {
         let mut store = ptr::null_mut();
         open_store(&mut store);
         let oversized = "a".repeat(MAX_ERROR_TEXT_BYTES + 1);
@@ -1894,7 +3133,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_rejects_aggregate_id_above_the_error_detail_limit_without_writing() {
+    fn commit_rejects_aggregate_id_above_the_identifier_limit_without_writing() {
         let mut store = ptr::null_mut();
         open_store(&mut store);
         let oversized = "a".repeat(MAX_ERROR_TEXT_BYTES + 1);
@@ -2218,5 +3457,1067 @@ mod tests {
         assert!(buffer.ptr.is_null());
         assert_eq!(buffer.len, 0);
         unsafe { es_buf_free(&raw mut buffer) };
+    }
+
+    #[test]
+    fn job_claim_tokens_support_the_lifecycle_and_reject_tampering_and_replay() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+        let mut renew_encoded = encode_request(&(1_u8, OpaqueBytes(token.clone()), 60_000_i64));
+        let renew = caller_buffer(&mut renew_encoded);
+        let mut renewal = u8::MAX;
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_renew(
+                    &raw mut store,
+                    &raw const renew,
+                    &raw mut renewal,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(renewal, 0);
+
+        let mut tampered = token.clone();
+        tampered[0] ^= 1;
+        let mut tampered_encoded = encode_request(&(1_u8, OpaqueBytes(tampered)));
+        let tampered_request = caller_buffer(&mut tampered_encoded);
+        let mut settlement = u8::MAX;
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const tampered_request,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert_eq!(settlement, 0);
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_STATE,
+                Value::Text("claim handle is invalid".to_string()),
+            )
+        );
+        unsafe { es_buf_free(&raw mut error) };
+
+        let mut ack_encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+        let ack = caller_buffer(&mut ack_encoded);
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 0);
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn renewal_excludes_replay_and_restores_the_token_when_interrupted() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let retained_token = decode_claim_token(&token).unwrap();
+        let renewal = lease.inner.begin_renewal(retained_token).unwrap();
+        let pruning_reservation = lease.inner.prepare_claim(100_000).unwrap();
+        assert!(matches!(
+            lease.inner.begin_renewal(retained_token),
+            Err(AbiError::State("claim handle is invalid"))
+        ));
+        drop(pruning_reservation);
+        drop(renewal);
+        drop(lease);
+
+        let mut ack_encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+        let ack = caller_buffer(&mut ack_encoded);
+        let mut settlement = u8::MAX;
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 0);
+        assert!(error.ptr.is_null());
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn concurrent_job_ack_consumes_exactly_one_claim_token() {
+        const CALLERS: usize = 16;
+
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+        let owner_address = (&raw mut store) as usize;
+        let barrier = Arc::new(std::sync::Barrier::new(CALLERS));
+
+        let results = std::thread::scope(|scope| {
+            (0..CALLERS)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let token = token.clone();
+                    scope.spawn(move || {
+                        let mut encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+                        let request = caller_buffer(&mut encoded);
+                        let mut settlement = u8::MAX;
+                        let mut error = empty_buffer();
+                        barrier.wait();
+                        let result = unsafe {
+                            es_job_ack(
+                                owner_address as *mut *mut EsStore,
+                                &raw const request,
+                                &raw mut settlement,
+                                &raw mut error,
+                            )
+                        };
+                        unsafe { es_buf_free(&raw mut error) };
+                        (result, settlement)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(result, settlement)| *result == ES_OK && *settlement == 0)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(result, settlement)| *result == ES_ERR_STATE && *settlement == 0)
+                .count(),
+            CALLERS - 1
+        );
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn concurrent_claims_reserve_the_last_active_claim_slot_once() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = ClaimToken::try_from(claim_test_job(&mut store, &job_id, 1_000, 0, 0)).unwrap();
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let mut claims = lease.inner.claims.lock().unwrap();
+        let retained = claims.retained.get(&token).unwrap().handle.clone();
+        (1..(MAX_ACTIVE_CLAIMS - 1)).for_each(|index| {
+            let mut fabricated_token = [0_u8; 16];
+            fabricated_token[..8].copy_from_slice(&index.to_be_bytes());
+            claims.retained.insert(
+                fabricated_token,
+                RetainedClaim {
+                    handle: retained.clone(),
+                    lease_until_ms: 31_000,
+                    state: ClaimState::Available,
+                },
+            );
+        });
+        assert_eq!(claims.retained.len(), MAX_ACTIVE_CLAIMS - 1);
+        drop(claims);
+
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let reserved = Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let first_ready = Arc::clone(&ready);
+            let first_reserved = Arc::clone(&reserved);
+            let first_inner = &lease.inner;
+            let first = scope.spawn(move || {
+                first_ready.wait();
+                let reservation = first_inner.prepare_claim(1_000);
+                first_reserved.wait();
+                reservation.is_ok()
+            });
+            let second_inner = &lease.inner;
+            let second = scope.spawn(move || {
+                ready.wait();
+                let reservation = second_inner.prepare_claim(1_000);
+                reserved.wait();
+                reservation.is_ok()
+            });
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+
+        assert_eq!(results.into_iter().filter(|granted| *granted).count(), 1);
+        drop(lease);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn abandoned_job_claim_retires_the_expired_token() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+
+        let mut reclaim_encoded =
+            encode_request(&(1_u8, job_id, "ffi-worker", 31_001_i64, 30_000_i64, 1_u32));
+        let reclaim_request = caller_buffer(&mut reclaim_encoded);
+        let mut reclaim = empty_buffer();
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_claim(
+                    &raw mut store,
+                    &raw const reclaim_request,
+                    &raw mut reclaim,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(
+            decode_output::<JobClaimWire>(&reclaim),
+            (1, 1, None, None, None, None)
+        );
+        unsafe { es_buf_free(&raw mut reclaim) };
+
+        let mut ack_encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+        let ack_request = caller_buffer(&mut ack_encoded);
+        let mut settlement = u8::MAX;
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack_request,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert_eq!(settlement, 0);
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn failed_job_settlement_restores_the_claim_token() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+        let mut retry_encoded = encode_request(&(
+            1_u8,
+            OpaqueBytes(token.clone()),
+            i64::MAX,
+            "invalid instant",
+        ));
+        let retry_request = caller_buffer(&mut retry_encoded);
+        let mut settlement = u8::MAX;
+        let mut error = empty_buffer();
+
+        assert_eq!(
+            unsafe {
+                es_job_retry(
+                    &raw mut store,
+                    &raw const retry_request,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_DECODE
+        );
+        assert_eq!(settlement, 0);
+        assert_eq!(
+            decode_error(&error),
+            (1, ES_ERR_DECODE, Value::Text("malformed input".to_string()),)
+        );
+        unsafe { es_buf_free(&raw mut error) };
+
+        let mut ack_encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+        let ack_request = caller_buffer(&mut ack_encoded);
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack_request,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 0);
+        assert!(error.ptr.is_null());
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn commit_with_job_is_atomic_and_invalid_job_instants_do_not_persist() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        let mut commit_encoded = encode_request(&(
+            1_u8,
+            "ffi-domain",
+            "one",
+            0_u64,
+            vec![("Created", "1.0", OpaqueBytes(vec![7]))],
+            (job_id.clone(), "ffi-test", OpaqueBytes(vec![42]), 1_000_i64),
+        ));
+        let commit = caller_buffer(&mut commit_encoded);
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe { es_commit_with_job(&raw mut store, &raw const commit, &raw mut error) },
+            ES_OK
+        );
+
+        let mut poll_encoded = encode_request(&(1_u8, "ffi-test", 1_000_i64, 10_u32));
+        let poll = caller_buffer(&mut poll_encoded);
+        let mut jobs = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_poll(
+                    &raw mut store,
+                    &raw const poll,
+                    &raw mut jobs,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(decode_output::<(u8, Vec<String>)>(&jobs), (1, vec![job_id]));
+        unsafe { es_buf_free(&raw mut jobs) };
+
+        let invalid_job_id = JobId::new().to_string();
+        let mut invalid_encoded = encode_request(&(
+            1_u8,
+            invalid_job_id,
+            "ffi-test",
+            OpaqueBytes(vec![1]),
+            i64::MAX,
+        ));
+        let invalid = caller_buffer(&mut invalid_encoded);
+        assert_eq!(
+            unsafe { es_job_enqueue(&raw mut store, &raw const invalid, &raw mut error) },
+            ES_ERR_DECODE
+        );
+        assert_eq!(
+            decode_error(&error),
+            (1, ES_ERR_DECODE, Value::Text("malformed input".to_string()),)
+        );
+        unsafe { es_buf_free(&raw mut error) };
+
+        let rollback_job_id = JobId::new().to_string();
+        let rollback_job_kind = "ffi-rollback";
+        let mut rollback_encoded = encode_request(&(
+            1_u8,
+            "ffi-domain",
+            "rollback",
+            0_u64,
+            vec![("Created", "1.0", OpaqueBytes(vec![9]))],
+            (
+                rollback_job_id,
+                rollback_job_kind,
+                OpaqueBytes(vec![9]),
+                i64::MAX,
+            ),
+        ));
+        let rollback = caller_buffer(&mut rollback_encoded);
+        assert_eq!(
+            unsafe { es_commit_with_job(&raw mut store, &raw const rollback, &raw mut error) },
+            ES_ERR_DECODE,
+            "an out-of-range job instant is the same caller fault on either entry point"
+        );
+        assert_eq!(
+            decode_error(&error),
+            (1, ES_ERR_DECODE, Value::Text("malformed input".to_string()),)
+        );
+        unsafe { es_buf_free(&raw mut error) };
+        let mut version_encoded = encode_request(&(1_u8, "ffi-domain", "rollback"));
+        let version_request = caller_buffer(&mut version_encoded);
+        let mut version = u64::MAX;
+        assert_eq!(
+            unsafe {
+                es_current_version(
+                    &raw mut store,
+                    &raw const version_request,
+                    &raw mut version,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(version, 0);
+        let mut rollback_poll_encoded =
+            encode_request(&(1_u8, rollback_job_kind, i64::MAX, 10_u32));
+        let rollback_poll = caller_buffer(&mut rollback_poll_encoded);
+        let mut rollback_jobs = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_poll(
+                    &raw mut store,
+                    &raw const rollback_poll,
+                    &raw mut rollback_jobs,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(
+            decode_output::<(u8, Vec<String>)>(&rollback_jobs),
+            (1, Vec::new())
+        );
+        unsafe { es_buf_free(&raw mut rollback_jobs) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn retry_defer_and_dead_letter_consume_each_claim_once() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let mut settlement = u8::MAX;
+        let mut error = empty_buffer();
+
+        let first = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+        let mut retry_encoded = encode_request(&(1_u8, OpaqueBytes(first), 2_000_i64, "transient"));
+        let retry = caller_buffer(&mut retry_encoded);
+        assert_eq!(
+            unsafe {
+                es_job_retry(
+                    &raw mut store,
+                    &raw const retry,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 0);
+        assert_eq!(
+            unsafe {
+                es_job_retry(
+                    &raw mut store,
+                    &raw const retry,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert_eq!(settlement, 0);
+        unsafe { es_buf_free(&raw mut error) };
+
+        let second = claim_test_job(&mut store, &job_id, 2_000, 1, 1);
+        let mut defer_encoded = encode_request(&(1_u8, OpaqueBytes(second), 3_000_i64));
+        let defer = caller_buffer(&mut defer_encoded);
+        assert_eq!(
+            unsafe {
+                es_job_defer(
+                    &raw mut store,
+                    &raw const defer,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 0);
+        assert_eq!(
+            unsafe {
+                es_job_defer(
+                    &raw mut store,
+                    &raw const defer,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert_eq!(settlement, 0);
+        unsafe { es_buf_free(&raw mut error) };
+
+        let third = claim_test_job(&mut store, &job_id, 3_000, 1, 1);
+        let mut dead_encoded = encode_request(&(1_u8, OpaqueBytes(third), 1_u8, "terminal"));
+        let dead = caller_buffer(&mut dead_encoded);
+        assert_eq!(
+            unsafe {
+                es_job_dead_letter(
+                    &raw mut store,
+                    &raw const dead,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 0);
+        assert_eq!(
+            unsafe {
+                es_job_dead_letter(
+                    &raw mut store,
+                    &raw const dead,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert_eq!(settlement, 0);
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn claim_tokens_outlive_their_local_lease_until_the_durable_job_settles() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let executing_job = JobId::new().to_string();
+        enqueue_test_job(&mut store, &executing_job, 1_000);
+        let token = claim_test_job(&mut store, &executing_job, 1_000, 0, 0);
+
+        let unrelated_job = JobId::new().to_string();
+        enqueue_test_job(&mut store, &unrelated_job, 1_000);
+        let unrelated_token = claim_test_job(&mut store, &unrelated_job, 100_000, 0, 0);
+        assert_ne!(unrelated_token, token);
+
+        let mut ack_encoded = encode_request(&(1_u8, OpaqueBytes(token)));
+        let ack = caller_buffer(&mut ack_encoded);
+        let mut settlement = u8::MAX;
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 0);
+        assert!(error.ptr.is_null());
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn claim_capacity_evicts_the_longest_lapsed_token_before_refusing() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let live = ClaimToken::try_from(claim_test_job(&mut store, &job_id, 1_000, 0, 0)).unwrap();
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let mut claims = lease.inner.claims.lock().unwrap();
+        let handle = claims.retained.get(&live).unwrap().handle.clone();
+        let mut lapsed = [0_u8; 16];
+        lapsed[0] = 1;
+        let mut newer_lapsed = [0_u8; 16];
+        newer_lapsed[0] = 2;
+        claims.retained.insert(
+            lapsed,
+            RetainedClaim {
+                handle: handle.clone(),
+                lease_until_ms: 10,
+                state: ClaimState::Available,
+            },
+        );
+        claims.retained.insert(
+            newer_lapsed,
+            RetainedClaim {
+                handle: handle.clone(),
+                lease_until_ms: 20,
+                state: ClaimState::Available,
+            },
+        );
+        (3..MAX_ACTIVE_CLAIMS).for_each(|index| {
+            let mut fabricated_token = [0_u8; 16];
+            fabricated_token[..8].copy_from_slice(&index.to_be_bytes());
+            claims.retained.insert(
+                fabricated_token,
+                RetainedClaim {
+                    handle: handle.clone(),
+                    lease_until_ms: 31_000,
+                    state: ClaimState::Available,
+                },
+            );
+        });
+        assert_eq!(claims.retained.len(), MAX_ACTIVE_CLAIMS);
+        drop(claims);
+
+        let reservation = lease.inner.prepare_claim(1_000).unwrap();
+        let claims = lease.inner.claims.lock().unwrap();
+        assert!(
+            !claims.retained.contains_key(&lapsed),
+            "the longest-lapsed token frees the slot"
+        );
+        assert!(
+            claims.retained.contains_key(&newer_lapsed),
+            "only one token is evicted per reservation"
+        );
+        assert!(
+            claims.retained.contains_key(&live),
+            "a live claim is never evicted to make room"
+        );
+        drop(claims);
+        drop(reservation);
+        drop(lease);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn a_claim_whose_payload_cannot_be_returned_is_dead_lettered_as_undecodable() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+
+        // A structured payload is what the native enqueue surface writes, and a
+        // mixed deployment lets a foreign worker poll the same kind. The shape
+        // is a property of the stored job, so re-arming it would loop forever.
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        lease
+            .inner
+            .runtime
+            .block_on(lease.inner.jobs.enqueue_job_payload(
+                job_id.parse::<JobId>().unwrap(),
+                "ffi-test".to_string(),
+                serde_json::json!({ "recipient": "ffi", "attempts": 3 }),
+                1_000,
+            ))
+            .unwrap();
+        drop(lease);
+
+        assert_eq!(poll_test_jobs(&mut store, 1_000), vec![job_id.clone()]);
+
+        let mut claim_encoded = encode_request(&(
+            1_u8,
+            job_id.as_str(),
+            "ffi-worker",
+            1_000_i64,
+            30_000_i64,
+            50_u32,
+        ));
+        let claim_request = caller_buffer(&mut claim_encoded);
+        let mut claim = empty_buffer();
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_claim(
+                    &raw mut store,
+                    &raw const claim_request,
+                    &raw mut claim,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_JOB_REFUSAL
+        );
+        assert!(claim.ptr.is_null());
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_JOB_REFUSAL,
+                Value::Array(vec![
+                    Value::Text(job_id.clone()),
+                    Value::Text("claimed job payload is not opaque bytes".to_string()),
+                ]),
+            )
+        );
+        unsafe { es_buf_free(&raw mut error) };
+
+        let events = load_page(&mut store, "job", &job_id, None);
+        let (_, event_type, _, OpaqueBytes(payload)) =
+            events.last().expect("the job stream must record the claim");
+        assert_eq!(event_type, "JobDead");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(payload).unwrap()["Dead"]["reason"],
+            serde_json::json!("Undecodable")
+        );
+
+        assert_eq!(poll_test_jobs(&mut store, 100_000), Vec::<String>::new());
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn claim_requests_reject_an_unusable_lease_or_claim_budget_before_claiming() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+
+        for (lease_ms, max_claims) in [(0_i64, 50_u32), (-1, 50), (30_000, 0)] {
+            let mut encoded = encode_request(&(
+                1_u8,
+                job_id.as_str(),
+                "ffi-worker",
+                1_000_i64,
+                lease_ms,
+                max_claims,
+            ));
+            let request = caller_buffer(&mut encoded);
+            let mut claim = empty_buffer();
+            let mut error = empty_buffer();
+            assert_eq!(
+                unsafe {
+                    es_job_claim(
+                        &raw mut store,
+                        &raw const request,
+                        &raw mut claim,
+                        &raw mut error,
+                    )
+                },
+                ES_ERR_DECODE
+            );
+            assert!(claim.ptr.is_null());
+            unsafe { es_buf_free(&raw mut error) };
+        }
+
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+        assert_eq!(token.len(), 16);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn an_unrepresentable_lease_instant_is_reported_as_a_job_refusal() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+
+        // Within `i64` but outside chrono's range, so the ABI's own overflow
+        // guard passes and the job itself is what refuses the claim.
+        let mut encoded = encode_request(&(
+            1_u8,
+            job_id.as_str(),
+            "ffi-worker",
+            i64::MAX - 1,
+            1_i64,
+            50_u32,
+        ));
+        let request = caller_buffer(&mut encoded);
+        let mut claim = empty_buffer();
+        let mut error = empty_buffer();
+
+        assert_eq!(
+            unsafe {
+                es_job_claim(
+                    &raw mut store,
+                    &raw const request,
+                    &raw mut claim,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_JOB_REFUSAL
+        );
+        assert!(claim.ptr.is_null());
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_JOB_REFUSAL,
+                Value::Array(vec![
+                    Value::Text(job_id),
+                    Value::Text("invalid job claim policy".to_string()),
+                ]),
+            )
+        );
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn a_re_claimed_job_reports_a_lost_renewal_and_a_fenced_settlement() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let first = ClaimToken::try_from(claim_test_job(&mut store, &job_id, 1_000, 0, 0)).unwrap();
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let claims = lease.inner.claims.lock().unwrap();
+        let stale = claims.retained.get(&first).unwrap().handle.clone();
+        drop(claims);
+        drop(lease);
+
+        // The first lease lapses at 31_000, so a re-claim wins the job and
+        // fences the handle the first claim was executing under.
+        let mut reclaim_encoded = encode_request(&(
+            1_u8,
+            job_id.as_str(),
+            "ffi-worker",
+            31_001_i64,
+            30_000_i64,
+            50_u32,
+        ));
+        let reclaim_request = caller_buffer(&mut reclaim_encoded);
+        let mut reclaim = empty_buffer();
+        let mut error = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_claim(
+                    &raw mut store,
+                    &raw const reclaim_request,
+                    &raw mut reclaim,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        let (1, 0, Some(_), Some(_), Some(_), Some(_)) = decode_output::<JobClaimWire>(&reclaim)
+        else {
+            panic!("the lapsed job must be re-claimable");
+        };
+        unsafe { es_buf_free(&raw mut reclaim) };
+
+        // The re-claim dropped the first token locally, so the stale handle is
+        // reinstated under a token of its own to drive it through the ABI.
+        let stale_token = [0xAA_u8; 16];
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let mut claims = lease.inner.claims.lock().unwrap();
+        claims.retained.insert(
+            stale_token,
+            RetainedClaim {
+                handle: stale.clone(),
+                lease_until_ms: 61_000,
+                state: ClaimState::Available,
+            },
+        );
+        drop(claims);
+        drop(lease);
+
+        let mut renew_encoded =
+            encode_request(&(1_u8, OpaqueBytes(stale_token.to_vec()), 61_000_i64));
+        let renew = caller_buffer(&mut renew_encoded);
+        let mut renewal = u8::MAX;
+        assert_eq!(
+            unsafe {
+                es_job_renew(
+                    &raw mut store,
+                    &raw const renew,
+                    &raw mut renewal,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(renewal, 1, "the lease belongs to the re-claimer");
+        assert!(error.ptr.is_null());
+
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let mut claims = lease.inner.claims.lock().unwrap();
+        assert!(
+            !claims.retained.contains_key(&stale_token),
+            "a lost renewal retires the token it was renewing"
+        );
+        claims.retained.insert(
+            stale_token,
+            RetainedClaim {
+                handle: stale,
+                lease_until_ms: 61_000,
+                state: ClaimState::Available,
+            },
+        );
+        drop(claims);
+        drop(lease);
+
+        let mut ack_encoded = encode_request(&(1_u8, OpaqueBytes(stale_token.to_vec())));
+        let ack = caller_buffer(&mut ack_encoded);
+        let mut settlement = u8::MAX;
+        assert_eq!(
+            unsafe {
+                es_job_ack(
+                    &raw mut store,
+                    &raw const ack,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_OK
+        );
+        assert_eq!(settlement, 1, "the re-claimer owns the outcome");
+        assert!(error.ptr.is_null());
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn claim_tokens_do_not_repeat() {
+        let tokens = (0..1_024)
+            .map(|_| claim_token().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(tokens.len(), 1_024);
+    }
+
+    #[test]
+    fn job_poll_rejects_limits_above_the_response_item_bound() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let limit = u32::try_from(MAX_LIST_ITEMS).unwrap() + 1;
+        let mut poll_encoded = encode_request(&(1_u8, "ffi-test", 1_000_i64, limit));
+        let poll = caller_buffer(&mut poll_encoded);
+        let mut jobs = empty_buffer();
+        let mut error = empty_buffer();
+
+        assert_eq!(
+            unsafe {
+                es_job_poll(
+                    &raw mut store,
+                    &raw const poll,
+                    &raw mut jobs,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_RESOURCE_LIMIT
+        );
+        assert!(jobs.ptr.is_null());
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_RESOURCE_LIMIT,
+                Value::Array(vec![
+                    Value::Text("job_poll_limit".to_string()),
+                    Value::Integer((MAX_LIST_ITEMS + 1).into()),
+                    Value::Integer(MAX_LIST_ITEMS.into()),
+                ]),
+            )
+        );
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn resource_limits_name_identifiers_and_error_text_apart() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let job_id = JobId::new().to_string();
+        enqueue_test_job(&mut store, &job_id, 1_000);
+        let token = claim_test_job(&mut store, &job_id, 1_000, 0, 0);
+        let mut error = empty_buffer();
+
+        let mut oversized_kind = encode_request(&(
+            1_u8,
+            "x".repeat(MAX_IDENTIFIER_BYTES + 1),
+            1_000_i64,
+            10_u32,
+        ));
+        let poll = caller_buffer(&mut oversized_kind);
+        let mut jobs = empty_buffer();
+        assert_eq!(
+            unsafe {
+                es_job_poll(
+                    &raw mut store,
+                    &raw const poll,
+                    &raw mut jobs,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_RESOURCE_LIMIT
+        );
+        assert!(jobs.ptr.is_null());
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_RESOURCE_LIMIT,
+                Value::Array(vec![
+                    Value::Text("identifier_text".to_string()),
+                    Value::Integer((MAX_IDENTIFIER_BYTES + 1).into()),
+                    Value::Integer(MAX_IDENTIFIER_BYTES.into()),
+                ]),
+            )
+        );
+        unsafe { es_buf_free(&raw mut error) };
+
+        let mut oversized_error = encode_request(&(
+            1_u8,
+            OpaqueBytes(token),
+            2_000_i64,
+            "x".repeat(MAX_ERROR_TEXT_BYTES + 1),
+        ));
+        let retry = caller_buffer(&mut oversized_error);
+        let mut settlement = u8::MAX;
+        assert_eq!(
+            unsafe {
+                es_job_retry(
+                    &raw mut store,
+                    &raw const retry,
+                    &raw mut settlement,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_RESOURCE_LIMIT
+        );
+        assert_eq!(settlement, 0);
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_RESOURCE_LIMIT,
+                Value::Array(vec![
+                    Value::Text("error_detail_text".to_string()),
+                    Value::Integer((MAX_ERROR_TEXT_BYTES + 1).into()),
+                    Value::Integer(MAX_ERROR_TEXT_BYTES.into()),
+                ]),
+            )
+        );
+        unsafe { es_buf_free(&raw mut error) };
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
     }
 }
