@@ -1,4 +1,4 @@
-module Main (main) where
+module JobSpec (spec) where
 
 import Conduit (runConduit, sinkList, (.|))
 import Control.Exception (finally)
@@ -53,8 +53,7 @@ import Event.Sorcery.Stream (
   commit,
   currentVersion,
  )
-import Test.Tasty (TestTree, defaultMain, testGroup)
-import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 import Prelude (
   Either (..),
   IO,
@@ -67,98 +66,105 @@ import Prelude (
  )
 
 
-main :: IO ()
-main = defaultMain tests
+spec :: Spec
+spec = describe "durable jobs" $ do
+  it "accepts only ULID-shaped job identifiers" $
+    case ( mkJobId "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+         , mkJobId "not-a-ulid"
+         , mkJobId "80000000000000000000000000"
+         ) of
+      (Just accepted, Nothing, Nothing) ->
+        jobIdText accepted `shouldBe` "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+      (_, _, _) ->
+        expectationFailure
+          "Haskell JobId validation diverged from the Rust engine"
 
+  it "commits events and the job they dispatch together" $
+    withStore $ \store -> do
+      commitWithJob store stream 0 (proposed :| []) seed
+        >>= (`shouldBe` Right ())
+      currentVersion store stream >>= (`shouldBe` Right 1)
+      pollJobs store kind now pollLimit >>= (`shouldBe` Right [identifier])
 
-tests :: TestTree
-tests =
-  testGroup
-    "durable jobs"
-    [ testCase "accepts only ULID-shaped job identifiers" $
-        case ( mkJobId "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-             , mkJobId "not-a-ulid"
-             , mkJobId "80000000000000000000000000"
-             ) of
-          (Just accepted, Nothing, Nothing) ->
-            jobIdText accepted @?= "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-          (_, _, _) ->
-            assertFailure
-              "Haskell JobId validation diverged from the Rust engine"
-    , testCase "commits events and the job they dispatch together" $
-        withStore $ \store -> do
-          commitWithJob store stream 0 (proposed :| []) seed
-            >>= (@?= Right ())
-          currentVersion store stream >>= (@?= Right 1)
-          pollJobs store kind now pollLimit >>= (@?= Right [identifier])
-    , testCase "leaves no job behind when the commit conflicts" $
-        withStore $ \store -> do
-          commit store stream 0 (proposed :| []) >>= (@?= Right ())
-          conflicted <- commitWithJob store stream 0 (proposed :| []) seed
-          conflicted
-            @?= Left
-              (OptimisticConflict (ConflictDetail aggregateType aggregateId 0 1))
-          currentVersion store stream >>= (@?= Right 1)
-          pollJobs store kind now pollLimit >>= (@?= Right [])
-    , testCase "claims a runnable job, renews it and acknowledges it" $
-        withStore $ \store -> do
-          enqueueJob store seed >>= (@?= Right ())
-          (details, token) <- claimFixture store now
-          details.attempt @?= 0
-          details.route @?= SubmitExecution
-          details.payload @?= payload
-          renewJob store details.reference (JobInstant 60_000)
-            >>= (@?= Right LeaseHeld)
-          acknowledgeJob store token >>= (@?= Right SettlementApplied)
-          pollJobs store kind later pollLimit >>= (@?= Right [])
-    , testCase "reschedules a retried job as a reconciliation" $
-        withStore $ \store -> do
-          enqueueJob store seed >>= (@?= Right ())
-          (_, firstToken) <- claimFixture store now
-          retryJob store firstToken later "transient failure"
-            >>= (@?= Right SettlementApplied)
-          pollJobs store kind now pollLimit >>= (@?= Right [])
-          pollJobs store kind later pollLimit >>= (@?= Right [identifier])
-          (details, secondToken) <- claimFixture store later
-          details.attempt @?= 1
-          details.route @?= ReconcileExecution
-          acknowledgeJob store secondToken >>= (@?= Right SettlementApplied)
-    , testCase "holds a deferred job back until its next instant" $
-        withStore $ \store -> do
-          enqueueJob store seed >>= (@?= Right ())
-          (_, firstToken) <- claimFixture store now
-          deferJob store firstToken later >>= (@?= Right SettlementApplied)
-          pollJobs store kind now pollLimit >>= (@?= Right [])
-          pollJobs store kind later pollLimit >>= (@?= Right [identifier])
-          (_, secondToken) <- claimFixture store later
-          acknowledgeJob store secondToken >>= (@?= Right SettlementApplied)
-    , testCase "takes a dead-lettered job out of the queue" $
-        withStore $ \store -> do
-          enqueueJob store seed >>= (@?= Right ())
-          (_, token) <- claimFixture store now
-          deadLetterJob store token Rejected "rejected by dependency"
-            >>= (@?= Right SettlementApplied)
-          pollJobs store kind later pollLimit >>= (@?= Right [])
-    , testCase "retires the claim that a later claim superseded" $
-        withStore $ \store -> do
-          enqueueJob store seed >>= (@?= Right ())
-          (stale, staleToken) <- claimFixture store now
-          (_, currentToken) <- claimFixture store later
-          renewJob store stale.reference (JobInstant 120_000)
-            >>= (@?= Left (InvalidState "claim handle is invalid"))
-          acknowledgeJob store staleToken
-            >>= (@?= Left (InvalidState "claim handle is invalid"))
-          acknowledgeJob store currentToken >>= (@?= Right SettlementApplied)
-    , testCase "streams the runnable jobs one poll answers with" $
-        withStore $ \store -> do
-          enqueueJob store seed >>= (@?= Right ())
-          streamed <-
-            runExceptT
-              ( runConduit
-                  (streamRunnableJobs store kind now pollLimit .| sinkList)
-              )
-          streamed @?= Right [identifier]
-    ]
+  it "leaves no job behind when the commit conflicts" $
+    withStore $ \store -> do
+      commit store stream 0 (proposed :| []) >>= (`shouldBe` Right ())
+      conflicted <- commitWithJob store stream 0 (proposed :| []) seed
+      conflicted
+        `shouldBe` Left
+          (OptimisticConflict (ConflictDetail aggregateType aggregateId 0 1))
+      currentVersion store stream >>= (`shouldBe` Right 1)
+      pollJobs store kind now pollLimit >>= (`shouldBe` Right [])
+
+  it "claims a runnable job, renews it and acknowledges it" $
+    withStore $ \store -> do
+      enqueueJob store seed >>= (`shouldBe` Right ())
+      (details, token) <- claimFixture store now
+      details.attempt `shouldBe` 0
+      details.route `shouldBe` SubmitExecution
+      details.payload `shouldBe` payload
+      renewJob store details.reference (JobInstant 60_000)
+        >>= (`shouldBe` Right LeaseHeld)
+      acknowledgeJob store token >>= (`shouldBe` Right SettlementApplied)
+      pollJobs store kind later pollLimit >>= (`shouldBe` Right [])
+
+  it "reschedules a retried job as a reconciliation" $
+    withStore $ \store -> do
+      enqueueJob store seed >>= (`shouldBe` Right ())
+      (_, firstToken) <- claimFixture store now
+      retryJob store firstToken later "transient failure"
+        >>= (`shouldBe` Right SettlementApplied)
+      pollJobs store kind now pollLimit >>= (`shouldBe` Right [])
+      pollJobs store kind later pollLimit
+        >>= (`shouldBe` Right [identifier])
+      (details, secondToken) <- claimFixture store later
+      details.attempt `shouldBe` 1
+      details.route `shouldBe` ReconcileExecution
+      acknowledgeJob store secondToken
+        >>= (`shouldBe` Right SettlementApplied)
+
+  it "holds a deferred job back until its next instant" $
+    withStore $ \store -> do
+      enqueueJob store seed >>= (`shouldBe` Right ())
+      (_, firstToken) <- claimFixture store now
+      deferJob store firstToken later
+        >>= (`shouldBe` Right SettlementApplied)
+      pollJobs store kind now pollLimit >>= (`shouldBe` Right [])
+      pollJobs store kind later pollLimit
+        >>= (`shouldBe` Right [identifier])
+      (_, secondToken) <- claimFixture store later
+      acknowledgeJob store secondToken
+        >>= (`shouldBe` Right SettlementApplied)
+
+  it "takes a dead-lettered job out of the queue" $
+    withStore $ \store -> do
+      enqueueJob store seed >>= (`shouldBe` Right ())
+      (_, token) <- claimFixture store now
+      deadLetterJob store token Rejected "rejected by dependency"
+        >>= (`shouldBe` Right SettlementApplied)
+      pollJobs store kind later pollLimit >>= (`shouldBe` Right [])
+
+  it "retires the claim that a later claim superseded" $
+    withStore $ \store -> do
+      enqueueJob store seed >>= (`shouldBe` Right ())
+      (stale, staleToken) <- claimFixture store now
+      (_, currentToken) <- claimFixture store later
+      renewJob store stale.reference (JobInstant 120_000)
+        >>= (`shouldBe` Left (InvalidState "claim handle is invalid"))
+      acknowledgeJob store staleToken
+        >>= (`shouldBe` Left (InvalidState "claim handle is invalid"))
+      acknowledgeJob store currentToken
+        >>= (`shouldBe` Right SettlementApplied)
+
+  it "streams the runnable jobs one poll answers with" $
+    withStore $ \store -> do
+      enqueueJob store seed >>= (`shouldBe` Right ())
+      streamed <-
+        runExceptT
+          ( runConduit
+              (streamRunnableJobs store kind now pollLimit .| sinkList)
+          )
+      streamed `shouldBe` Right [identifier]
 
 
 withStore :: (Store -> IO ()) -> IO ()
@@ -166,13 +172,14 @@ withStore action = do
   opened <- openStore options
   case opened of
     Left engineError ->
-      assertFailure ("failed to open the shared engine: " <> show engineError)
+      expectationFailure
+        ("failed to open the shared engine: " <> show engineError)
     Right store ->
       action store `finally` do
         closed <- closeStore store
         case closed of
           Left engineError ->
-            assertFailure
+            expectationFailure
               ("failed to close the shared engine: " <> show engineError)
           Right () -> pure ()
 
@@ -198,7 +205,7 @@ claimFixture store claimedAt = do
 
   case claimed of
     Right (JobClaimed result) -> pure result
-    outcome -> assertFailure ("expected a won claim, got " <> show outcome)
+    outcome -> error ("expected a won claim, got " <> show outcome)
 
 
 releaseClaim

@@ -1,5 +1,6 @@
-module Main (main) where
+module WireSpec (spec) where
 
+import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.Either (Either (Left, Right))
@@ -55,17 +56,22 @@ import Event.Sorcery.Stream (
   encodeLoadStream,
   nextCursor,
  )
-import Test.Tasty (TestTree, defaultMain, testGroup, withResource)
-import Test.Tasty.HUnit (Assertion, assertBool, assertFailure, testCase, (@?=))
+import Test.Hspec (
+  Expectation,
+  Spec,
+  describe,
+  expectationFailure,
+  it,
+  runIO,
+  shouldBe,
+ )
 import Prelude (
   IO,
   Maybe (..),
   String,
-  const,
   error,
   lines,
   map,
-  pure,
   read,
   readFile,
   words,
@@ -77,167 +83,192 @@ import Prelude (
  )
 
 
-main :: IO ()
-main = defaultMain tests
+spec :: Spec
+spec = describe "engine wire format" $ do
+  describe "encoding" $ do
+    it "open options" $
+      encodeOpenOptions options `shouldBe` expectedOpen
 
+    it "load stream without a cursor" $
+      encodeLoadStream stream Nothing `shouldBe` expectedLoadWithoutCursor
 
-tests :: TestTree
-tests =
-  testGroup
-    "engine wire format"
-    [ testGroup
-        "encoding"
-        [ testCase "open options" $
-            encodeOpenOptions options @?= expectedOpen
-        , testCase "load stream without a cursor" $
-            encodeLoadStream stream Nothing @?= expectedLoadWithoutCursor
-        , testCase "load stream after a cursor" $
-            encodeLoadStream stream (Just 256) @?= expectedLoadAfterCursor
-        , testCase "current version" $
-            encodeCurrentVersion stream @?= expectedCurrentVersion
-        , testCase "commit" $
-            encodeCommit stream 0 [proposed] @?= expectedCommit
-        , testCase "commit carrying a job intent" $
-            encodeCommitWithJob stream 0 (proposed :| []) seed
-              @?= expectedCommitWithJob
-        , testCase "job enqueue" $
-            encodeEnqueue seed @?= expectedEnqueue
-        , testCase "job poll" $
-            encodePoll kind (JobInstant 5) (PollLimit 10) @?= expectedPoll
-        , testCase "job claim" $
-            encodeClaim
-              wireJobId
-              (WorkerId "worker")
-              (JobInstant 5)
-              (LeaseDuration 30_000)
-              (ClaimBudget 50)
-              @?= expectedClaim
-        , testCase "claim renewal" $
-            encodeRenew reference (JobInstant 60_000) @?= expectedRenew
-        ]
-    , testGroup
-        "decoding"
-        [ testCase "stored event" $
-            decodeStoredEvents stored @?= Right [expectedStored]
-        , testCase "malformed-input detail" $
-            decodeEngineError 1 malformedInput @?= Right MalformedInput
-        , testCase "storage-failure detail" $
-            decodeEngineError 4 storageFailure
-              @?= Right (StorageFailure "storage failure")
-        , testCase "invalid-state detail" $
-            decodeEngineError 5 invalidState
-              @?= Right (InvalidState "store is closed")
-        , testCase "keeps the numeric identity of an unmodelled code" $
-            decodeEngineError 42 unmodelledCode
-              @?= Right (UnknownEngineError 42)
-        , testCase "job-refusal detail" $
-            decodeEngineError 3 jobRefusal
-              @?= Right
-                ( JobRefused
-                    (JobRefusalDetail wireJobId InvalidClaimPolicy)
-                )
-        , testCase "keeps the identity of an unmodelled refusal" $
-            decodeEngineError 3 unmodelledRefusal
-              @?= Right
-                ( JobRefused
-                    ( JobRefusalDetail
-                        wireJobId
-                        (UnrecognizedRefusal "later reason")
-                    )
-                )
-        , testCase "conflict detail" $
-            decodeEngineError 2 conflict
-              @?= Right
-                ( OptimisticConflict
-                    ( ConflictDetail
-                        (AggregateType "account")
-                        (AggregateId "one")
-                        0
-                        1
-                    )
-                )
-        , testCase "resource-limit detail" $
-            decodeEngineError 6 resourceLimit
-              @?= Right
-                ( ResourceLimitExceeded
-                    (ResourceLimitDetail "payload" 65 64)
-                )
-        , testCase "panic detail" $
-            decodeEngineError 100 enginePanic @?= Right EnginePanic
-        , testCase "rejects disagreement between status and encoded code" $
-            assertDecodeFailure
-              "engine status does not match encoded error code"
-              (decodeEngineError 4 conflict)
-        , testCase "rejects trailing bytes" $
-            decodeStoredEvents (stored <> ByteString.singleton 0)
-              @?= Left "trailing bytes after stored events"
-        , testCase "rejects unsupported versions" $
-            assertDecodeFailure
-              "unsupported stored-events format version"
-              (decodeStoredEvents unsupportedVersion)
-        , testCase "enforces top-level arity" $
-            assertDecodeFailure
-              "unexpected CBOR list length"
-              (decodeStoredEvents wrongTopLevelArity)
-        , testCase "enforces stored-event arity" $
-            assertDecodeFailure
-              "unexpected CBOR list length"
-              (decodeStoredEvents wrongEventArity)
-        , testCase "requires byte-string payloads" $
-            assertDecodeFailure "expected bytes" (decodeStoredEvents arrayPayload)
-        , testCase "polled jobs" $
-            decodePolledJobs polledJobs @?= Right [wireJobId]
-        , testCase "won claim" $
-            decodeClaimResult wonClaim
-              @?= Right
-                ( JobClaimed
-                    ( JobClaimDetails
-                        reference
-                        3
-                        ReconcileExecution
-                        (ByteString.pack [0, 1])
-                    )
-                )
-        , testCase "claim on an abandoned job" $
-            decodeClaimResult abandonedClaim @?= Right JobAbandoned
-        , testCase "rejects unsupported job versions" $
-            assertDecodeFailure
-              "unsupported job format version"
-              (decodePolledJobs unsupportedJobVersion)
-        ]
-    , testGroup
-        "stream paging"
-        [ testCase "starts a fresh walk at the last sequence of the page" $
-            nextCursor Nothing (pageEndingAt 4096) @?= Right 4096
-        , testCase "advances to the last sequence the page reached" $
-            nextCursor (Just 4096) (pageEndingAt 4097) @?= Right 4097
-        , testCase "refuses a page that ends on the cursor" $
-            nextCursor (Just 4096) (pageEndingAt 4096)
-              @?= Left
-                ( BindingProtocolError
-                    (PageDidNotAdvance (PageAdvanceDetail 4096 4096))
-                )
-        , testCase "refuses a page that ends behind the cursor" $
-            nextCursor (Just 4096) (pageEndingAt 4095)
-              @?= Left
-                ( BindingProtocolError
-                    (PageDidNotAdvance (PageAdvanceDetail 4096 4095))
-                )
-        ]
-    , testGroup
-        "detail-free close statuses"
-        [ testCase "success" $
-            decodeCloseStatus 0 @?= Right ()
-        , testCase "rejected owner handle" $
-            decodeCloseStatus 5
-              @?= Left (InvalidState "store close rejected the owner handle")
-        , testCase "panic" $
-            decodeCloseStatus 100 @?= Left EnginePanic
-        , testCase "unmodelled status" $
-            decodeCloseStatus 42 @?= Left (UnknownEngineError 42)
-        ]
-    , conformance
-    ]
+    it "load stream after a cursor" $
+      encodeLoadStream stream (Just 256) `shouldBe` expectedLoadAfterCursor
+
+    it "current version" $
+      encodeCurrentVersion stream `shouldBe` expectedCurrentVersion
+
+    it "commit" $
+      encodeCommit stream 0 [proposed] `shouldBe` expectedCommit
+
+    it "commit carrying a job intent" $
+      encodeCommitWithJob stream 0 (proposed :| []) seed
+        `shouldBe` expectedCommitWithJob
+
+    it "job enqueue" $
+      encodeEnqueue seed `shouldBe` expectedEnqueue
+
+    it "job poll" $
+      encodePoll kind (JobInstant 5) (PollLimit 10) `shouldBe` expectedPoll
+
+    it "job claim" $
+      encodeClaim
+        wireJobId
+        (WorkerId "worker")
+        (JobInstant 5)
+        (LeaseDuration 30_000)
+        (ClaimBudget 50)
+        `shouldBe` expectedClaim
+
+    it "claim renewal" $
+      encodeRenew reference (JobInstant 60_000) `shouldBe` expectedRenew
+
+  describe "decoding" $ do
+    it "stored event" $
+      decodeStoredEvents stored `shouldBe` Right [expectedStored]
+
+    it "malformed-input detail" $
+      decodeEngineError 1 malformedInput `shouldBe` Right MalformedInput
+
+    it "storage-failure detail" $
+      decodeEngineError 4 storageFailure
+        `shouldBe` Right (StorageFailure "storage failure")
+
+    it "invalid-state detail" $
+      decodeEngineError 5 invalidState
+        `shouldBe` Right (InvalidState "store is closed")
+
+    it "keeps the numeric identity of an unmodelled code" $
+      decodeEngineError 42 unmodelledCode
+        `shouldBe` Right (UnknownEngineError 42)
+
+    it "job-refusal detail" $
+      decodeEngineError 3 jobRefusal
+        `shouldBe` Right
+          ( JobRefused
+              (JobRefusalDetail wireJobId InvalidClaimPolicy)
+          )
+
+    it "keeps the identity of an unmodelled refusal" $
+      decodeEngineError 3 unmodelledRefusal
+        `shouldBe` Right
+          ( JobRefused
+              ( JobRefusalDetail
+                  wireJobId
+                  (UnrecognizedRefusal "later reason")
+              )
+          )
+
+    it "conflict detail" $
+      decodeEngineError 2 conflict
+        `shouldBe` Right
+          ( OptimisticConflict
+              ( ConflictDetail
+                  (AggregateType "account")
+                  (AggregateId "one")
+                  0
+                  1
+              )
+          )
+
+    it "resource-limit detail" $
+      decodeEngineError 6 resourceLimit
+        `shouldBe` Right
+          ( ResourceLimitExceeded
+              (ResourceLimitDetail "payload" 65 64)
+          )
+
+    it "panic detail" $
+      decodeEngineError 100 enginePanic `shouldBe` Right EnginePanic
+
+    it "rejects disagreement between status and encoded code" $
+      assertDecodeFailure
+        "engine status does not match encoded error code"
+        (decodeEngineError 4 conflict)
+
+    it "rejects trailing bytes" $
+      decodeStoredEvents (stored <> ByteString.singleton 0)
+        `shouldBe` Left "trailing bytes after stored events"
+
+    it "rejects unsupported versions" $
+      assertDecodeFailure
+        "unsupported stored-events format version"
+        (decodeStoredEvents unsupportedVersion)
+
+    it "enforces top-level arity" $
+      assertDecodeFailure
+        "unexpected CBOR list length"
+        (decodeStoredEvents wrongTopLevelArity)
+
+    it "enforces stored-event arity" $
+      assertDecodeFailure
+        "unexpected CBOR list length"
+        (decodeStoredEvents wrongEventArity)
+
+    it "requires byte-string payloads" $
+      assertDecodeFailure
+        "expected bytes"
+        (decodeStoredEvents arrayPayload)
+
+    it "polled jobs" $
+      decodePolledJobs polledJobs `shouldBe` Right [wireJobId]
+
+    it "won claim" $
+      decodeClaimResult wonClaim
+        `shouldBe` Right
+          ( JobClaimed
+              ( JobClaimDetails
+                  reference
+                  3
+                  ReconcileExecution
+                  (ByteString.pack [0, 1])
+              )
+          )
+
+    it "claim on an abandoned job" $
+      decodeClaimResult abandonedClaim `shouldBe` Right JobAbandoned
+
+    it "rejects unsupported job versions" $
+      assertDecodeFailure
+        "unsupported job format version"
+        (decodePolledJobs unsupportedJobVersion)
+
+  describe "stream paging" $ do
+    it "starts a fresh walk at the last sequence of the page" $
+      nextCursor Nothing (pageEndingAt 4096) `shouldBe` Right 4096
+
+    it "advances to the last sequence the page reached" $
+      nextCursor (Just 4096) (pageEndingAt 4097) `shouldBe` Right 4097
+
+    it "refuses a page that ends on the cursor" $
+      nextCursor (Just 4096) (pageEndingAt 4096)
+        `shouldBe` Left
+          ( BindingProtocolError
+              (PageDidNotAdvance (PageAdvanceDetail 4096 4096))
+          )
+
+    it "refuses a page that ends behind the cursor" $
+      nextCursor (Just 4096) (pageEndingAt 4095)
+        `shouldBe` Left
+          ( BindingProtocolError
+              (PageDidNotAdvance (PageAdvanceDetail 4096 4095))
+          )
+
+  describe "detail-free close statuses" $ do
+    it "success" $
+      decodeCloseStatus 0 `shouldBe` Right ()
+
+    it "rejected owner handle" $
+      decodeCloseStatus 5
+        `shouldBe` Left (InvalidState "store close rejected the owner handle")
+
+    it "panic" $
+      decodeCloseStatus 100 `shouldBe` Left EnginePanic
+
+    it "unmodelled status" $
+      decodeCloseStatus 42 `shouldBe` Left (UnknownEngineError 42)
+
+  conformance
 
 
 -- | Drives the corpus both bindings share through this binding's codecs.
@@ -245,39 +276,40 @@ tests =
 -- The fixtures above pin the shape this binding expects on its own terms. The
 -- corpus is the same bytes the Rust ABI asserts against, so a boundary change
 -- only one side made is a failure here rather than a runtime disagreement.
-conformance :: TestTree
-conformance =
-  withResource loadVectors (const (pure ())) $ \vectors ->
-    testGroup
-      "shared encoding conformance"
-      [ testCase "open options" $ do
-          expected <- conformanceVector "open-options" <$> vectors
-          encodeOpenOptions options @?= expected
-      , testCase "load stream without a cursor" $ do
-          expected <- conformanceVector "load-stream" <$> vectors
-          encodeLoadStream stream Nothing @?= expected
-      , testCase "current version" $ do
-          expected <- conformanceVector "current-version" <$> vectors
-          encodeCurrentVersion stream @?= expected
-      , testCase "commit" $ do
-          expected <- conformanceVector "commit" <$> vectors
-          encodeCommit stream 0 [proposed] @?= expected
-      , testCase "stored events" $ do
-          encoded <- conformanceVector "stored-events" <$> vectors
-          decodeStoredEvents encoded @?= Right [expectedStored]
-      , testCase "conflict error" $ do
-          encoded <- conformanceVector "conflict-error" <$> vectors
-          decodeEngineError 2 encoded
-            @?= Right
-              ( OptimisticConflict
-                  ( ConflictDetail
-                      (AggregateType "account")
-                      (AggregateId "one")
-                      0
-                      1
-                  )
+conformance :: Spec
+conformance = do
+  vectors <- runIO loadVectors
+
+  let vector name = conformanceVector name vectors
+
+  describe "shared encoding conformance" $ do
+    it "open options" $
+      encodeOpenOptions options `shouldBe` vector "open-options"
+
+    it "load stream without a cursor" $
+      encodeLoadStream stream Nothing `shouldBe` vector "load-stream"
+
+    it "current version" $
+      encodeCurrentVersion stream `shouldBe` vector "current-version"
+
+    it "commit" $
+      encodeCommit stream 0 [proposed] `shouldBe` vector "commit"
+
+    it "stored events" $
+      decodeStoredEvents (vector "stored-events")
+        `shouldBe` Right [expectedStored]
+
+    it "conflict error" $
+      decodeEngineError 2 (vector "conflict-error")
+        `shouldBe` Right
+          ( OptimisticConflict
+              ( ConflictDetail
+                  (AggregateType "account")
+                  (AggregateId "one")
+                  0
+                  1
               )
-      ]
+          )
 
 
 -- | Pins a negative case to the rule it was written for.
@@ -285,14 +317,15 @@ conformance =
 -- The decoders report failures as text, and a fixture that is both malformed
 -- and truncated fails for either reason, so only the codec's own message shows
 -- that the intended check is still the one doing the rejecting.
-assertDecodeFailure :: String -> Either String value -> Assertion
+assertDecodeFailure :: String -> Either String value -> Expectation
 assertDecodeFailure expected outcome =
   case outcome of
     Left message ->
-      assertBool
-        ("expected a failure mentioning " <> expected <> ", got " <> message)
-        (expected `isInfixOf` message)
-    Right _ -> assertFailure ("expected a failure mentioning " <> expected)
+      unless (expected `isInfixOf` message) $
+        expectationFailure
+          ("expected a failure mentioning " <> expected <> ", got " <> message)
+    Right _ ->
+      expectationFailure ("expected a failure mentioning " <> expected)
 
 
 -- | Reads the corpus from the package root Cabal runs test suites from.

@@ -1,4 +1,4 @@
-module Main (main) where
+module StoreSpec (spec) where
 
 import Data.Bits (shiftL, shiftR)
 import Data.ByteString qualified as ByteString
@@ -40,10 +40,10 @@ import Event.Sorcery.Store (
   snapshotEntity,
  )
 import Event.Sorcery.Stream (streamKey, streamKeyIdentity)
+import Test.Hspec (Spec, expectationFailure, it, shouldBe)
 import Prelude (
   Either (..),
   Eq,
-  IO,
   Int,
   Maybe (..),
   Show,
@@ -53,18 +53,18 @@ import Prelude (
   length,
   otherwise,
   pure,
-  (&&),
+  ($),
   (+),
   (==),
  )
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "executes typed commands against the shared engine" $ do
   opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)
 
   case opened of
-    Left _ -> error "failed to open the shared engine"
+    Left _ -> expectationFailure "failed to open the shared engine"
     Right engine -> do
       let store = mkStore engine (pure jobIdentifier)
           key = streamKey @Account AccountId
@@ -94,52 +94,32 @@ main = do
       discarded <- Snapshot.discardSnapshot engine (streamKeyIdentity key)
       recovered <- loadEntity store key
 
-      if initially
-        == Right Nothing
-        && emptySnapshot
-          == Right Nothing
-        && openedAccount
-          == Right (Account 10)
-        && deposited
-          == Right (Account 15)
-        && snapshotted
-          == Right (Just (Account 15))
-        && afterSnapshotDeposit
-          == Right (Account 22)
-        && reloaded
-          == Right (Just (Account 22))
-        && invalidEvent
-          == Left (StoreDecisionRejected AccountAlreadyOpened)
-        && afterInvalidEvent
-          == Right (Just (Account 22))
-        && dispatched
-          == Right (Account 22)
-        && jobs
-          == Right [jobIdentifier]
-        && rejected
-          == Left (StoreCommandRejected AlreadyOpen)
-        && afterRejection
-          == Right (Just (Account 22))
-        && corrupted
-          == Right (Snapshot.SnapshotVersion 2)
-        && corruptedLoad
-          == Left
-            ( StoreSnapshotDecodeFailed
-                4
-                (DecodeCause "invalid account snapshot")
-            )
-        && discarded
-          == Right ()
-        && recovered
-          == Right (Just (Account 22))
-        then pure ()
-        else error "typed command execution did not preserve store invariants"
+      initially `shouldBe` Right Nothing
+      emptySnapshot `shouldBe` Right Nothing
+      openedAccount `shouldBe` Right (Account 10)
+      deposited `shouldBe` Right (Account 15)
+      snapshotted `shouldBe` Right (Just (Account 15))
+      afterSnapshotDeposit `shouldBe` Right (Account 22)
+      reloaded `shouldBe` Right (Just (Account 22))
+      invalidEvent
+        `shouldBe` Left (StoreDecisionRejected AccountAlreadyOpened)
+      afterInvalidEvent `shouldBe` Right (Just (Account 22))
+      dispatched `shouldBe` Right (Account 22)
+      jobs `shouldBe` Right [jobIdentifier]
+      rejected `shouldBe` Left (StoreCommandRejected AlreadyOpen)
+      afterRejection `shouldBe` Right (Just (Account 22))
+      corrupted `shouldBe` Right (Snapshot.SnapshotVersion 2)
+      corruptedLoad
+        `shouldBe` Left
+          ( StoreSnapshotDecodeFailed
+              4
+              (DecodeCause "invalid account snapshot")
+          )
+      discarded `shouldBe` Right ()
+      recovered `shouldBe` Right (Just (Account 22))
 
       closed <- closeStore engine
-
-      if closed == Right ()
-        then pure ()
-        else error "failed to close the shared engine"
+      closed `shouldBe` Right ()
 
 
 newtype Account = Account Int

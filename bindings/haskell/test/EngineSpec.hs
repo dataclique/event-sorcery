@@ -1,4 +1,4 @@
-module Main (main) where
+module EngineSpec (spec) where
 
 import Control.Concurrent (forkFinally)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
@@ -24,7 +24,6 @@ import Event.Sorcery.Engine (
   openStore,
   supportedAbiMajor,
  )
-import Event.Sorcery.Engine.AcquisitionSpec qualified as AcquisitionSpec
 import Event.Sorcery.Engine.Internal.FFI (EsBuf (..))
 import Event.Sorcery.Stream (
   EventType (..),
@@ -41,8 +40,7 @@ import Foreign.C.Types (CSize)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, nullPtr, plusPtr)
 import Foreign.Storable (alignment, peekByteOff, poke, sizeOf)
-import Test.Tasty (TestTree, defaultMain, testGroup)
-import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 import Prelude (
   Either (..),
   Functor (fmap),
@@ -69,92 +67,101 @@ import Prelude (
  )
 
 
-main :: IO ()
-main = defaultMain tests
+spec :: Spec
+spec = describe "shared engine FFI" $ do
+  it "reports an ABI this binding supports" $ do
+    version <- abiVersion
+    version `shiftR` 16 `shouldBe` supportedAbiMajor
+    checkAbiVersion version `shouldBe` Right ()
 
+  it "accepts an engine at the minimum ABI minor" $
+    checkAbiVersion minimumAbiMinor `shouldBe` Right ()
 
-tests :: TestTree
-tests =
-  testGroup
-    "shared engine FFI"
-    [ AcquisitionSpec.tests
-    , testCase "reports an ABI this binding supports" $ do
-        version <- abiVersion
-        version `shiftR` 16 @?= supportedAbiMajor
-        checkAbiVersion version @?= Right ()
-    , testCase "accepts an engine at the minimum ABI minor" $
-        checkAbiVersion minimumAbiMinor @?= Right ()
-    , testCase "accepts an engine above the minimum ABI minor" $
-        checkAbiVersion (minimumAbiMinor + 1) @?= Right ()
-    , testCase "rejects an engine whose ABI major differs" $
-        checkAbiVersion (1 `shiftL` 16)
-          @?= Left
-            ( AbiVersionMismatch
-                (AbiVersionDetail supportedAbiMajor minimumAbiMinor 1 0)
-            )
-    , testCase "rejects an engine below the minimum ABI minor" $
-        checkAbiVersion 1
-          @?= Left
-            ( AbiVersionMismatch
-                (AbiVersionDetail supportedAbiMajor minimumAbiMinor 0 1)
-            )
-    , testCase "commits and loads opaque event bytes" $
-        withStore $ \store -> do
-          commitFixture store
-          currentVersion store stream >>= (@?= Right 1)
-          loadStream store stream Nothing >>= (@?= Right [stored])
-    , testCase "loads only the events after a cursor" $
-        withStore $ \store -> do
-          commitFixture store
-          commit store stream 1 (amended :| []) >>= (@?= Right ())
-          loadStream store stream (Just 1) >>= (@?= Right [storedAmended])
-    , testCase "walks a stream longer than one engine page" $
-        withStore $ \store -> do
-          commitFiller store pageOverflowLength
-          firstPage <- loadStreamPage store stream Nothing
-          fmap (map (.sequence)) firstPage @?= Right [1 .. enginePageLimit]
-          walked <- loadStream store stream Nothing
-          fmap (map (.sequence)) walked @?= Right [1 .. pageOverflowLength]
-    , testCase "preserves optimistic conflict identity and versions" $
-        withStore $ \store -> do
-          commitFixture store
-          conflict <- commit store stream 0 (proposed :| [])
-          conflict
-            @?= Left
-              ( OptimisticConflict
-                  (ConflictDetail aggregateType aggregateId 0 1)
-              )
-    , testCase "serves reads issued from concurrent threads" $
-        withStore $ \store -> do
-          commitFixture store
-          concurrentReads store
-    , testCase "closes idempotently and rejects later operations" $
-        withStore $ \store -> do
-          closeStore store >>= (@?= Right ())
-          loadStream store stream Nothing
-            >>= (@?= Left (InvalidState "store is closed"))
-          closeStore store >>= (@?= Right ())
-    , testCase "lays EsBuf out the way the C header declares it" esBufLayout
-    ]
+  it "accepts an engine above the minimum ABI minor" $
+    checkAbiVersion (minimumAbiMinor + 1) `shouldBe` Right ()
+
+  it "rejects an engine whose ABI major differs" $
+    checkAbiVersion (1 `shiftL` 16)
+      `shouldBe` Left
+        ( AbiVersionMismatch
+            (AbiVersionDetail supportedAbiMajor minimumAbiMinor 1 0)
+        )
+
+  it "rejects an engine below the minimum ABI minor" $
+    checkAbiVersion 1
+      `shouldBe` Left
+        ( AbiVersionMismatch
+            (AbiVersionDetail supportedAbiMajor minimumAbiMinor 0 1)
+        )
+
+  it "commits and loads opaque event bytes" $
+    withStore $ \store -> do
+      commitFixture store
+      currentVersion store stream >>= (`shouldBe` Right 1)
+      loadStream store stream Nothing >>= (`shouldBe` Right [stored])
+
+  it "loads only the events after a cursor" $
+    withStore $ \store -> do
+      commitFixture store
+      commit store stream 1 (amended :| []) >>= (`shouldBe` Right ())
+      loadStream store stream (Just 1)
+        >>= (`shouldBe` Right [storedAmended])
+
+  it "walks a stream longer than one engine page" $
+    withStore $ \store -> do
+      commitFiller store pageOverflowLength
+      firstPage <- loadStreamPage store stream Nothing
+      fmap (map (.sequence)) firstPage
+        `shouldBe` Right [1 .. enginePageLimit]
+      walked <- loadStream store stream Nothing
+      fmap (map (.sequence)) walked
+        `shouldBe` Right [1 .. pageOverflowLength]
+
+  it "preserves optimistic conflict identity and versions" $
+    withStore $ \store -> do
+      commitFixture store
+      conflict <- commit store stream 0 (proposed :| [])
+      conflict
+        `shouldBe` Left
+          ( OptimisticConflict
+              (ConflictDetail aggregateType aggregateId 0 1)
+          )
+
+  it "serves reads issued from concurrent threads" $
+    withStore $ \store -> do
+      commitFixture store
+      concurrentReads store
+
+  it "closes idempotently and rejects later operations" $
+    withStore $ \store -> do
+      closeStore store >>= (`shouldBe` Right ())
+      loadStream store stream Nothing
+        >>= (`shouldBe` Left (InvalidState "store is closed"))
+      closeStore store >>= (`shouldBe` Right ())
+
+  it "lays EsBuf out the way the C header declares it" esBufLayout
 
 
 withStore :: (Store -> IO ()) -> IO ()
 withStore action = do
   opened <- openStore options
   case opened of
-    Left engineError -> assertFailure ("failed to open the shared engine: " <> show engineError)
+    Left engineError ->
+      expectationFailure
+        ("failed to open the shared engine: " <> show engineError)
     Right store ->
       action store `finally` do
         closed <- closeStore store
         case closed of
           Left engineError ->
-            assertFailure ("failed to close the shared engine: " <> show engineError)
+            expectationFailure
+              ("failed to close the shared engine: " <> show engineError)
           Right () -> pure ()
 
 
 commitFixture :: Store -> IO ()
 commitFixture store =
-  commit store stream 0 (proposed :| []) >>= (@?= Right ())
+  commit store stream 0 (proposed :| []) >>= (`shouldBe` Right ())
 
 
 -- | Appends @total@ filler events, respecting the engine's per-commit bound.
@@ -170,7 +177,7 @@ commitFiller store total = go 0
             stream
             committed
             (proposed :| replicate (fromIntegral batch - 1) proposed)
-            >>= (@?= Right ())
+            >>= (`shouldBe` Right ())
           go (committed + batch)
 
 
@@ -197,20 +204,20 @@ concurrentReads store = do
 assertLoadedFixture
   :: Either SomeException (Either EngineError [StoredEvent]) -> IO ()
 assertLoadedFixture (Left failure) =
-  assertFailure ("a concurrent read raised " <> displayException failure)
-assertLoadedFixture (Right loaded) = loaded @?= Right [stored]
+  expectationFailure ("a concurrent read raised " <> displayException failure)
+assertLoadedFixture (Right loaded) = loaded `shouldBe` Right [stored]
 
 
 -- | Pins the struct the engine and the binding exchange every buffer through.
 esBufLayout :: IO ()
 esBufLayout = do
-  sizeOf (EsBuf nullPtr 0) @?= 2 * pointerWidth
-  alignment (EsBuf nullPtr 0) @?= alignment (nullPtr :: Ptr Word8)
-  sizeOf (0 :: CSize) @?= pointerWidth
+  sizeOf (EsBuf nullPtr 0) `shouldBe` 2 * pointerWidth
+  alignment (EsBuf nullPtr 0) `shouldBe` alignment (nullPtr :: Ptr Word8)
+  sizeOf (0 :: CSize) `shouldBe` pointerWidth
   alloca $ \buffer -> do
     poke buffer (EsBuf lengthFixturePointer 7)
-    peekByteOff buffer 0 >>= (@?= lengthFixturePointer)
-    peekByteOff buffer pointerWidth >>= (@?= (7 :: CSize))
+    peekByteOff buffer 0 >>= (`shouldBe` lengthFixturePointer)
+    peekByteOff buffer pointerWidth >>= (`shouldBe` (7 :: CSize))
 
 
 pointerWidth :: Int

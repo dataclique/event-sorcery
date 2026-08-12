@@ -1,4 +1,4 @@
-module Main (main) where
+module DispatchWorkerSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
@@ -69,19 +69,18 @@ import Event.Sorcery.Store (
   mkStore,
  )
 import Event.Sorcery.Stream (StreamKey, streamKey)
+import Test.Hspec (Spec, expectationFailure, it, shouldBe)
 import Prelude (
   Bool (False, True),
   Either (Left, Right),
   Eq,
-  IO,
   Maybe (Just, Nothing),
   Show,
-  String,
   error,
   fmap,
   otherwise,
   pure,
-  (&&),
+  ($),
   (<>),
   (==),
  )
@@ -212,12 +211,12 @@ instance EventSourced Account where
         Right (Events (ChargeChanged event :| fmap ChargeChanged remaining))
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "delivers a sealed dispatch verdict before acknowledging" $ do
   opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)
 
   case opened of
-    Left _ -> error "failed to open the shared engine"
+    Left _ -> expectationFailure "failed to open the shared engine"
     Right engine -> do
       let originStore = mkStore engine (pure jobIdentifier)
       calls <- newIORef []
@@ -236,19 +235,14 @@ main = do
       settled <- loadEntity originStore accountKey
       recorded <- readIORef calls
 
-      expect "account did not open" (fmap isIdle openedAccount == Right True)
-      expect
-        "charge was not dispatched"
-        (fmap isInFlight dispatched == Right True)
-      expect
-        "verdict was not delivered before the job acknowledged"
-        ( result == Right (JobSucceeded "charged")
-            && fmap (fmap settledOutputOf) settled == Right (Just "charged")
-            && recorded == ["submit"]
-        )
+      fmap isIdle openedAccount `shouldBe` Right True
+      fmap isInFlight dispatched `shouldBe` Right True
+      result `shouldBe` Right (JobSucceeded "charged")
+      fmap (fmap settledOutputOf) settled `shouldBe` Right (Just "charged")
+      recorded `shouldBe` ["submit"]
 
       closed <- closeStore engine
-      expect "failed to close the shared engine" (closed == Right ())
+      closed `shouldBe` Right ()
 
 
 runner
@@ -323,8 +317,3 @@ now = JobInstant 1_000
 
 later :: JobInstant
 later = JobInstant 90_000
-
-
-expect :: String -> Bool -> IO ()
-expect _ True = pure ()
-expect message False = error message

@@ -1,4 +1,4 @@
-module Main (main) where
+module DomainSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)))
@@ -31,6 +31,7 @@ import Event.Sorcery.Stream (
   ReplayError (..),
   StoredEvent (..),
   StreamIdentity (StreamIdentity),
+  StreamKey,
   StreamPosition (StreamPosition),
   StreamVersion (StreamVersion),
   replay,
@@ -38,119 +39,126 @@ import Event.Sorcery.Stream (
   streamKey,
   streamKeyIdentity,
  )
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 import Prelude (
   Either (..),
   Eq,
-  IO,
   Int,
   Maybe (..),
   Show,
   error,
+  fmap,
   maxBound,
   otherwise,
   pure,
-  (&&),
+  ($),
   (==),
  )
 
 
-main :: IO ()
-main = do
-  identifier <-
-    case mkJobId testJobIdText of
-      Just value -> pure value
-      Nothing -> error "valid job identifier was rejected"
+spec :: Spec
+spec = do
+  describe "typed job dispatch" $ do
+    it "accepts a ULID-shaped job identifier" $
+      fmap jobIdText (mkJobId testJobIdText) `shouldBe` Just testJobIdText
 
-  case mkJobId "" of
-    Nothing -> pure ()
-    Just _ -> error "empty job identifier was accepted"
+    it "rejects an empty job identifier" $
+      mkJobId "" `shouldBe` Nothing
 
-  let intent = dispatchIntent identifier SendWelcomeEmail
+    it "preserves the job identity a dispatch intent carries" $
+      dispatchJobId (dispatchIntent testJobId SendWelcomeEmail)
+        `shouldBe` testJobId
 
-  if dispatchJobId intent == identifier && jobIdText identifier == testJobIdText
-    then pure ()
-    else error "dispatch intent did not preserve the job identity"
+    it "reflects the job type from its type-level symbol" $
+      jobType @SendWelcomeEmail `shouldBe` "send-welcome-email"
 
-  if jobType @SendWelcomeEmail == "send-welcome-email"
-    then pure ()
-    else error "job type was not reflected from its type-level symbol"
+    it "produces a dispatch effect for a declared job membership" $
+      case transition (Account 1) SendWelcome of
+        Right (Dispatch _) -> pure ()
+        _ ->
+          expectationFailure
+            "declared job membership did not produce a dispatch effect"
 
-  case transition (Account 1) SendWelcome of
-    Right (Dispatch _) -> pure ()
-    _ -> error "declared job membership did not produce a dispatch effect"
+  describe "stream replay" $ do
+    it "preserves the typed aggregate identity in the stream key" $
+      streamKeyIdentity accountKey
+        `shouldBe` StreamIdentity
+          (AggregateType "account")
+          (AggregateId "account-1")
 
-  exerciseReplay
+    it "replays a valid stream" $
+      replay accountKey [openedEvent] `shouldBe` Right (Just (Account 1))
+
+    it "rejects a stream gap" $
+      replay accountKey [openedEvent {sequence = 2}]
+        `shouldBe` Left
+          ( EventSequenceMismatch
+              (ExpectedSequence (StreamPosition 1))
+              (ActualSequence (StreamPosition 2))
+          )
+
+    it "rejects an event whose metadata disagrees with the entity" $
+      replay accountKey [openedEvent {eventType = EventType "renamed"}]
+        `shouldBe` Left
+          ( EventMetadataMismatch
+              (StreamPosition 1)
+              (EventTypeMismatch "account-opened" "renamed")
+          )
+
+    it "rejects an event whose version disagrees with the entity" $
+      replay accountKey [openedEvent {eventVersion = EventVersion "2"}]
+        `shouldBe` Left
+          ( EventMetadataMismatch
+              (StreamPosition 1)
+              (EventVersionMismatch (EventVersion "1") (EventVersion "2"))
+          )
+
+    it "retains the cause an event decode failed with" $
+      replay accountKey [openedEvent {payload = ByteString.pack [2]}]
+        `shouldBe` Left
+          ( EventDecodeFailed
+              (StreamPosition 1)
+              (DecodeCause "invalid account event")
+          )
+
+    it "retains the error an event application failed with" $
+      replay accountKey [welcomeEvent]
+        `shouldBe` Left
+          (EventApplicationFailed (StreamPosition 1) AccountError)
+
+    it "replays a snapshot continuation" $
+      resume
+        accountKey
+        (StreamVersion 1)
+        (Account 1)
+        [welcomeEvent {sequence = 2}]
+        `shouldBe` Right (Account 1)
+
+    it "rejects a stream sequence overflow" $
+      resume accountKey (StreamVersion maxBound) (Account 1) []
+        `shouldBe` Left (EventSequenceOverflow (StreamPosition maxBound))
 
 
-exerciseReplay :: IO ()
-exerciseReplay = do
-  if streamKeyIdentity key
-    == StreamIdentity (AggregateType "account") (AggregateId "account-1")
-    then pure ()
-    else error "stream key did not preserve the typed aggregate identity"
+accountKey :: StreamKey Account
+accountKey = streamKey @Account AccountId
 
-  case replay key [opened] of
-    Right (Just (Account 1)) -> pure ()
-    _ -> error "valid stream did not replay"
 
-  case replay key [opened {sequence = 2}] of
-    Left
-      ( EventSequenceMismatch
-          (ExpectedSequence (StreamPosition 1))
-          (ActualSequence (StreamPosition 2))
-        ) -> pure ()
-    _ -> error "stream gap was not rejected"
+openedEvent :: StoredEvent
+openedEvent =
+  StoredEvent
+    1
+    (EventType "account-opened")
+    (EventVersion "1")
+    ByteString.empty
 
-  case replay key [opened {eventType = EventType "renamed"}] of
-    Left
-      ( EventMetadataMismatch
-          (StreamPosition 1)
-          (EventTypeMismatch "account-opened" "renamed")
-        ) -> pure ()
-    _ -> error "event metadata mismatch was not rejected"
 
-  case replay key [opened {eventVersion = EventVersion "2"}] of
-    Left
-      ( EventMetadataMismatch
-          (StreamPosition 1)
-          (EventVersionMismatch (EventVersion "1") (EventVersion "2"))
-        ) -> pure ()
-    _ -> error "event version mismatch was not rejected"
-
-  case replay key [opened {payload = ByteString.pack [2]}] of
-    Left
-      ( EventDecodeFailed
-          (StreamPosition 1)
-          (DecodeCause "invalid account event")
-        ) -> pure ()
-    _ -> error "event decode failure was not retained"
-
-  case replay key [welcome] of
-    Left (EventApplicationFailed (StreamPosition 1) AccountError) -> pure ()
-    _ -> error "event application failure was not retained"
-
-  case resume key (StreamVersion 1) (Account 1) [welcome {sequence = 2}] of
-    Right (Account 1) -> pure ()
-    _ -> error "valid snapshot continuation did not replay"
-
-  case resume key (StreamVersion maxBound) (Account 1) [] of
-    Left (EventSequenceOverflow (StreamPosition position))
-      | position == maxBound -> pure ()
-    _ -> error "stream sequence overflow was not rejected"
-  where
-    key = streamKey @Account AccountId
-    opened =
-      StoredEvent
-        1
-        (EventType "account-opened")
-        (EventVersion "1")
-        ByteString.empty
-    welcome =
-      StoredEvent
-        1
-        (EventType "welcome-requested")
-        (EventVersion "1")
-        (ByteString.pack [1])
+welcomeEvent :: StoredEvent
+welcomeEvent =
+  StoredEvent
+    1
+    (EventType "welcome-requested")
+    (EventVersion "1")
+    (ByteString.pack [1])
 
 
 newtype Account = Account Int

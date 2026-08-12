@@ -1,4 +1,4 @@
-module Main (main) where
+module DispatchSpec (spec) where
 
 import Data.ByteString qualified as ByteString
 import Data.Text (Text)
@@ -30,18 +30,16 @@ import Event.Sorcery.Job (
   JobId,
   mkJobId,
  )
+import Test.Hspec (Spec, expectationFailure, it, shouldBe)
 import Prelude (
   Either (..),
   Eq,
-  IO,
   Maybe (..),
   Show,
   error,
-  pure,
   show,
-  (&&),
+  ($),
   (<$>),
-  (==),
  )
 
 
@@ -67,8 +65,8 @@ instance Job ChargeCard where
   decodeJob _ = Right ChargeCard
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "preserves the dispatch state machine" $ do
   let first = requireJobId "01ARZ3NDEKTSV4RRFFQ69G5FAV"
       second = requireJobId "01ARZ3NDEKTSV4RRFFQ69G5FAW"
       dispatched = Dispatched first ChargeCard
@@ -80,7 +78,7 @@ main = do
           3
 
   case originateDispatch dispatched of
-    Left failure -> error (show failure)
+    Left failure -> expectationFailure (show failure)
     Right inFlight -> do
       let guardedIdle = dispatchJob <$> guardDispatch Idle ChargeCard
           refusedOverlap = dispatchJob <$> guardDispatch inFlight ChargeCard
@@ -119,30 +117,29 @@ main = do
                 evolveDispatch (Idle @ChargeCard) (ConfirmedEvent settled)
               overlappingReplay = evolveDispatch inFlight dispatched
 
-          if guardedIdle == Right ChargeCard
-            && refusedOverlap == Left DispatchInFlight
-            && wrongOutcome == Left DispatchOutcomeMismatch
-            && wrongFailure == Left DispatchOutcomeMismatch
-            && settledJobId settled == first
-            && settledOutput settled == Receipt
-            && settledAttempts settled == 2
-            && settledFailureJobId rejected == first
-            && dispatchFailure rejected
-              == DeadLettered RetriesExhausted "gateway timeout"
-            && settledFailureAttempts rejected == 3
-            && duplicate == Just (Right [])
-            && refusedAfterConfirmation
-              == Just (Left DispatchAlreadyConfirmed)
-            && contradictoryVerdict
-              == Just (Left DispatchOutcomeMismatch)
-            && ((dispatchJob <$>) <$> retryAfterFailure)
-              == Just (Right ChargeCard)
-            && duplicateFailure == Just (Right [])
-            && invalidReplay == Left DispatchReplay
-            && overlappingReplay == Left DispatchReplay
-            then pure ()
-            else error "dispatch state machine violated its native contract"
-        _ -> error "dispatch settlement did not produce sealed events"
+          guardedIdle `shouldBe` Right ChargeCard
+          refusedOverlap `shouldBe` Left DispatchInFlight
+          wrongOutcome `shouldBe` Left DispatchOutcomeMismatch
+          wrongFailure `shouldBe` Left DispatchOutcomeMismatch
+          settledJobId settled `shouldBe` first
+          settledOutput settled `shouldBe` Receipt
+          settledAttempts settled `shouldBe` 2
+          settledFailureJobId rejected `shouldBe` first
+          dispatchFailure rejected
+            `shouldBe` DeadLettered RetriesExhausted "gateway timeout"
+          settledFailureAttempts rejected `shouldBe` 3
+          duplicate `shouldBe` Just (Right [])
+          refusedAfterConfirmation
+            `shouldBe` Just (Left DispatchAlreadyConfirmed)
+          contradictoryVerdict `shouldBe` Just (Left DispatchOutcomeMismatch)
+          ((dispatchJob <$>) <$> retryAfterFailure)
+            `shouldBe` Just (Right ChargeCard)
+          duplicateFailure `shouldBe` Just (Right [])
+          invalidReplay `shouldBe` Left DispatchReplay
+          overlappingReplay `shouldBe` Left DispatchReplay
+        _ ->
+          expectationFailure
+            "dispatch settlement did not produce sealed events"
 
 
 requireJobId :: Text -> JobId

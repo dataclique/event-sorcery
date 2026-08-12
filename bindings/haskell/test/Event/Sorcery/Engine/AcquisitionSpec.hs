@@ -1,11 +1,10 @@
-module Event.Sorcery.Engine.AcquisitionSpec (tests) where
+module Event.Sorcery.Engine.AcquisitionSpec (spec) where
 
 import Control.Exception (IOException, try)
 import Control.Monad (join)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Event.Sorcery.Engine.Acquisition (StoreAcquisition (..), acquireStore)
-import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 import Prelude (
   Either (..),
   IO,
@@ -20,66 +19,67 @@ import Prelude (
  )
 
 
-tests :: TestTree
-tests =
-  testGroup
-    "store acquisition"
-    [ testCase "releases a rejected opening in close-then-free order" $ do
-        trace <- newIORef []
+spec :: Spec
+spec = describe "store acquisition" $ do
+  it "releases a rejected opening in close-then-free order" $ do
+    trace <- newIORef []
 
-        result <- acquireStore (fixture trace (pure (Left "rejected")) pureOwner)
+    result <- acquireStore (fixture trace (pure (Left "rejected")) pureOwner)
 
-        result @?= Left "rejected"
-        readIORef trace >>= (@?= ["allocate", "open", "close", "free"])
-    , testCase "releases when opening raises" $ do
-        trace <- newIORef []
+    result `shouldBe` Left "rejected"
+    readIORef trace >>= (`shouldBe` ["allocate", "open", "close", "free"])
 
-        result <-
-          try @IOException
-            ( acquireStore
-                (fixture trace (ioError (userError "open failed")) pureOwner)
-            )
+  it "releases when opening raises" $ do
+    trace <- newIORef []
 
-        assertRaised result
-        readIORef trace >>= (@?= ["allocate", "open", "close", "free"])
-    , testCase "releases when gate creation raises" $ do
-        trace <- newIORef []
-        let acquisition =
-              (fixture trace (pure (Right ())) pureOwner)
-                { createGate =
-                    record trace "gate" >> ioError (userError "gate failed")
-                }
+    result <-
+      try @IOException
+        ( acquireStore
+            (fixture trace (ioError (userError "open failed")) pureOwner)
+        )
 
-        result <- try @IOException (acquireStore acquisition)
+    assertRaised result
+    readIORef trace >>= (`shouldBe` ["allocate", "open", "close", "free"])
 
-        assertRaised result
-        readIORef trace
-          >>= (@?= ["allocate", "open", "gate", "close", "free"])
-    , testCase "releases when owner creation raises" $ do
-        trace <- newIORef []
-        let failingOwner _ = ioError (userError "owner failed")
+  it "releases when gate creation raises" $ do
+    trace <- newIORef []
+    let acquisition =
+          (fixture trace (pure (Right ())) pureOwner)
+            { createGate =
+                record trace "gate" >> ioError (userError "gate failed")
+            }
 
-        result <-
-          try @IOException
-            (acquireStore (fixture trace (pure (Right ())) failingOwner))
+    result <- try @IOException (acquireStore acquisition)
 
-        assertRaised result
-        readIORef trace
-          >>= (@?= ["allocate", "open", "gate", "owner", "close", "free"])
-    , testCase "transfers release ownership after acquisition" $ do
-        trace <- newIORef []
-        finalizer <- newIORef (pure ())
-        let captureOwner release = writeIORef finalizer release >> pure "owner"
+    assertRaised result
+    readIORef trace
+      >>= (`shouldBe` ["allocate", "open", "gate", "close", "free"])
 
-        result <- acquireStore (fixture trace (pure (Right ())) captureOwner)
+  it "releases when owner creation raises" $ do
+    trace <- newIORef []
+    let failingOwner _ = ioError (userError "owner failed")
 
-        result @?= Right "ownergate"
-        readIORef trace >>= (@?= ["allocate", "open", "gate", "owner"])
+    result <-
+      try @IOException
+        (acquireStore (fixture trace (pure (Right ())) failingOwner))
 
-        join (readIORef finalizer)
-        readIORef trace
-          >>= (@?= ["allocate", "open", "gate", "owner", "close", "free"])
-    ]
+    assertRaised result
+    readIORef trace
+      >>= (`shouldBe` ["allocate", "open", "gate", "owner", "close", "free"])
+
+  it "transfers release ownership after acquisition" $ do
+    trace <- newIORef []
+    finalizer <- newIORef (pure ())
+    let captureOwner release = writeIORef finalizer release >> pure "owner"
+
+    result <- acquireStore (fixture trace (pure (Right ())) captureOwner)
+
+    result `shouldBe` Right "ownergate"
+    readIORef trace >>= (`shouldBe` ["allocate", "open", "gate", "owner"])
+
+    join (readIORef finalizer)
+    readIORef trace
+      >>= (`shouldBe` ["allocate", "open", "gate", "owner", "close", "free"])
 
 
 fixture
@@ -112,4 +112,4 @@ assertRaised :: Either IOException value -> IO ()
 assertRaised result =
   case result of
     Left _ -> pure ()
-    Right _ -> assertFailure "expected an IOException"
+    Right _ -> expectationFailure "expected an IOException"
