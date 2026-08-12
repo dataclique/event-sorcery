@@ -21,7 +21,7 @@ import EventSorcery.Job (
   JobClaimReference (..),
   JobClaimResult (JobAbandoned, JobClaimed),
   JobExecutionRoute (ReconcileExecution),
-  JobId (..),
+  JobId,
   JobInstant (..),
   JobKind (..),
   JobRefusal (InvalidClaimPolicy, UnrecognizedRefusal),
@@ -37,6 +37,7 @@ import EventSorcery.Job (
   encodeEnqueue,
   encodePoll,
   encodeRenew,
+  mkJobId,
  )
 import EventSorcery.Stream (
   AggregateId (..),
@@ -56,7 +57,7 @@ import EventSorcery.Stream (
  )
 import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit (Assertion, assertBool, assertFailure, testCase, (@?=))
-import Prelude (IO, Maybe (..), String, ($), (<>))
+import Prelude (IO, Maybe (..), String, error, ($), (<>))
 
 
 main :: IO ()
@@ -88,7 +89,7 @@ tests =
             encodePoll kind (JobInstant 5) (PollLimit 10) @?= expectedPoll
         , testCase "job claim" $
             encodeClaim
-              (JobId "job")
+              wireJobId
               (WorkerId "worker")
               (JobInstant 5)
               (LeaseDuration 30_000)
@@ -116,14 +117,14 @@ tests =
             decodeEngineError 3 jobRefusal
               @?= Right
                 ( JobRefused
-                    (JobRefusalDetail (JobId "job") InvalidClaimPolicy)
+                    (JobRefusalDetail wireJobId InvalidClaimPolicy)
                 )
         , testCase "keeps the identity of an unmodelled refusal" $
             decodeEngineError 3 unmodelledRefusal
               @?= Right
                 ( JobRefused
                     ( JobRefusalDetail
-                        (JobId "job")
+                        wireJobId
                         (UnrecognizedRefusal "later reason")
                     )
                 )
@@ -168,7 +169,7 @@ tests =
         , testCase "requires byte-string payloads" $
             assertDecodeFailure "expected bytes" (decodeStoredEvents arrayPayload)
         , testCase "polled jobs" $
-            decodePolledJobs polledJobs @?= Right [JobId "job"]
+            decodePolledJobs polledJobs @?= Right [wireJobId]
         , testCase "won claim" $
             decodeClaimResult wonClaim
               @?= Right
@@ -256,10 +257,16 @@ kind :: JobKind
 kind = JobKind "email"
 
 
+wireJobId :: JobId
+wireJobId = case mkJobId "job" of
+  Just identifier -> identifier
+  Nothing -> error "wire fixture job identifier was rejected"
+
+
 seed :: JobSeed
 seed =
   JobSeed
-    (JobId "job")
+    wireJobId
     kind
     (ByteString.pack [0, 1])
     (JobInstant 5)

@@ -21,11 +21,13 @@ module EventSorcery.Job (
   DeadReason (..),
   EngineError (..),
   EngineErrorDecodeDetail (..),
+  Job (..),
   JobClaimDetails (..),
   JobClaimReference (..),
   JobClaimResult (..),
+  JobDecodeError (..),
   JobExecutionRoute (..),
-  JobId (..),
+  JobId,
   JobInstant (..),
   JobKind (..),
   JobLeaseResult (..),
@@ -53,6 +55,9 @@ module EventSorcery.Job (
   encodePoll,
   encodeRenew,
   enqueueJob,
+  jobIdText,
+  jobType,
+  mkJobId,
   pollJobs,
   renewJob,
   retryJob,
@@ -130,6 +135,13 @@ import EventSorcery.Engine.Internal.FFI (
   esJobPoll,
   esJobRenew,
   esJobRetry,
+ )
+import EventSorcery.Job.Definition (
+  Job (..),
+  JobDecodeError (..),
+  jobIdText,
+  jobType,
+  mkJobId,
  )
 import EventSorcery.Stream (
   ProposedEvent,
