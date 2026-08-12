@@ -54,6 +54,7 @@ library
     EventSorcery.Aggregate
     EventSorcery.Dispatch
     EventSorcery.Dispatch.TestSupport
+    EventSorcery.Dispatch.Worker
     EventSorcery.Engine
     EventSorcery.Engine.Internal.FFI
     EventSorcery.Job
@@ -68,6 +69,8 @@ library
     EventSorcery.Engine.Acquisition
     EventSorcery.Engine.Internal
     EventSorcery.Job.Definition
+    EventSorcery.Job.Worker.Definition
+    EventSorcery.Job.Worker.Internal
 
   extra-libraries: event_sorcery_ffi
   build-depends:
@@ -172,6 +175,17 @@ test-suite job-worker-spec
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        JobWorkerSpec.hs
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring     >=0.11 && <0.13
+    , event-sorcery
+    , text           >=2.0  && <2.2
+
+test-suite dispatch-worker-spec
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        DispatchWorkerSpec.hs
   build-depends:
     , base           >=4.18 && <5
     , bytestring     >=0.11 && <0.13
