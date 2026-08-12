@@ -10,32 +10,32 @@ import Data.List.NonEmpty (NonEmpty (..))
 import Data.Traversable (traverse)
 import Data.Word (Word64, Word8)
 import EventSorcery.Engine (
+  AbiVersionDetail (..),
+  AggregateId (..),
+  AggregateType (..),
+  ConflictDetail (..),
+  EngineError (..),
+  OpenOptions (..),
   Store,
   abiVersion,
   checkAbiVersion,
   closeStore,
-  commit,
-  currentVersion,
-  loadStream,
-  loadStreamPage,
   minimumAbiMinor,
   openStore,
   supportedAbiMajor,
  )
 import EventSorcery.Engine.AcquisitionSpec qualified as AcquisitionSpec
 import EventSorcery.Engine.Internal.FFI (EsBuf (..))
-import EventSorcery.Engine.Protocol (
-  AbiVersionDetail (..),
-  AggregateId (..),
-  AggregateType (..),
-  ConflictDetail (..),
-  EngineError (..),
+import EventSorcery.Stream (
   EventType (..),
   EventVersion (..),
-  OpenOptions (..),
   ProposedEvent (..),
   StoredEvent (..),
   StreamIdentity (..),
+  commit,
+  currentVersion,
+  loadStream,
+  loadStreamPage,
  )
 import Foreign.C.Types (CSize)
 import Foreign.Marshal.Alloc (alloca)
@@ -82,6 +82,10 @@ tests =
         version <- abiVersion
         version `shiftR` 16 @?= supportedAbiMajor
         checkAbiVersion version @?= Right ()
+    , testCase "accepts an engine at the minimum ABI minor" $
+        checkAbiVersion minimumAbiMinor @?= Right ()
+    , testCase "accepts an engine above the minimum ABI minor" $
+        checkAbiVersion (minimumAbiMinor + 1) @?= Right ()
     , testCase "rejects an engine whose ABI major differs" $
         checkAbiVersion (1 `shiftL` 16)
           @?= Left
