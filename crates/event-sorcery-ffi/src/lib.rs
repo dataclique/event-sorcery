@@ -332,8 +332,8 @@ pub unsafe extern "C" fn es_load_stream(
             .transpose()
             .map_err(AbiError::InputInteger)?;
         let stream = StreamIdentity::new(aggregate_type, aggregate_id);
-        let query_limit = NonZeroUsize::new(MAX_LIST_ITEMS)
-            .ok_or(AbiError::State("invalid list query limit"))?;
+        let query_limit =
+            NonZeroUsize::new(MAX_LIST_ITEMS).ok_or(AbiError::State("invalid list query limit"))?;
         let events = lease
             .inner
             .runtime
