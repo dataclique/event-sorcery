@@ -1,7 +1,21 @@
 module Main (main) where
 
+import Control.Concurrent.Async (async, wait)
+import Control.Concurrent.MVar (
+  MVar,
+  newEmptyMVar,
+  newMVar,
+  putMVar,
+  takeMVar,
+ )
 import Data.ByteString qualified as ByteString
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (
+  IORef,
+  atomicModifyIORef',
+  modifyIORef',
+  newIORef,
+  readIORef,
+ )
 import Data.Text (Text)
 import Data.Word (Word32)
 import EventSorcery.Engine (
@@ -37,6 +51,8 @@ import EventSorcery.Job.Worker (
   JobWorker,
   jobWorker,
   mkAttemptLimit,
+  renewalSchedule,
+  renewingJobWorker,
   runJobOnce,
  )
 import Prelude (
@@ -48,6 +64,7 @@ import Prelude (
   error,
   pure,
   (&&),
+  (+),
   (<>),
   (==),
  )
@@ -57,6 +74,9 @@ data ProbeJob
   = Succeeds
   | FailsTransiently
   | FailsTerminally
+
+
+data RenewingProbeJob = WaitsForRelease
 
 
 instance Job ProbeJob where
@@ -76,6 +96,20 @@ instance Job ProbeJob where
     [1] -> Right FailsTransiently
     [2] -> Right FailsTerminally
     _ -> Left (JobDecodeError "invalid probe job")
+
+
+instance Job RenewingProbeJob where
+  type JobType RenewingProbeJob = "renewing-worker-probe"
+  type JobOutput RenewingProbeJob = Text
+  type JobError RenewingProbeJob = Text
+
+
+  encodeJob WaitsForRelease = ByteString.singleton 0
+
+
+  decodeJob bytes = case ByteString.unpack bytes of
+    [0] -> Right WaitsForRelease
+    _ -> Left (JobDecodeError "invalid renewing probe job")
 
 
 instance DurableJob ProbeJob where
@@ -99,6 +133,22 @@ instance DurableJob ProbeJob where
     pure (Right (Reconciled "reconciled"))
 
 
+instance DurableJob RenewingProbeJob where
+  type JobInput RenewingProbeJob = MVar ()
+
+
+  renderJobError _ failure = failure
+
+
+  submit _ release WaitsForRelease = do
+    takeMVar release
+    pure (Right (JobDone "renewed"))
+
+
+  reconcile _ _ WaitsForRelease =
+    pure (Right (Reconciled "reconciled"))
+
+
 main :: IO ()
 main = do
   opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)
@@ -111,6 +161,7 @@ main = do
       terminalFailureIsDeadLettered store
       exhaustedFailureIsDeadLettered store
       undecodableJobIsDeadLettered store
+      longExecutionRenewsItsLease store
 
       closed <- closeStore store
       expect "failed to close the shared engine" (closed == Right ())
@@ -206,6 +257,60 @@ undecodableJobIsDeadLettered store = do
     )
 
 
+longExecutionRenewsItsLease :: Store -> IO ()
+longExecutionRenewsItsLease store = do
+  releaseExecution <- newEmptyMVar
+  allowRenewal <- newEmptyMVar
+  renewalCompleted <- newEmptyMVar
+  stopRenewal <- newEmptyMVar
+  competingRelease <- newMVar ()
+  waitCount <- newIORef 0
+  identifier <- enqueueRenewing store
+  let schedule =
+        renewalSchedule
+          (renewalWait waitCount allowRenewal renewalCompleted stopRenewal)
+          (pure renewedUntil)
+      renewingRunner =
+        renewingJobWorker
+          (renewingProbeRunner store releaseExecution)
+          schedule
+  running <- async (runJobOnce renewingRunner identifier now)
+
+  putMVar allowRenewal ()
+  takeMVar renewalCompleted
+  competing <-
+    runJobOnce
+      (renewingProbeRunner store competingRelease)
+      identifier
+      afterOriginalLease
+
+  putMVar releaseExecution ()
+  completed <- wait running
+
+  expect
+    "competing worker acquired a renewed lease"
+    (competing == Right JobRunSkipped)
+  expect
+    "renewing worker did not settle the completed job"
+    (completed == Right (JobSucceeded "renewed"))
+
+
+renewalWait
+  :: IORef Word32
+  -> MVar ()
+  -> MVar ()
+  -> MVar ()
+  -> IO ()
+renewalWait waitCount allowRenewal renewalCompleted stopRenewal = do
+  invocation <- atomicModifyIORef' waitCount (\count -> (count + 1, count))
+
+  if invocation == 0
+    then takeMVar allowRenewal
+    else do
+      putMVar renewalCompleted ()
+      takeMVar stopRenewal
+
+
 runner :: Store -> IORef [Text] -> AttemptLimit -> JobWorker ProbeJob
 runner store calls limit =
   jobWorker
@@ -218,6 +323,17 @@ runner store calls limit =
     calls
 
 
+renewingProbeRunner :: Store -> MVar () -> JobWorker RenewingProbeJob
+renewingProbeRunner store =
+  jobWorker
+    store
+    (WorkerId "renewing-haskell-worker")
+    (LeaseDuration 30_000)
+    (ClaimBudget 50)
+    attemptLimit
+    retrySchedule
+
+
 enqueue :: Store -> Text -> ProbeJob -> IO JobId
 enqueue store rawIdentifier job = do
   let identifier = validJobId rawIdentifier
@@ -226,6 +342,22 @@ enqueue store rawIdentifier job = do
   case result of
     Right () -> pure identifier
     Left _ -> error "failed to enqueue test job"
+
+
+enqueueRenewing :: Store -> IO JobId
+enqueueRenewing store = do
+  let identifier = validJobId "01ARZ3NDEKTSV4RRFFQ69G5FB5"
+      seed =
+        JobSeed
+          identifier
+          (JobKind "renewing-worker-probe")
+          (encodeJob WaitsForRelease)
+          now
+  result <- enqueueJob store seed
+
+  case result of
+    Right () -> pure identifier
+    Left _ -> error "failed to enqueue renewing test job"
 
 
 retrySchedule :: JobAttempt -> JobInstant
@@ -262,6 +394,14 @@ now = JobInstant 1_000
 
 later :: JobInstant
 later = JobInstant 90_000
+
+
+afterOriginalLease :: JobInstant
+afterOriginalLease = JobInstant 40_000
+
+
+renewedUntil :: JobInstant
+renewedUntil = JobInstant 90_000
 
 
 expect :: String -> Bool -> IO ()

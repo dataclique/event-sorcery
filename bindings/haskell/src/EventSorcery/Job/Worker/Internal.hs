@@ -5,6 +5,14 @@ module EventSorcery.Job.Worker.Internal (
   runJobOnceWith,
 ) where
 
+import Control.Concurrent.Async (cancel, link, withAsync)
+import Control.Concurrent.MVar (
+  MVar,
+  newEmptyMVar,
+  putMVar,
+  tryReadMVar,
+ )
+import Data.Maybe (Maybe (..))
 import Data.Unrestricted.Linear (Ur (Ur))
 import EventSorcery.Engine (EngineError)
 import EventSorcery.Job (
@@ -12,16 +20,19 @@ import EventSorcery.Job (
   DeadReason (..),
   Job (JobError, JobOutput, decodeJob),
   JobClaimDetails (..),
+  JobClaimReference,
   JobClaimResult (..),
   JobDecodeError (..),
   JobId,
   JobInstant,
+  JobLeaseResult (..),
   JobSettlement (..),
   JobSettlementToken,
   acknowledgeJob,
   claimJob,
   deadLetterJob,
   deferJob,
+  renewJob,
   retryJob,
   settlementToken,
  )
@@ -38,6 +49,7 @@ import EventSorcery.Job.Worker.Definition (
   JobRunError (..),
   JobRunResult (..),
   JobWorker (..),
+  RenewalSchedule (..),
  )
 import Prelude (
   Bool,
@@ -47,6 +59,7 @@ import Prelude (
   otherwise,
   pure,
   (+),
+  (<$>),
   (==),
   (>=),
  )
@@ -115,15 +128,25 @@ runJobOnceWith settlement runtime identifier now = do
         Right job -> do
           let attempt = JobAttempt details.attempt
               context = JobContext identifier attempt
-          executed <- executeDurableJob context details.route runtime.input job
-          persistExecution
-            settlement
-            runtime
-            identifier
-            job
-            token
-            attempt
-            executed
+          executed <-
+            executeWithRenewal
+              runtime
+              details.reference
+              (executeDurableJob context details.route runtime.input job)
+
+          case executed of
+            ExecutionCompleted result ->
+              persistExecution
+                settlement
+                runtime
+                identifier
+                job
+                token
+                attempt
+                result
+            ExecutionLeaseLost -> pure (Right JobRunFenced)
+            ExecutionRenewalFailed failure ->
+              pure (Left (JobRunEngineFailed failure))
     Right JobAbandoned -> pure (Right JobRunAbandoned)
     Right JobContended -> pure (Right JobRunContended)
     Right JobSkipped -> pure (Right JobRunSkipped)
@@ -273,3 +296,57 @@ releaseClaim
 releaseClaim details won =
   case settlementToken won of
     Ur token -> Ur (details, token)
+
+
+data RenewedExecution result
+  = ExecutionCompleted result
+  | ExecutionLeaseLost
+  | ExecutionRenewalFailed EngineError
+
+
+data RenewalTerminal
+  = RenewalLost
+  | RenewalFailed EngineError
+
+
+executeWithRenewal
+  :: JobWorker job
+  -> JobClaimReference
+  -> IO result
+  -> IO (RenewedExecution result)
+executeWithRenewal runtime reference execute = case runtime.leaseRenewal of
+  Nothing -> do
+    ExecutionCompleted <$> execute
+  Just schedule -> do
+    terminal <- newEmptyMVar
+
+    withAsync
+      (renewUntilTerminal runtime schedule reference terminal)
+      \renewer -> do
+        link renewer
+        result <- execute
+        cancel renewer
+        renewal <- tryReadMVar terminal
+
+        pure case renewal of
+          Nothing -> ExecutionCompleted result
+          Just RenewalLost -> ExecutionLeaseLost
+          Just (RenewalFailed failure) -> ExecutionRenewalFailed failure
+
+
+renewUntilTerminal
+  :: JobWorker job
+  -> RenewalSchedule
+  -> JobClaimReference
+  -> MVar RenewalTerminal
+  -> IO ()
+renewUntilTerminal runtime schedule reference terminal = do
+  schedule.waitBeforeRenewal
+  newLease <- schedule.renewalDeadline
+  renewed <- renewJob runtime.store reference newLease
+
+  case renewed of
+    Left failure -> putMVar terminal (RenewalFailed failure)
+    Right LeaseLost -> putMVar terminal RenewalLost
+    Right LeaseHeld ->
+      renewUntilTerminal runtime schedule reference terminal
