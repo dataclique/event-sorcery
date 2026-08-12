@@ -4,6 +4,7 @@
 //! atomically commit aggregate events, snapshots, and durable job intent.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use cqrs_es::persist::{PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot};
 use futures_util::TryStreamExt;
@@ -14,6 +15,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use crate::job::EnqueueRequest;
 use crate::job_sqlite::SqliteJobError;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
+use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaTarget};
 
 const ENGINE_PAYLOAD_PROVENANCE_KEY: &str = "$event-sorcery-engine-owned";
 const ENGINE_PAYLOAD_PROVENANCE: &str = "opaque-v1";
@@ -184,6 +186,7 @@ pub struct CommitRequest<'events> {
 #[derive(Clone)]
 pub struct Engine {
     pool: SqlitePool,
+    reconciler: Arc<Reconciler>,
 }
 
 /// Failures produced by serialized engine operations.
@@ -217,6 +220,8 @@ pub enum EngineError {
     Integer(#[from] std::num::TryFromIntError),
     #[error(transparent)]
     JobFlush(#[from] crate::job::JobStoreError),
+    #[error(transparent)]
+    Schema(#[from] ReconcileError),
 }
 
 /// An erased durable-job intent committed atomically with domain events.
@@ -294,8 +299,14 @@ impl Engine {
     ///
     /// This constructor does not run migrations. Call [`Self::migrate`] before
     /// using storage operations when the pool's schema is not initialized.
+    ///
+    /// The schema registry's CQRS framework is built once here and reused by
+    /// every schema call, so one engine never holds more than one framework
+    /// instance for that aggregate.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        let reconciler = Arc::new(Reconciler::new(pool.clone()));
+
+        Self { pool, reconciler }
     }
 
     /// Migrates the engine's existing SQLite schema.
@@ -304,6 +315,21 @@ impl Engine {
             .run(&self.pool)
             .await
             .map_err(|error| SqliteJobError::Sql(error.into()))?;
+        Ok(())
+    }
+
+    /// Runs the existing schema-registry recovery for language-neutral metadata.
+    pub async fn reconcile_schema(
+        &self,
+        target: &SchemaTarget,
+    ) -> Result<SchemaReconciliation, EngineError> {
+        Ok(self.reconciler.reconcile_target(target).await?)
+    }
+
+    /// Records a schema version after its recovery has durably completed.
+    pub async fn record_schema(&self, target: &SchemaTarget) -> Result<(), EngineError> {
+        self.reconciler.record_target(target).await?;
+
         Ok(())
     }
 
@@ -1237,6 +1263,7 @@ impl From<EngineError> for PersistenceError {
             Json(source) => Self::DeserializationError(Box::new(source)),
             Integer(source) => Self::UnknownError(Box::new(source)),
             JobFlush(source) => Self::UnknownError(Box::new(source)),
+            Schema(source) => Self::UnknownError(Box::new(source)),
         }
     }
 }
@@ -1449,6 +1476,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::CompactionPolicy;
     use crate::job::{
         JobId, JobKind, JobStoreError, WorkerId, enqueued_event, pending_seed_payload, plan_claim,
     };
@@ -1576,6 +1604,79 @@ mod tests {
             panic!("oversized stored page must report its exact accounting");
         };
         assert_eq!((observed, limit), (302, 64));
+    }
+
+    #[tokio::test]
+    async fn schema_reconciliation_uses_the_existing_event_sourced_registry() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let target = SchemaTarget::new("engine-schema-test", 1, CompactionPolicy::Retain);
+
+        assert_eq!(
+            engine.reconcile_schema(&target).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        assert_eq!(
+            engine.reconcile_schema(&target).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+
+        engine.record_schema(&target).await.unwrap();
+
+        assert_eq!(
+            engine.reconcile_schema(&target).await.unwrap(),
+            SchemaReconciliation::Unchanged
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_version_change_clears_derived_snapshots() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-schema-snapshot", "one");
+        let version_one = SchemaTarget::new("engine-schema-snapshot", 1, CompactionPolicy::Retain);
+        assert_eq!(
+            engine.reconcile_schema(&version_one).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        engine.record_schema(&version_one).await.unwrap();
+        persist_test_snapshot(&engine, &stream).await;
+
+        let version_two = SchemaTarget::new("engine-schema-snapshot", 2, CompactionPolicy::Retain);
+        let outcome = engine.reconcile_schema(&version_two).await.unwrap();
+
+        assert_eq!(outcome, SchemaReconciliation::Changed);
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn schema_version_change_preserves_compacted_snapshots_by_refusing_recovery() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-schema-compact", "one");
+        let version_one = SchemaTarget::new("engine-schema-compact", 1, CompactionPolicy::Retain);
+        assert_eq!(
+            engine.reconcile_schema(&version_one).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        engine.record_schema(&version_one).await.unwrap();
+        persist_test_snapshot(&engine, &stream).await;
+        let preserved = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        let version_two = SchemaTarget::new(
+            "engine-schema-compact",
+            2,
+            CompactionPolicy::CompactAfterSnapshot,
+        );
+
+        let result = engine.reconcile_schema(&version_two).await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::Schema(
+                ReconcileError::CompactedSnapshotClear { .. }
+            ))
+        ));
+        assert_eq!(
+            engine.load_snapshot(&stream).await.unwrap(),
+            Some(preserved)
+        );
     }
 
     #[tokio::test]
@@ -2122,5 +2223,23 @@ mod tests {
 
         assert!(matches!(result, Err(EngineError::EmptySnapshotUpdate)));
         assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    async fn persist_test_snapshot(engine: &Engine, stream: &StreamIdentity) {
+        let event = serialized_event(stream, 1);
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+        engine
+            .store_snapshot(
+                stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 42 }), 1),
+            )
+            .await
+            .unwrap();
     }
 }
