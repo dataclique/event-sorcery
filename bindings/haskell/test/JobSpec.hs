@@ -8,8 +8,8 @@ import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Maybe (Maybe (Just, Nothing))
 import Data.Unrestricted.Linear (Ur (Ur))
-import EventSorcery.Engine (OpenOptions (..), closeStore, openStore)
-import EventSorcery.Job (
+import Event.Sorcery.Engine (OpenOptions (..), closeStore, openStore)
+import Event.Sorcery.Job (
   AggregateId (..),
   AggregateType (..),
   ClaimBudget (..),
@@ -45,7 +45,7 @@ import EventSorcery.Job (
   settlementToken,
   streamRunnableJobs,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   EventType (..),
   EventVersion (..),
   ProposedEvent (..),

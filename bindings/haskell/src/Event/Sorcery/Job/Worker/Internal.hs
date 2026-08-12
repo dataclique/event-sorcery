@@ -1,4 +1,4 @@
-module EventSorcery.Job.Worker.Internal (
+module Event.Sorcery.Job.Worker.Internal (
   SettlementStrategy (..),
   VerdictDelivery (..),
   genericSettlement,
@@ -14,8 +14,8 @@ import Control.Concurrent.MVar (
  )
 import Data.Maybe (Maybe (..))
 import Data.Unrestricted.Linear (Ur (Ur))
-import EventSorcery.Engine (EngineError)
-import EventSorcery.Job (
+import Event.Sorcery.Engine (EngineError)
+import Event.Sorcery.Job (
   ClaimedJob,
   DeadReason (..),
   Job (JobError, JobOutput, decodeJob),
@@ -36,7 +36,7 @@ import EventSorcery.Job (
   retryJob,
   settlementToken,
  )
-import EventSorcery.Job.Execution (
+import Event.Sorcery.Job.Execution (
   DurableJob (renderJobError),
   JobAttempt (JobAttempt),
   JobContext (JobContext),
@@ -44,7 +44,7 @@ import EventSorcery.Job.Execution (
   JobOutcome (..),
   executeDurableJob,
  )
-import EventSorcery.Job.Worker.Definition (
+import Event.Sorcery.Job.Worker.Definition (
   AttemptLimit (AttemptLimit),
   JobRunError (..),
   JobRunResult (..),

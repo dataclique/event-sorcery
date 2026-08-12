@@ -9,7 +9,7 @@ import Data.Foldable (traverse_)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Traversable (traverse)
 import Data.Word (Word64, Word8)
-import EventSorcery.Engine (
+import Event.Sorcery.Engine (
   AbiVersionDetail (..),
   AggregateId (..),
   AggregateType (..),
@@ -24,9 +24,9 @@ import EventSorcery.Engine (
   openStore,
   supportedAbiMajor,
  )
-import EventSorcery.Engine.AcquisitionSpec qualified as AcquisitionSpec
-import EventSorcery.Engine.Internal.FFI (EsBuf (..))
-import EventSorcery.Stream (
+import Event.Sorcery.Engine.AcquisitionSpec qualified as AcquisitionSpec
+import Event.Sorcery.Engine.Internal.FFI (EsBuf (..))
+import Event.Sorcery.Stream (
   EventType (..),
   EventVersion (..),
   ProposedEvent (..),

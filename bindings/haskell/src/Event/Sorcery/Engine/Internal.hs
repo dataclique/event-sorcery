@@ -1,10 +1,10 @@
 -- | The engine feature: the store handle, its lifecycle, and the ABI it speaks.
 --
--- "EventSorcery.Engine" re-exports the consumer-facing half of this module.
+-- "Event.Sorcery.Engine" re-exports the consumer-facing half of this module.
 -- The call marshalling and the errors every call can answer with stay here so
 -- the stream and job features can issue engine calls without republishing the
 -- ABI plumbing to consumers.
-module EventSorcery.Engine.Internal (
+module Event.Sorcery.Engine.Internal (
   AbiVersionDetail (..),
   AggregateId (..),
   AggregateType (..),
@@ -67,11 +67,11 @@ import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Word (Word32, Word64, Word8)
-import EventSorcery.Engine.Acquisition (
+import Event.Sorcery.Engine.Acquisition (
   StoreAcquisition (..),
   acquireStore,
  )
-import EventSorcery.Engine.Internal.FFI (
+import Event.Sorcery.Engine.Internal.FFI (
   EsBuf (..),
   EsStore,
   esAbiVersion,
@@ -79,7 +79,7 @@ import EventSorcery.Engine.Internal.FFI (
   esClose,
   esOpen,
  )
-import EventSorcery.Job.Definition (JobId (..))
+import Event.Sorcery.Job.Definition (JobId (..))
 import Foreign.C.Types (CInt, CSize)
 import Foreign.Concurrent qualified as Foreign
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)

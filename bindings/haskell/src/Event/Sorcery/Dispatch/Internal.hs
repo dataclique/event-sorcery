@@ -1,4 +1,4 @@
-module EventSorcery.Dispatch.Internal (
+module Event.Sorcery.Dispatch.Internal (
   DispatchEvent (..),
   DispatchFailure (..),
   DispatchOutcome (..),
@@ -19,7 +19,7 @@ module EventSorcery.Dispatch.Internal (
 
 import Data.Text (Text)
 import Data.Word (Word32)
-import EventSorcery.Job.Definition (
+import Event.Sorcery.Job.Definition (
   DeadReason,
   Job (JobError, JobOutput),
   JobId,

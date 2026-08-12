@@ -1,4 +1,4 @@
-module EventSorcery.Job.Worker (
+module Event.Sorcery.Job.Worker (
   AttemptLimit,
   JobRunError (..),
   JobRunResult (..),
@@ -11,9 +11,9 @@ module EventSorcery.Job.Worker (
   runJobOnce,
 ) where
 
-import EventSorcery.Job (Job (JobError, JobOutput), JobId, JobInstant)
-import EventSorcery.Job.Execution (DurableJob)
-import EventSorcery.Job.Worker.Definition (
+import Event.Sorcery.Job (Job (JobError, JobOutput), JobId, JobInstant)
+import Event.Sorcery.Job.Execution (DurableJob)
+import Event.Sorcery.Job.Worker.Definition (
   AttemptLimit,
   JobRunError (..),
   JobRunResult (..),
@@ -24,7 +24,7 @@ import EventSorcery.Job.Worker.Definition (
   renewalSchedule,
   renewingJobWorker,
  )
-import EventSorcery.Job.Worker.Internal (
+import Event.Sorcery.Job.Worker.Internal (
   genericSettlement,
   runJobOnceWith,
  )

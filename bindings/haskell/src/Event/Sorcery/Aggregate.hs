@@ -1,6 +1,6 @@
 {-# LANGUAGE FunctionalDependencies #-}
 
-module EventSorcery.Aggregate (
+module Event.Sorcery.Aggregate (
   DecodeCause (..),
   DispatchIntent,
   Dispatches (..),
@@ -21,8 +21,8 @@ import Data.Proxy (Proxy)
 import Data.Text (Text)
 import Data.Type.Equality (type (~))
 import Data.Word (Word16)
-import EventSorcery.Dispatch (DispatchOutcome, JobDispatch)
-import EventSorcery.Job.Definition (
+import Event.Sorcery.Dispatch (DispatchOutcome, JobDispatch)
+import Event.Sorcery.Job.Definition (
   Job (..),
   JobId,
  )

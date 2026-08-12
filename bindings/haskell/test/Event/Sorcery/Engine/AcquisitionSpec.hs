@@ -1,9 +1,9 @@
-module EventSorcery.Engine.AcquisitionSpec (tests) where
+module Event.Sorcery.Engine.AcquisitionSpec (tests) where
 
 import Control.Exception (IOException, try)
 import Control.Monad (join)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import EventSorcery.Engine.Acquisition (StoreAcquisition (..), acquireStore)
+import Event.Sorcery.Engine.Acquisition (StoreAcquisition (..), acquireStore)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase, (@?=))
 import Prelude (

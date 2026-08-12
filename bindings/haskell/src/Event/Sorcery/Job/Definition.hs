@@ -1,6 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 
-module EventSorcery.Job.Definition (
+module Event.Sorcery.Job.Definition (
   DeadReason (..),
   Job (..),
   JobDecodeError (..),

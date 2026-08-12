@@ -1,4 +1,4 @@
-module EventSorcery.Dispatch.Worker (
+module Event.Sorcery.Dispatch.Worker (
   DeliveryPolicy,
   DispatchWorker,
   OriginDeliveryError (..),
@@ -12,38 +12,38 @@ module EventSorcery.Dispatch.Worker (
 ) where
 
 import Data.Word (Word32)
-import EventSorcery.Aggregate (
+import Event.Sorcery.Aggregate (
   Dispatches (injectDispatchOutcome),
   EventSourced,
  )
-import EventSorcery.Dispatch (DispatchFailure (..), DispatchOutcome)
-import EventSorcery.Dispatch.Internal qualified as Dispatch
-import EventSorcery.Job (
+import Event.Sorcery.Dispatch (DispatchFailure (..), DispatchOutcome)
+import Event.Sorcery.Dispatch.Internal qualified as Dispatch
+import Event.Sorcery.Job (
   DeadReason (RetriesExhausted),
   Job (JobError, JobOutput),
   JobId,
   JobInstant,
  )
-import EventSorcery.Job.Execution (
+import Event.Sorcery.Job.Execution (
   DurableJob (renderJobError),
   JobAttempt (JobAttempt),
  )
-import EventSorcery.Job.Worker (
+import Event.Sorcery.Job.Worker (
   JobRunError,
   JobRunResult,
   JobWorker,
  )
-import EventSorcery.Job.Worker.Internal (
+import Event.Sorcery.Job.Worker.Internal (
   SettlementStrategy (..),
   VerdictDelivery (..),
   runJobOnceWith,
  )
-import EventSorcery.Store (
+import Event.Sorcery.Store (
   Store,
   StoreError (..),
   executeCommand,
  )
-import EventSorcery.Stream (StreamKey)
+import Event.Sorcery.Stream (StreamKey)
 import Prelude (Either (..), IO, pure)
 
 
