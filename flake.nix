@@ -41,16 +41,12 @@
         };
         but = but-nix.packages.${system}.default;
         haskellPackages = pkgs.haskell.packages.ghc914;
-        haskellBindingBase = haskellPackages.callCabal2nix "event-sorcery" ./bindings/haskell {
-          event_sorcery_ffi = ffiEngine;
-        };
-        haskellBinding = haskellBindingBase.overrideAttrs (old: {
-          buildInputs = (old.buildInputs or [ ]) ++ [ ffiEngine ];
-          configureFlags = (old.configureFlags or [ ]) ++ [
-            "--extra-include-dirs=${ffiEngine}/include"
-            "--extra-lib-dirs=${ffiEngine}/lib"
-          ];
-        });
+        haskellBinding = pkgs.haskell.lib.overrideSrc (haskellPackages.callPackage
+          ./nix/event-sorcery-haskell.nix
+          {
+            event_sorcery_ffi = ffiEngine;
+          }
+        ) { src = ./bindings/haskell; };
         rustBuildInputs = rainix.rust-build-inputs.${system};
         rustToolchain = rainix.rust-toolchain.${system};
         rustWorkspace = pkgs.rustPlatform.buildRustPackage {
@@ -87,6 +83,10 @@
             "--package"
             "event-sorcery-ffi"
           ];
+          cargoTestFlags = [
+            "--package"
+            "event-sorcery-ffi"
+          ];
           installPhase = ''
             runHook preInstall
             mkdir -p $out/include $out/lib
@@ -98,6 +98,12 @@
               $out/include/event_sorcery.h
             runHook postInstall
           '';
+
+          meta = {
+            description = "event-sorcery FFI engine: static library and C header";
+            license = pkgs.lib.licenses.mit;
+            platforms = pkgs.lib.platforms.unix;
+          };
         };
         hooks = import ./git-hooks.nix {
           inherit
@@ -131,8 +137,6 @@
         };
 
         devShells.default = pkgs.mkShell {
-          buildInputs = [ ffiEngine ];
-
           nativeBuildInputs =
             rustBuildInputs
             ++ hooks.enabledPackages

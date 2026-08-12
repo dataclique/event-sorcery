@@ -108,6 +108,7 @@ pub struct OpaqueCommitRequest<'events> {
     stream: StreamIdentity,
     expected_version: usize,
     events: &'events [OpaqueProposedEvent],
+    jobs: Vec<EnqueueRequest>,
 }
 
 impl<'events> OpaqueCommitRequest<'events> {
@@ -121,7 +122,20 @@ impl<'events> OpaqueCommitRequest<'events> {
             stream,
             expected_version,
             events,
+            jobs: vec![],
         }
+    }
+
+    /// Includes one durable job intent in the same event-store transaction.
+    ///
+    /// The job's `Enqueued` event and its queue row are written by the
+    /// transaction that appends these events, so a binding never observes a
+    /// committed event whose job never reached the queue.
+    #[must_use]
+    pub fn with_job(mut self, job: JobSeed) -> Self {
+        let JobSeed(request) = job;
+        self.jobs.push(request);
+        self
     }
 }
 
@@ -634,22 +648,15 @@ impl Engine {
             .collect()
     }
 
-    /// Reads the current stream version, where zero means no events.
+    /// Reads the current stream version, where zero means the stream holds no
+    /// events and no snapshot covers any.
+    ///
+    /// This is the same oracle [`Engine::commit`] validates against, so a
+    /// compacted stream reports the version its snapshot still covers rather
+    /// than the lower maximum sequence its surviving events show.
     pub async fn current_version(&self, stream: &StreamIdentity) -> Result<usize, EngineError> {
-        let version = sqlx::query_scalar::<_, Option<i64>>(
-            r"
-            SELECT MAX(sequence)
-            FROM events
-            WHERE aggregate_type = ?1 AND aggregate_id = ?2
-            ",
-        )
-        .bind(&stream.aggregate_type)
-        .bind(&stream.aggregate_id)
-        .fetch_one(&self.pool)
-        .await?;
-        version.map_or(Ok(0), |version| {
-            usize::try_from(version).map_err(Into::into)
-        })
+        let mut connection = self.pool.acquire().await?;
+        committed_stream_version(&mut connection, stream).await
     }
 
     /// Loads the current snapshot for one stream when present.
@@ -777,6 +784,7 @@ impl Engine {
             stream,
             expected_version,
             events,
+            jobs,
         } = request;
         let serialized = events
             .iter()
@@ -799,7 +807,9 @@ impl Engine {
             .collect::<Result<Vec<_>, EngineError>>()?;
 
         self.commit_serialized(
-            CommitRequest::new(stream, &serialized).at_expected_version(expected_version),
+            CommitRequest::new(stream, &serialized)
+                .at_expected_version(expected_version)
+                .with_jobs(jobs),
         )
         .await
     }
@@ -819,19 +829,7 @@ impl Engine {
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(expected) = expected_version {
-            let current = sqlx::query!(
-                r#"
-                SELECT MAX(sequence) AS "sequence?: i64"
-                FROM events
-                WHERE aggregate_type = ?1
-                  AND aggregate_id = ?2
-                "#,
-                stream.aggregate_type,
-                stream.aggregate_id,
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            let actual = current.sequence.map_or(Ok(0), usize::try_from)?;
+            let actual = committed_stream_version(&mut tx, &stream).await?;
             if actual != expected {
                 return Err(EngineError::OptimisticLock);
             }
@@ -903,6 +901,44 @@ impl Engine {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// Reads one stream's durable version, where zero means nothing was ever
+/// committed.
+///
+/// Compaction deletes every event a snapshot already covers, so
+/// `MAX(events.sequence)` alone can fall back below the aggregate's real version
+/// and stop reporting stale writers. `snapshots.last_sequence` is the durable
+/// record of how far the erased prefix reached, so the greater of the two is the
+/// only sound conflict oracle. Reads on the caller's connection, so a commit
+/// sees the two records under the write lock it already holds and appends
+/// against exactly what it observed.
+async fn committed_stream_version(
+    connection: &mut SqliteConnection,
+    stream: &StreamIdentity,
+) -> Result<usize, EngineError> {
+    let version = sqlx::query_scalar::<_, i64>(
+        r"
+        SELECT MAX(
+            COALESCE(
+                (SELECT MAX(sequence) FROM events
+                 WHERE aggregate_type = ?1 AND aggregate_id = ?2),
+                0
+            ),
+            COALESCE(
+                (SELECT last_sequence FROM snapshots
+                 WHERE aggregate_type = ?1 AND aggregate_id = ?2),
+                0
+            )
+        )
+        ",
+    )
+    .bind(&stream.aggregate_type)
+    .bind(&stream.aggregate_id)
+    .fetch_one(connection)
+    .await?;
+
+    usize::try_from(version).map_err(EngineError::from)
 }
 
 enum TransactionOutcome<Output> {
@@ -1477,6 +1513,88 @@ mod tests {
 
         let loaded = engine.load_events(&stream, Some(1)).await.unwrap();
         assert_eq!(loaded, events[1..]);
+    }
+
+    #[tokio::test]
+    async fn current_version_reports_the_sequence_a_snapshot_covers_after_compaction() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("engine-compacted-version-test", "one");
+        let persisted = (1..=2)
+            .map(|sequence| serialized_event(&stream, sequence))
+            .collect::<Vec<_>>();
+        engine
+            .commit(
+                CommitRequest::new(stream.clone(), &persisted)
+                    .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 2 }), 1))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        compact_covered_prefix(&pool, &stream).await;
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), vec![]);
+
+        // The events table forgot every sequence, so only the snapshot still
+        // records how far the stream reached. A reader that trusted the events
+        // alone would restart a live aggregate from version zero.
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_a_stale_writer_whose_sequence_a_snapshot_already_covers() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("engine-compaction-conflict-test", "one");
+        let persisted = [serialized_event(&stream, 1)];
+        engine
+            .commit(
+                CommitRequest::new(stream.clone(), &persisted)
+                    .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 1 }), 1))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        compact_covered_prefix(&pool, &stream).await;
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 1);
+
+        // A writer that loaded before the first commit proposes sequence 1
+        // again. Replay would never reach it behind the snapshot, so accepting
+        // it would lose the update silently.
+        let stale = [serialized_event(&stream, 1)];
+        let result = engine
+            .commit(CommitRequest::new(stream.clone(), &stale).at_expected_version(0))
+            .await;
+
+        assert!(matches!(result, Err(EngineError::OptimisticLock)));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 1);
+
+        // A writer that loaded the snapshot proposes the sequence after it and
+        // still commits.
+        let next = [serialized_event(&stream, 2)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &next).at_expected_version(1))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 2);
+    }
+
+    /// Deletes exactly the event prefix the stream's snapshot already covers.
+    async fn compact_covered_prefix(pool: &SqlitePool, stream: &StreamIdentity) {
+        sqlx::query(
+            "DELETE FROM events \
+             WHERE aggregate_type = ?1 \
+               AND aggregate_id = ?2 \
+               AND sequence <= (SELECT last_sequence FROM snapshots \
+                                WHERE aggregate_type = ?1 AND aggregate_id = ?2)",
+        )
+        .bind(&stream.aggregate_type)
+        .bind(&stream.aggregate_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -134,6 +134,43 @@ jobs:
       - name: examples
         run: nix run .#check-examples
 
+  haskell:
+    runs-on: ubuntu-latest
+    # The first uncached build compiles the GHC dependency closure, which
+    # takes far longer than the steady state; cachix carries the closure
+    # across runs, so the bound only has to cover the cold start once.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035  # v34
+        with:
+          nix_version: "2.31.2"
+          nix_conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71  # v17
+        continue-on-error: true
+        with:
+          name: data-cartel-public
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569  # v7
+        with:
+          primary-key: nix-${{ runner.os }}-haskell-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-haskell-
+          gc-max-store-size-linux: 5G
+
+      - name: haskell
+        run: nix build .#checks.x86_64-linux.haskell -L
+
   hooks:
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -264,15 +264,22 @@ boundary:
 
 ABI major version 0 has these normative resource limits:
 
-| Resource                                        |  Limit |
-| ----------------------------------------------- | -----: |
-| Encoded request buffer                          | 16 MiB |
-| Encoded response buffer, including error detail | 64 MiB |
-| CBOR container nesting depth                    |     32 |
-| One opaque domain payload                       |  1 MiB |
-| Events in one commit                            |  1,024 |
-| Items in one page or list response              |  4,096 |
-| UTF-8 error-detail text                         |  4 KiB |
+| Resource                                        |            Limit |
+| ----------------------------------------------- | ---------------: |
+| Encoded request buffer                          |           16 MiB |
+| Encoded response buffer, including error detail |           64 MiB |
+| CBOR container nesting depth                    |               32 |
+| One opaque domain payload                       |            1 MiB |
+| Events in one commit                            |            1,024 |
+| Items in one page or list response              |            4,096 |
+| UTF-8 error-detail text                         |            4 KiB |
+| UTF-8 identifier text                           |            4 KiB |
+| Store busy timeout                              | 2,147,483,647 ms |
+
+An identifier is any caller-supplied name the store persists or matches on: an
+aggregate type or id, a job id or kind, and a worker name. The busy-timeout
+bound is what the SQLite driver accepts; a larger value is refused at open
+rather than failing later as an infrastructure error.
 
 Lengths and counts MUST be checked before proportional allocation or durable
 work whenever the encoded shape makes that possible. Exceeding any limit MUST

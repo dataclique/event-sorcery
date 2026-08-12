@@ -2,31 +2,38 @@ module Main (main) where
 
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
-import Data.Either (Either (Right), isLeft)
-import EventSorcery.Engine.Codec (
+import Data.Either (Either (Left, Right))
+import Data.List (isInfixOf)
+import Data.List.NonEmpty (NonEmpty (..))
+import Data.Word (Word64)
+import EventSorcery.Engine (
+  ConflictDetail (..),
+  EngineError (..),
+  OpenOptions (..),
+  ResourceLimitDetail (..),
+  decodeCloseStatus,
   decodeEngineError,
+  encodeOpenOptions,
+ )
+import EventSorcery.Stream (
+  AggregateId (..),
+  AggregateType (..),
+  BindingFault (..),
+  EventType (..),
+  EventVersion (..),
+  PageAdvanceDetail (..),
+  ProposedEvent (..),
+  StoredEvent (..),
+  StreamIdentity (..),
   decodeStoredEvents,
   encodeCommit,
   encodeCurrentVersion,
   encodeLoadStream,
-  encodeOpenOptions,
- )
-import EventSorcery.Engine.Protocol (
-  AggregateId (..),
-  AggregateType (..),
-  ConflictDetail (..),
-  EngineError (..),
-  EventType (..),
-  EventVersion (..),
-  OpenOptions (..),
-  ProposedEvent (..),
-  ResourceLimitDetail (..),
-  StoredEvent (..),
-  StreamIdentity (..),
+  nextCursor,
  )
 import Test.Tasty (TestTree, defaultMain, testGroup)
-import Test.Tasty.HUnit (assertBool, testCase, (@?=))
-import Prelude (IO, Maybe (..), ($), (<>))
+import Test.Tasty.HUnit (Assertion, assertBool, assertFailure, testCase, (@?=))
+import Prelude (IO, Maybe (..), String, ($), (<>))
 
 
 main :: IO ()
@@ -36,7 +43,7 @@ main = defaultMain tests
 tests :: TestTree
 tests =
   testGroup
-    "engine codecs"
+    "engine wire format"
     [ testGroup
         "encoding"
         [ testCase "open options" $
@@ -54,6 +61,16 @@ tests =
         "decoding"
         [ testCase "stored event" $
             decodeStoredEvents stored @?= Right [expectedStored]
+        , testCase "malformed-input detail" $
+            decodeEngineError 1 malformedInput @?= Right MalformedInput
+        , testCase "storage-failure detail" $
+            decodeEngineError 4 storageFailure
+              @?= Right (StorageFailure "storage failure")
+        , testCase "invalid-state detail" $
+            decodeEngineError 5 invalidState
+              @?= Right (InvalidState "store is closed")
+        , testCase "keeps the numeric identity of an unmodelled code" $
+            decodeEngineError 3 unmodelledCode @?= Right (UnknownEngineError 3)
         , testCase "conflict detail" $
             decodeEngineError 2 conflict
               @?= Right
@@ -74,31 +91,74 @@ tests =
         , testCase "panic detail" $
             decodeEngineError 100 enginePanic @?= Right EnginePanic
         , testCase "rejects disagreement between status and encoded code" $
-            assertBool
-              "status mismatch must fail"
-              (isLeft (decodeEngineError 4 conflict))
+            assertDecodeFailure
+              "engine status does not match encoded error code"
+              (decodeEngineError 4 conflict)
         , testCase "rejects trailing bytes" $
-            assertBool
-              "trailing byte must fail"
-              (isLeft (decodeStoredEvents (stored <> ByteString.singleton 0)))
+            decodeStoredEvents (stored <> ByteString.singleton 0)
+              @?= Left "trailing bytes after stored events"
         , testCase "rejects unsupported versions" $
-            assertBool
-              "unsupported version must fail"
-              (isLeft (decodeStoredEvents unsupportedVersion))
+            assertDecodeFailure
+              "unsupported stored-events format version"
+              (decodeStoredEvents unsupportedVersion)
         , testCase "enforces top-level arity" $
-            assertBool
-              "wrong top-level arity must fail"
-              (isLeft (decodeStoredEvents wrongTopLevelArity))
+            assertDecodeFailure
+              "unexpected CBOR list length"
+              (decodeStoredEvents wrongTopLevelArity)
         , testCase "enforces stored-event arity" $
-            assertBool
-              "wrong stored-event arity must fail"
-              (isLeft (decodeStoredEvents wrongEventArity))
+            assertDecodeFailure
+              "unexpected CBOR list length"
+              (decodeStoredEvents wrongEventArity)
         , testCase "requires byte-string payloads" $
-            assertBool
-              "array payload must fail"
-              (isLeft (decodeStoredEvents arrayPayload))
+            assertDecodeFailure "expected bytes" (decodeStoredEvents arrayPayload)
+        ]
+    , testGroup
+        "stream paging"
+        [ testCase "starts a fresh walk at the last sequence of the page" $
+            nextCursor Nothing (pageEndingAt 4096) @?= Right 4096
+        , testCase "advances to the last sequence the page reached" $
+            nextCursor (Just 4096) (pageEndingAt 4097) @?= Right 4097
+        , testCase "refuses a page that ends on the cursor" $
+            nextCursor (Just 4096) (pageEndingAt 4096)
+              @?= Left
+                ( BindingProtocolError
+                    (PageDidNotAdvance (PageAdvanceDetail 4096 4096))
+                )
+        , testCase "refuses a page that ends behind the cursor" $
+            nextCursor (Just 4096) (pageEndingAt 4095)
+              @?= Left
+                ( BindingProtocolError
+                    (PageDidNotAdvance (PageAdvanceDetail 4096 4095))
+                )
+        ]
+    , testGroup
+        "detail-free close statuses"
+        [ testCase "success" $
+            decodeCloseStatus 0 @?= Right ()
+        , testCase "rejected owner handle" $
+            decodeCloseStatus 5
+              @?= Left (InvalidState "store close rejected the owner handle")
+        , testCase "panic" $
+            decodeCloseStatus 100 @?= Left EnginePanic
+        , testCase "unmodelled status" $
+            decodeCloseStatus 42 @?= Left (UnknownEngineError 42)
         ]
     ]
+
+
+-- | Pins a negative case to the rule it was written for.
+--
+-- The decoders report failures as text, and a fixture that is both malformed
+-- and truncated fails for either reason, so only the codec's own message shows
+-- that the intended check is still the one doing the rejecting.
+assertDecodeFailure :: String -> Either String value -> Assertion
+assertDecodeFailure expected outcome =
+  case outcome of
+    Left message ->
+      assertBool
+        ("expected a failure mentioning " <> expected <> ", got " <> message)
+        (expected `isInfixOf` message)
+    Right _ -> assertFailure ("expected a failure mentioning " <> expected)
 
 
 options :: OpenOptions
@@ -115,6 +175,20 @@ proposed =
     (EventType "Created")
     (EventVersion "1.0")
     (ByteString.pack [0, 1])
+
+
+-- | A two-event page, so the cursor has to come from the last event.
+pageEndingAt :: Word64 -> NonEmpty StoredEvent
+pageEndingAt lastSequence = pageEvent 1 :| [pageEvent lastSequence]
+
+
+pageEvent :: Word64 -> StoredEvent
+pageEvent sequenceNumber =
+  StoredEvent
+    sequenceNumber
+    (EventType "Created")
+    (EventVersion "1.0")
+    ByteString.empty
 
 
 expectedStored :: StoredEvent
@@ -372,6 +446,104 @@ conflict =
     , 101 -- text(3) one
     , 0 -- expected version 0
     , 1 -- actual version 1
+    ]
+
+
+malformedInput :: ByteString
+malformedInput =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 1 -- malformed-input error
+    , 111
+    , 109
+    , 97
+    , 108
+    , 102
+    , 111
+    , 114
+    , 109
+    , 101
+    , 100
+    , 32
+    , 105
+    , 110
+    , 112
+    , 117
+    , 116 -- text(15) malformed input
+    ]
+
+
+storageFailure :: ByteString
+storageFailure =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 4 -- storage-failure error
+    , 111
+    , 115
+    , 116
+    , 111
+    , 114
+    , 97
+    , 103
+    , 101
+    , 32
+    , 102
+    , 97
+    , 105
+    , 108
+    , 117
+    , 114
+    , 101 -- text(15) storage failure
+    ]
+
+
+invalidState :: ByteString
+invalidState =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 5 -- invalid-state error
+    , 111
+    , 115
+    , 116
+    , 111
+    , 114
+    , 101
+    , 32
+    , 105
+    , 115
+    , 32
+    , 99
+    , 108
+    , 111
+    , 115
+    , 101
+    , 100 -- text(15) store is closed
+    ]
+
+
+-- | An error class the engine does not define, carrying an arbitrary detail.
+--
+-- The catch-all has to survive a detail whose shape the binding has never
+-- seen, so the fixture pairs an undefined class with a product the decoder
+-- has no clause for.
+unmodelledCode :: ByteString
+unmodelledCode =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 3 -- an error class the engine does not define
+    , 130 -- array(2) detail of an unknown shape
+    , 98
+    , 105
+    , 100 -- text(2) id
+    , 100
+    , 108
+    , 97
+    , 116
+    , 101 -- text(4) late
     ]
 
 
