@@ -640,31 +640,22 @@ impl Engine {
         load_snapshot_on(&mut connection, stream).await
     }
 
+    /// Writes one snapshot under the same write lock the commit path takes.
+    ///
+    /// The write runs inside a `BEGIN IMMEDIATE` transaction whose guard rolls
+    /// back when it is dropped, so a cancelled caller never returns an open
+    /// write transaction to the pool.
     pub async fn store_snapshot(
         &self,
         stream: &StreamIdentity,
         snapshot: SnapshotWrite,
     ) -> Result<usize, EngineError> {
-        let mut connection = self.pool.acquire().await?;
-        sqlx::query!("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
-            .await?;
-        let result = store_snapshot_in_transaction(&mut connection, stream, snapshot).await;
-        let commit = result.is_ok();
-        let close = if commit {
-            sqlx::query!("COMMIT").execute(&mut *connection).await
-        } else {
-            sqlx::query!("ROLLBACK").execute(&mut *connection).await
-        };
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let snapshot_version =
+            store_snapshot_in_transaction(&mut transaction, stream, snapshot).await?;
+        transaction.commit().await?;
 
-        match close {
-            Err(error) if commit => Err(EngineError::Sql(error)),
-            Err(error) => {
-                tracing::warn!(target: "cqrs", ?error, "snapshot rollback failed");
-                result
-            }
-            Ok(_) => result,
-        }
+        Ok(snapshot_version)
     }
 
     pub async fn discard_snapshot(&self, stream: &StreamIdentity) -> Result<(), EngineError> {
@@ -1055,16 +1046,22 @@ async fn load_snapshot_on(
     row.map(SerializedSnapshot::try_from).transpose()
 }
 
+/// Writes one snapshot against the version the stream durably committed.
+///
+/// Compaction erases the events a snapshot already covers, so the surviving
+/// maximum sequence is not the stream's version. Validating against
+/// [`committed_stream_version`] keeps a snapshot of a compacted stream
+/// acceptable while still rejecting one that runs ahead of the committed
+/// version.
 async fn store_snapshot_in_transaction(
     connection: &mut SqliteConnection,
     stream: &StreamIdentity,
     snapshot: SnapshotWrite,
 ) -> Result<usize, EngineError> {
-    let events = load_events_on(connection, stream, None).await?;
-    let current_sequence = events
-        .last()
-        .map(|event| event.sequence)
-        .ok_or(EngineError::EmptySnapshotUpdate)?;
+    let current_sequence = committed_stream_version(connection, stream).await?;
+    if current_sequence == 0 {
+        return Err(EngineError::EmptySnapshotUpdate);
+    }
 
     if snapshot.last_sequence > current_sequence {
         return Err(EngineError::SnapshotBeyondCurrentVersion {
@@ -1295,13 +1292,36 @@ struct EngineOpaquePayload {
     bytes: Vec<u8>,
 }
 
-fn encode_opaque_payload(payload: Vec<u8>) -> Result<Value, EngineError> {
+/// Wraps binding-owned bytes in the envelope the engine stores them under.
+///
+/// Every erased payload the engine owns -- event or snapshot -- is stored
+/// through this envelope, so one reader understands all of them.
+pub fn encode_opaque_payload(payload: Vec<u8>) -> Result<Value, EngineError> {
     Ok(serde_json::to_value(EnginePayloadEnvelope {
         opaque: EngineOpaquePayload {
             version: 1,
             bytes: payload,
         },
     })?)
+}
+
+/// Reads binding-owned bytes back out of the envelope they were stored under.
+///
+/// # Errors
+///
+/// Returns [`EngineError::Json`] when the stored value is not an engine-owned
+/// envelope -- the shape a native consumer's own JSON has -- and
+/// [`EngineError::OpaquePayloadVersion`] when the envelope is one this engine
+/// cannot read.
+pub fn decode_opaque_payload(payload: Value) -> Result<Vec<u8>, EngineError> {
+    let envelope: EnginePayloadEnvelope = serde_json::from_value(payload)?;
+    if envelope.opaque.version != 1 {
+        return Err(EngineError::OpaquePayloadVersion {
+            actual: envelope.opaque.version,
+        });
+    }
+
+    Ok(envelope.opaque.bytes)
 }
 
 fn engine_payload_metadata() -> Value {
@@ -1356,13 +1376,7 @@ fn decode_opaque_event(event: SerializedEvent) -> Result<OpaqueStoredEvent, Engi
         ..
     } = event;
     let payload = if has_engine_payload_provenance(&metadata) {
-        let envelope: EnginePayloadEnvelope = serde_json::from_value(payload)?;
-        if envelope.opaque.version != 1 {
-            return Err(EngineError::OpaquePayloadVersion {
-                actual: envelope.opaque.version,
-            });
-        }
-        envelope.opaque.bytes
+        decode_opaque_payload(payload)?
     } else {
         serde_json::to_vec(&payload)?
     };
@@ -2051,6 +2065,62 @@ mod tests {
         assert_eq!(current.aggregate, serde_json::json!({ "value": 84 }));
 
         engine.discard_snapshot(&stream).await.unwrap();
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_beyond_the_committed_version_keeps_the_stored_snapshot() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-snapshot-ahead-test", "one");
+        let event = serialized_event(&stream, 1);
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+        engine
+            .store_snapshot(
+                &stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 42 }), 1),
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .store_snapshot(
+                &stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 84 }), 2),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::SnapshotBeyondCurrentVersion {
+                proposed: 2,
+                current: 1
+            })
+        ));
+        let stored = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        assert_eq!(stored.current_sequence, 1);
+        assert_eq!(stored.current_snapshot, 1);
+        assert_eq!(stored.aggregate, serde_json::json!({ "value": 42 }));
+    }
+
+    #[tokio::test]
+    async fn snapshot_of_a_stream_that_committed_nothing_writes_no_row() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-snapshot-empty-test", "one");
+
+        let result = engine
+            .store_snapshot(
+                &stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 42 }), 0),
+            )
+            .await;
+
+        assert!(matches!(result, Err(EngineError::EmptySnapshotUpdate)));
         assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
     }
 }
