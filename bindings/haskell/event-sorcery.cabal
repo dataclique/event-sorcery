@@ -1,16 +1,19 @@
-cabal-version: 3.0
-name:          event-sorcery
-version:       0.4.0.0
-synopsis:      Type-driven event sourcing over the event-sorcery engine
+cabal-version:      3.0
+name:               event-sorcery
+version:            0.4.0.0
+synopsis:           Type-driven event sourcing over the event-sorcery engine
 description:
   An idiomatic Haskell binding over the shared event-sorcery Rust engine.
 
-homepage:      https://github.com/dataclique/event-sorcery
-bug-reports:   https://github.com/dataclique/event-sorcery/issues
-license:       MIT
-license-file:  LICENSE
-build-type:    Simple
-category:      Database
+homepage:           https://github.com/dataclique/event-sorcery
+bug-reports:        https://github.com/dataclique/event-sorcery/issues
+license:            MIT
+license-file:       LICENSE
+build-type:         Simple
+category:           Database
+extra-source-files:
+  conformance/encoding-v1.vectors
+  conformance/README.md
 
 common strict
   default-language:   GHC2024

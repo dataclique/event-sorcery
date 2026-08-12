@@ -69,11 +69,12 @@
           };
         };
         engineSource = pkgs.runCommand "event-sorcery-engine-source" { } ''
-          mkdir -p $out
+          mkdir -p $out/bindings/haskell
           cp ${./Cargo.toml} $out/Cargo.toml
           cp ${./Cargo.lock} $out/Cargo.lock
           cp -R ${./crates} $out/crates
           cp -R ${./.sqlx} $out/.sqlx
+          cp -R ${./bindings/haskell/conformance} $out/bindings/haskell/conformance
         '';
         ffiEngine = pkgs.rustPlatform.buildRustPackage {
           pname = "event-sorcery-ffi";
