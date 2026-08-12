@@ -15,6 +15,29 @@ import EventSorcery.Engine (
   decodeEngineError,
   encodeOpenOptions,
  )
+import EventSorcery.Job (
+  ClaimBudget (..),
+  JobClaimDetails (..),
+  JobClaimReference (..),
+  JobClaimResult (JobAbandoned, JobClaimed),
+  JobExecutionRoute (ReconcileExecution),
+  JobId (..),
+  JobInstant (..),
+  JobKind (..),
+  JobRefusal (InvalidClaimPolicy, UnrecognizedRefusal),
+  JobRefusalDetail (..),
+  JobSeed (..),
+  LeaseDuration (..),
+  PollLimit (..),
+  WorkerId (..),
+  decodeClaimResult,
+  decodePolledJobs,
+  encodeClaim,
+  encodeCommitWithJob,
+  encodeEnqueue,
+  encodePoll,
+  encodeRenew,
+ )
 import EventSorcery.Stream (
   AggregateId (..),
   AggregateType (..),
@@ -56,6 +79,23 @@ tests =
             encodeCurrentVersion stream @?= expectedCurrentVersion
         , testCase "commit" $
             encodeCommit stream 0 [proposed] @?= expectedCommit
+        , testCase "commit carrying a job intent" $
+            encodeCommitWithJob stream 0 (proposed :| []) seed
+              @?= expectedCommitWithJob
+        , testCase "job enqueue" $
+            encodeEnqueue seed @?= expectedEnqueue
+        , testCase "job poll" $
+            encodePoll kind (JobInstant 5) (PollLimit 10) @?= expectedPoll
+        , testCase "job claim" $
+            encodeClaim
+              (JobId "job")
+              (WorkerId "worker")
+              (JobInstant 5)
+              (LeaseDuration 30_000)
+              (ClaimBudget 50)
+              @?= expectedClaim
+        , testCase "claim renewal" $
+            encodeRenew reference (JobInstant 60_000) @?= expectedRenew
         ]
     , testGroup
         "decoding"
@@ -70,7 +110,23 @@ tests =
             decodeEngineError 5 invalidState
               @?= Right (InvalidState "store is closed")
         , testCase "keeps the numeric identity of an unmodelled code" $
-            decodeEngineError 3 unmodelledCode @?= Right (UnknownEngineError 3)
+            decodeEngineError 42 unmodelledCode
+              @?= Right (UnknownEngineError 42)
+        , testCase "job-refusal detail" $
+            decodeEngineError 3 jobRefusal
+              @?= Right
+                ( JobRefused
+                    (JobRefusalDetail (JobId "job") InvalidClaimPolicy)
+                )
+        , testCase "keeps the identity of an unmodelled refusal" $
+            decodeEngineError 3 unmodelledRefusal
+              @?= Right
+                ( JobRefused
+                    ( JobRefusalDetail
+                        (JobId "job")
+                        (UnrecognizedRefusal "later reason")
+                    )
+                )
         , testCase "conflict detail" $
             decodeEngineError 2 conflict
               @?= Right
@@ -111,6 +167,25 @@ tests =
               (decodeStoredEvents wrongEventArity)
         , testCase "requires byte-string payloads" $
             assertDecodeFailure "expected bytes" (decodeStoredEvents arrayPayload)
+        , testCase "polled jobs" $
+            decodePolledJobs polledJobs @?= Right [JobId "job"]
+        , testCase "won claim" $
+            decodeClaimResult wonClaim
+              @?= Right
+                ( JobClaimed
+                    ( JobClaimDetails
+                        reference
+                        3
+                        ReconcileExecution
+                        (ByteString.pack [0, 1])
+                    )
+                )
+        , testCase "claim on an abandoned job" $
+            decodeClaimResult abandonedClaim @?= Right JobAbandoned
+        , testCase "rejects unsupported job versions" $
+            assertDecodeFailure
+              "unsupported job format version"
+              (decodePolledJobs unsupportedJobVersion)
         ]
     , testGroup
         "stream paging"
@@ -175,6 +250,23 @@ proposed =
     (EventType "Created")
     (EventVersion "1.0")
     (ByteString.pack [0, 1])
+
+
+kind :: JobKind
+kind = JobKind "email"
+
+
+seed :: JobSeed
+seed =
+  JobSeed
+    (JobId "job")
+    kind
+    (ByteString.pack [0, 1])
+    (JobInstant 5)
+
+
+reference :: JobClaimReference
+reference = JobClaimReference (ByteString.pack [7, 8])
 
 
 -- | A two-event page, so the cursor has to come from the last event.
@@ -330,6 +422,257 @@ expectedCommit =
     , 66
     , 0
     , 1 -- bytes(2)
+    ]
+
+
+expectedCommitWithJob :: ByteString
+expectedCommitWithJob =
+  ByteString.pack
+    [ 134 -- array(6)
+    , 1 -- format version 1
+    , 103
+    , 97
+    , 99
+    , 99
+    , 111
+    , 117
+    , 110
+    , 116 -- text(7) account
+    , 99
+    , 111
+    , 110
+    , 101 -- text(3) one
+    , 0 -- expected version 0
+    , 129 -- array(1) proposed event
+    , 131 -- array(3) event product
+    , 103
+    , 67
+    , 114
+    , 101
+    , 97
+    , 116
+    , 101
+    , 100 -- text(7) Created
+    , 99
+    , 49
+    , 46
+    , 48 -- text(3) 1.0
+    , 66
+    , 0
+    , 1 -- bytes(2)
+    , 132 -- array(4) job seed
+    , 99
+    , 106
+    , 111
+    , 98 -- text(3) job
+    , 101
+    , 101
+    , 109
+    , 97
+    , 105
+    , 108 -- text(5) email
+    , 66
+    , 0
+    , 1 -- bytes(2)
+    , 5 -- run at 5
+    ]
+
+
+expectedEnqueue :: ByteString
+expectedEnqueue =
+  ByteString.pack
+    [ 133 -- array(5)
+    , 1 -- format version 1
+    , 99
+    , 106
+    , 111
+    , 98 -- text(3) job
+    , 101
+    , 101
+    , 109
+    , 97
+    , 105
+    , 108 -- text(5) email
+    , 66
+    , 0
+    , 1 -- bytes(2)
+    , 5 -- run at 5
+    ]
+
+
+expectedPoll :: ByteString
+expectedPoll =
+  ByteString.pack
+    [ 132 -- array(4)
+    , 1 -- format version 1
+    , 101
+    , 101
+    , 109
+    , 97
+    , 105
+    , 108 -- text(5) email
+    , 5 -- now 5
+    , 10 -- limit 10
+    ]
+
+
+expectedClaim :: ByteString
+expectedClaim =
+  ByteString.pack
+    [ 134 -- array(6)
+    , 1 -- format version 1
+    , 99
+    , 106
+    , 111
+    , 98 -- text(3) job
+    , 102
+    , 119
+    , 111
+    , 114
+    , 107
+    , 101
+    , 114 -- text(6) worker
+    , 5 -- now 5
+    , 25
+    , 117
+    , 48 -- uint16(30000) lease duration
+    , 24
+    , 50 -- uint8(50) claim budget
+    ]
+
+
+expectedRenew :: ByteString
+expectedRenew =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 66
+    , 7
+    , 8 -- bytes(2) claim reference
+    , 25
+    , 234
+    , 96 -- uint16(60000) new lease instant
+    ]
+
+
+polledJobs :: ByteString
+polledJobs =
+  ByteString.pack
+    [ 130 -- array(2)
+    , 1 -- format version 1
+    , 129 -- array(1) runnable job
+    , 99
+    , 106
+    , 111
+    , 98 -- text(3) job
+    ]
+
+
+wonClaim :: ByteString
+wonClaim =
+  ByteString.pack
+    [ 134 -- array(6)
+    , 1 -- format version 1
+    , 0 -- claimed
+    , 66
+    , 7
+    , 8 -- bytes(2) claim reference
+    , 3 -- attempt 3
+    , 1 -- reconcile execution
+    , 66
+    , 0
+    , 1 -- bytes(2) payload
+    ]
+
+
+-- | A claim on a job the queue has given up on, so every field is absent.
+abandonedClaim :: ByteString
+abandonedClaim =
+  ByteString.pack
+    [ 134 -- array(6)
+    , 1 -- format version 1
+    , 1 -- abandoned
+    , 246
+    , 246
+    , 246
+    , 246 -- null claim, attempt, route and payload
+    ]
+
+
+unsupportedJobVersion :: ByteString
+unsupportedJobVersion =
+  ByteString.pack
+    [ 130 -- array(2)
+    , 2 -- unsupported format version 2
+    , 128 -- array(0) runnable jobs
+    ]
+
+
+jobRefusal :: ByteString
+jobRefusal =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 3 -- job-refusal error
+    , 130 -- array(2) refusal detail
+    , 99
+    , 106
+    , 111
+    , 98 -- text(3) job
+    , 120
+    , 24
+    , 105
+    , 110
+    , 118
+    , 97
+    , 108
+    , 105
+    , 100
+    , 32
+    , 106
+    , 111
+    , 98
+    , 32
+    , 99
+    , 108
+    , 97
+    , 105
+    , 109
+    , 32
+    , 112
+    , 111
+    , 108
+    , 105
+    , 99
+    , 121 -- text(24) invalid job claim policy
+    ]
+
+
+-- | A refusal reason a newer engine renders and this binding has no leaf for.
+unmodelledRefusal :: ByteString
+unmodelledRefusal =
+  ByteString.pack
+    [ 131 -- array(3)
+    , 1 -- format version 1
+    , 3 -- job-refusal error
+    , 130 -- array(2) refusal detail
+    , 99
+    , 106
+    , 111
+    , 98 -- text(3) job
+    , 108
+    , 108
+    , 97
+    , 116
+    , 101
+    , 114
+    , 32
+    , 114
+    , 101
+    , 97
+    , 115
+    , 111
+    , 110 -- text(12) later reason
     ]
 
 
@@ -534,7 +877,8 @@ unmodelledCode =
   ByteString.pack
     [ 131 -- array(3)
     , 1 -- format version 1
-    , 3 -- an error class the engine does not define
+    , 24
+    , 42 -- an error class the engine does not define
     , 130 -- array(2) detail of an unknown shape
     , 98
     , 105

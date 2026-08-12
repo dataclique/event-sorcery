@@ -2,8 +2,8 @@
 --
 -- "EventSorcery.Engine" re-exports the consumer-facing half of this module.
 -- The call marshalling and the errors every call can answer with stay here so
--- the stream feature can issue engine calls without republishing the ABI
--- plumbing to consumers.
+-- the stream and job features can issue engine calls without republishing the
+-- ABI plumbing to consumers.
 module EventSorcery.Engine.Internal (
   AbiVersionDetail (..),
   AggregateId (..),
@@ -12,12 +12,16 @@ module EventSorcery.Engine.Internal (
   ConflictDetail (..),
   EngineError (..),
   EngineErrorDecodeDetail (..),
+  JobId (..),
+  JobRefusal (..),
+  JobRefusalDetail (..),
   OpenOptions (..),
   PageAdvanceDetail (..),
   ResourceLimitDetail (..),
   Store,
   abiVersion,
   callWithOutput,
+  callWithTag,
   callWithoutOutput,
   checkAbiVersion,
   closeStore,
@@ -62,7 +66,7 @@ import Data.ByteString.Lazy qualified as LazyByteString
 import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Word (Word32, Word64)
+import Data.Word (Word32, Word64, Word8)
 import EventSorcery.Engine.Acquisition (
   StoreAcquisition (..),
   acquireStore,
@@ -136,7 +140,7 @@ supportedAbiMajor = 0
 
 -- | The oldest ABI minor version whose calls this binding can make.
 minimumAbiMinor :: Word32
-minimumAbiMinor = 2
+minimumAbiMinor = 3
 
 
 -- | Decides whether a packed engine ABI version can serve this binding.
@@ -195,6 +199,36 @@ data ConflictDetail = ConflictDetail
   deriving stock (Eq, Show)
 
 
+-- | Identity of a durable job -- a ULID minted when the job is enqueued.
+newtype JobId = JobId Text
+  deriving newtype (Eq, Show)
+
+
+-- | Why one job refused the request made of it.
+--
+-- The engine renders each reason as fixed ABI text, so the reason is a closed
+-- vocabulary rather than prose: a refusal is terminal for the job it names,
+-- and a caller decides what to do next by matching on it. A newer engine may
+-- add a leaf this binding has no constructor for, which keeps its rendered
+-- identity the way an unmodelled error class keeps its numeric one.
+data JobRefusal
+  = AttemptExhausted
+  | InvalidClaimPolicy
+  | SettlementRefused
+  | PayloadNotOpaqueBytes
+  | PayloadByteOutOfRange
+  | PayloadAboveAbiLimit
+  | UnrecognizedRefusal Text
+  deriving stock (Eq, Show)
+
+
+data JobRefusalDetail = JobRefusalDetail
+  { jobId :: JobId
+  , refusal :: JobRefusal
+  }
+  deriving stock (Eq, Show)
+
+
 data ResourceLimitDetail = ResourceLimitDetail
   { resource :: Text
   , observed :: Word64
@@ -239,12 +273,14 @@ data BindingFault
   | PageDidNotAdvance PageAdvanceDetail
   | UndecodableEngineError EngineErrorDecodeDetail
   | UndecodableResponse Text
+  | UnknownResultTag Word8
   deriving stock (Eq, Show)
 
 
 data EngineError
   = MalformedInput
   | OptimisticConflict ConflictDetail
+  | JobRefused JobRefusalDetail
   | StorageFailure Text
   | InvalidState Text
   | ResourceLimitExceeded ResourceLimitDetail
@@ -349,6 +385,24 @@ callWithOutput call =
     useOutput `finally` esBufFree output
 
 
+-- | Reads a call that answers with a single byte tag rather than a buffer.
+--
+-- The tag only means anything once the call has succeeded, and the engine
+-- writes it while it still owns the cell. The sentinel poked in first is
+-- outside the tags the ABI defines, so a call that answered without writing
+-- one is reported as an unknown tag instead of being read as the zero tag.
+callWithTag
+  :: (Ptr Word8 -> Ptr EsBuf -> IO CInt)
+  -> IO (Either EngineError Word8)
+callWithTag call =
+  alloca $ \output -> do
+    poke output unwrittenTag
+    called <- callWithoutOutput (call output)
+    case called of
+      Left engineError -> pure (Left engineError)
+      Right () -> Right <$> peek output
+
+
 decodeResponse
   :: (ByteString -> Either String value)
   -> ByteString
@@ -425,6 +479,11 @@ decodeEngineErrorDetail 2 = do
     ( OptimisticConflict
         (ConflictDetail {aggregateType, aggregateId, expectedVersion, actualVersion})
     )
+decodeEngineErrorDetail 3 = do
+  expectListLength 2
+  jobId <- JobId <$> decodeString
+  refusal <- decodeJobRefusal
+  pure (JobRefused (JobRefusalDetail {jobId, refusal}))
 decodeEngineErrorDetail 4 = StorageFailure <$> decodeString
 decodeEngineErrorDetail 5 = InvalidState <$> decodeString
 decodeEngineErrorDetail 6 = do
@@ -445,6 +504,20 @@ decodeEngineErrorDetail 100 = do
 decodeEngineErrorDetail code = do
   _ <- decodeTerm
   pure (UnknownEngineError code)
+
+
+-- | Reads the refusal reason the engine renders as fixed ABI text.
+decodeJobRefusal :: Decoder s JobRefusal
+decodeJobRefusal = do
+  reason <- decodeString
+  pure case reason of
+    "job attempt counter exhausted" -> AttemptExhausted
+    "invalid job claim policy" -> InvalidClaimPolicy
+    "job aggregate refused the settlement" -> SettlementRefused
+    "claimed job payload is not opaque bytes" -> PayloadNotOpaqueBytes
+    "claimed job payload contains an invalid byte" -> PayloadByteOutOfRange
+    "claimed job payload exceeds the ABI payload limit" -> PayloadAboveAbiLimit
+    unmodelled -> UnrecognizedRefusal unmodelled
 
 
 withErrorBuffer :: (Ptr EsBuf -> IO value) -> IO value
@@ -495,3 +568,8 @@ readEngineError status buffer = do
 
 emptyBuffer :: EsBuf
 emptyBuffer = EsBuf nullPtr (0 :: CSize)
+
+
+-- | The byte a tag cell holds before an engine call writes its answer.
+unwrittenTag :: Word8
+unwrittenTag = 255

@@ -26,6 +26,8 @@ module EventSorcery.Stream (
   encodeCommit,
   encodeCurrentVersion,
   encodeLoadStream,
+  encodeProposedEvent,
+  encodeStreamIdentity,
   loadStream,
   loadStreamPage,
   nextCursor,
@@ -215,8 +217,7 @@ encodeLoadStream stream after =
   toStrictByteString $
     encodeListLen 4
       <> encodeWord 1
-      <> encodeAggregateType stream.aggregateType
-      <> encodeAggregateId stream.aggregateId
+      <> encodeStreamIdentity stream
       <> maybe encodeNull encodeWord64 after
 
 
@@ -225,8 +226,7 @@ encodeCurrentVersion stream =
   toStrictByteString $
     encodeListLen 3
       <> encodeWord 1
-      <> encodeAggregateType stream.aggregateType
-      <> encodeAggregateId stream.aggregateId
+      <> encodeStreamIdentity stream
 
 
 encodeCommit :: StreamIdentity -> Word64 -> [ProposedEvent] -> ByteString
@@ -234,11 +234,29 @@ encodeCommit stream expected events =
   toStrictByteString $
     encodeListLen 5
       <> encodeWord 1
-      <> encodeAggregateType stream.aggregateType
-      <> encodeAggregateId stream.aggregateId
+      <> encodeStreamIdentity stream
       <> encodeWord64 expected
       <> encodeListLen (fromIntegral (length events))
       <> foldMap encodeProposedEvent events
+
+
+-- | Writes the two names an operation addresses a stream by.
+--
+-- Every operation that names a stream spells the pair the same way, and a
+-- commit that carries a job intent is one of them, so the pair is encoded in
+-- one place rather than at each call.
+encodeStreamIdentity :: StreamIdentity -> Encoding
+encodeStreamIdentity stream =
+  encodeAggregateType stream.aggregateType
+    <> encodeAggregateId stream.aggregateId
+
+
+encodeProposedEvent :: ProposedEvent -> Encoding
+encodeProposedEvent event =
+  encodeListLen 3
+    <> encodeEventType event.eventType
+    <> encodeEventVersion event.eventVersion
+    <> encodeBytes event.payload
 
 
 decodeStoredEvents :: ByteString -> Either String [StoredEvent]
@@ -265,14 +283,6 @@ walkPages store stream loaded after = do
       Just eventPage -> case nextCursor after eventPage of
         Left engineError -> pure (Left engineError)
         Right cursor -> walkPages store stream (loaded . (events <>)) (Just cursor)
-
-
-encodeProposedEvent :: ProposedEvent -> Encoding
-encodeProposedEvent event =
-  encodeListLen 3
-    <> encodeEventType event.eventType
-    <> encodeEventVersion event.eventVersion
-    <> encodeBytes event.payload
 
 
 encodeAggregateType :: AggregateType -> Encoding
