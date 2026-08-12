@@ -5,6 +5,8 @@
   bytestring,
   cborg,
   conduit,
+  criterion,
+  deepseq,
   event_sorcery_ffi,
   lib,
   linear-base,
@@ -12,6 +14,7 @@
   tasty-hunit,
   text,
   transformers,
+  ulid,
 }:
 mkDerivation {
   pname = "event-sorcery";
@@ -26,6 +29,7 @@ mkDerivation {
     linear-base
     text
     transformers
+    ulid
   ];
   librarySystemDepends = [ event_sorcery_ffi ];
   testHaskellDepends = [
@@ -38,6 +42,14 @@ mkDerivation {
     tasty-hunit
     text
     transformers
+  ];
+  benchmarkHaskellDepends = [
+    base
+    bytestring
+    criterion
+    deepseq
+    linear-base
+    text
   ];
   homepage = "https://github.com/dataclique/event-sorcery";
   description = "Type-driven event sourcing over the event-sorcery engine";

@@ -86,6 +86,7 @@ library
     , linear-base                >=0.5    && <0.6
     , text                       >=2.0    && <2.2
     , transformers               >=0.6    && <0.7
+    , ulid                       >=0.3    && <0.4
 
 test-suite wire-spec
   import:         strict
@@ -140,6 +141,7 @@ test-suite domain-spec
     , base           >=4.18 && <5
     , bytestring     >=0.11 && <0.13
     , event-sorcery
+    , text           >=2.0  && <2.2
 
 test-suite store-spec
   import:         strict
@@ -195,4 +197,19 @@ test-suite dispatch-worker-spec
     , base           >=4.18 && <5
     , bytestring     >=0.11 && <0.13
     , event-sorcery
+    , text           >=2.0  && <2.2
+
+benchmark event-sorcery-benchmarks
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: benchmark
+  main-is:        Main.hs
+  ghc-options:    -O2 -threaded -rtsopts
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring     >=0.11 && <0.13
+    , criterion      >=1.6  && <1.7
+    , deepseq        >=1.4  && <1.6
+    , event-sorcery
+    , linear-base    >=0.5  && <0.6
     , text           >=2.0  && <2.2
