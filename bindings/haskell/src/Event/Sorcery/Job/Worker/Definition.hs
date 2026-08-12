@@ -1,4 +1,4 @@
-module EventSorcery.Job.Worker.Definition (
+module Event.Sorcery.Job.Worker.Definition (
   AttemptLimit (AttemptLimit),
   JobRunError (..),
   JobRunResult (..),
@@ -12,8 +12,8 @@ module EventSorcery.Job.Worker.Definition (
 
 import Data.Maybe (Maybe (..))
 import Data.Word (Word32)
-import EventSorcery.Engine (EngineError, Store)
-import EventSorcery.Job (
+import Event.Sorcery.Engine (EngineError, Store)
+import Event.Sorcery.Job (
   ClaimBudget,
   JobDecodeError,
   JobId,
@@ -21,7 +21,7 @@ import EventSorcery.Job (
   LeaseDuration,
   WorkerId,
  )
-import EventSorcery.Job.Execution (
+import Event.Sorcery.Job.Execution (
   DurableJob (JobInput),
   JobAttempt,
  )

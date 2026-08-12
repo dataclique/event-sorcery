@@ -1,4 +1,4 @@
-module EventSorcery.Engine.Acquisition (
+module Event.Sorcery.Engine.Acquisition (
   StoreAcquisition (..),
   acquireStore,
 ) where

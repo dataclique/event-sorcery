@@ -4,13 +4,13 @@
 -- Everything a consumer needs to enqueue a job, take a claim on it and settle
 -- that claim is here, down to the wire codecs the engine and this binding
 -- agree on. The engine handle and the errors every call can answer with belong
--- to "EventSorcery.Engine" and are re-exported so a job worker needs this one
+-- to "Event.Sorcery.Engine" and are re-exported so a job worker needs this one
 -- import.
 --
 -- Committing events together with a job intent belongs to this feature rather
 -- than to the stream: what the caller is buying is that the events and the
 -- intent land in one transaction, and the intent is the half a job can refuse.
-module EventSorcery.Job (
+module Event.Sorcery.Job (
   AbiVersionDetail (..),
   AggregateId (..),
   AggregateType (..),
@@ -101,7 +101,7 @@ import Data.List.NonEmpty qualified as NonEmpty
 import Data.Text (Text)
 import Data.Unrestricted.Linear (Ur (Ur))
 import Data.Word (Word32, Word64, Word8)
-import EventSorcery.Engine.Internal (
+import Event.Sorcery.Engine.Internal (
   AbiVersionDetail (..),
   AggregateId (..),
   AggregateType (..),
@@ -123,7 +123,7 @@ import EventSorcery.Engine.Internal (
   withInputBuffer,
   withOpenStore,
  )
-import EventSorcery.Engine.Internal.FFI (
+import Event.Sorcery.Engine.Internal.FFI (
   EsBuf,
   EsStore,
   esCommitWithJob,
@@ -136,7 +136,7 @@ import EventSorcery.Engine.Internal.FFI (
   esJobRenew,
   esJobRetry,
  )
-import EventSorcery.Job.Definition (
+import Event.Sorcery.Job.Definition (
   DeadReason (..),
   Job (..),
   JobDecodeError (..),
@@ -144,7 +144,7 @@ import EventSorcery.Job.Definition (
   jobType,
   mkJobId,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   ProposedEvent,
   StreamIdentity,
   encodeProposedEvent,

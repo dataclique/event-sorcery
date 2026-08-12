@@ -1,4 +1,4 @@
-module EventSorcery.Snapshot (
+module Event.Sorcery.Snapshot (
   SnapshotVersion (..),
   SnapshotWrite,
   StoredSnapshot (..),
@@ -31,21 +31,21 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Unrestricted.Linear (Ur (Ur))
 import Data.Word (Word64)
-import EventSorcery.Engine (EngineError)
-import EventSorcery.Engine qualified as Engine
-import EventSorcery.Engine.Internal (
+import Event.Sorcery.Engine (EngineError)
+import Event.Sorcery.Engine qualified as Engine
+import Event.Sorcery.Engine.Internal (
   callWithOutput,
   callWithoutOutput,
   decodeResponse,
   withInputBuffer,
   withOpenStore,
  )
-import EventSorcery.Engine.Internal.FFI (
+import Event.Sorcery.Engine.Internal.FFI (
   esSnapshotDiscard,
   esSnapshotLoad,
   esSnapshotStore,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   AggregateId (AggregateId),
   AggregateType (AggregateType),
   StreamIdentity (StreamIdentity),

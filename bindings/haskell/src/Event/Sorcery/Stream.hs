@@ -2,9 +2,9 @@
 --
 -- Everything a consumer needs to read and append to a stream is here, down to
 -- the wire codecs the engine and this binding agree on. The engine handle and
--- the errors every call can answer with belong to "EventSorcery.Engine" and
+-- the errors every call can answer with belong to "Event.Sorcery.Engine" and
 -- are re-exported so a stream handler needs this one import.
-module EventSorcery.Stream (
+module Event.Sorcery.Stream (
   AbiVersionDetail (..),
   ActualSequence (..),
   AggregateId (..),
@@ -74,13 +74,13 @@ import Data.Maybe (fromMaybe, maybe)
 import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text)
 import Data.Word (Word64)
-import EventSorcery.Aggregate (
+import Event.Sorcery.Aggregate (
   DecodeCause,
   EventSourced,
   EventVersion (..),
  )
-import EventSorcery.Aggregate qualified as Aggregate
-import EventSorcery.Engine.Internal (
+import Event.Sorcery.Aggregate qualified as Aggregate
+import Event.Sorcery.Engine.Internal (
   AbiVersionDetail (..),
   AggregateId (..),
   AggregateType (..),
@@ -98,7 +98,7 @@ import EventSorcery.Engine.Internal (
   withInputBuffer,
   withOpenStore,
  )
-import EventSorcery.Engine.Internal.FFI (
+import Event.Sorcery.Engine.Internal.FFI (
   esCommit,
   esCurrentVersion,
   esLoadStream,

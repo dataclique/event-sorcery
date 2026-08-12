@@ -47,33 +47,33 @@ common strict
 library acquisition
   import:          strict
   hs-source-dirs:  src
-  exposed-modules: EventSorcery.Engine.Acquisition
+  exposed-modules: Event.Sorcery.Engine.Acquisition
   build-depends:   base >=4.18 && <5
 
 library
   import:          strict
   hs-source-dirs:  src
   exposed-modules:
-    EventSorcery.Aggregate
-    EventSorcery.Dispatch
-    EventSorcery.Dispatch.TestSupport
-    EventSorcery.Dispatch.Worker
-    EventSorcery.Engine
-    EventSorcery.Engine.Internal.FFI
-    EventSorcery.Job
-    EventSorcery.Job.Execution
-    EventSorcery.Job.Worker
-    EventSorcery.Snapshot
-    EventSorcery.Store
-    EventSorcery.Stream
+    Event.Sorcery.Aggregate
+    Event.Sorcery.Dispatch
+    Event.Sorcery.Dispatch.TestSupport
+    Event.Sorcery.Dispatch.Worker
+    Event.Sorcery.Engine
+    Event.Sorcery.Engine.Internal.FFI
+    Event.Sorcery.Job
+    Event.Sorcery.Job.Execution
+    Event.Sorcery.Job.Worker
+    Event.Sorcery.Snapshot
+    Event.Sorcery.Store
+    Event.Sorcery.Stream
 
   other-modules:
-    EventSorcery.Dispatch.Internal
-    EventSorcery.Engine.Acquisition
-    EventSorcery.Engine.Internal
-    EventSorcery.Job.Definition
-    EventSorcery.Job.Worker.Definition
-    EventSorcery.Job.Worker.Internal
+    Event.Sorcery.Dispatch.Internal
+    Event.Sorcery.Engine.Acquisition
+    Event.Sorcery.Engine.Internal
+    Event.Sorcery.Job.Definition
+    Event.Sorcery.Job.Worker.Definition
+    Event.Sorcery.Job.Worker.Internal
 
   extra-libraries: event_sorcery_ffi
   build-depends:
@@ -106,7 +106,7 @@ test-suite engine-spec
   type:           exitcode-stdio-1.0
   hs-source-dirs: test
   main-is:        EngineSpec.hs
-  other-modules:  EventSorcery.Engine.AcquisitionSpec
+  other-modules:  Event.Sorcery.Engine.AcquisitionSpec
   ghc-options:    -threaded -with-rtsopts=-N
   build-depends:
     , base                       >=4.18 && <5

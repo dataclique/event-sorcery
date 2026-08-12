@@ -6,7 +6,7 @@ import Data.Either (Either (Left, Right))
 import Data.List (isInfixOf)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Word (Word64)
-import EventSorcery.Engine (
+import Event.Sorcery.Engine (
   ConflictDetail (..),
   EngineError (..),
   OpenOptions (..),
@@ -15,7 +15,7 @@ import EventSorcery.Engine (
   decodeEngineError,
   encodeOpenOptions,
  )
-import EventSorcery.Job (
+import Event.Sorcery.Job (
   ClaimBudget (..),
   JobClaimDetails (..),
   JobClaimReference (..),
@@ -39,7 +39,7 @@ import EventSorcery.Job (
   encodeRenew,
   mkJobId,
  )
-import EventSorcery.Stream (
+import Event.Sorcery.Stream (
   AggregateId (..),
   AggregateType (..),
   BindingFault (..),

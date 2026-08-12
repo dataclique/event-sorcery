@@ -1,15 +1,15 @@
-module EventSorcery.Dispatch.TestSupport (
+module Event.Sorcery.Dispatch.TestSupport (
   confirmedOutcome,
   failedOutcome,
 ) where
 
 import Data.Word (Word32)
-import EventSorcery.Dispatch.Internal (
+import Event.Sorcery.Dispatch.Internal (
   DispatchFailure,
   DispatchOutcome,
  )
-import EventSorcery.Dispatch.Internal qualified as Internal
-import EventSorcery.Job.Definition (
+import Event.Sorcery.Dispatch.Internal qualified as Internal
+import Event.Sorcery.Job.Definition (
   Job (JobError, JobOutput),
   JobId,
  )

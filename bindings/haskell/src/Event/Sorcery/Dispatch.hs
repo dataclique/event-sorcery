@@ -1,4 +1,4 @@
-module EventSorcery.Dispatch (
+module Event.Sorcery.Dispatch (
   DispatchEvent (..),
   DispatchFailure (..),
   DispatchOutcome,
@@ -23,7 +23,7 @@ module EventSorcery.Dispatch (
 ) where
 
 import Data.Word (Word32)
-import EventSorcery.Dispatch.Internal (
+import Event.Sorcery.Dispatch.Internal (
   DispatchEvent (..),
   DispatchFailure (..),
   DispatchOutcome,
@@ -39,7 +39,7 @@ import EventSorcery.Dispatch.Internal (
   originateDispatch,
   settleDispatch,
  )
-import EventSorcery.Job.Definition (JobId)
+import Event.Sorcery.Job.Definition (JobId)
 
 
 dispatchJob :: JobDispatch job -> job
