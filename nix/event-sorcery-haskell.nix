@@ -1,5 +1,6 @@
 {
   mkDerivation,
+  async,
   base,
   bytestring,
   cborg,
@@ -17,6 +18,7 @@ mkDerivation {
   version = "0.4.0.0";
   src = bindings/haskell;
   libraryHaskellDepends = [
+    async
     base
     bytestring
     cborg
@@ -27,6 +29,7 @@ mkDerivation {
   ];
   librarySystemDepends = [ event_sorcery_ffi ];
   testHaskellDepends = [
+    async
     base
     bytestring
     conduit

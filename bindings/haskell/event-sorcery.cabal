@@ -74,6 +74,7 @@ library
 
   extra-libraries: event_sorcery_ffi
   build-depends:
+    , async                      >=2.2    && <2.3
     , base                       >=4.18   && <5
     , bytestring                 >=0.11   && <0.13
     , cborg                      >=0.2.10 && <0.3
@@ -176,6 +177,7 @@ test-suite job-worker-spec
   hs-source-dirs: test
   main-is:        JobWorkerSpec.hs
   build-depends:
+    , async          >=2.2  && <2.3
     , base           >=4.18 && <5
     , bytestring     >=0.11 && <0.13
     , event-sorcery
