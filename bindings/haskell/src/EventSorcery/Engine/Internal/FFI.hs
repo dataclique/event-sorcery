@@ -21,13 +21,13 @@ import Foreign.Storable (
 import Prelude (IO, Int, max, (+), (<$>), (<*>))
 
 
-data EsBuf = EsBuf
+data {-# CTYPE "event_sorcery.h" "struct EsBuf" #-} EsBuf = EsBuf
   { pointer :: Ptr Word8
   , length :: CSize
   }
 
 
-data EsStore
+data {-# CTYPE "event_sorcery.h" "struct EsStore" #-} EsStore
 
 
 instance Storable EsBuf where
