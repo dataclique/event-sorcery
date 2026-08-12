@@ -6,6 +6,7 @@ import Control.Monad.Trans.Except (runExceptT)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty (..))
+import Data.Maybe (Maybe (Just, Nothing))
 import Data.Unrestricted.Linear (Ur (Ur))
 import EventSorcery.Engine (OpenOptions (..), closeStore, openStore)
 import EventSorcery.Job (
@@ -19,7 +20,7 @@ import EventSorcery.Job (
   JobClaimDetails (..),
   JobClaimResult (JobClaimed),
   JobExecutionRoute (ReconcileExecution, SubmitExecution),
-  JobId (..),
+  JobId,
   JobInstant (..),
   JobKind (..),
   JobLeaseResult (LeaseHeld),
@@ -36,6 +37,7 @@ import EventSorcery.Job (
   deadLetterJob,
   deferJob,
   enqueueJob,
+  mkJobId,
   pollJobs,
   renewJob,
   retryJob,
@@ -56,6 +58,7 @@ import Prelude (
   Either (..),
   IO,
   Show (show),
+  error,
   pure,
   ($),
   (<>),
@@ -217,7 +220,9 @@ proposed = ProposedEvent (EventType "Opened") (EventVersion "1.0") payload
 
 
 identifier :: JobId
-identifier = JobId "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+identifier = case mkJobId "01ARZ3NDEKTSV4RRFFQ69G5FAV" of
+  Just fixture -> fixture
+  Nothing -> error "the fixture job identifier was rejected"
 
 
 kind :: JobKind

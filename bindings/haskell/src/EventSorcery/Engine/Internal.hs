@@ -79,6 +79,7 @@ import EventSorcery.Engine.Internal.FFI (
   esClose,
   esOpen,
  )
+import EventSorcery.Job.Definition (JobId (..))
 import Foreign.C.Types (CInt, CSize)
 import Foreign.Concurrent qualified as Foreign
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
@@ -197,11 +198,6 @@ data ConflictDetail = ConflictDetail
   , actualVersion :: Word64
   }
   deriving stock (Eq, Show)
-
-
--- | Identity of a durable job -- a ULID minted when the job is enqueued.
-newtype JobId = JobId Text
-  deriving newtype (Eq, Show)
 
 
 -- | Why one job refused the request made of it.

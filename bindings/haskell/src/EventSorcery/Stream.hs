@@ -6,6 +6,7 @@
 -- are re-exported so a stream handler needs this one import.
 module EventSorcery.Stream (
   AbiVersionDetail (..),
+  ActualSequence (..),
   AggregateId (..),
   AggregateType (..),
   BindingFault (..),
@@ -14,12 +15,18 @@ module EventSorcery.Stream (
   EngineErrorDecodeDetail (..),
   EventType (..),
   EventVersion (..),
+  ExpectedSequence (..),
+  MetadataMismatch (..),
   PageAdvanceDetail (..),
   ProposedEvent (..),
+  ReplayError (..),
   ResourceLimitDetail (..),
   Store,
   StoredEvent (..),
   StreamIdentity (..),
+  StreamKey,
+  StreamPosition (..),
+  StreamVersion (..),
   commit,
   currentVersion,
   decodeStoredEvents,
@@ -31,6 +38,10 @@ module EventSorcery.Stream (
   loadStream,
   loadStreamPage,
   nextCursor,
+  replay,
+  resume,
+  streamKey,
+  streamKeyIdentity,
 ) where
 
 import Codec.CBOR.Decoding (
@@ -52,15 +63,23 @@ import Codec.CBOR.Encoding (
  )
 import Codec.CBOR.Read (deserialiseFromBytes)
 import Codec.CBOR.Write (toStrictByteString)
-import Control.Monad (replicateM)
+import Control.Monad (foldM, replicateM)
+import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as LazyByteString
 import Data.Foldable (foldMap)
 import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NonEmpty
-import Data.Maybe (maybe)
+import Data.Maybe (fromMaybe, maybe)
+import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text)
 import Data.Word (Word64)
+import EventSorcery.Aggregate (
+  DecodeCause,
+  EventSourced,
+  EventVersion (..),
+ )
+import EventSorcery.Aggregate qualified as Aggregate
 import EventSorcery.Engine.Internal (
   AbiVersionDetail (..),
   AggregateId (..),
@@ -91,16 +110,21 @@ import Prelude (
   Eq ((==)),
   IO,
   Maybe (Just, Nothing),
+  Ord,
   Show (show),
   String,
   fail,
   fromIntegral,
+  fst,
   id,
   length,
+  maxBound,
   otherwise,
   pure,
   ($),
+  (+),
   (.),
+  (/=),
   (<$>),
   (<>),
   (>),
@@ -112,15 +136,53 @@ newtype EventType = EventType Text
   deriving newtype (Eq, Show)
 
 
-newtype EventVersion = EventVersion Text
-  deriving newtype (Eq, Show)
-
-
 data StreamIdentity = StreamIdentity
   { aggregateType :: AggregateType
   , aggregateId :: AggregateId
   }
   deriving stock (Eq, Show)
+
+
+newtype StreamVersion = StreamVersion Word64
+  deriving stock (Eq, Ord, Show)
+
+
+newtype StreamPosition = StreamPosition Word64
+  deriving stock (Eq, Ord, Show)
+
+
+newtype ExpectedSequence = ExpectedSequence StreamPosition
+  deriving stock (Eq, Show)
+
+
+newtype ActualSequence = ActualSequence StreamPosition
+  deriving stock (Eq, Show)
+
+
+newtype StreamKey entity = StreamKey StreamIdentity
+  deriving stock (Eq, Show)
+
+
+data MetadataMismatch
+  = EventTypeMismatch Text Text
+  | EventVersionMismatch EventVersion EventVersion
+  deriving stock (Eq, Show)
+
+
+data ReplayError entity
+  = EventDecodeFailed StreamPosition DecodeCause
+  | EventMetadataMismatch StreamPosition MetadataMismatch
+  | EventSequenceMismatch ExpectedSequence ActualSequence
+  | EventSequenceOverflow StreamPosition
+  | EventApplicationFailed StreamPosition (Aggregate.ApplyError entity)
+
+
+deriving stock instance
+  Eq (Aggregate.ApplyError entity) => Eq (ReplayError entity)
+
+
+deriving stock instance
+  Show (Aggregate.ApplyError entity) => Show (ReplayError entity)
 
 
 data ProposedEvent = ProposedEvent
@@ -138,6 +200,65 @@ data StoredEvent = StoredEvent
   , payload :: ByteString
   }
   deriving stock (Eq, Show)
+
+
+-- | Names the stream an entity of a given identity keeps its events in.
+--
+-- The pair of names is taken from the entity's own declaration rather than
+-- spelled by the caller, so a handler cannot address the wrong stream for the
+-- entity it is holding.
+streamKey
+  :: forall entity
+   . EventSourced entity
+  => Aggregate.EntityId entity
+  -> StreamKey entity
+streamKey identifier =
+  StreamKey
+    StreamIdentity
+      { aggregateType = AggregateType (Aggregate.aggregateType (Proxy @entity))
+      , aggregateId = AggregateId (Aggregate.encodeEntityId identifier)
+      }
+
+
+-- | Reads back the untyped stream identity a key stands for.
+streamKeyIdentity :: StreamKey entity -> StreamIdentity
+streamKeyIdentity (StreamKey identity) = identity
+
+
+-- | Rebuilds an entity from its whole stream, or nothing when the stream is
+-- empty.
+--
+-- The events have to start at the stream's first sequence, follow on from one
+-- another, and carry the type and version the entity declares for them. A
+-- stream that fails any of those is answered with a 'ReplayError' rather than
+-- with a differently shaped entity.
+replay
+  :: forall entity
+   . EventSourced entity
+  => StreamKey entity
+  -> [StoredEvent]
+  -> Either (ReplayError entity) (Maybe entity)
+replay _ events =
+  fst <$> foldM replayEvent (Nothing, StreamPosition 1) events
+
+
+-- | Carries an entity read at a version forward over the events after it.
+--
+-- The first event has to be the one that follows the version the entity was
+-- read at, so a snapshot cannot silently skip a committed event.
+resume
+  :: forall entity
+   . EventSourced entity
+  => StreamKey entity
+  -> StreamVersion
+  -> entity
+  -> [StoredEvent]
+  -> Either (ReplayError entity) entity
+resume _ (StreamVersion version) entity events = do
+  initialPosition <- nextPosition (StreamPosition version)
+  (result, _) <- foldM replayEvent (Just entity, initialPosition) events
+
+  pure (fromMaybe entity result)
 
 
 -- | Reads every event after the cursor, walking as many pages as it takes.
@@ -283,6 +404,71 @@ walkPages store stream loaded after = do
       Just eventPage -> case nextCursor after eventPage of
         Left engineError -> pure (Left engineError)
         Right cursor -> walkPages store stream (loaded . (events <>)) (Just cursor)
+
+
+replayEvent
+  :: forall entity
+   . EventSourced entity
+  => (Maybe entity, StreamPosition)
+  -> StoredEvent
+  -> Either (ReplayError entity) (Maybe entity, StreamPosition)
+replayEvent (currentState, expectedPosition) stored = do
+  let storedPosition = StreamPosition stored.sequence
+
+  validateSequence expectedPosition storedPosition
+  event <-
+    first
+      (EventDecodeFailed storedPosition)
+      (Aggregate.decodeEvent @entity stored.payload)
+  validateEventMetadata storedPosition stored event
+  nextState <-
+    first (EventApplicationFailed storedPosition) case currentState of
+      Nothing -> Aggregate.originate event
+      Just current -> Aggregate.evolve current event
+  followingPosition <- nextPosition expectedPosition
+
+  pure (Just nextState, followingPosition)
+
+
+validateSequence
+  :: StreamPosition
+  -> StreamPosition
+  -> Either (ReplayError entity) ()
+validateSequence expected actual
+  | actual == expected = Right ()
+  | otherwise =
+      Left
+        ( EventSequenceMismatch
+            (ExpectedSequence expected)
+            (ActualSequence actual)
+        )
+
+
+validateEventMetadata
+  :: EventSourced entity
+  => StreamPosition
+  -> StoredEvent
+  -> Aggregate.Event entity
+  -> Either (ReplayError entity) ()
+validateEventMetadata position stored event
+  | storedType /= expectedType =
+      mismatch (EventTypeMismatch expectedType storedType)
+  | stored.eventVersion /= expectedVersion =
+      mismatch (EventVersionMismatch expectedVersion stored.eventVersion)
+  | otherwise = Right ()
+  where
+    EventType storedType = stored.eventType
+    expectedType = Aggregate.eventType event
+    expectedVersion = Aggregate.eventVersion event
+    mismatch = Left . EventMetadataMismatch position
+
+
+nextPosition
+  :: StreamPosition
+  -> Either (ReplayError entity) StreamPosition
+nextPosition position@(StreamPosition sequence)
+  | sequence == maxBound = Left (EventSequenceOverflow position)
+  | otherwise = Right (StreamPosition (sequence + 1))
 
 
 encodeAggregateType :: AggregateType -> Encoding
