@@ -45,6 +45,7 @@
           ./nix/event-sorcery-haskell.nix
           {
             event_sorcery_ffi = ffiEngine;
+            linear-base = pkgs.haskell.lib.dontCheck haskellPackages.linear-base;
           }
         ) { src = ./bindings/haskell; };
         rustBuildInputs = rainix.rust-build-inputs.${system};

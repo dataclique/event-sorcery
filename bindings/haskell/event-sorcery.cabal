@@ -52,6 +52,7 @@ library
   exposed-modules:
     EventSorcery.Engine
     EventSorcery.Engine.Internal.FFI
+    EventSorcery.Job
     EventSorcery.Stream
 
   other-modules:
@@ -63,8 +64,11 @@ library
     , base                       >=4.18   && <5
     , bytestring                 >=0.11   && <0.13
     , cborg                      >=0.2.10 && <0.3
+    , conduit                    >=1.3.6  && <1.4
     , event-sorcery:acquisition
+    , linear-base                >=0.5    && <0.6
     , text                       >=2.0    && <2.2
+    , transformers               >=0.6    && <0.7
 
 test-suite wire-spec
   import:         strict
@@ -93,3 +97,18 @@ test-suite engine-spec
     , event-sorcery:acquisition
     , tasty                      >=1.5  && <1.6
     , tasty-hunit                >=0.10 && <0.11
+
+test-suite job-spec
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        JobSpec.hs
+  build-depends:
+    , base           >=4.18  && <5
+    , bytestring     >=0.11  && <0.13
+    , conduit        >=1.3.6 && <1.4
+    , event-sorcery
+    , linear-base    >=0.5   && <0.6
+    , tasty          >=1.5   && <1.6
+    , tasty-hunit    >=0.10  && <0.11
+    , transformers   >=0.6   && <0.7
