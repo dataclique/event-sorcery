@@ -88,116 +88,36 @@ library
     , transformers               >=0.6    && <0.7
     , ulid                       >=0.3    && <0.4
 
-test-suite wire-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        WireSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring     >=0.11 && <0.13
-    , event-sorcery
-    , tasty          >=1.5  && <1.6
-    , tasty-hunit    >=0.10 && <0.11
-    , text           >=2.0  && <2.2
+test-suite spec
+  import:             strict
+  type:               exitcode-stdio-1.0
+  hs-source-dirs:     test
+  main-is:            Spec.hs
+  build-tool-depends: hspec-discover:hspec-discover
+  ghc-options:        -threaded -with-rtsopts=-N
+  other-modules:
+    DispatchSpec
+    DispatchWorkerSpec
+    DomainSpec
+    EngineSpec
+    Event.Sorcery.Engine.AcquisitionSpec
+    JobExecutionSpec
+    JobSpec
+    JobWorkerSpec
+    StoreSpec
+    WireSpec
 
-test-suite engine-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        EngineSpec.hs
-  other-modules:  Event.Sorcery.Engine.AcquisitionSpec
-  ghc-options:    -threaded -with-rtsopts=-N
   build-depends:
-    , base                       >=4.18 && <5
-    , bytestring                 >=0.11 && <0.13
+    , async                      >=2.2   && <2.3
+    , base                       >=4.18  && <5
+    , bytestring                 >=0.11  && <0.13
+    , conduit                    >=1.3.6 && <1.4
     , event-sorcery
     , event-sorcery:acquisition
-    , tasty                      >=1.5  && <1.6
-    , tasty-hunit                >=0.10 && <0.11
-
-test-suite job-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        JobSpec.hs
-  build-depends:
-    , base           >=4.18  && <5
-    , bytestring     >=0.11  && <0.13
-    , conduit        >=1.3.6 && <1.4
-    , event-sorcery
-    , linear-base    >=0.5   && <0.6
-    , tasty          >=1.5   && <1.6
-    , tasty-hunit    >=0.10  && <0.11
-    , text           >=2.0   && <2.2
-    , transformers   >=0.6   && <0.7
-
-test-suite domain-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        DomainSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring     >=0.11 && <0.13
-    , event-sorcery
-    , text           >=2.0  && <2.2
-
-test-suite store-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        StoreSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring     >=0.11 && <0.13
-    , event-sorcery
-    , text           >=2.0  && <2.2
-
-test-suite dispatch-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        DispatchSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring     >=0.11 && <0.13
-    , event-sorcery
-    , text           >=2.0  && <2.2
-
-test-suite job-execution-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        JobExecutionSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring     >=0.11 && <0.13
-    , event-sorcery
-    , text           >=2.0  && <2.2
-
-test-suite job-worker-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        JobWorkerSpec.hs
-  build-depends:
-    , async          >=2.2  && <2.3
-    , base           >=4.18 && <5
-    , bytestring     >=0.11 && <0.13
-    , event-sorcery
-    , text           >=2.0  && <2.2
-
-test-suite dispatch-worker-spec
-  import:         strict
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        DispatchWorkerSpec.hs
-  build-depends:
-    , base           >=4.18 && <5
-    , bytestring     >=0.11 && <0.13
-    , event-sorcery
-    , text           >=2.0  && <2.2
+    , hspec                      >=2.11  && <2.12
+    , linear-base                >=0.5   && <0.6
+    , text                       >=2.0   && <2.2
+    , transformers               >=0.6   && <0.7
 
 benchmark event-sorcery-benchmarks
   import:         strict

@@ -32,6 +32,6 @@ name; a new wire format gets a new corpus file next to this one.
 
 - The Rust ABI tests in `crates/event-sorcery-ffi` include this file at compile
   time, relative to that crate's manifest directory.
-- The Haskell `wire-spec` suite reads it at test time as
+- The Haskell `WireSpec` module reads it at test time as
   `conformance/encoding-v1.vectors`, relative to the package root that Cabal
   runs test suites from.

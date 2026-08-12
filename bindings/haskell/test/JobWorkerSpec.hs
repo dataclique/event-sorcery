@@ -1,4 +1,4 @@
-module Main (main) where
+module JobWorkerSpec (spec) where
 
 import Control.Concurrent.Async (async, wait)
 import Control.Concurrent.MVar (
@@ -55,15 +55,14 @@ import Event.Sorcery.Job.Worker (
   renewingJobWorker,
   runJobOnce,
  )
+import Test.Hspec (Spec, expectationFailure, it, shouldBe)
 import Prelude (
-  Bool (False, True),
   Either (Left, Right),
   IO,
   Maybe (Just, Nothing),
-  String,
   error,
   pure,
-  (&&),
+  ($),
   (+),
   (<>),
   (==),
@@ -149,12 +148,12 @@ instance DurableJob RenewingProbeJob where
     pure (Right (Reconciled "reconciled"))
 
 
-main :: IO ()
-main = do
+spec :: Spec
+spec = it "settles and renews durable job executions" $ do
   opened <- openStore (OpenOptions "sqlite::memory:" 5000 1 1)
 
   case opened of
-    Left _ -> error "failed to open the shared engine"
+    Left _ -> expectationFailure "failed to open the shared engine"
     Right store -> do
       successfulJobIsAcknowledged store
       transientFailureRetriesThenReconciles store
@@ -164,7 +163,7 @@ main = do
       longExecutionRenewsItsLease store
 
       closed <- closeStore store
-      expect "failed to close the shared engine" (closed == Right ())
+      closed `shouldBe` Right ()
 
 
 successfulJobIsAcknowledged :: Store -> IO ()
@@ -175,12 +174,9 @@ successfulJobIsAcknowledged store = do
   repeated <- runJobOnce (runner store calls attemptLimit) identifier later
   recorded <- readIORef calls
 
-  expect
-    "successful job was not submitted and acknowledged"
-    ( result == Right (JobSucceeded "submitted")
-        && repeated == Right JobRunSkipped
-        && recorded == ["submit"]
-    )
+  result `shouldBe` Right (JobSucceeded "submitted")
+  repeated `shouldBe` Right JobRunSkipped
+  recorded `shouldBe` ["submit"]
 
 
 transientFailureRetriesThenReconciles :: Store -> IO ()
@@ -191,18 +187,10 @@ transientFailureRetriesThenReconciles store = do
   second <- runJobOnce (runner store calls attemptLimit) identifier later
   recorded <- readIORef calls
 
-  expect
-    "transient job did not retry and reconcile"
-    ( first
-        == Right
-          ( JobRetryScheduled
-              (JobAttempt 1)
-              later
-              "unavailable"
-          )
-        && second == Right (JobSucceeded "reconciled")
-        && recorded == ["submit", "reconcile"]
-    )
+  first
+    `shouldBe` Right (JobRetryScheduled (JobAttempt 1) later "unavailable")
+  second `shouldBe` Right (JobSucceeded "reconciled")
+  recorded `shouldBe` ["submit", "reconcile"]
 
 
 terminalFailureIsDeadLettered :: Store -> IO ()
@@ -212,11 +200,8 @@ terminalFailureIsDeadLettered store = do
   result <- runJobOnce (runner store calls attemptLimit) identifier now
   repeated <- runJobOnce (runner store calls attemptLimit) identifier later
 
-  expect
-    "terminal failure was not retained as a rejected job"
-    ( result == Right (JobRejected "rejected")
-        && repeated == Right JobRunSkipped
-    )
+  result `shouldBe` Right (JobRejected "rejected")
+  repeated `shouldBe` Right JobRunSkipped
 
 
 exhaustedFailureIsDeadLettered :: Store -> IO ()
@@ -226,13 +211,8 @@ exhaustedFailureIsDeadLettered store = do
   result <- runJobOnce (runner store calls singleAttempt) identifier now
   repeated <- runJobOnce (runner store calls singleAttempt) identifier later
 
-  expect
-    "retry exhaustion did not retain the final failure"
-    ( result
-        == Right
-          (JobRetriesExhausted (JobAttempt 1) "unavailable")
-        && repeated == Right JobRunSkipped
-    )
+  result `shouldBe` Right (JobRetriesExhausted (JobAttempt 1) "unavailable")
+  repeated `shouldBe` Right JobRunSkipped
 
 
 undecodableJobIsDeadLettered :: Store -> IO ()
@@ -244,17 +224,11 @@ undecodableJobIsDeadLettered store = do
   result <- runJobOnce (runner store calls attemptLimit) identifier now
   repeated <- runJobOnce (runner store calls attemptLimit) identifier later
 
-  expect "invalid test job was not enqueued" (enqueued == Right ())
-  expect
-    "undecodable job did not fail closed after dead-lettering"
-    ( result
-        == Left
-          ( JobRunDecodeFailed
-              identifier
-              (JobDecodeError "invalid probe job")
-          )
-        && repeated == Right JobRunSkipped
-    )
+  enqueued `shouldBe` Right ()
+  result
+    `shouldBe` Left
+      (JobRunDecodeFailed identifier (JobDecodeError "invalid probe job"))
+  repeated `shouldBe` Right JobRunSkipped
 
 
 longExecutionRenewsItsLease :: Store -> IO ()
@@ -287,12 +261,8 @@ longExecutionRenewsItsLease store = do
   putMVar releaseExecution ()
   completed <- wait running
 
-  expect
-    "competing worker acquired a renewed lease"
-    (competing == Right JobRunSkipped)
-  expect
-    "renewing worker did not settle the completed job"
-    (completed == Right (JobSucceeded "renewed"))
+  competing `shouldBe` Right JobRunSkipped
+  completed `shouldBe` Right (JobSucceeded "renewed")
 
 
 renewalWait
@@ -402,8 +372,3 @@ afterOriginalLease = JobInstant 40_000
 
 renewedUntil :: JobInstant
 renewedUntil = JobInstant 90_000
-
-
-expect :: String -> Bool -> IO ()
-expect _ True = pure ()
-expect message False = error message

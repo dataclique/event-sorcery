@@ -8,10 +8,10 @@
   criterion,
   deepseq,
   event_sorcery_ffi,
+  hspec,
+  hspec-discover,
   lib,
   linear-base,
-  tasty,
-  tasty-hunit,
   text,
   transformers,
   ulid,
@@ -37,12 +37,12 @@ mkDerivation {
     base
     bytestring
     conduit
+    hspec
     linear-base
-    tasty
-    tasty-hunit
     text
     transformers
   ];
+  testToolDepends = [ hspec-discover ];
   benchmarkHaskellDepends = [
     base
     bytestring
