@@ -1,8 +1,10 @@
 module Main (main) where
 
+import Data.Bits (shiftL, shiftR)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text.Encoding qualified as Text
+import Data.Word (Word8)
 import EventSorcery.Aggregate (
   DecodeCause (DecodeCause),
   Dispatches (injectDispatchIntent),
@@ -45,7 +47,9 @@ import Prelude (
   Maybe (..),
   Show,
   error,
+  fmap,
   fromIntegral,
+  length,
   otherwise,
   pure,
   (&&),
@@ -212,10 +216,12 @@ instance EventSourced Account where
     Just (1, amount) -> decodeAmount FundsDeposited amount
     Just (2, encodedIdentifier) -> decodeWelcome encodedIdentifier
     _ -> Left invalidEventEncoding
-  encodeSnapshot (Account balance) = ByteString.singleton (fromIntegral balance)
-  decodeSnapshot bytes = case ByteString.unpack bytes of
-    [balance] -> Right (Account (fromIntegral balance))
-    _ -> Left (DecodeCause "invalid account snapshot")
+  encodeSnapshot (Account balance) =
+    ByteString.pack (fmap (balanceByte balance) snapshotByteOffsets)
+  decodeSnapshot bytes
+    | ByteString.length bytes == snapshotByteWidth =
+        Right (Account (ByteString.foldl' appendBalanceByte 0 bytes))
+    | otherwise = Left (DecodeCause "invalid account snapshot")
   originate (AccountOpened amount) = Right (Account amount)
   originate _ = Left DepositBeforeOpen
   evolve _ (AccountOpened _) = Left AccountAlreadyOpened
@@ -228,6 +234,23 @@ instance EventSourced Account where
   transition _ (Deposit amount) = Right (Events (FundsDeposited amount :| []))
   transition _ EmitInvalidEvent = Right (Events (AccountOpened 99 :| []))
   transition _ SendWelcome = Right (Dispatch SendWelcomeEmail)
+
+
+-- | Bit offsets of the big-endian snapshot balance, most significant first.
+snapshotByteOffsets :: [Int]
+snapshotByteOffsets = [56, 48, 40, 32, 24, 16, 8, 0]
+
+
+snapshotByteWidth :: Int
+snapshotByteWidth = length snapshotByteOffsets
+
+
+balanceByte :: Int -> Int -> Word8
+balanceByte balance offset = fromIntegral (shiftR balance offset)
+
+
+appendBalanceByte :: Int -> Word8 -> Int
+appendBalanceByte accumulated byte = shiftL accumulated 8 + fromIntegral byte
 
 
 decodeAmount

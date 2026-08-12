@@ -28,6 +28,7 @@ use event_sorcery::{
     DeadReason, Engine, EngineError, JobClaimHandle, JobClaimResult, JobId, JobLeaseResult,
     JobRuntime, JobRuntimeError, JobSeed, JobSettlementResult, JobStoreError, OpaqueCommitRequest,
     OpaqueProposedEvent, OpaqueStoredEvent, SnapshotWrite, SqliteJobError, StreamIdentity,
+    decode_opaque_payload, encode_opaque_payload,
 };
 
 const ABI_MAJOR: u32 = 0;
@@ -544,7 +545,7 @@ pub unsafe extern "C" fn es_snapshot_store(
         require_identifier_limit(aggregate_id.len())?;
         require_payload_limit(payload.len())?;
         let sequence = usize::try_from(sequence).map_err(AbiError::InputInteger)?;
-        let aggregate = serde_json::Value::Array(payload.into_iter().map(Into::into).collect());
+        let aggregate = encode_opaque_payload(payload).map_err(AbiError::from)?;
         let stream = StreamIdentity::new(aggregate_type, aggregate_id);
         let snapshot_version = lease
             .inner
@@ -1399,8 +1400,6 @@ enum AbiError {
     JobRuntime(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("job payload encoding failure")]
     JobPayload(#[source] serde_json::Error),
-    #[error("stored snapshot payload cannot be returned")]
-    SnapshotPayload(#[source] SnapshotPayloadFault),
     #[error("engine storage failure")]
     Engine(#[source] EngineError),
     #[error("SQLite storage failure")]
@@ -1450,20 +1449,6 @@ enum JobRefusal {
     PayloadByteOutOfRange,
     #[error("claimed job payload exceeds the ABI payload limit")]
     PayloadAboveAbiLimit,
-}
-
-/// Why a stored snapshot cannot be rendered as the opaque bytes the ABI returns.
-///
-/// Snapshots written outside this ABI -- by a native [`Engine`] consumer sharing
-/// the same database -- carry the aggregate's own JSON, which has no opaque-byte
-/// reading. The shape of a stored snapshot never changes on its own, so each
-/// leaf here is permanent for the snapshot it describes rather than retryable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-enum SnapshotPayloadFault {
-    #[error("stored snapshot payload is not opaque bytes")]
-    NotOpaqueBytes,
-    #[error("stored snapshot payload contains an invalid byte")]
-    ByteOutOfRange,
 }
 
 fn store_registry() -> &'static Mutex<HashMap<usize, StoreEntry>> {
@@ -1729,8 +1714,7 @@ impl AbiError {
             | Self::Migration(_)
             | Self::StorageInteger(_)
             | Self::JobRuntime(_)
-            | Self::JobPayload(_)
-            | Self::SnapshotPayload(_) => ES_ERR_STORAGE,
+            | Self::JobPayload(_) => ES_ERR_STORAGE,
             Self::CborEncode(_) | Self::ResponseIo(_) | Self::Runtime(_) | Self::State(_) => {
                 ES_ERR_STATE
             }
@@ -2034,6 +2018,11 @@ fn event_to_wire(event: OpaqueStoredEvent) -> Result<StoredEventWire, AbiError> 
 }
 
 /// Renders a stored snapshot as the opaque triple the ABI answers a load with.
+///
+/// The payload is read back through the same engine envelope [`es_snapshot_store`]
+/// wrote it under, so a snapshot written outside this ABI -- by a native engine
+/// consumer sharing the database, carrying the aggregate's own JSON -- is
+/// reported as a storage failure rather than decoded into meaningless bytes.
 fn snapshot_to_wire(snapshot: SerializedSnapshot) -> Result<(u64, u64, OpaqueBytes), AbiError> {
     let SerializedSnapshot {
         aggregate,
@@ -2041,7 +2030,7 @@ fn snapshot_to_wire(snapshot: SerializedSnapshot) -> Result<(u64, u64, OpaqueByt
         current_snapshot,
         ..
     } = snapshot;
-    let payload = snapshot_payload_bytes(aggregate).map_err(AbiError::SnapshotPayload)?;
+    let payload = decode_opaque_payload(aggregate).map_err(AbiError::from)?;
     require_payload_limit(payload.len())?;
 
     Ok((
@@ -2049,23 +2038,6 @@ fn snapshot_to_wire(snapshot: SerializedSnapshot) -> Result<(u64, u64, OpaqueByt
         u64::try_from(current_snapshot).map_err(AbiError::StorageInteger)?,
         OpaqueBytes(payload),
     ))
-}
-
-/// Reads a stored snapshot's aggregate state back as the bytes it was written
-/// from, failing on any snapshot this ABI did not write.
-fn snapshot_payload_bytes(aggregate: serde_json::Value) -> Result<Vec<u8>, SnapshotPayloadFault> {
-    let serde_json::Value::Array(bytes) = aggregate else {
-        return Err(SnapshotPayloadFault::NotOpaqueBytes);
-    };
-
-    bytes
-        .into_iter()
-        .map(|byte| {
-            byte.as_u64()
-                .and_then(|byte| u8::try_from(byte).ok())
-                .ok_or(SnapshotPayloadFault::ByteOutOfRange)
-        })
-        .collect()
 }
 
 const fn require_payload_limit(observed: usize) -> Result<(), AbiError> {
@@ -2372,8 +2344,7 @@ fn write_error(out_error: *mut EsBuf, error: AbiError) -> i32 {
         | AbiError::Migration(_)
         | AbiError::StorageInteger(_)
         | AbiError::JobRuntime(_)
-        | AbiError::JobPayload(_)
-        | AbiError::SnapshotPayload(_) => ciborium::Value::Text("storage failure".to_string()),
+        | AbiError::JobPayload(_) => ciborium::Value::Text("storage failure".to_string()),
         AbiError::CborEncode(_) | AbiError::ResponseIo(_) => {
             ciborium::Value::Text("response encoding failed".to_string())
         }

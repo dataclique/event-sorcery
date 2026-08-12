@@ -127,7 +127,8 @@ pub use dispatch::{
 };
 pub use engine::{
     CommitRequest, Engine, EngineError, JobSeed, OpaqueCommitRequest, OpaqueProposedEvent,
-    OpaqueStoredEvent, SnapshotUpdate, SnapshotWrite, StreamIdentity,
+    OpaqueStoredEvent, SnapshotUpdate, SnapshotWrite, StreamIdentity, decode_opaque_payload,
+    encode_opaque_payload,
 };
 pub use job::{
     DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,
