@@ -17,6 +17,9 @@ module EventSorcery.Engine.Internal.FFI (
   esJobRetry,
   esLoadStream,
   esOpen,
+  esSnapshotDiscard,
+  esSnapshotLoad,
+  esSnapshotStore,
 ) where
 
 import Data.Word (Word32, Word64, Word8)
@@ -91,6 +94,20 @@ foreign import capi safe "event_sorcery.h es_commit"
 
 foreign import capi safe "event_sorcery.h es_commit_with_job"
   esCommitWithJob :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_snapshot_load"
+  esSnapshotLoad
+    :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_snapshot_store"
+  esSnapshotStore
+    :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr Word64 -> Ptr EsBuf -> IO CInt
+
+
+foreign import capi safe "event_sorcery.h es_snapshot_discard"
+  esSnapshotDiscard :: Ptr (Ptr EsStore) -> Ptr EsBuf -> Ptr EsBuf -> IO CInt
 
 
 foreign import capi safe "event_sorcery.h es_job_enqueue"

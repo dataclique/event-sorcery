@@ -140,8 +140,11 @@ supportedAbiMajor = 0
 
 
 -- | The oldest ABI minor version whose calls this binding can make.
+--
+-- The snapshot entry points this binding issues arrive in minor 4, so an
+-- engine below that floor cannot serve every call the binding makes.
 minimumAbiMinor :: Word32
-minimumAbiMinor = 3
+minimumAbiMinor = 4
 
 
 -- | Decides whether a packed engine ABI version can serve this binding.

@@ -55,6 +55,7 @@ library
     EventSorcery.Engine
     EventSorcery.Engine.Internal.FFI
     EventSorcery.Job
+    EventSorcery.Snapshot
     EventSorcery.Store
     EventSorcery.Stream
 

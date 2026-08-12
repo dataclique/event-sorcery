@@ -28,13 +28,15 @@ import EventSorcery.Job (
   mkJobId,
   pollJobs,
  )
+import EventSorcery.Snapshot qualified as Snapshot
 import EventSorcery.Store (
   StoreError (..),
   executeCommand,
   loadEntity,
   mkStore,
+  snapshotEntity,
  )
-import EventSorcery.Stream (streamKey)
+import EventSorcery.Stream (streamKey, streamKeyIdentity)
 import Prelude (
   Either (..),
   Eq,
@@ -63,8 +65,11 @@ main = do
           key = streamKey @Account AccountId
 
       initially <- loadEntity store key
+      emptySnapshot <- snapshotEntity store key
       openedAccount <- executeCommand store key (OpenAccount 10)
       deposited <- executeCommand store key (Deposit 5)
+      snapshotted <- snapshotEntity store key
+      afterSnapshotDeposit <- executeCommand store key (Deposit 7)
       reloaded <- loadEntity store key
       invalidEvent <- executeCommand store key EmitInvalidEvent
       afterInvalidEvent <- loadEntity store key
@@ -72,27 +77,56 @@ main = do
       jobs <- pollJobs engine kind (JobInstant 1) (PollLimit 10)
       rejected <- executeCommand store key (OpenAccount 20)
       afterRejection <- loadEntity store key
+      corrupted <-
+        Snapshot.storeSnapshot
+          engine
+          ( Snapshot.snapshotWrite
+              (streamKeyIdentity key)
+              4
+              (ByteString.pack [255, 255])
+          )
+      corruptedLoad <- loadEntity store key
+      discarded <- Snapshot.discardSnapshot engine (streamKeyIdentity key)
+      recovered <- loadEntity store key
 
       if initially
         == Right Nothing
+        && emptySnapshot
+          == Right Nothing
         && openedAccount
           == Right (Account 10)
         && deposited
           == Right (Account 15)
-        && reloaded
+        && snapshotted
           == Right (Just (Account 15))
+        && afterSnapshotDeposit
+          == Right (Account 22)
+        && reloaded
+          == Right (Just (Account 22))
         && invalidEvent
           == Left (StoreDecisionRejected AccountAlreadyOpened)
         && afterInvalidEvent
-          == Right (Just (Account 15))
+          == Right (Just (Account 22))
         && dispatched
-          == Right (Account 15)
+          == Right (Account 22)
         && jobs
           == Right [jobIdentifier]
         && rejected
           == Left (StoreCommandRejected AlreadyOpen)
         && afterRejection
-          == Right (Just (Account 15))
+          == Right (Just (Account 22))
+        && corrupted
+          == Right (Snapshot.SnapshotVersion 2)
+        && corruptedLoad
+          == Left
+            ( StoreSnapshotDecodeFailed
+                4
+                (DecodeCause "invalid account snapshot")
+            )
+        && discarded
+          == Right ()
+        && recovered
+          == Right (Just (Account 22))
         then pure ()
         else error "typed command execution did not preserve store invariants"
 
@@ -178,8 +212,10 @@ instance EventSourced Account where
     Just (1, amount) -> decodeAmount FundsDeposited amount
     Just (2, encodedIdentifier) -> decodeWelcome encodedIdentifier
     _ -> Left invalidEventEncoding
-  encodeSnapshot _ = ByteString.empty
-  decodeSnapshot _ = Left (DecodeCause "snapshots are not used in this test")
+  encodeSnapshot (Account balance) = ByteString.singleton (fromIntegral balance)
+  decodeSnapshot bytes = case ByteString.unpack bytes of
+    [balance] -> Right (Account (fromIntegral balance))
+    _ -> Left (DecodeCause "invalid account snapshot")
   originate (AccountOpened amount) = Right (Account amount)
   originate _ = Left DepositBeforeOpen
   evolve _ (AccountOpened _) = Left AccountAlreadyOpened
