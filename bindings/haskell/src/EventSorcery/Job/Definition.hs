@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 
 module EventSorcery.Job.Definition (
+  DeadReason (..),
   Job (..),
   JobDecodeError (..),
   JobId (..),
@@ -10,6 +11,7 @@ module EventSorcery.Job.Definition (
 ) where
 
 import Data.ByteString (ByteString)
+import Data.Kind (Type)
 import Data.Maybe (Maybe (..))
 import Data.Proxy (Proxy (Proxy))
 import Data.Text (Text)
@@ -26,8 +28,20 @@ newtype JobDecodeError = JobDecodeError Text
   deriving stock (Eq, Show)
 
 
+data DeadReason
+  = RetriesExhausted
+  | Rejected
+  | Undecodable
+  | Abandoned
+  deriving stock (Eq, Show)
+
+
 class KnownSymbol (JobType job) => Job job where
   type JobType job :: Symbol
+  type JobOutput job :: Type
+  type JobOutput job = ()
+  type JobError job :: Type
+  type JobError job = ()
 
 
   encodeJob :: job -> ByteString

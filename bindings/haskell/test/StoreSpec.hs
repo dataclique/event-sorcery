@@ -12,6 +12,7 @@ import EventSorcery.Aggregate (
   SchemaVersion (SchemaVersion),
   dispatchJobId,
  )
+import EventSorcery.Dispatch (kickoff)
 import EventSorcery.Engine (
   OpenOptions (OpenOptions),
   closeStore,
@@ -227,7 +228,7 @@ instance EventSourced Account where
   transition _ (OpenAccount _) = Left AlreadyOpen
   transition _ (Deposit amount) = Right (Events (FundsDeposited amount :| []))
   transition _ EmitInvalidEvent = Right (Events (AccountOpened 99 :| []))
-  transition _ SendWelcome = Right (Dispatch SendWelcomeEmail)
+  transition _ SendWelcome = Right (Dispatch (kickoff SendWelcomeEmail))
 
 
 decodeAmount

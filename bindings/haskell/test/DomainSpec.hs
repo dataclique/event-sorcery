@@ -12,6 +12,7 @@ import EventSorcery.Aggregate (
   dispatchIntent,
   dispatchJobId,
  )
+import EventSorcery.Dispatch (kickoff)
 import EventSorcery.Job (
   Job (..),
   JobId,
@@ -217,7 +218,7 @@ instance EventSourced Account where
   initialize OpenAccount = Right (Events (AccountOpened :| []))
   initialize SendWelcome = Left AccountError
   transition _ OpenAccount = Left AccountError
-  transition _ SendWelcome = Right (Dispatch SendWelcomeEmail)
+  transition _ SendWelcome = Right (Dispatch (kickoff SendWelcomeEmail))
 
 
 testJobId :: JobId
