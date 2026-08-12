@@ -2424,6 +2424,28 @@ mod tests {
 
     use super::*;
 
+    /// The corpus both bindings encode against, shared with the Haskell suite.
+    const ENCODING_VECTORS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../bindings/haskell/conformance/encoding-v1.vectors"
+    ));
+
+    /// Joins every corpus line recorded under one vector name.
+    fn conformance_vector(name: &str) -> Vec<u8> {
+        let bytes: Vec<u8> = ENCODING_VECTORS
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_ascii_whitespace();
+                (fields.next() == Some(name)).then_some(fields)
+            })
+            .flatten()
+            .map(|octet| octet.parse::<u8>().expect("conformance octet"))
+            .collect();
+
+        assert!(!bytes.is_empty(), "missing conformance vector: {name}");
+        bytes
+    }
+
     fn empty_buffer() -> EsBuf {
         EsBuf {
             ptr: ptr::null_mut(),
@@ -2644,6 +2666,37 @@ mod tests {
         assert_eq!(token.len(), 16);
         unsafe { es_buf_free(&raw mut claim) };
         token
+    }
+
+    #[test]
+    fn codecs_match_the_shared_conformance_corpus() {
+        let proposed = ("Created", "1.0", OpaqueBytes(vec![0, 1]));
+        let stored = (1_u64, "Created", "1.0", OpaqueBytes(vec![0, 1]));
+
+        assert_eq!(
+            encode_request(&(1_u8, "sqlite::memory:", 5_000_u64, 1_u32, 256_u32)),
+            conformance_vector("open-options")
+        );
+        assert_eq!(
+            encode_request(&(1_u8, "account", "one", Option::<u64>::None)),
+            conformance_vector("load-stream")
+        );
+        assert_eq!(
+            encode_request(&(1_u8, "account", "one")),
+            conformance_vector("current-version")
+        );
+        assert_eq!(
+            encode_request(&(1_u8, "account", "one", 0_u64, vec![proposed])),
+            conformance_vector("commit")
+        );
+        assert_eq!(
+            encode_request(&(1_u8, vec![stored])),
+            conformance_vector("stored-events")
+        );
+        assert_eq!(
+            encode_request(&(1_u8, ES_ERR_CONFLICT, ("account", "one", 0_u64, 1_u64))),
+            conformance_vector("conflict-error")
+        );
     }
 
     #[test]

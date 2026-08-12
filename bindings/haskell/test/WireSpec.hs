@@ -55,9 +55,26 @@ import EventSorcery.Stream (
   encodeLoadStream,
   nextCursor,
  )
-import Test.Tasty (TestTree, defaultMain, testGroup)
+import Test.Tasty (TestTree, defaultMain, testGroup, withResource)
 import Test.Tasty.HUnit (Assertion, assertBool, assertFailure, testCase, (@?=))
-import Prelude (IO, Maybe (..), String, error, ($), (<>))
+import Prelude (
+  IO,
+  Maybe (..),
+  String,
+  const,
+  error,
+  lines,
+  map,
+  pure,
+  read,
+  readFile,
+  words,
+  ($),
+  (.),
+  (<$>),
+  (<>),
+  (==),
+ )
 
 
 main :: IO ()
@@ -219,7 +236,48 @@ tests =
         , testCase "unmodelled status" $
             decodeCloseStatus 42 @?= Left (UnknownEngineError 42)
         ]
+    , conformance
     ]
+
+
+-- | Drives the corpus both bindings share through this binding's codecs.
+--
+-- The fixtures above pin the shape this binding expects on its own terms. The
+-- corpus is the same bytes the Rust ABI asserts against, so a boundary change
+-- only one side made is a failure here rather than a runtime disagreement.
+conformance :: TestTree
+conformance =
+  withResource loadVectors (const (pure ())) $ \vectors ->
+    testGroup
+      "shared encoding conformance"
+      [ testCase "open options" $ do
+          expected <- conformanceVector "open-options" <$> vectors
+          encodeOpenOptions options @?= expected
+      , testCase "load stream without a cursor" $ do
+          expected <- conformanceVector "load-stream" <$> vectors
+          encodeLoadStream stream Nothing @?= expected
+      , testCase "current version" $ do
+          expected <- conformanceVector "current-version" <$> vectors
+          encodeCurrentVersion stream @?= expected
+      , testCase "commit" $ do
+          expected <- conformanceVector "commit" <$> vectors
+          encodeCommit stream 0 [proposed] @?= expected
+      , testCase "stored events" $ do
+          encoded <- conformanceVector "stored-events" <$> vectors
+          decodeStoredEvents encoded @?= Right [expectedStored]
+      , testCase "conflict error" $ do
+          encoded <- conformanceVector "conflict-error" <$> vectors
+          decodeEngineError 2 encoded
+            @?= Right
+              ( OptimisticConflict
+                  ( ConflictDetail
+                      (AggregateType "account")
+                      (AggregateId "one")
+                      0
+                      1
+                  )
+              )
+      ]
 
 
 -- | Pins a negative case to the rule it was written for.
@@ -235,6 +293,27 @@ assertDecodeFailure expected outcome =
         ("expected a failure mentioning " <> expected <> ", got " <> message)
         (expected `isInfixOf` message)
     Right _ -> assertFailure ("expected a failure mentioning " <> expected)
+
+
+-- | Reads the corpus from the package root Cabal runs test suites from.
+loadVectors :: IO [(String, ByteString)]
+loadVectors =
+  map decodeVector . lines <$> readFile "conformance/encoding-v1.vectors"
+
+
+-- | Takes one corpus line as a vector name and its decimal octets.
+decodeVector :: String -> (String, ByteString)
+decodeVector encoded = case words encoded of
+  [] -> error "empty conformance vector"
+  name : octets -> (name, ByteString.pack (map read octets))
+
+
+-- | Joins every line the corpus records under one vector name.
+conformanceVector :: String -> [(String, ByteString)] -> ByteString
+conformanceVector name vectors =
+  case [octets | (vectorName, octets) <- vectors, vectorName == name] of
+    [] -> error ("missing conformance vector: " <> name)
+    chunks -> ByteString.concat chunks
 
 
 options :: OpenOptions
