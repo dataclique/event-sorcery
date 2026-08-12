@@ -136,7 +136,10 @@ jobs:
 
   haskell:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The first uncached build compiles the GHC dependency closure, which
+    # takes far longer than the steady state; cachix carries the closure
+    # across runs, so the bound only has to cover the cold start once.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
