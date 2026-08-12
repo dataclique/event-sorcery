@@ -6,30 +6,30 @@ import Data.Either (Either (Left, Right))
 import Data.List (isInfixOf)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Word (Word64)
-import EventSorcery.Engine.Codec (
+import EventSorcery.Engine (
+  ConflictDetail (..),
+  EngineError (..),
+  OpenOptions (..),
+  ResourceLimitDetail (..),
   decodeCloseStatus,
   decodeEngineError,
+  encodeOpenOptions,
+ )
+import EventSorcery.Stream (
+  AggregateId (..),
+  AggregateType (..),
+  BindingFault (..),
+  EventType (..),
+  EventVersion (..),
+  PageAdvanceDetail (..),
+  ProposedEvent (..),
+  StoredEvent (..),
+  StreamIdentity (..),
   decodeStoredEvents,
   encodeCommit,
   encodeCurrentVersion,
   encodeLoadStream,
-  encodeOpenOptions,
- )
-import EventSorcery.Engine.Internal.Paging (nextCursor)
-import EventSorcery.Engine.Protocol (
-  AggregateId (..),
-  AggregateType (..),
-  BindingFault (..),
-  ConflictDetail (..),
-  EngineError (..),
-  EventType (..),
-  EventVersion (..),
-  OpenOptions (..),
-  PageAdvanceDetail (..),
-  ProposedEvent (..),
-  ResourceLimitDetail (..),
-  StoredEvent (..),
-  StreamIdentity (..),
+  nextCursor,
  )
 import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit (Assertion, assertBool, assertFailure, testCase, (@?=))
@@ -43,7 +43,7 @@ main = defaultMain tests
 tests :: TestTree
 tests =
   testGroup
-    "engine codecs"
+    "engine wire format"
     [ testGroup
         "encoding"
         [ testCase "open options" $
