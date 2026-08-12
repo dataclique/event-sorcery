@@ -48,3 +48,4 @@ import EventSorcery.Engine.Internal (
   openStore,
   supportedAbiMajor,
  )
+

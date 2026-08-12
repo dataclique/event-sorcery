@@ -332,7 +332,7 @@ pub unsafe extern "C" fn es_load_stream(
             .transpose()
             .map_err(AbiError::InputInteger)?;
         let stream = StreamIdentity::new(aggregate_type, aggregate_id);
-        let query_limit = NonZeroUsize::new(MAX_LIST_ITEMS + 1)
+        let query_limit = NonZeroUsize::new(MAX_LIST_ITEMS)
             .ok_or(AbiError::State("invalid list query limit"))?;
         let events = lease
             .inner
@@ -347,13 +347,6 @@ pub unsafe extern "C" fn es_load_stream(
                 ),
             )
             .map_err(AbiError::from)?;
-        if events.len() > MAX_LIST_ITEMS {
-            return Err(AbiError::ResourceLimit {
-                resource: "list_items",
-                observed: events.len(),
-                limit: MAX_LIST_ITEMS,
-            });
-        }
         unsafe { out_events.write(encode_event_page(events)?) };
         Ok(())
     })
@@ -3266,7 +3259,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_load_rejects_a_response_beyond_the_item_limit() {
+    fn stream_load_pages_a_stream_beyond_the_item_limit() {
         let mut store = ptr::null_mut();
         open_store(&mut store);
         let Ok(lease) = EsStore::acquire(&raw mut store) else {
@@ -3296,35 +3289,22 @@ mod tests {
             .unwrap();
         drop(lease);
 
-        let mut request = encode_request(&(1_u8, "list-limit-test", "one", Option::<u64>::None));
-        let request_buffer = caller_buffer(&mut request);
-        let mut output = empty_buffer();
-        let mut error = empty_buffer();
-        assert_eq!(
-            unsafe {
-                es_load_stream(
-                    &raw mut store,
-                    &raw const request_buffer,
-                    &raw mut output,
-                    &raw mut error,
-                )
-            },
-            ES_ERR_RESOURCE_LIMIT
-        );
-        assert!(output.ptr.is_null());
-        assert_eq!(
-            decode_error(&error),
-            (
-                1,
-                ES_ERR_RESOURCE_LIMIT,
-                Value::Array(vec![
-                    Value::Text("list_items".to_string()),
-                    Value::Integer((MAX_LIST_ITEMS + 1).into()),
-                    Value::Integer(MAX_LIST_ITEMS.into()),
-                ]),
-            )
-        );
-        unsafe { es_buf_free(&raw mut error) };
+        let first = load_page(&mut store, "list-limit-test", "one", None);
+        assert_eq!(first.len(), MAX_LIST_ITEMS);
+        let Some((first_cursor, _, _, _)) = first.last() else {
+            panic!("a full first page must carry a final sequence");
+        };
+        assert_eq!(*first_cursor, MAX_LIST_ITEMS as u64);
+
+        let second = load_page(&mut store, "list-limit-test", "one", Some(*first_cursor));
+        assert_eq!(second.len(), 1);
+        let Some((second_cursor, _, _, _)) = second.last() else {
+            panic!("the trailing page must carry the last sequence");
+        };
+        assert_eq!(*second_cursor, (MAX_LIST_ITEMS + 1) as u64);
+
+        let ended = load_page(&mut store, "list-limit-test", "one", Some(*second_cursor));
+        assert!(ended.is_empty());
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
     }
 
