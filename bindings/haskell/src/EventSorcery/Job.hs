@@ -137,6 +137,7 @@ import EventSorcery.Engine.Internal.FFI (
   esJobRetry,
  )
 import EventSorcery.Job.Definition (
+  DeadReason (..),
   Job (..),
   JobDecodeError (..),
   jobIdText,
@@ -254,15 +255,6 @@ data JobSettlement
 -- can only be issued by the worker the engine handed the claim to.
 newtype JobSettlementToken = JobSettlementToken ByteString
   deriving newtype (Eq, Show)
-
-
--- | Why a job left the queue for good.
-data DeadReason
-  = RetriesExhausted
-  | Rejected
-  | Undecodable
-  | Abandoned
-  deriving stock (Eq, Show)
 
 
 -- | A won claim, which its worker consumes exactly once.

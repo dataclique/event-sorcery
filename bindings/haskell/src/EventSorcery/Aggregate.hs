@@ -18,6 +18,7 @@ import Data.Proxy (Proxy)
 import Data.Text (Text)
 import Data.Type.Equality (type (~))
 import Data.Word (Word16)
+import EventSorcery.Dispatch (JobDispatch)
 import EventSorcery.Job.Definition (
   Job (..),
   JobId,
@@ -58,7 +59,7 @@ data Effect entity where
   Events :: NonEmpty (Event entity) -> Effect entity
   Dispatch
     :: (Job job, Member job (Jobs entity), Dispatches entity job)
-    => job
+    => JobDispatch job
     -> Effect entity
 
 
