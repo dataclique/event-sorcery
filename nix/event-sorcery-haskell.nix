@@ -9,6 +9,7 @@
   deepseq,
   event_sorcery_ffi,
   hspec,
+  QuickCheck,
   hspec-discover,
   lib,
   linear-base,
@@ -38,6 +39,7 @@ mkDerivation {
     bytestring
     conduit
     hspec
+    QuickCheck
     linear-base
     text
     transformers
