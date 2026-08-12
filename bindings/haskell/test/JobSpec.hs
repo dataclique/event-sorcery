@@ -37,6 +37,7 @@ import EventSorcery.Job (
   deadLetterJob,
   deferJob,
   enqueueJob,
+  jobIdText,
   mkJobId,
   pollJobs,
   renewJob,
@@ -74,7 +75,17 @@ tests :: TestTree
 tests =
   testGroup
     "durable jobs"
-    [ testCase "commits events and the job they dispatch together" $
+    [ testCase "accepts only ULID-shaped job identifiers" $
+        case ( mkJobId "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+             , mkJobId "not-a-ulid"
+             , mkJobId "80000000000000000000000000"
+             ) of
+          (Just accepted, Nothing, Nothing) ->
+            jobIdText accepted @?= "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+          (_, _, _) ->
+            assertFailure
+              "Haskell JobId validation diverged from the Rust engine"
+    , testCase "commits events and the job they dispatch together" $
         withStore $ \store -> do
           commitWithJob store stream 0 (proposed :| []) seed
             >>= (@?= Right ())

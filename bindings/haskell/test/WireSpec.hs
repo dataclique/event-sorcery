@@ -337,7 +337,7 @@ kind = JobKind "email"
 
 
 wireJobId :: JobId
-wireJobId = case mkJobId "job" of
+wireJobId = case mkJobId "01ARZ3NDEKTSV4RRFFQ69G5FAV" of
   Just identifier -> identifier
   Nothing -> error "wire fixture job identifier was rejected"
 
@@ -547,10 +547,34 @@ expectedCommitWithJob =
     , 0
     , 1 -- bytes(2)
     , 132 -- array(4) job seed
-    , 99
-    , 106
-    , 111
-    , 98 -- text(3) job
+    , 120
+    , 26
+    , 48
+    , 49
+    , 65
+    , 82
+    , 90
+    , 51
+    , 78
+    , 68
+    , 69
+    , 75
+    , 84
+    , 83
+    , 86
+    , 52
+    , 82
+    , 82
+    , 70
+    , 70
+    , 81
+    , 54
+    , 57
+    , 71
+    , 53
+    , 70
+    , 65
+    , 86 -- text(26) 01ARZ3NDEKTSV4RRFFQ69G5FAV
     , 101
     , 101
     , 109
@@ -569,10 +593,34 @@ expectedEnqueue =
   ByteString.pack
     [ 133 -- array(5)
     , 1 -- format version 1
-    , 99
-    , 106
-    , 111
-    , 98 -- text(3) job
+    , 120
+    , 26
+    , 48
+    , 49
+    , 65
+    , 82
+    , 90
+    , 51
+    , 78
+    , 68
+    , 69
+    , 75
+    , 84
+    , 83
+    , 86
+    , 52
+    , 82
+    , 82
+    , 70
+    , 70
+    , 81
+    , 54
+    , 57
+    , 71
+    , 53
+    , 70
+    , 65
+    , 86 -- text(26) 01ARZ3NDEKTSV4RRFFQ69G5FAV
     , 101
     , 101
     , 109
@@ -607,10 +655,34 @@ expectedClaim =
   ByteString.pack
     [ 134 -- array(6)
     , 1 -- format version 1
-    , 99
-    , 106
-    , 111
-    , 98 -- text(3) job
+    , 120
+    , 26
+    , 48
+    , 49
+    , 65
+    , 82
+    , 90
+    , 51
+    , 78
+    , 68
+    , 69
+    , 75
+    , 84
+    , 83
+    , 86
+    , 52
+    , 82
+    , 82
+    , 70
+    , 70
+    , 81
+    , 54
+    , 57
+    , 71
+    , 53
+    , 70
+    , 65
+    , 86 -- text(26) 01ARZ3NDEKTSV4RRFFQ69G5FAV
     , 102
     , 119
     , 111
@@ -647,10 +719,34 @@ polledJobs =
     [ 130 -- array(2)
     , 1 -- format version 1
     , 129 -- array(1) runnable job
-    , 99
-    , 106
-    , 111
-    , 98 -- text(3) job
+    , 120
+    , 26
+    , 48
+    , 49
+    , 65
+    , 82
+    , 90
+    , 51
+    , 78
+    , 68
+    , 69
+    , 75
+    , 84
+    , 83
+    , 86
+    , 52
+    , 82
+    , 82
+    , 70
+    , 70
+    , 81
+    , 54
+    , 57
+    , 71
+    , 53
+    , 70
+    , 65
+    , 86 -- text(26) 01ARZ3NDEKTSV4RRFFQ69G5FAV
     ]
 
 
@@ -701,10 +797,34 @@ jobRefusal =
     , 1 -- format version 1
     , 3 -- job-refusal error
     , 130 -- array(2) refusal detail
-    , 99
-    , 106
-    , 111
-    , 98 -- text(3) job
+    , 120
+    , 26
+    , 48
+    , 49
+    , 65
+    , 82
+    , 90
+    , 51
+    , 78
+    , 68
+    , 69
+    , 75
+    , 84
+    , 83
+    , 86
+    , 52
+    , 82
+    , 82
+    , 70
+    , 70
+    , 81
+    , 54
+    , 57
+    , 71
+    , 53
+    , 70
+    , 65
+    , 86 -- text(26) 01ARZ3NDEKTSV4RRFFQ69G5FAV
     , 120
     , 24
     , 105
@@ -742,10 +862,34 @@ unmodelledRefusal =
     , 1 -- format version 1
     , 3 -- job-refusal error
     , 130 -- array(2) refusal detail
-    , 99
-    , 106
-    , 111
-    , 98 -- text(3) job
+    , 120
+    , 26
+    , 48
+    , 49
+    , 65
+    , 82
+    , 90
+    , 51
+    , 78
+    , 68
+    , 69
+    , 75
+    , 84
+    , 83
+    , 86
+    , 52
+    , 82
+    , 82
+    , 70
+    , 70
+    , 81
+    , 54
+    , 57
+    , 71
+    , 53
+    , 70
+    , 65
+    , 86 -- text(26) 01ARZ3NDEKTSV4RRFFQ69G5FAV
     , 108
     , 108
     , 97
