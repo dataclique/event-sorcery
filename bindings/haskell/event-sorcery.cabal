@@ -55,6 +55,7 @@ library
     EventSorcery.Engine
     EventSorcery.Engine.Internal.FFI
     EventSorcery.Job
+    EventSorcery.Store
     EventSorcery.Stream
 
   other-modules:
@@ -126,3 +127,14 @@ test-suite domain-spec
     , base           >=4.18 && <5
     , bytestring     >=0.11 && <0.13
     , event-sorcery
+
+test-suite store-spec
+  import:         strict
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        StoreSpec.hs
+  build-depends:
+    , base           >=4.18 && <5
+    , bytestring     >=0.11 && <0.13
+    , event-sorcery
+    , text           >=2.0  && <2.2
