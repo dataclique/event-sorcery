@@ -96,6 +96,7 @@ test-suite spec
   build-tool-depends: hspec-discover:hspec-discover
   ghc-options:        -threaded -with-rtsopts=-N
   other-modules:
+    DispatchPropertySpec
     DispatchSpec
     DispatchWorkerSpec
     DomainSpec
@@ -116,6 +117,7 @@ test-suite spec
     , event-sorcery:acquisition
     , hspec                      >=2.11  && <2.12
     , linear-base                >=0.5   && <0.6
+    , QuickCheck                 >=2.14  && <2.17
     , text                       >=2.0   && <2.2
     , transformers               >=0.6   && <0.7
 
