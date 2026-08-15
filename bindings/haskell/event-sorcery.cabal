@@ -63,6 +63,7 @@ library
     Event.Sorcery.Job
     Event.Sorcery.Job.Execution
     Event.Sorcery.Job.Worker
+    Event.Sorcery.Schema
     Event.Sorcery.Snapshot
     Event.Sorcery.Store
     Event.Sorcery.Stream
@@ -105,6 +106,7 @@ test-suite spec
     JobExecutionSpec
     JobSpec
     JobWorkerSpec
+    SchemaSpec
     StoreSpec
     WireSpec
 
