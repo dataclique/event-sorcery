@@ -15,21 +15,22 @@ Event-sourcing primitives in Rust. A thin, opinionated layer on top of
   submit/reconcile retry safety and outcome feedback; see
   [ADR-0008](adrs/0008-entity-scoped-durable-operations.md) and
   [ADR-0009](adrs/0009-handlers-return-events-or-one-job-dispatch.md)).
+- **[`crates/event-sorcery-ffi`](crates/event-sorcery-ffi)** — C ABI over the
+  shared Rust engine, with a generated C header and static library for language
+  bindings.
 
 `event-sorcery` is the recommended entry point. Use `sqlite-es` directly only if
 you need lower-level control.
 
 ## Status
 
-This repository is an experimental fork maintained by Data Clique Software
-Design FZCO in the `dataclique` GitHub organization. It contains work unrelated
-to ST0x, including the Haskell binding in 0.4.0 and the planned TypeScript
+Data Clique Software Design FZCO maintains the open-source
+[`dataclique/event-sorcery`](https://github.com/dataclique/event-sorcery)
+repository. It includes the Haskell binding in 0.4.0 and the planned TypeScript
 binding in 0.5.0.
 
-The original Event Sorcery project remains owned and maintained by ST0x, with
-contributions from Data Clique Software Design FZCO and other contributors.
-Features developed in this fork do not imply ST0x ownership or adoption.
-External users are welcome, but the API surface is still in flux.
+The project began as a fork of the ST0x implementation. External users are
+welcome, but the API surface is still in flux.
 
 ## Examples
 

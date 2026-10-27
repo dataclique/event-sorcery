@@ -17,11 +17,9 @@ typed language surfaces:
 - the current native Rust API; and
 - an idiomatic Haskell binding over a versioned C ABI.
 
-This specification governs the experimental fork hosted in the `dataclique`
-GitHub organization. The original Event Sorcery project remains owned and
-maintained by ST0x, with contributions from Data Clique Software Design FZCO
-and other contributors. Experimental bindings in this fork are not part of the
-ST0x project unless ST0x adopts them separately.
+Data Clique Software Design FZCO maintains the open-source
+`dataclique/event-sorcery` repository governed by this specification. The project
+began as a fork of the ST0x implementation.
 
 The shared engine MUST be extracted from the implementation already present in
 this repository. It MUST continue to build on:

@@ -203,13 +203,15 @@ visible conversation, treat the change as unjustified and revert it.
 ## Project Overview
 
 `event-sorcery` is an event-sourcing library on top of `cqrs-es`. The Cargo
-workspace has two crates and no application binaries:
+workspace has three crates and no application binaries:
 
 - **`crates/sqlite-es`** — SQLite implementation of `cqrs-es`'s event/view
   repository traits. Standalone; usable wherever a `cqrs-es` backend is needed.
 - **`crates/event-sorcery`** — higher-level ergonomics on top of `sqlite-es`:
   the `EventSourced` trait, `Lifecycle` adapter, typed `Store`, projections,
   schema registry, reactor.
+- **`crates/event-sorcery-ffi`** — C ABI over the shared Rust engine, with a
+  generated C header and static library for language bindings.
 
 The `crates/sqlite-es/migrations/` directory holds the canonical SQLite schema
 (events, snapshots, job queue, and schema registry tables), embedded at compile
@@ -236,7 +238,7 @@ verification before a release).
 
 ### Testing
 
-- `cargo nextest run --workspace` - Run all tests in both crates
+- `cargo nextest run --workspace` - Run all tests in the three Rust crates
 - `cargo nextest run --lib` - Run library tests only
 - `cargo nextest run -p event-sorcery` - Run event-sorcery crate tests
 - `cargo nextest run -p sqlite-es` - Run sqlite-es crate tests
