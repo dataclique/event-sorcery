@@ -1,7 +1,7 @@
 { pkgs, craneLib }:
 
 let
-  version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+  version = (fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
   src = pkgs.lib.cleanSourceWith {
     src = ./.;
     filter =
@@ -16,7 +16,7 @@ let
     filter =
       path: type:
       type == "directory"
-      || builtins.elem (builtins.baseNameOf path) [
+      || builtins.elem (baseNameOf path) [
         "Cargo.toml"
         "Cargo.lock"
       ];
@@ -52,6 +52,11 @@ in
       cargoBuildExtraArgs = "--all-targets";
     }
   );
+
+  fmt = craneLib.cargoFmt {
+    inherit (commonArgs) pname version src;
+    cargoExtraArgs = "--all";
+  };
 
   test = craneLib.cargoNextest (
     commonArgs

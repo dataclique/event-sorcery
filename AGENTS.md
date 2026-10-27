@@ -288,9 +288,10 @@ use `<dep>.workspace = true` (with optional per-crate features added on top).
   hooks declared in `git-hooks.nix`. Shell state lives under `.tmp/devenv/`.
 - The flake pins nixpkgs and rust-overlay directly; Crane builds Rust and FFI
   packages. Standalone package and formatting-check builds remain pure.
-- CI runs `nix develop --impure` for shell commands and builds
-  `checks.x86_64-linux.formatting` directly for hooks; hooks never need the
-  development shell.
+- CI builds Rust, Haskell, and formatting checks directly as pure Nix
+  derivations, without entering the development shell. Hooks use
+  `checks.x86_64-linux.formatting`; Rust formatting uses
+  `checks.x86_64-linux.rust-fmt`.
 
 ### Generated paths
 

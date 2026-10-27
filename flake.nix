@@ -111,6 +111,7 @@
           rust = rustPkgs.package;
           rust-test = rustPkgs.test;
           rust-clippy = rustPkgs.clippy;
+          rust-fmt = rustPkgs.fmt;
         };
 
         apps.check-examples = {
@@ -130,14 +131,16 @@
           rust = rustPkgs.package;
           rust-test = rustPkgs.test;
           rust-clippy = rustPkgs.clippy;
+          rust-fmt = rustPkgs.fmt;
           package-version =
             let
-              expected = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+              expected = (fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
               versions = map (package: package.version) [
                 rustPkgs.package
                 rustPkgs.engine
                 rustPkgs.test
                 rustPkgs.clippy
+                rustPkgs.fmt
               ];
             in
             assert pkgs.lib.assertMsg (builtins.all (

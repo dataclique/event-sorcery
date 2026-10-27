@@ -35,7 +35,7 @@ jobs:
           - name: clippy
             command: nix build --no-link -L .#checks.x86_64-linux.rust-clippy
           - name: fmt
-            command: nix develop --impure -c cargo fmt --all -- --check
+            command: nix build --no-link -L .#checks.x86_64-linux.rust-fmt
     env:
       CARGO_INCREMENTAL: "0"
 

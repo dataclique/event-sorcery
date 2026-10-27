@@ -34,10 +34,11 @@ welcome, but the API surface is still in flux.
 
 ## Examples
 
-Runnable end-to-end examples live under [`examples/`](examples/) — one directory
-per concept (`basic_entity`, `projection`, `reactor`), each with its own README
-explaining what it covers. Run any of them with
-`cargo run -p event-sorcery --example <name>`.
+Runnable end-to-end examples live in [`examples/simple`](examples/simple/) and
+[`examples/complex`](examples/complex/), each with its own README. Run one with
+`cargo run --manifest-path examples/simple/Cargo.toml` (or the complex
+manifest). Run both examples' formatting, linting, tests, and demos with
+`nix run .#check-examples`.
 
 ## Documentation
 
