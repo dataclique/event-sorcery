@@ -378,10 +378,16 @@ pub(crate) enum JobState {
         attempt: u32,
         claims: u32,
     },
-    /// Completed successfully (terminal).
-    Done,
-    /// Dead-lettered (terminal).
-    Dead { reason: DeadReason },
+    /// Completed successfully (terminal). Keeps the job's kind so
+    /// terminal queue rows stay attributable -- a board reading the
+    /// projection can say WHICH work finished, not just that something
+    /// did.
+    Done { kind: JobKind },
+    /// Dead-lettered (terminal). Keeps the job's kind so dead rows can
+    /// be explained instead of counted: thousands of unlabeled dead
+    /// jobs are noise, the same thousands labeled by kind are a
+    /// diagnosis.
+    Dead { kind: JobKind, reason: DeadReason },
 }
 
 /// A command against a claimed job: the ack of the claim `claim_id` ran. The
@@ -441,7 +447,9 @@ impl EventSourced for JobState {
     type Jobs = Nil;
 
     const PROJECTION: Table = Table("job_queue");
-    const SCHEMA_VERSION: u64 = 1;
+    // 2: terminal states carry the job kind so queue rows stay
+    // attributable after completion or death.
+    const SCHEMA_VERSION: u64 = 2;
     const AGGREGATE_TYPE: &'static str = JOB_AGGREGATE_TYPE;
     const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
@@ -495,7 +503,7 @@ impl EventSourced for JobState {
                 attempt: *attempt,
                 claims: claims + 1,
             },
-            (Self::Claimed { .. }, JobEvent::Succeeded) => Self::Done,
+            (Self::Claimed { kind, .. }, JobEvent::Succeeded) => Self::Done { kind: kind.clone() },
             (
                 Self::Claimed {
                     kind,
@@ -531,11 +539,13 @@ impl EventSourced for JobState {
                 attempt: *attempt,
                 claims: 0,
             },
-            (Self::Pending { .. } | Self::Claimed { .. }, JobEvent::Dead { reason, .. }) => {
-                Self::Dead {
-                    reason: reason.clone(),
-                }
-            }
+            (
+                Self::Pending { kind, .. } | Self::Claimed { kind, .. },
+                JobEvent::Dead { reason, .. },
+            ) => Self::Dead {
+                kind: kind.clone(),
+                reason: reason.clone(),
+            },
             // Any other event for this state is a corrupt stream; surface it
             // loudly rather than silently no-op.
             _ => return Ok(None),
@@ -649,7 +659,7 @@ pub(crate) fn plan_claim(
     let runnable = match &state {
         JobState::Pending { run_at, .. } => run_at.timestamp_millis() <= now_ms,
         JobState::Claimed { .. } => read.lease_until_ms.is_none_or(|lease| lease < now_ms),
-        JobState::Done | JobState::Dead { .. } => false,
+        JobState::Done { .. } | JobState::Dead { .. } => false,
     };
     if !runnable {
         return ClaimDecision::Skip;
@@ -671,7 +681,7 @@ pub(crate) fn plan_claim(
             claims,
             ..
         } => (kind, payload, run_at, attempt, claims),
-        JobState::Done | JobState::Dead { .. } => return ClaimDecision::Skip,
+        JobState::Done { .. } | JobState::Dead { .. } => return ClaimDecision::Skip,
     };
 
     let claim_seq = read.version + 1;
@@ -681,7 +691,7 @@ pub(crate) fn plan_claim(
     };
 
     if claims >= max_claims {
-        return plan_abandon(job_id, claim_seq_usize);
+        return plan_abandon(job_id, &kind, claim_seq_usize);
     }
 
     let Some(lease_until_ms) = now_ms.checked_add(lease_ms) else {
@@ -728,7 +738,7 @@ pub(crate) fn plan_claim(
     }
 }
 
-fn plan_abandon(job_id: &str, claim_seq_usize: usize) -> ClaimDecision<WonClaim> {
+fn plan_abandon(job_id: &str, kind: &JobKind, claim_seq_usize: usize) -> ClaimDecision<WonClaim> {
     let dead = JobEvent::Dead {
         reason: DeadReason::Abandoned,
         error: "claim budget exhausted".to_string(),
@@ -736,6 +746,7 @@ fn plan_abandon(job_id: &str, claim_seq_usize: usize) -> ClaimDecision<WonClaim>
     let (Ok(event), Ok(payload_str)) = (
         dead.serialized(job_id, claim_seq_usize),
         serde_json::to_string(&Lifecycle::<JobState>::Live(JobState::Dead {
+            kind: kind.clone(),
             reason: DeadReason::Abandoned,
         })),
     ) else {
