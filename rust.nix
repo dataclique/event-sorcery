@@ -75,10 +75,16 @@ in
       pname = "event-sorcery-ffi";
       inherit cargoArtifacts;
       cargoExtraArgs = "--locked --package event-sorcery-ffi";
-      installPhaseCommand = ''
-        mkdir -p $out/include $out/lib
-        cp target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/libevent_sorcery_ffi.a $out/lib/
-        cp target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/build/event-sorcery-ffi-*/out/event_sorcery.h $out/include/event_sorcery.h
+      postInstall = ''
+        mkdir -p $out/include
+        cp target/release/build/event-sorcery-ffi-*/out/event_sorcery.h $out/include/event_sorcery.h
+      '';
+      doInstallCheck = true;
+      installCheckPhase = ''
+        runHook preInstallCheck
+        test -s $out/lib/libevent_sorcery_ffi.a
+        test -s $out/include/event_sorcery.h
+        runHook postInstallCheck
       '';
       meta = commonArgs.meta // {
         description = "event-sorcery FFI engine: static library and generated C header";
