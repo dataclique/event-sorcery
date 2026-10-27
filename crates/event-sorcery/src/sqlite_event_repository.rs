@@ -84,24 +84,27 @@ impl PersistedEventRepository for SqliteEventRepository {
             // is returned as stored -- no shape check is needed here, and doing
             // one would only duplicate the deserialize cqrs-es already performs.
             CompactionPolicy::Retain => Ok(Some(snapshot)),
-            // A `CompactAfterSnapshot` aggregate may have lost the events behind
-            // the snapshot, making the snapshot the only durable record of
-            // state. An incompatible payload must surface an error rather than
-            // letting cqrs-es silently rebuild from an incomplete history.
-            CompactionPolicy::CompactAfterSnapshot => match A::deserialize(&snapshot.aggregate) {
-                Ok(_) => Ok(Some(snapshot)),
-                Err(source) => {
-                    warn!(
-                        target: "cqrs",
-                        aggregate_type = A::TYPE,
-                        aggregate_id,
-                        %source,
-                        "Incompatible snapshot for a compactable aggregate cannot be \
-                         safely rebuilt from events; surfacing error"
-                    );
-                    Err(EngineError::Json(source).into())
+            // A compacting aggregate (full or windowed) may have lost the
+            // events behind the snapshot, making the snapshot the only
+            // durable record of state. An incompatible payload must surface
+            // an error rather than letting cqrs-es silently rebuild from an
+            // incomplete history.
+            CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => {
+                match A::deserialize(&snapshot.aggregate) {
+                    Ok(_) => Ok(Some(snapshot)),
+                    Err(source) => {
+                        warn!(
+                            target: "cqrs",
+                            aggregate_type = A::TYPE,
+                            aggregate_id,
+                            %source,
+                            "Incompatible snapshot for a compactable aggregate cannot be \
+                             safely rebuilt from events; surfacing error"
+                        );
+                        Err(EngineError::Json(source).into())
+                    }
                 }
-            },
+            }
         }
     }
 

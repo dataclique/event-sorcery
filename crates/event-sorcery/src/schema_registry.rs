@@ -205,12 +205,17 @@ impl Reconciler {
             return Ok(SchemaReconciliation::Unchanged);
         }
 
-        if stored_version.is_some() && target.compaction == CompactionPolicy::CompactAfterSnapshot {
-            return Err(ReconcileError::CompactedSnapshotClear {
-                aggregate: target.aggregate_type.clone(),
-                old_version: stored_version,
-                new_version: target.version,
-            });
+        if stored_version.is_some() {
+            match target.compaction {
+                CompactionPolicy::Retain => {}
+                CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => {
+                    return Err(ReconcileError::CompactedSnapshotClear {
+                        aggregate: target.aggregate_type.clone(),
+                        old_version: stored_version,
+                        new_version: target.version,
+                    });
+                }
+            }
         }
 
         sqlx::query!(
@@ -579,6 +584,40 @@ mod tests {
         let outcome = reconciler.reconcile::<CompactableWidget>().await.unwrap();
 
         assert_eq!(outcome, SchemaReconciliation::Changed);
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_schema_changes_for_windowed_compaction() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
+        let reconciler = Reconciler::new(pool);
+        let original = SchemaTarget::new(
+            "WindowedWidget",
+            1,
+            CompactionPolicy::RetainLast { events: 2 },
+        );
+        assert_eq!(
+            reconciler.reconcile_target(&original).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        reconciler.record_target(&original).await.unwrap();
+        let changed = SchemaTarget::new(
+            "WindowedWidget",
+            2,
+            CompactionPolicy::RetainLast { events: 2 },
+        );
+
+        let error = reconciler.reconcile_target(&changed).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ReconcileError::CompactedSnapshotClear {
+                aggregate,
+                old_version: Some(1),
+                new_version: 2,
+            } if aggregate == "WindowedWidget"
+        ));
+        let registry = reconciler.load_registry().await.unwrap().unwrap();
+        assert_eq!(registry.version_of("WindowedWidget"), Some(1));
     }
 
     #[tokio::test]
