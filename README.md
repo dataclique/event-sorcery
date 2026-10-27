@@ -58,10 +58,23 @@ explaining what it covers. Run any of them with
 ## Development
 
 ```bash
-nix develop          # rust toolchain + sqlx-cli + cargo-nextest
+nix develop --impure # devenv shell: Rust, GHC, Stack and development tools
 cargo check --workspace
 cargo nextest run --workspace
 ```
+
+The flake pins nixpkgs and the Rust overlay directly. Crane builds the Rust
+workspace and the FFI engine used by the Haskell package. The devenv shell needs
+`--impure` to resolve its working directory; standalone package and hook builds
+remain pure:
+
+```bash
+nix build --no-link .#rust .#engine .#haskell
+nix build --no-link .#checks.aarch64-darwin.formatting
+```
+
+Use your platform's system name for the hook check (`x86_64-linux` in CI).
+Development-shell state lives under `.tmp/devenv/`.
 
 See [AGENTS.md](AGENTS.md) for contribution conventions.
 

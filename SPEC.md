@@ -424,6 +424,11 @@ development shell includes the Rust toolchain, Stack, GHC 9.14.1 via the
 Stack-compatible Nix toolchain workaround, cbindgen, Fourmolu, HLint, and the
 native libraries required to link the engine.
 
+The flake pins nixpkgs and rust-overlay directly and builds Rust packages with
+Crane. The devenv development shell is entered with `nix develop --impure` and
+keeps its state under `.tmp/devenv/`. Standalone package and hook checks MUST
+remain evaluable without impure development-shell configuration.
+
 `.envrc` uses nix-direnv. Git hooks are declared with `git-hooks.nix` and run
 through `prek`. Hooks include fast formatting and static file checks only;
 `cargo check` and Clippy are CI checks and MUST NOT be git hooks.

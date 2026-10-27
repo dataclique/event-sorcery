@@ -281,10 +281,14 @@ use `<dep>.workspace = true` (with optional per-crate features added on top).
 
 ### Nix Development Environment
 
-- `nix develop` - Enter development shell. Provides the rust toolchain,
-  `sqlx-cli`, `cargo-expand`, `cargo-nextest`, and the pre-commit hooks listed
-  in `.pre-commit-config.yaml`. Built on top of `rainix` for shared Rust
-  tooling.
+- `nix develop --impure` - Enter the devenv shell. Provides the pinned Rust
+  toolchain, GHC, Stack, `sqlx-cli`, `cargo-expand`, `cargo-nextest`, and the
+  hooks declared in `git-hooks.nix`. Shell state lives under `.tmp/devenv/`.
+- The flake pins nixpkgs and rust-overlay directly; Crane builds Rust and FFI
+  packages. Standalone package and formatting-check builds remain pure.
+- CI runs `nix develop --impure` for shell commands and builds
+  `checks.x86_64-linux.formatting` directly for hooks; hooks never need the
+  development shell.
 
 ### Generated paths
 

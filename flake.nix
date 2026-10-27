@@ -2,27 +2,53 @@
   description = "event-sorcery: one Rust engine with Rust and Haskell bindings";
 
   inputs = {
-    rainix.url = "github:rainprotocol/rainix";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
     but-nix.url = "github:dataclique/but.nix";
 
     git-hooks.url = "github:cachix/git-hooks.nix";
-    git-hooks.inputs.nixpkgs.follows = "rainix/nixpkgs";
+    git-hooks.inputs.nixpkgs.follows = "nixpkgs";
+
+    devenv.url = "github:cachix/devenv";
+    devenv.inputs = {
+      nixpkgs.follows = "nixpkgs";
+      git-hooks.follows = "git-hooks";
+    };
+
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
     {
       self,
+      nixpkgs,
       but-nix,
       flake-utils,
       git-hooks,
-      rainix,
+      devenv,
+      rust-overlay,
+      crane,
       ...
-    }:
+    }@inputs:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = rainix.pkgs.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        };
+        rustToolchain = pkgs.rust-bin.stable.latest.default;
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+        rustPkgs = pkgs.callPackage ./rust.nix { inherit craneLib; };
+        rustBuildInputs = [
+          rustToolchain
+          pkgs.stdenv.cc
+          pkgs.pkg-config
+          pkgs.openssl.dev
+          pkgs.sqlite.dev
+        ];
         checkExamples = pkgs.writeShellApplication {
           name = "check-examples";
           meta = {
@@ -36,6 +62,13 @@
           ];
           text = ''
             export CARGO_INCREMENTAL=0
+            export SQLX_OFFLINE=true
+            export PKG_CONFIG_PATH="${
+              pkgs.lib.makeSearchPath "lib/pkgconfig" [
+                pkgs.openssl.dev
+                pkgs.sqlite.dev
+              ]
+            }"
             exec nu ${./scripts/check-examples.nu}
           '';
         };
@@ -46,6 +79,7 @@
             microstache = pkgs.haskell.lib.doJailbreak previous.microstache;
           };
         };
+        ffiEngine = rustPkgs.engine;
         haskellBinding = pkgs.haskell.lib.overrideSrc (haskellPackages.callPackage
           ./nix/event-sorcery-haskell.nix
           {
@@ -56,88 +90,26 @@
         haskellBenchmarks = (pkgs.haskell.lib.doBenchmark haskellBinding).overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
             mkdir -p $out/bin
-            cp \
-              dist/build/event-sorcery-benchmarks/event-sorcery-benchmarks \
-              $out/bin/
+            cp dist/build/event-sorcery-benchmarks/event-sorcery-benchmarks $out/bin/
           '';
         });
-        rustBuildInputs = rainix.rust-build-inputs.${system};
-        rustToolchain = rainix.rust-toolchain.${system};
-        rustWorkspace = pkgs.rustPlatform.buildRustPackage {
-          pname = "event-sorcery-workspace";
-          version = "0.4.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          cargoBuildFlags = [
-            "--workspace"
-            "--all-targets"
-            "--all-features"
-          ];
-          nativeBuildInputs = rustBuildInputs;
-
-          meta = {
-            description = "Event Sorcery Rust workspace";
-            license = pkgs.lib.licenses.mit;
-            platforms = pkgs.lib.platforms.unix;
-          };
-        };
-        engineSource = pkgs.runCommand "event-sorcery-engine-source" { } ''
-          mkdir -p $out/bindings/haskell
-          cp ${./Cargo.toml} $out/Cargo.toml
-          cp ${./Cargo.lock} $out/Cargo.lock
-          cp -R ${./crates} $out/crates
-          cp -R ${./.sqlx} $out/.sqlx
-          cp -R ${./bindings/haskell/conformance} $out/bindings/haskell/conformance
-        '';
-        ffiEngine = pkgs.rustPlatform.buildRustPackage {
-          pname = "event-sorcery-ffi";
-          version = "0.4.0";
-          src = engineSource;
-          cargoLock.lockFile = ./Cargo.lock;
-          cargoBuildFlags = [
-            "--package"
-            "event-sorcery-ffi"
-          ];
-          cargoTestFlags = [
-            "--package"
-            "event-sorcery-ffi"
-          ];
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out/include $out/lib
-            cp \
-              target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/libevent_sorcery_ffi.a \
-              $out/lib/
-            cp \
-              target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/build/event-sorcery-ffi-*/out/event_sorcery.h \
-              $out/include/event_sorcery.h
-            runHook postInstall
-          '';
-
-          meta = {
-            description = "event-sorcery FFI engine: static library and C header";
-            license = pkgs.lib.licenses.mit;
-            platforms = pkgs.lib.platforms.unix;
-          };
-        };
-        hooks = import ./git-hooks.nix {
-          inherit
-            git-hooks
-            pkgs
-            rustToolchain
-            self
-            system
-            ;
+        hooks = import ./git-hooks.nix { inherit pkgs rustToolchain; };
+        hookCheck = git-hooks.lib.${system}.run {
+          src = self;
+          package = pkgs.prek;
+          inherit hooks;
         };
       in
       {
-        packages = rainix.packages.${system} // {
+        packages = {
           check-examples = checkExamples;
           inherit but;
           engine = ffiEngine;
           haskell = haskellBinding;
           haskell-benchmarks = haskellBenchmarks;
-          rust = rustWorkspace;
+          rust = rustPkgs.package;
+          rust-test = rustPkgs.test;
+          rust-clippy = rustPkgs.clippy;
         };
 
         apps.check-examples = {
@@ -145,53 +117,96 @@
           program = pkgs.lib.getExe checkExamples;
           meta = checkExamples.meta;
         };
-
-        checks = {
-          formatting = hooks;
-          haskell = haskellBinding;
-          rust = rustWorkspace;
-        };
-
         apps.haskell-benchmarks = {
           type = "app";
           program = "${haskellBenchmarks}/bin/event-sorcery-benchmarks";
           meta = haskellBenchmarks.meta;
         };
 
-        devShells.default = pkgs.mkShell {
-          nativeBuildInputs =
-            rustBuildInputs
-            ++ hooks.enabledPackages
-            ++ [
-              but
-              haskellPackages.ghc
-              pkgs.cabal-install
-              pkgs.cargo-expand
-              pkgs.cargo-nextest
-              pkgs.rust-cbindgen
-              pkgs.fourmolu
-              pkgs.haskellPackages.cabal-fmt
-              pkgs.hlint
-              pkgs.nixfmt
-              pkgs.nushell
-              pkgs.prek
-              pkgs.sqlite
-              pkgs.sqlx-cli
-              pkgs.stack
-            ];
+        checks = {
+          formatting = hookCheck;
+          haskell = haskellBinding;
+          rust = rustPkgs.package;
+          rust-test = rustPkgs.test;
+          rust-clippy = rustPkgs.clippy;
+          package-version =
+            let
+              expected = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+              versions = map (package: package.version) [
+                rustPkgs.package
+                rustPkgs.engine
+                rustPkgs.test
+                rustPkgs.clippy
+              ];
+            in
+            assert pkgs.lib.assertMsg (builtins.all (
+              version: version == expected
+            ) versions) "Rust package versions must match the workspace manifest.";
+            pkgs.writeText "event-sorcery-package-version" expected;
+        };
 
-          shellHook = ''
-            ${hooks.shellHook}
-
-            hooks_dir="$(git rev-parse --git-path hooks)"
-
-            if grep -q 'generated by prek' "$hooks_dir"/pre-commit 2>/dev/null; then
-              if grep -q GITBUTLER_MANAGED_HOOK_V1 "$hooks_dir"/pre-commit.legacy 2>/dev/null; then
-                mv "$hooks_dir"/pre-commit "$hooks_dir"/pre-commit-user
-                mv "$hooks_dir"/pre-commit.legacy "$hooks_dir"/pre-commit
-              fi
-            fi
-          '';
+        devShells.default = devenv.lib.mkShell {
+          inherit inputs pkgs;
+          modules = [
+            (
+              { config, ... }:
+              {
+                devenv.dotfile = "${config.devenv.root}/.tmp/devenv";
+                packages = [
+                  but
+                  pkgs.git
+                  pkgs.pkg-config
+                  pkgs.openssl.dev
+                  pkgs.sqlite.dev
+                  pkgs.sqlite
+                  haskellPackages.ghc
+                  pkgs.cabal-install
+                  pkgs.cargo-expand
+                  pkgs.cargo-nextest
+                  pkgs.rust-cbindgen
+                  pkgs.fourmolu
+                  pkgs.haskellPackages.cabal-fmt
+                  pkgs.hlint
+                  pkgs.nixfmt
+                  pkgs.nushell
+                  pkgs.prek
+                  pkgs.sqlx-cli
+                  pkgs.stack
+                ];
+                languages = {
+                  nix.enable = true;
+                  rust = {
+                    enable = true;
+                    toolchain.rustc = rustToolchain;
+                    toolchain.cargo = rustToolchain;
+                    toolchain.rustfmt = rustToolchain;
+                    toolchain.clippy = rustToolchain;
+                  };
+                };
+                env = {
+                  SQLX_OFFLINE = "true";
+                  CARGO_INCREMENTAL = "0";
+                };
+                git-hooks = {
+                  inherit hooks;
+                  package = pkgs.prek;
+                };
+                tasks."event-sorcery:gitbutler-hooks" = {
+                  after = [ "devenv:git-hooks:install" ];
+                  before = [ "devenv:enterShell" ];
+                  exec = ''
+                    hooks_dir="$(git rev-parse --git-path hooks)"
+                    if grep -q 'generated by prek' "$hooks_dir"/pre-commit 2>/dev/null; then
+                      if grep -q GITBUTLER_MANAGED_HOOK_V1 "$hooks_dir"/pre-commit.legacy 2>/dev/null; then
+                        mv "$hooks_dir"/pre-commit "$hooks_dir"/pre-commit-user
+                        mv "$hooks_dir"/pre-commit.legacy "$hooks_dir"/pre-commit
+                      fi
+                    fi
+                  '';
+                };
+              }
+            )
+          ];
         };
 
         formatter = pkgs.nixfmt-tree;
