@@ -1,6 +1,11 @@
+//! SQLite repository adapter with ordered read-time event upcasting.
+
+use std::sync::Arc;
+
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{
-    PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot,
+    EventUpcaster, PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent,
+    SerializedSnapshot,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -17,6 +22,10 @@ pub struct SqliteEventRepository {
     engine: Engine,
     compaction_policy: CompactionPolicy,
     stream_channel_size: usize,
+    /// Applied in registration order to every event on the way out of the
+    /// store, so a persisted event whose shape predates the current one is
+    /// read as the current shape.
+    upcasters: Arc<Vec<Arc<dyn EventUpcaster>>>,
 }
 
 impl SqliteEventRepository {
@@ -25,7 +34,20 @@ impl SqliteEventRepository {
             engine: Engine::new(pool),
             compaction_policy,
             stream_channel_size: 1000,
+            upcasters: Arc::new(Vec::new()),
         }
+    }
+
+    /// Registers the upcasters every load and replay applies, in order.
+    ///
+    /// Order is the contract, not an implementation detail: a chain that
+    /// carries an event from v1 to v3 must register the v1->v2 step before
+    /// the v2->v3 one, because each step sees the event as the previous step
+    /// left it.
+    #[must_use]
+    pub fn with_upcasters(mut self, upcasters: Vec<Arc<dyn EventUpcaster>>) -> Self {
+        self.upcasters = Arc::new(upcasters);
+        self
     }
 
     /// Stream events from the `events` table for replay.
@@ -37,10 +59,12 @@ impl SqliteEventRepository {
     /// handles this correctly via snapshot loading, but
     /// stream-based replay will miss snapshot-only entities.
     fn stream_events_impl<A: Aggregate>(&self, aggregate_id: Option<&str>) -> ReplayStream {
+        let upcasters = Arc::clone(&self.upcasters);
         self.engine.stream_events(
             A::TYPE,
             aggregate_id.map(String::from),
             self.stream_channel_size,
+            move |event| upcast_event(event, &upcasters),
         )
     }
 }
@@ -51,7 +75,13 @@ impl PersistedEventRepository for SqliteEventRepository {
         aggregate_id: &str,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
         let stream = StreamIdentity::new(A::TYPE, aggregate_id);
-        Ok(self.engine.load_events(&stream, None).await?)
+        Ok(self
+            .engine
+            .load_events(&stream, None)
+            .await?
+            .into_iter()
+            .map(|event| upcast_event(event, &self.upcasters))
+            .collect())
     }
 
     async fn get_last_events<A: Aggregate>(
@@ -63,7 +93,10 @@ impl PersistedEventRepository for SqliteEventRepository {
         Ok(self
             .engine
             .load_events(&stream, Some(last_sequence))
-            .await?)
+            .await?
+            .into_iter()
+            .map(|event| upcast_event(event, &self.upcasters))
+            .collect())
     }
 
     async fn get_snapshot<A: Aggregate>(
@@ -145,6 +178,28 @@ impl PersistedEventRepository for SqliteEventRepository {
     }
 }
 
+/// Walks one event through the registered upcasters, in order.
+///
+/// Each upcaster re-examines the event AFTER earlier ones have run, so a
+/// chain can carry an event forward across several versions in one load
+/// (v1 -> v2 -> v3) rather than only one hop per deployment.
+///
+/// An upcaster changes SHAPE, never facts: it exists because a persisted
+/// event predates a field, not because the recorded history was wrong. Data
+/// that was never observed cannot be invented here -- a gap in the record is
+/// a different problem, and one an upcaster has nothing to work from.
+fn upcast_event(
+    mut event: SerializedEvent,
+    upcasters: &[Arc<dyn EventUpcaster>],
+) -> SerializedEvent {
+    for upcaster in upcasters {
+        if upcaster.can_upcast(&event.event_type, &event.event_version) {
+            event = upcaster.upcast(event);
+        }
+    }
+    event
+}
+
 #[cfg(test)]
 mod tests {
     //! Repository integration coverage for atomic engine delegation.
@@ -154,6 +209,9 @@ mod tests {
     use cqrs_es::{AggregateContext, AggregateError, DomainEvent, EventStore};
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
 
     use sqlite_es::testing::create_test_pool;
 
@@ -519,33 +577,247 @@ mod tests {
     /// The policy alone decides this -- no inspection of the event rows.
     #[tokio::test]
     async fn incompatible_snapshot_preserved_for_compactable_entity() {
+        for policy in [
+            CompactionPolicy::CompactAfterSnapshot,
+            CompactionPolicy::RetainLast { events: 2 },
+        ] {
+            let pool = create_test_pool().await.unwrap();
+            let repo = SqliteEventRepository::new(pool.clone(), policy);
+
+            repo.persist::<TestAggregate>(
+                &covering_events("agg-compacted", 3),
+                Some((
+                    "agg-compacted".to_string(),
+                    serde_json::json!({"events": "not-a-list"}),
+                    1,
+                )),
+            )
+            .await
+            .unwrap();
+
+            let result = repo.get_snapshot::<TestAggregate>("agg-compacted").await;
+            assert!(matches!(
+                result,
+                Err(PersistenceError::DeserializationError(_))
+            ));
+
+            let remaining: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM snapshots WHERE aggregate_id = 'agg-compacted'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(remaining, 1);
+        }
+    }
+
+    /// Stamps a marker into the payload so a test can see it ran, and bumps
+    /// the version so the NEXT upcaster in the chain recognises its input.
+    struct StampVersion {
+        from: &'static str,
+        to: &'static str,
+    }
+
+    impl EventUpcaster for StampVersion {
+        fn can_upcast(&self, _event_type: &str, event_version: &str) -> bool {
+            event_version == self.from
+        }
+
+        fn upcast(&self, mut event: SerializedEvent) -> SerializedEvent {
+            if let Value::Object(payload) = &mut event.payload {
+                payload.insert(
+                    format!("upcast_{}_{}", self.from, self.to),
+                    Value::Bool(true),
+                );
+            }
+            event.event_version = self.to.to_string();
+            event
+        }
+    }
+
+    // A chain must carry an event across SEVERAL versions in one load, not
+    // one hop per deployment: each upcaster examines the event as the
+    // previous one left it, so v1 -> v2 -> v3 resolves in a single read.
+    #[tokio::test]
+    async fn upcasters_chain_across_versions_on_load() {
         let pool = create_test_pool().await.unwrap();
-        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::CompactAfterSnapshot);
+        let writer = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+        // An object payload, as a real enum-variant event serializes to --
+        // the shared fixture persists a bare JSON string, which an upcaster
+        // adding a FIELD has nowhere to put it.
+        let persisted = SerializedEvent {
+            aggregate_type: TestAggregate::TYPE.to_string(),
+            aggregate_id: "agg-upcast".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({ "Created": {} }),
+            metadata: serde_json::json!({}),
+        };
+        writer
+            .persist::<TestAggregate>(&[persisted], None)
+            .await
+            .unwrap();
 
-        repo.persist::<TestAggregate>(
-            &covering_events("agg-compacted", 3),
-            Some((
-                "agg-compacted".to_string(),
-                serde_json::json!({"events": "not-a-list"}),
-                1,
-            )),
-        )
-        .await
-        .unwrap();
+        let reader = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain)
+            .with_upcasters(vec![
+                Arc::new(StampVersion {
+                    from: "1.0",
+                    to: "2.0",
+                }),
+                Arc::new(StampVersion {
+                    from: "2.0",
+                    to: "3.0",
+                }),
+            ]);
 
-        let result = repo.get_snapshot::<TestAggregate>("agg-compacted").await;
-        assert!(matches!(
-            result,
-            Err(PersistenceError::DeserializationError(_))
-        ));
+        let events = reader
+            .get_events::<TestAggregate>("agg-upcast")
+            .await
+            .unwrap();
 
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM snapshots WHERE aggregate_id = 'agg-compacted'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(remaining, 1);
+        let event = events.first().expect("the persisted event loads");
+        assert_eq!(
+            event.event_version, "3.0",
+            "both hops ran, so the event arrives at the current version"
+        );
+        assert_eq!(
+            event.payload.get("upcast_1.0_2.0"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            event.payload.get("upcast_2.0_3.0"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    // A store with no upcasters registered must read exactly what was
+    // written -- the mechanism is opt-in and cannot alter existing history.
+    #[tokio::test]
+    async fn no_upcasters_leaves_the_event_untouched() {
+        let pool = create_test_pool().await.unwrap();
+        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+        repo.persist::<TestAggregate>(&covering_events("agg-plain", 1), None)
+            .await
+            .unwrap();
+
+        let events = repo.get_events::<TestAggregate>("agg-plain").await.unwrap();
+
+        let event = events.first().expect("the persisted event loads");
+        assert_eq!(event.event_version, "1.0");
+        assert_eq!(event.payload.get("upcast_1.0_2.0"), None);
+    }
+
+    #[tokio::test]
+    async fn dropping_replay_releases_the_engine_connection() {
+        let pool = create_test_pool().await.unwrap();
+        let repository = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+        repository
+            .persist::<TestAggregate>(&covering_events("cancelled", 3), None)
+            .await
+            .unwrap();
+        let started = Arc::new(Notify::new());
+        let producer_started = Arc::clone(&started);
+        let replay = repository.engine.stream_events(
+            TestAggregate::TYPE,
+            Some("cancelled".to_string()),
+            1,
+            move |event| {
+                producer_started.notify_one();
+                event
+            },
+        );
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        drop(replay);
+        let connection = timeout(Duration::from_secs(1), pool.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            repository
+                .get_events::<TestAggregate>("cancelled")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    struct RenameLegacyEvent {
+        from: &'static str,
+        to: &'static str,
+        payload: &'static str,
+    }
+
+    impl EventUpcaster for RenameLegacyEvent {
+        fn can_upcast(&self, event_type: &str, event_version: &str) -> bool {
+            event_type == "Created" && event_version == self.from
+        }
+
+        fn upcast(&self, mut event: SerializedEvent) -> SerializedEvent {
+            event.event_version = self.to.to_string();
+            event.payload = serde_json::json!(self.payload);
+            event
+        }
+    }
+
+    #[tokio::test]
+    async fn upcasters_apply_to_suffix_and_both_replay_paths_without_rewriting_history() {
+        let pool = create_test_pool().await.unwrap();
+        let writer = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+        let mut legacy = covering_events("legacy", 2);
+        for event in &mut legacy {
+            event.payload = serde_json::json!("LegacyCreated");
+        }
+        writer
+            .persist::<TestAggregate>(&legacy, None)
+            .await
+            .unwrap();
+        let reader =
+            SqliteEventRepository::new(pool, CompactionPolicy::Retain).with_upcasters(vec![
+                Arc::new(RenameLegacyEvent {
+                    from: "1.0",
+                    to: "2.0",
+                    payload: "IntermediateCreated",
+                }),
+                Arc::new(RenameLegacyEvent {
+                    from: "2.0",
+                    to: "3.0",
+                    payload: "Created",
+                }),
+            ]);
+
+        let suffix = reader
+            .get_last_events::<TestAggregate>("legacy", 1)
+            .await
+            .unwrap();
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].sequence, 2);
+        assert_eq!(suffix[0].event_version, "3.0");
+        assert_eq!(suffix[0].payload, serde_json::json!("Created"));
+
+        let mut replay = reader
+            .stream_events::<TestAggregate>("legacy")
+            .await
+            .unwrap();
+        let mut all = reader.stream_all_events::<TestAggregate>().await.unwrap();
+        for sequence in 1..=2 {
+            let event = replay.next::<TestAggregate>(&[]).await.unwrap().unwrap();
+            assert_eq!(event.sequence, sequence);
+            assert_eq!(event.payload, TestEvent::Created);
+            let event = all.next::<TestAggregate>(&[]).await.unwrap().unwrap();
+            assert_eq!(event.sequence, sequence);
+            assert_eq!(event.payload, TestEvent::Created);
+        }
+        assert!(replay.next::<TestAggregate>(&[]).await.is_none());
+        assert!(all.next::<TestAggregate>(&[]).await.is_none());
+        assert_eq!(
+            writer.get_events::<TestAggregate>("legacy").await.unwrap(),
+            legacy
+        );
     }
 
     /// End-to-end: loading a `Retain` aggregate whose snapshot is incompatible
@@ -593,28 +865,33 @@ mod tests {
     /// recovery, which fires only on `Ok(Some(..))`/`Ok(None)`).
     #[tokio::test]
     async fn load_aggregate_errors_for_compactable_entity_with_incompatible_snapshot() {
-        let pool = create_test_pool().await.unwrap();
-        let repo = SqliteEventRepository::new(pool.clone(), CompactionPolicy::CompactAfterSnapshot);
+        for policy in [
+            CompactionPolicy::CompactAfterSnapshot,
+            CompactionPolicy::RetainLast { events: 2 },
+        ] {
+            let pool = create_test_pool().await.unwrap();
+            let repo = SqliteEventRepository::new(pool.clone(), policy);
 
-        repo.persist::<TestAggregate>(
-            &covering_events("agg-compact-load", 3),
-            Some((
-                "agg-compact-load".to_string(),
-                serde_json::json!({"events": "not-a-list"}),
-                1,
-            )),
-        )
-        .await
-        .unwrap();
+            repo.persist::<TestAggregate>(
+                &covering_events("agg-compact-load", 3),
+                Some((
+                    "agg-compact-load".to_string(),
+                    serde_json::json!({"events": "not-a-list"}),
+                    1,
+                )),
+            )
+            .await
+            .unwrap();
 
-        let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(
-            SqliteEventRepository::new(pool.clone(), CompactionPolicy::CompactAfterSnapshot),
-            100,
-        );
-        let result = store.load_aggregate("agg-compact-load").await;
-        assert!(matches!(
-            result,
-            Err(AggregateError::DeserializationError(_))
-        ));
+            let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(
+                SqliteEventRepository::new(pool.clone(), policy),
+                100,
+            );
+            let result = store.load_aggregate("agg-compact-load").await;
+            assert!(matches!(
+                result,
+                Err(AggregateError::DeserializationError(_))
+            ));
+        }
     }
 }
