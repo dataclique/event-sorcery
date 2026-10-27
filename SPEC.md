@@ -17,11 +17,9 @@ typed language surfaces:
 - the current native Rust API; and
 - an idiomatic Haskell binding over a versioned C ABI.
 
-This specification governs the experimental fork hosted in the `dataclique`
-GitHub organization. The original Event Sorcery project remains owned and
-maintained by ST0x, with contributions from Data Clique Software Design FZCO
-and other contributors. Experimental bindings in this fork are not part of the
-ST0x project unless ST0x adopts them separately.
+Data Clique Software Design FZCO maintains the open-source
+`dataclique/event-sorcery` repository governed by this specification. The project
+began as a fork of the ST0x implementation.
 
 The shared engine MUST be extracted from the implementation already present in
 this repository. It MUST continue to build on:
@@ -423,6 +421,11 @@ The repository is managed with Nix. The flake consumes the shared external
 development shell includes the Rust toolchain, Stack, GHC 9.14.1 via the
 Stack-compatible Nix toolchain workaround, cbindgen, Fourmolu, HLint, and the
 native libraries required to link the engine.
+
+The flake pins nixpkgs and rust-overlay directly and builds Rust packages with
+Crane. The devenv development shell is entered with `nix develop --impure` and
+keeps its state under `.tmp/devenv/`. Standalone package and hook checks MUST
+remain evaluable without impure development-shell configuration.
 
 `.envrc` uses nix-direnv. Git hooks are declared with `git-hooks.nix` and run
 through `prek`. Hooks include fast formatting and static file checks only;
