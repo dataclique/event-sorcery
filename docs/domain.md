@@ -108,8 +108,9 @@ event log.
 ### Compaction
 
 Optional deletion of events at or before a snapshot's sequence number. Trades
-replay latency for storage. Per-aggregate `CompactionPolicy`: `Retain` (default,
-safe) or `CompactAfterSnapshot`. Compaction never crosses snapshot boundaries.
+replay latency for storage. Each aggregate explicitly selects its
+`CompactionPolicy`: `Retain` keeps all events; compaction policies can delete
+snapshotted history. Compaction never crosses snapshot boundaries.
 
 ### Reactor
 

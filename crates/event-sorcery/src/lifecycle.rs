@@ -378,7 +378,7 @@ mod tests {
         IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS,
         RetryOnBusy, backoff_delay_ms,
     };
-    use crate::{EventSourced, Nil, uneventful};
+    use crate::{CompactionPolicy, EventSourced, Nil, uneventful};
 
     /// Test entity: a simple counter with controllable error behavior.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,7 +433,9 @@ mod tests {
 
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "Counter";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
         fn originate(event: &CounterEvent) -> Option<Self> {
             match event {

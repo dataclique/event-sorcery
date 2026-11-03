@@ -1,5 +1,5 @@
 //! `Inventory` aggregate: stock-on-hand per SKU with a materialized view.
-//! Keeps the default `CompactionPolicy::Retain` -- the projection's
+//! Explicitly selects `CompactionPolicy::Retain` -- the projection's
 //! `rebuild_all` reads from the events table, so compacted entities would
 //! be invisible to the rebuild path. See `Order` for the compactable case.
 
@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
-use event_sorcery::{Effect, EventSourced, Nil, Table, fx};
+use event_sorcery::{CompactionPolicy, Effect, EventSourced, Nil, Table, fx};
 
 /// Stock-keeping unit. Used both as `Inventory::Id` and as the foreign-key
 /// payload on `Order::item`, so the two entities share an identifier currency.
@@ -88,7 +88,9 @@ impl EventSourced for Inventory {
 
     const PROJECTION: Table = Table("inventory_view");
     const SCHEMA_VERSION: u64 = 1;
+    const SNAPSHOT_SIZE: usize = 10;
     const AGGREGATE_TYPE: &'static str = "Inventory";
+    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
     fn originate(event: &InventoryEvent) -> Option<Self> {
         use InventoryEvent::{Consumed, Initialized, Restocked};

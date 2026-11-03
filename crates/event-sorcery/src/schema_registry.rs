@@ -103,7 +103,9 @@ impl EventSourced for SchemaRegistry {
 
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
+    const SNAPSHOT_SIZE: usize = 10;
     const AGGREGATE_TYPE: &'static str = "SchemaRegistry";
+    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         let SchemaRegistryEvent::VersionUpdated { name, version } = event;
@@ -547,6 +549,7 @@ mod tests {
 
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 2;
+        const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "CompactableWidget";
         const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
 

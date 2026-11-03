@@ -17,9 +17,9 @@ use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 
 use event_sorcery::{
-    Column, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect, EventSourced,
-    Job, JobContext, JobFailure, JobOutcome, Label, Never, Reconciliation, StandaloneJob, Table,
-    fx,
+    Column, CompactionPolicy, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob,
+    Effect, EventSourced, Job, JobContext, JobFailure, JobOutcome, Label, Never, Reconciliation,
+    StandaloneJob, Table, fx,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -215,6 +215,7 @@ impl StandaloneJob for SweepStaleTickets {
 
     const WORKER_NAME: &'static str = "sweep-stale-tickets";
     const KIND: &'static str = "sweep-stale-tickets";
+    const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
 
     fn label(&self) -> Label {
         Label::new("sweep-stale-tickets")
@@ -241,7 +242,9 @@ impl EventSourced for SupportTicket {
 
     const PROJECTION: Table = Table("support_ticket_view");
     const SCHEMA_VERSION: u64 = 2;
+    const SNAPSHOT_SIZE: usize = 10;
     const AGGREGATE_TYPE: &'static str = "SupportTicket";
+    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
     fn originate(event: &SupportTicketEvent) -> Option<Self> {
         use SupportTicketEvent::{AwaitingCustomer, Dispatch, Opened};

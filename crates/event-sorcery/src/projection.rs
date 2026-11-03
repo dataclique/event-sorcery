@@ -694,7 +694,7 @@ mod tests {
     use super::*;
     use crate::Nil;
     use crate::lifecycle::Never;
-    use crate::{Effect, uneventful};
+    use crate::{CompactionPolicy, Effect, uneventful};
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct TestEntity {
@@ -724,7 +724,9 @@ mod tests {
 
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "TestEntity";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
         fn originate(_event: &TestEvent) -> Option<Self> {
             Some(Self {
@@ -1400,7 +1402,9 @@ mod tests {
 
         const PROJECTION: Table = Table("counter_view");
         const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "Counter";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
         fn originate(event: &CounterEvent) -> Option<Self> {
             match event {

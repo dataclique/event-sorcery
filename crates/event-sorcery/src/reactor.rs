@@ -318,7 +318,7 @@ mod tests {
     use crate::dependency::{Cons, Nil, OneOf};
     use crate::lifecycle::Never;
     use crate::projection::ProjectionError;
-    use crate::{Effect, EventSourced, uneventful};
+    use crate::{CompactionPolicy, Effect, EventSourced, uneventful};
 
     /// Minimal [`DatabaseError`] impl so tests don't need real SQLite lock
     /// contention -- just a stand-in with a controllable extended result code.
@@ -708,7 +708,9 @@ mod tests {
 
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "TestEntity";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
         fn originate(_event: &TestEvent) -> Option<Self> {
             Some(Self {

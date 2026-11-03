@@ -80,7 +80,9 @@ impl EventSourced for MyEntity {
 
     const PROJECTION: Table = Table("my_entity_view");
     const SCHEMA_VERSION: u64 = 1;
+    const SNAPSHOT_SIZE: usize = 10;
     const AGGREGATE_TYPE: &'static str = "MyEntity";
+    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
     // Event-side: reconstruct state from events
     fn originate(event: &Self::Event) -> Option<Self> { /* ... */ }
@@ -94,6 +96,9 @@ impl EventSourced for MyEntity {
         -> Result<Effect<Self>, Self::Error> { /* ... */ }
 }
 ```
+
+Every entity chooses `SNAPSHOT_SIZE` and `COMPACTION_POLICY` explicitly. The
+interval `10` above is a selected value, not a library fallback.
 
 `Jobs` is the type-level list of `Job`s the entity may dispatch -- written with
 the `jobs!` macro (`jobs![ChargeCard, SendReceipt]`), or `Nil` for none. A
@@ -437,7 +442,9 @@ below for the worker wiring; the `Desk` entity in `dispatch.rs`'s tests and both
 
 Origin-less background work (reactor sweeps, pollers, startup recovery)
 implements `StandaloneJob` (a plain `perform`) and is enqueued directly with
-`JobRuntime::enqueue` (ADR-0007) -- never from a command handler.
+`JobRuntime::enqueue` (ADR-0007) -- never from a command handler. Each direct
+`StandaloneJob` implementation also declares its `TERMINAL_FAILURE_MSG`
+explicitly.
 
 ## Schema Versioning
 
