@@ -6,10 +6,11 @@
 
 ## Context
 
-`EventSourced` supplies a snapshot interval of `10` and a `Retain` compaction
-policy when an implementation omits those constants. `StandaloneJob` supplies
-`"Job failed after retries"` as its terminal-failure message. An implementation
-can therefore hide persistence and reporting choices behind inherited values.
+The previous `EventSourced` contract supplied a snapshot interval of `10` and a
+`Retain` compaction policy when an implementation omitted those constants.
+`StandaloneJob` supplied `"Job failed after retries"` as its terminal-failure
+message. An implementation could therefore hide persistence and reporting
+choices behind inherited values.
 
 ADR-0010 preserves the native Rust interface unless a separate, documented 0.4.0
 compatibility decision changes it. Requiring explicit configuration is a

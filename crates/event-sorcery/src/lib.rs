@@ -83,6 +83,9 @@
 //! immediately obvious whether code belongs to this crate or
 //! to cqrs-es.
 
+#[cfg(doctest)]
+mod configuration_contracts;
+
 pub(crate) mod dependency;
 mod dispatch;
 mod engine;
@@ -280,23 +283,25 @@ pub trait EventSourced:
     /// Schema version for migration reconciliation. Bump when the
     /// event schema changes.
     const SCHEMA_VERSION: u64;
-    /// How many commands between automatic snapshots.
+    /// How many events between automatic snapshot boundaries.
     ///
-    /// A snapshot of `1` means every command triggers a snapshot
-    /// write -- ideal for compactable aggregates where the snapshot
+    /// A value of `1` triggers a snapshot write for every command that emits
+    /// events -- ideal for compactable aggregates where the snapshot
     /// is the durable source of pre-compaction state. Retained
     /// aggregates with low event counts per instance benefit from a
     /// larger value (e.g., 10-50) to reduce write amplification.
-    const SNAPSHOT_SIZE: usize = 10;
+    ///
+    /// Each implementation must select this interval explicitly.
+    const SNAPSHOT_SIZE: usize;
     /// Unique string identifying this aggregate type in the event
     /// store. Must be stable across deployments.
     const AGGREGATE_TYPE: &'static str;
     /// Event retention policy for this entity.
     ///
-    /// Financial audit aggregates must use the default
+    /// Financial audit aggregates must explicitly select
     /// [`CompactionPolicy::Retain`]. Only observational aggregates
     /// whose old events have no audit value should opt into compaction.
-    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
+    const COMPACTION_POLICY: CompactionPolicy;
 
     /// Create initial state from a genesis event.
     ///
@@ -1046,6 +1051,7 @@ mod tests {
             const SCHEMA_VERSION: u64 = 1;
             const SNAPSHOT_SIZE: usize = 1;
             const AGGREGATE_TYPE: &'static str = "Tally";
+            const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
             fn originate(event: &TallyEvent) -> Option<Self> {
                 match event {
@@ -1132,7 +1138,9 @@ mod tests {
 
             const PROJECTION: Nil = Nil;
             const SCHEMA_VERSION: u64 = 1;
+            const SNAPSHOT_SIZE: usize = 10;
             const AGGREGATE_TYPE: &'static str = "RetainedWidget";
+            const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
             fn originate(event: &WidgetEvent) -> Option<Self> {
                 match event {
