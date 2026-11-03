@@ -15,28 +15,30 @@ Event-sourcing primitives in Rust. A thin, opinionated layer on top of
   submit/reconcile retry safety and outcome feedback; see
   [ADR-0008](adrs/0008-entity-scoped-durable-operations.md) and
   [ADR-0009](adrs/0009-handlers-return-events-or-one-job-dispatch.md)).
+- **[`crates/event-sorcery-ffi`](crates/event-sorcery-ffi)** — C ABI over the
+  shared Rust engine, with a generated C header and static library for language
+  bindings.
 
 `event-sorcery` is the recommended entry point. Use `sqlite-es` directly only if
 you need lower-level control.
 
 ## Status
 
-This repository is an experimental fork maintained by Data Clique Software
-Design FZCO in the `dataclique` GitHub organization. It contains work unrelated
-to ST0x, including the Haskell binding in 0.4.0 and the planned TypeScript
+Data Clique Software Design FZCO maintains the open-source
+[`dataclique/event-sorcery`](https://github.com/dataclique/event-sorcery)
+repository. It includes the Haskell binding in 0.4.0 and the planned TypeScript
 binding in 0.5.0.
 
-The original Event Sorcery project remains owned and maintained by ST0x, with
-contributions from Data Clique Software Design FZCO and other contributors.
-Features developed in this fork do not imply ST0x ownership or adoption.
-External users are welcome, but the API surface is still in flux.
+The project began as a fork of the ST0x implementation. External users are
+welcome, but the API surface is still in flux.
 
 ## Examples
 
-Runnable end-to-end examples live under [`examples/`](examples/) — one directory
-per concept (`basic_entity`, `projection`, `reactor`), each with its own README
-explaining what it covers. Run any of them with
-`cargo run -p event-sorcery --example <name>`.
+Runnable end-to-end examples live in [`examples/simple`](examples/simple/) and
+[`examples/complex`](examples/complex/), each with its own README. Run one with
+`cargo run --manifest-path examples/simple/Cargo.toml` (or the complex
+manifest). Run both examples' formatting, linting, tests, and demos with
+`nix run .#check-examples`.
 
 ## Documentation
 
@@ -58,10 +60,23 @@ explaining what it covers. Run any of them with
 ## Development
 
 ```bash
-nix develop          # rust toolchain + sqlx-cli + cargo-nextest
+nix develop --impure # devenv shell: Rust, GHC, Stack and development tools
 cargo check --workspace
 cargo nextest run --workspace
 ```
+
+The flake pins nixpkgs and the Rust overlay directly. Crane builds the Rust
+workspace and the FFI engine used by the Haskell package. The devenv shell needs
+`--impure` to resolve its working directory; standalone package and hook builds
+remain pure:
+
+```bash
+nix build --no-link .#rust .#engine .#haskell
+nix build --no-link .#checks.aarch64-darwin.formatting
+```
+
+Use your platform's system name for the hook check (`x86_64-linux` in CI).
+Development-shell state lives under `.tmp/devenv/`.
 
 See [AGENTS.md](AGENTS.md) for contribution conventions.
 

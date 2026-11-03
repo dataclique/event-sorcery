@@ -1,10 +1,4 @@
-{
-  git-hooks,
-  pkgs,
-  rustToolchain,
-  self,
-  system,
-}:
+{ pkgs, rustToolchain }:
 let
   rustfmtHook = pkgs.writeShellApplication {
     name = "event-sorcery-rustfmt-hook";
@@ -14,23 +8,18 @@ let
     '';
   };
 in
-git-hooks.lib.${system}.run {
-  src = self;
-  package = pkgs.prek;
-
-  hooks = {
-    cabal-fmt.enable = true;
-    fourmolu = {
-      enable = true;
-      excludes = [ "bindings/haskell/test/Spec\\.hs" ];
-    };
-    hlint.enable = true;
-    nixfmt.enable = true;
-    rustfmt = {
-      enable = true;
-      entry = "${rustfmtHook}/bin/event-sorcery-rustfmt-hook";
-    };
-    taplo.enable = true;
-    trim-trailing-whitespace.enable = true;
+{
+  cabal-fmt.enable = true;
+  fourmolu = {
+    enable = true;
+    excludes = [ "bindings/haskell/test/Spec\\.hs" ];
   };
+  hlint.enable = true;
+  nixfmt.enable = true;
+  rustfmt = {
+    enable = true;
+    entry = "${rustfmtHook}/bin/event-sorcery-rustfmt-hook";
+  };
+  taplo.enable = true;
+  trim-trailing-whitespace.enable = true;
 }
