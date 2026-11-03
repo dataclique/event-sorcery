@@ -10,9 +10,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 
 use event_sorcery::{
-    DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect, EventSourced, Job,
-    JobContext, JobFailure, JobId, JobOutcome, Label, Never, Nil, Reconciliation, Settled, fx,
-    jobs,
+    CompactionPolicy, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect,
+    EventSourced, Job, JobContext, JobFailure, JobId, JobOutcome, Label, Never, Nil,
+    Reconciliation, Settled, fx, jobs,
 };
 
 fn ok<Value, Error: Debug>(result: Result<Value, Error>) -> Value {
@@ -79,7 +79,9 @@ impl EventSourced for BenchEntity {
 
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
+    const SNAPSHOT_SIZE: usize = 10;
     const AGGREGATE_TYPE: &'static str = "BenchEntity";
+    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
     fn originate(event: &BenchEvent) -> Option<Self> {
         let BenchEvent::Dispatch(dispatch_event) = event;

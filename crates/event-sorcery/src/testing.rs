@@ -402,7 +402,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::{Effect, Nil, uneventful};
+    use crate::{CompactionPolicy, Effect, Nil, uneventful};
 
     // Required for ReactorHarness::receive to resolve HasEntity<Counter>.
     crate::register_entities!(Counter);
@@ -459,7 +459,9 @@ mod tests {
 
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "Counter";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
         fn originate(event: &CounterEvent) -> Option<Self> {
             use CounterEvent::*;
