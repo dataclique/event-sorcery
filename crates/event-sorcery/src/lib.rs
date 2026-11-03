@@ -1068,6 +1068,7 @@ mod tests {
         let widget = entity.expect("entity should exist after a post-compaction command");
         assert_eq!(widget.name, "second");
     }
+
     #[tokio::test]
     async fn oversized_retention_window_is_rejected() {
         let pool = test_pool().await;
@@ -1168,6 +1169,7 @@ mod tests {
             .expect("the entity loads from snapshot plus the retained window");
         assert_eq!(entity.name, "fifth");
     }
+
     #[tokio::test]
     async fn snapshot_version_advances_across_loads() {
         let pool = test_pool().await;
