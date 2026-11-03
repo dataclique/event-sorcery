@@ -482,6 +482,54 @@ mod tests {
         assert!(replay.next::<TestAggregate>(&[]).await.is_none());
     }
 
+    #[tokio::test]
+    async fn retained_window_snapshot_guard_preserves_incompatible_state() {
+        let pool = create_test_pool().await.unwrap();
+        let repo =
+            SqliteEventRepository::new(pool.clone(), CompactionPolicy::RetainLast { events: 2 });
+
+        repo.persist::<TestAggregate>(
+            &covering_events("agg-windowed-incompatible", 3),
+            Some((
+                "agg-windowed-incompatible".to_string(),
+                serde_json::json!({"events": "not-a-list"}),
+                1,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let result = repo
+            .get_snapshot::<TestAggregate>("agg-windowed-incompatible")
+            .await;
+        assert!(matches!(
+            result,
+            Err(PersistenceError::DeserializationError(_))
+        ));
+
+        let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(repo, 100);
+        let result = store.load_aggregate("agg-windowed-incompatible").await;
+        assert!(matches!(
+            result,
+            Err(AggregateError::DeserializationError(_))
+        ));
+
+        let snapshot = Engine::new(pool)
+            .load_snapshot(&StreamIdentity::new(
+                TestAggregate::TYPE,
+                "agg-windowed-incompatible",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.current_sequence, 3);
+        assert_eq!(snapshot.current_snapshot, 1);
+        assert_eq!(
+            snapshot.aggregate,
+            serde_json::json!({"events": "not-a-list"})
+        );
+    }
+
     /// For a `Retain` entity, get_snapshot returns the incompatible snapshot
     /// unchanged (no shape check, no discard); cqrs-es then rebuilds from the
     /// always-complete event history. See the end-to-end rebuild test below.
