@@ -151,7 +151,7 @@ mod tests {
 
     use cqrs_es::event_sink::EventSink;
     use cqrs_es::persist::PersistedEventStore;
-    use cqrs_es::{AggregateContext, AggregateError, DomainEvent, EventStore};
+    use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, DomainEvent, EventStore};
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
 
@@ -226,6 +226,34 @@ mod tests {
 
         fn apply(&mut self, event: Self::Event) {
             self.events.push(event.event_type());
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    struct PreviousSnapshotAggregate {
+        events: String,
+    }
+
+    impl Aggregate for PreviousSnapshotAggregate {
+        const TYPE: &'static str = TestAggregate::TYPE;
+        type Command = ();
+        type Event = TestEvent;
+        type Error = TestError;
+        type Services = ();
+
+        async fn handle(
+            &mut self,
+            _command: Self::Command,
+            _services: &Self::Services,
+            event_sink: &EventSink<Self>,
+        ) -> Result<(), Self::Error> {
+            let mut scratch = self.clone();
+            event_sink.write(TestEvent::Created, &mut scratch).await;
+            Ok(())
+        }
+
+        fn apply(&mut self, event: Self::Event) {
+            self.events.push_str(&event.event_type());
         }
     }
 
@@ -485,20 +513,30 @@ mod tests {
     #[tokio::test]
     async fn retained_window_snapshot_guard_preserves_incompatible_state() {
         let pool = create_test_pool().await.unwrap();
+        let writer = CqrsFramework::new(
+            PersistedEventStore::<_, PreviousSnapshotAggregate>::new_snapshot_store(
+                SqliteEventRepository::new(
+                    pool.clone(),
+                    CompactionPolicy::RetainLast { events: 2 },
+                ),
+                1,
+            ),
+            vec![],
+            (),
+        );
+        for _ in 0..3 {
+            writer
+                .execute("agg-windowed-incompatible", ())
+                .await
+                .unwrap();
+        }
+
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new(TestAggregate::TYPE, "agg-windowed-incompatible");
+        let version = engine.current_version(&stream).await.unwrap();
+        assert_eq!(version, 3);
         let repo =
             SqliteEventRepository::new(pool.clone(), CompactionPolicy::RetainLast { events: 2 });
-
-        repo.persist::<TestAggregate>(
-            &covering_events("agg-windowed-incompatible", 3),
-            Some((
-                "agg-windowed-incompatible".to_string(),
-                serde_json::json!({"events": "not-a-list"}),
-                1,
-            )),
-        )
-        .await
-        .unwrap();
-
         let result = repo
             .get_snapshot::<TestAggregate>("agg-windowed-incompatible")
             .await;
@@ -514,19 +552,12 @@ mod tests {
             Err(AggregateError::DeserializationError(_))
         ));
 
-        let snapshot = Engine::new(pool)
-            .load_snapshot(&StreamIdentity::new(
-                TestAggregate::TYPE,
-                "agg-windowed-incompatible",
-            ))
-            .await
-            .unwrap()
-            .unwrap();
+        let snapshot = engine.load_snapshot(&stream).await.unwrap().unwrap();
         assert_eq!(snapshot.current_sequence, 3);
-        assert_eq!(snapshot.current_snapshot, 1);
+        assert_eq!(snapshot.current_snapshot, 3);
         assert_eq!(
             snapshot.aggregate,
-            serde_json::json!({"events": "not-a-list"})
+            serde_json::json!({"events": "CreatedCreatedCreated"})
         );
     }
 
