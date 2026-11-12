@@ -341,6 +341,10 @@ public API — consumers interact through `EventSourced`, `Store`, `Projection`,
 etc., so it's immediately obvious whether code belongs to this crate or to
 cqrs-es.
 
+All projection tables MUST use the `_projection` suffix. Simple materialized
+views may instead use `_view`, consistent with cqrs-es. Table names must make
+derived state distinguishable from the authoritative event store.
+
 ### Code Quality & Best Practices
 
 - **CRITICAL: Package by Feature, Not by Layer**: Organize by business domain,

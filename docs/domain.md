@@ -231,11 +231,14 @@ payload shape changes; never edit a shipped variant.
 
 ### Projection table name
 
+Projection tables use snake_case names with the `_projection` suffix. Simple
+materialized views may instead use `_view`, consistent with cqrs-es
+(`"position_view"`, `"offchain_order_view"`). The suffix identifies derived
+state; the event store remains authoritative.
+
 For entities with `type Materialized = Table`,
 `Entity::PROJECTION =
-Table("...")` declares the SQLite table name. Convention:
-snake_case matching the entity, suffixed `_view` (`"position_view"`,
-`"offchain_order_view"`).
+Table("...")` declares the materialized table name.
 
 ### Domain types in errors
 
