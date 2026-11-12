@@ -700,12 +700,16 @@ impl Engine {
     }
 
     /// Replays matching events through a bounded feed without materializing the full result.
-    pub(crate) fn stream_events(
+    pub(crate) fn stream_events<Transform>(
         &self,
         aggregate_type: &'static str,
         aggregate_id: Option<String>,
         channel_size: usize,
-    ) -> ReplayStream {
+        transform: Transform,
+    ) -> ReplayStream
+    where
+        Transform: Fn(SerializedEvent) -> SerializedEvent + Send + 'static,
+    {
         let (mut feed, stream) = ReplayStream::new(channel_size);
         let pool = self.pool.clone();
 
@@ -770,7 +774,7 @@ impl Engine {
                     }
                 };
 
-                if feed.push(Ok(event)).await.is_err() {
+                if feed.push(Ok(transform(event))).await.is_err() {
                     return;
                 }
             }
