@@ -78,6 +78,20 @@ nix build --no-link .#checks.aarch64-darwin.formatting
 Use your platform's system name for the hook check (`x86_64-linux` in CI).
 Development-shell state lives under `.tmp/devenv/`.
 
+### Local PostgreSQL
+
+The devenv shell includes a PostgreSQL service managed by the pinned Process
+Compose flake input. Start it and run the service smoke test with:
+
+```bash
+devenv up --detached postgres
+devenv test
+```
+
+The service accepts private Unix-socket connections only. It creates the
+`event_sorcery_test` database and role; that role can create isolated test
+databases. PostgreSQL data lives under `.tmp/devenv/state/postgres/`.
+
 See [AGENTS.md](AGENTS.md) for contribution conventions.
 
 ## License
