@@ -293,6 +293,7 @@ impl<'events> CommitRequest<'events> {
         self
     }
 
+    #[cfg(feature = "postgres")]
     pub(crate) fn for_job(job: JobSeed) -> Self {
         let JobSeed(request) = job;
         let stream = StreamIdentity::new(
