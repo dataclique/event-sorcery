@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "event-sorcery"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "apalis-core",
  "async-trait",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "event-sorcery-ffi"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "cbindgen",
  "ciborium",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite-es"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "cqrs-es",

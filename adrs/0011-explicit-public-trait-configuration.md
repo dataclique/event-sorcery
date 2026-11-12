@@ -1,6 +1,6 @@
 # ADR-0011: Explicit public trait configuration
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-03
 - Issue: [#118](https://github.com/dataclique/event-sorcery/issues/118)
 
@@ -12,9 +12,9 @@ The previous `EventSourced` contract supplied a snapshot interval of `10` and a
 message. An implementation could therefore hide persistence and reporting
 choices behind inherited values.
 
-ADR-0010 preserves the native Rust interface unless a separate, documented 0.4.0
-compatibility decision changes it. Requiring explicit configuration is a
-source-compatibility change for implementations that currently omit settings; it
+ADR-0010 establishes the native Rust interface baseline. Requiring explicit
+configuration changes source compatibility for implementations that currently
+omit settings, so this contract takes effect in Rust workspace version 0.5.0. It
 does not require different persistence, worker, or ABI behavior.
 
 ## Decision
@@ -56,5 +56,5 @@ are unchanged.
 - Compiler-contract tests must reject omission of each required constant and
   accept fully configured implementations.
 - No event schema, snapshot format, C ABI signature, or encoding changes.
-- This records an explicit compatibility change within the 0.4.0 migration; it
-  does not authorize a release or a separate version bump.
+- The Rust workspace version advances from 0.4.0 to 0.5.0 to signal the breaking
+  source-compatibility change.

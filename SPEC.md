@@ -391,13 +391,14 @@ not justification to break consumers. The implementation MUST first add
 facade-level characterization tests, then route the native surface through the
 facade while keeping its behavioral suite green.
 
-Native Rust configuration MUST be explicit: `EventSourced` implementations MUST
-state `SNAPSHOT_SIZE` and `COMPACTION_POLICY`, and `StandaloneJob`
-implementations MUST state `TERMINAL_FAILURE_MSG`. These public trait constants
-MUST NOT provide default values. Existing implementations MUST preserve their
-selected values during migration. This is a Rust source-compatibility change,
-not a change to persisted data, the C ABI, or runtime choices. Test-only
-const-generic defaults remain permitted.
+Starting with Rust workspace version 0.5.0, native configuration MUST be
+explicit: `EventSourced` implementations MUST state `SNAPSHOT_SIZE` and
+`COMPACTION_POLICY`, and `StandaloneJob` implementations MUST state
+`TERMINAL_FAILURE_MSG`. These public trait constants MUST NOT provide default
+values. Existing implementations MUST preserve their selected values during
+migration. This is a Rust source-compatibility change, not a change to persisted
+data, the C ABI, or runtime choices. Test-only const-generic defaults remain
+permitted.
 
 The native worker remains Apalis-hosted. Its adapter consumes the same facade
 claim and settlement operations exported to foreign bindings.
