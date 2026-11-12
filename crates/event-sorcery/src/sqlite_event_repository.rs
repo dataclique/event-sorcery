@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use tracing::warn;
 
 use crate::CompactionPolicy;
-use crate::engine::{CommitRequest, Engine, EngineError, SnapshotUpdate, StreamIdentity};
+use crate::engine::{CommitRequest, Engine, EngineError, StreamIdentity};
 
 /// SQLite implementation of the cqrs-es [`PersistedEventRepository`].
 ///
@@ -110,21 +110,8 @@ impl PersistedEventRepository for SqliteEventRepository {
         events: &[SerializedEvent],
         snapshot_update: Option<(String, Value, usize)>,
     ) -> Result<(), PersistenceError> {
-        let aggregate_id = snapshot_update
-            .as_ref()
-            .map_or_else(
-                || events.first().map(|event| event.aggregate_id.as_str()),
-                |update| Some(update.0.as_str()),
-            )
-            .unwrap_or_default();
-        let stream = StreamIdentity::new(A::TYPE, aggregate_id);
-        let mut pending_jobs = crate::job::prepare_pending().map_err(EngineError::from)?;
-        let mut request =
-            CommitRequest::new(stream, events).with_jobs(pending_jobs.take_requests());
-        if let Some((_, aggregate, snapshot_version)) = snapshot_update {
-            request = request.with_snapshot(SnapshotUpdate::new(aggregate, snapshot_version))?;
-        }
-
+        let (request, pending_jobs) =
+            CommitRequest::prepare_repository(A::TYPE, events, snapshot_update)?;
         self.engine.commit(request).await?;
         pending_jobs.mark_committed();
         Ok(())

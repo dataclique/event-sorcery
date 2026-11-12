@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{SqliteConnection, SqlitePool};
 
-use crate::job::EnqueueRequest;
+use crate::job::{EnqueueRequest, PreparedPendingJobs};
 use crate::job_sqlite::SqliteJobError;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation, SchemaTarget};
@@ -291,6 +291,54 @@ impl<'events> CommitRequest<'events> {
         let JobSeed(request) = job;
         self.jobs.push(request);
         self
+    }
+
+    pub(crate) fn prepare_repository(
+        aggregate_type: &str,
+        events: &'events [SerializedEvent],
+        snapshot_update: Option<(String, Value, usize)>,
+    ) -> Result<(Self, PreparedPendingJobs), EngineError> {
+        let aggregate_id = snapshot_update
+            .as_ref()
+            .map_or_else(
+                || events.first().map(|event| event.aggregate_id.as_str()),
+                |update| Some(update.0.as_str()),
+            )
+            .unwrap_or_default();
+        let stream = StreamIdentity::new(aggregate_type, aggregate_id);
+        let mut pending_jobs = crate::job::prepare_pending()?;
+        let mut request = Self::new(stream, events).with_jobs(pending_jobs.take_requests());
+        if let Some((_, aggregate, snapshot_version)) = snapshot_update {
+            request = request.with_snapshot(SnapshotUpdate::new(aggregate, snapshot_version))?;
+        }
+
+        Ok((request, pending_jobs))
+    }
+
+    pub(crate) fn validate_metadata(&self) -> Result<(), EngineError> {
+        if self
+            .events
+            .iter()
+            .any(|event| reserves_engine_payload(&event.metadata))
+        {
+            return Err(EngineError::ReservedMetadata {
+                key: ENGINE_PAYLOAD_PROVENANCE_KEY,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn validate_stream(&self) -> Result<(), EngineError> {
+        validate_event_stream(&self.stream, self.events)?;
+        if self
+            .expected_version
+            .is_some_and(|expected| !events_follow_version(self.events, expected))
+        {
+            return Err(EngineError::OptimisticLock);
+        }
+
+        Ok(())
     }
 }
 
@@ -781,16 +829,7 @@ impl Engine {
 
     /// Atomically persists a validated event, snapshot, and durable-job batch.
     pub async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
-        if request
-            .events
-            .iter()
-            .any(|event| reserves_engine_payload(&event.metadata))
-        {
-            return Err(EngineError::ReservedMetadata {
-                key: ENGINE_PAYLOAD_PROVENANCE_KEY,
-            });
-        }
-
+        request.validate_metadata()?;
         self.commit_serialized(request).await
     }
 
@@ -831,6 +870,7 @@ impl Engine {
     }
 
     async fn commit_serialized(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
+        request.validate_stream()?;
         let CommitRequest {
             stream,
             expected_version,
@@ -838,11 +878,6 @@ impl Engine {
             snapshot,
             jobs,
         } = request;
-        validate_event_stream(&stream, events)?;
-        if expected_version.is_some_and(|expected| !events_follow_version(events, expected)) {
-            return Err(EngineError::OptimisticLock);
-        }
-
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(expected) = expected_version {
             let actual = committed_stream_version(&mut tx, &stream).await?;
