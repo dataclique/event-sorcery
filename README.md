@@ -32,6 +32,15 @@ binding in 0.5.0.
 The project began as a fork of the ST0x implementation. External users are
 welcome, but the API surface is still in flux.
 
+## Event retention
+
+Aggregates can retain every event, compact snapshot-covered history, or keep a
+trailing sequence window with `CompactionPolicy::RetainLast { events }`.
+Compaction preserves unsnapshotted events and leaves streams without snapshots
+untouched. Projected entities retain all events. See
+[event compaction](docs/cqrs.md#event-compaction) for window semantics and
+snapshot-recovery requirements.
+
 ## Examples
 
 Runnable end-to-end examples live in [`examples/simple`](examples/simple/) and

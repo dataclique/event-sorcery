@@ -6,14 +6,17 @@ implementation detail hidden behind it.
 
 ## Core Principle: Events Are Immutable
 
-**Events are the source of truth and can NEVER be changed or deleted.**
-Everything else -- entities, commands, projections -- can be freely modified
-because they're derived from events.
+**Persisted events are immutable and cannot be changed or rewritten.** Audit
+streams retain their complete history. Only observational aggregates with an
+explicit [compaction policy](#event-compaction) may prune snapshot-covered
+history through the framework. Changes to domain facts use compensating events,
+not edits to past events.
 
 - **Commands**: Can add, remove, or change freely
 - **Entities**: Can restructure, add fields, change logic freely
 - **Projections**: Can add, drop, restructure freely (just replay from events)
-- **Events**: PERMANENT. Think carefully before adding new event types.
+- **Events**: Immutable facts with explicitly selected history retention. Think
+  carefully before adding new event types.
 
 ## Architecture
 
@@ -443,7 +446,9 @@ implements `StandaloneJob` (a plain `perform`) and is enqueued directly with
 
 Bump `SCHEMA_VERSION` when the entity's state, event, or projection schema
 changes. On startup, the wiring infrastructure (via `StoreBuilder::build()`)
-detects version mismatches and automatically clears stale snapshots.
+detects version mismatches and clears stale snapshots for `Retain` entities. For
+current policies that may delete history, it refuses a recorded schema version
+change instead; those entities require snapshot-aware migration.
 
 ### Adding Optional Fields to Events
 
@@ -658,10 +663,10 @@ Snapshots are enabled for all aggregates through `StoreBuilder`. They are used
 as a replay starting point so hot aggregates do not reload their full event
 history on every command.
 
-After changing aggregate struct layout, bump `SCHEMA_VERSION` so startup clears
-stale snapshots through the schema reconciler. Manual snapshot deletion is safe
-only for retained event streams where the full event history remains available
-for replay.
+For `Retain` entities, bump `SCHEMA_VERSION` after changing aggregate struct
+layout so startup clears stale snapshots through the schema reconciler. Manual
+snapshot deletion is safe only for retained event streams where the full event
+history remains available for replay.
 
 ```sql
 -- Retained streams only: reset snapshots when full event replay is available.
@@ -669,22 +674,37 @@ DELETE FROM snapshots WHERE aggregate_type = 'Mint';
 ```
 
 Do not manually delete snapshots for aggregates using
-`CompactionPolicy::CompactAfterSnapshot`. For compacted streams, the snapshot
-may be the only durable pre-snapshot state. Those aggregates need a
-snapshot-aware rebuild path or an external source before snapshots can be
-discarded.
+`CompactionPolicy::CompactAfterSnapshot` or `CompactionPolicy::RetainLast`. For
+compacted streams, the snapshot may be the only durable pre-snapshot state.
+Those aggregates need a snapshot-aware rebuild path or an external source before
+snapshots can be discarded. Under either current policy, incompatible snapshots
+return typed deserialization errors and remain unchanged; schema reconciliation
+refuses to clear snapshots for a recorded version change.
 
 ### Event Compaction
 
 Financial audit aggregates retain every event indefinitely. Observational
-aggregates may opt into `CompactionPolicy::CompactAfterSnapshot`, which deletes
-events already represented by an aggregate snapshot. This is currently intended
-for high-frequency external-state snapshots such as `InventorySnapshot`.
+aggregates may select either snapshot-bounded compaction policy:
 
-Only compact aggregates when historical events have no long-term audit value and
-the aggregate can be reconstructed from the `snapshots` table plus newer events.
-Do not enable compaction for projections that must support full rebuild from the
-`events` table unless the projection also has a snapshot-aware rebuild path.
+- `CompactionPolicy::CompactAfterSnapshot` deletes events represented by the
+  current aggregate snapshot.
+- `CompactionPolicy::RetainLast { events: window }` additionally preserves a
+  trailing sequence window for each aggregate type and ID. An event is deleted
+  only when its sequence is at most both the snapshot's covered sequence and
+  `newest_sequence - window` for that stream.
+
+For example, a stream ending at sequence 10 with a snapshot covering sequence 7
+and a window of 2 retains sequences 8–10: unsnapshotted events survive even when
+there are more of them than the window. Without a snapshot, nothing is deleted.
+A zero window deletes only snapshot-covered events. Sparse histories may retain
+fewer rows than the numeric window because it measures sequence distance, not a
+row count. An unrepresentable SQLite integer window fails before deletion.
+
+Only compact observational aggregates whose older events have no long-term audit
+value. Projected entities must use `Retain`; `StoreBuilder` enforces this so
+views remain rebuildable from the event log. See
+[SPEC.md](../SPEC.md#snapshot-bounded-event-retention) for the retention and
+snapshot-recovery contract.
 
 ### View Tables (Projections)
 

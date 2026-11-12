@@ -158,12 +158,12 @@ mod tests {
     use sqlite_es::testing::create_test_pool;
 
     use super::*;
-    use crate::SqliteBackend;
     use crate::job::{
         EnqueueRequest, ErasedJob, JobId, JobKind, PendingPush, enqueued_event,
         pending_seed_payload,
     };
     use crate::job_store::EventBackend;
+    use crate::{Effect, EventSourced, Never, Nil, SqliteBackend, compact_events};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     struct TestAggregate {
@@ -254,6 +254,42 @@ mod tests {
 
         fn apply(&mut self, event: Self::Event) {
             self.events.push_str(&event.event_type());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSourced for PreviousSnapshotAggregate {
+        type Id = String;
+        type Error = Never;
+        type Command = ();
+        type Event = TestEvent;
+        type Materialized = Nil;
+        type Jobs = Nil;
+
+        const PROJECTION: Nil = Nil;
+        const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 1;
+        const AGGREGATE_TYPE: &'static str = <Self as Aggregate>::TYPE;
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::RetainLast { events: 2 };
+
+        fn originate(event: &TestEvent) -> Option<Self> {
+            Some(Self {
+                events: event.event_type(),
+            })
+        }
+
+        fn evolve(entity: &Self, event: &TestEvent) -> Result<Option<Self>, Never> {
+            let mut events = entity.events.clone();
+            events.push_str(&event.event_type());
+            Ok(Some(Self { events }))
+        }
+
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![TestEvent::Created]))
+        }
+
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![TestEvent::Created]))
         }
     }
 
@@ -535,6 +571,23 @@ mod tests {
         let stream = StreamIdentity::new(TestAggregate::TYPE, "agg-windowed-incompatible");
         let version = engine.current_version(&stream).await.unwrap();
         assert_eq!(version, 3);
+        assert_eq!(
+            compact_events::<PreviousSnapshotAggregate>(&pool)
+                .await
+                .unwrap(),
+            1,
+        );
+        let remaining: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM events \
+             WHERE aggregate_type = ?1 AND aggregate_id = ?2 ORDER BY sequence",
+        )
+        .bind(TestAggregate::TYPE)
+        .bind("agg-windowed-incompatible")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, vec![2, 3]);
+
         let repo =
             SqliteEventRepository::new(pool.clone(), CompactionPolicy::RetainLast { events: 2 });
         let result = repo

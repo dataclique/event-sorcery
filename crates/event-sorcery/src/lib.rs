@@ -177,20 +177,14 @@ pub enum CompactionPolicy {
     Retain,
     /// Delete events at or before the current snapshot sequence.
     CompactAfterSnapshot,
-    /// Keep the newest `events` rows per aggregate; delete anything both
-    /// older than that window and at or below the snapshot sequence.
+    /// Preserve a trailing sequence window independently for each aggregate type and id.
     ///
-    /// For observational aggregates whose trailing history feeds live
-    /// readers (a forecast window, a reconciliation tape), full
-    /// compaction would starve those readers. This policy bounds the
-    /// per-aggregate series instead: the window is a sequence count
-    /// because events carry no timestamp column, and for a
-    /// fixed-cadence observer a count converts to wall-clock time
-    /// directly. The snapshot bound still holds -- an event newer than
-    /// the snapshot is never deleted, so snapshot-plus-replay always
-    /// reconstructs the aggregate.
+    /// Delete only events both covered by the snapshot and at or below the
+    /// stream's newest sequence minus `events`. Unsnapshotted events survive
+    /// even when they exceed the window. Sparse histories may retain fewer
+    /// rows than the numeric window. Without a snapshot, nothing is deleted.
     RetainLast {
-        /// Newest rows kept per aggregate id.
+        /// Width of the retained sequence interval; zero keeps only unsnapshotted events.
         events: usize,
     },
 }
@@ -530,14 +524,16 @@ pub async fn send_command<Entity: EventSourced>(
 
 /// Delete compactable events that are already represented by snapshots.
 ///
-/// This is a no-op for entities with [`CompactionPolicy::Retain`]. For
-/// compactable entities, events with `sequence <= snapshots.last_sequence` are
-/// removed. Snapshot-backed loading can still reconstruct the aggregate from the
-/// snapshot and replay any newer events.
+/// This is a no-op for entities with [`CompactionPolicy::Retain`].
+/// [`CompactionPolicy::CompactAfterSnapshot`] removes snapshot-covered events;
+/// [`CompactionPolicy::RetainLast`] additionally preserves the trailing sequence
+/// window for each aggregate type and id. Neither policy deletes unsnapshotted
+/// events or events from streams without snapshots.
 ///
 /// # Errors
 ///
-/// Returns database errors from the delete query.
+/// Returns database errors from the delete query or an encoding error when the
+/// retention window cannot be represented as a SQLite integer.
 pub async fn compact_events<Entity: EventSourced>(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     let result = match Entity::COMPACTION_POLICY {
         CompactionPolicy::Retain => return Ok(0),
