@@ -23,8 +23,8 @@ const ENGINE_PAYLOAD_PROVENANCE: &str = "opaque-v1";
 /// Identifies one serialized aggregate event stream at the storage boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamIdentity {
-    aggregate_type: String,
-    aggregate_id: String,
+    pub(crate) aggregate_type: String,
+    pub(crate) aggregate_id: String,
 }
 
 /// Constructs and compares storage-boundary stream identities.
@@ -143,8 +143,8 @@ impl<'events> OpaqueCommitRequest<'events> {
 
 /// Snapshot payload written atomically with the events it covers.
 pub struct SnapshotUpdate {
-    aggregate: Value,
-    snapshot_version: usize,
+    pub(crate) aggregate: Value,
+    pub(crate) snapshot_version: usize,
 }
 
 impl SnapshotUpdate {
@@ -175,11 +175,11 @@ impl SnapshotWrite {
 
 /// One atomic event-store commit, including optional snapshot and job intent.
 pub struct CommitRequest<'events> {
-    stream: StreamIdentity,
-    expected_version: Option<usize>,
-    events: &'events [SerializedEvent],
-    snapshot: Option<SnapshotUpdate>,
-    jobs: Vec<EnqueueRequest>,
+    pub(crate) stream: StreamIdentity,
+    pub(crate) expected_version: Option<usize>,
+    pub(crate) events: &'events [SerializedEvent],
+    pub(crate) snapshot: Option<SnapshotUpdate>,
+    pub(crate) jobs: Vec<EnqueueRequest>,
 }
 
 /// Shared serialized SQLite persistence engine.
@@ -881,9 +881,7 @@ impl Engine {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(expected) = expected_version {
             let actual = committed_stream_version(&mut tx, &stream).await?;
-            if actual != expected {
-                return Err(EngineError::OptimisticLock);
-            }
+            validate_expected_version(expected, actual)?;
         }
 
         sqlite_es::insert_serialized_events_batch(&mut tx, "events", events).await?;
@@ -1315,6 +1313,14 @@ impl From<sqlite_es::SqliteAggregateError> for EngineError {
     }
 }
 
+pub(crate) fn validate_expected_version(expected: usize, actual: usize) -> Result<(), EngineError> {
+    if actual != expected {
+        return Err(EngineError::OptimisticLock);
+    }
+
+    Ok(())
+}
+
 fn validate_event_stream(
     stream: &StreamIdentity,
     events: &[SerializedEvent],
@@ -1452,7 +1458,7 @@ fn decode_opaque_event(event: SerializedEvent) -> Result<OpaqueStoredEvent, Engi
 }
 
 #[derive(sqlx::FromRow)]
-struct StoredEventRow {
+pub(crate) struct StoredEventRow {
     aggregate_type: String,
     aggregate_id: String,
     sequence: i64,
@@ -1478,7 +1484,8 @@ impl TryFrom<StoredEventRow> for SerializedEvent {
     }
 }
 
-struct StoredSnapshotRow {
+#[derive(sqlx::FromRow)]
+pub(crate) struct StoredSnapshotRow {
     aggregate_id: String,
     last_sequence: i64,
     snapshot_version: i64,
