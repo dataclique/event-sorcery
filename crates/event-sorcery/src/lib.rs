@@ -144,7 +144,7 @@ pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseR
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 #[cfg(feature = "postgres")]
-pub use postgres::POSTGRES_MIGRATOR;
+pub use postgres::{POSTGRES_MIGRATOR, PostgresEventRepository};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::{
     IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,
