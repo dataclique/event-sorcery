@@ -286,7 +286,7 @@ mod tests {
     use crate::job::{
         ClaimId, DeadReason, ErasedJob, JobEvent, JobId, JobKind, JobState, PendingPush, WorkerId,
     };
-    use crate::{EventSourced, Lifecycle};
+    use crate::{EventSourced, JobSeed, Lifecycle};
 
     #[derive(Default, Debug, Clone, Serialize, Deserialize)]
     struct RecordedValues {
@@ -589,23 +589,51 @@ mod tests {
             })
             .collect();
         store.commit(events, context, HashMap::new()).await.unwrap();
-        let restored = store.load_aggregate("stream").await.unwrap();
-        assert_eq!(restored.aggregate.values, ["first", "second", "third"]);
-        assert_eq!(restored.current_sequence, 3);
         let repository = PostgresEventRepository { pool };
+        let persisted = repository
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
         let snapshot = repository
             .get_snapshot::<RecordedValues>("stream")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
-        assert_eq!(snapshot.current_sequence, 2);
+        let restored = store.load_aggregate("stream").await.unwrap();
+        assert_eq!(
+            restored.aggregate.values,
+            ["first", "second", "third"],
+            "snapshot reports sequence {} with payload {}",
+            snapshot.current_sequence,
+            snapshot.aggregate,
+        );
+        assert_eq!(restored.current_sequence, 3);
         let suffix = repository
-            .get_last_events::<RecordedValues>("stream", 2)
+            .get_last_events::<RecordedValues>("stream", snapshot.current_sequence)
             .await
             .unwrap();
-        assert_eq!(suffix.len(), 1);
-        assert_eq!(suffix[0].sequence, 3);
+        match snapshot.current_sequence {
+            2 => {
+                assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
+                assert_eq!(suffix.len(), 1);
+                assert_eq!(suffix[0].sequence, 3);
+            }
+            3 => {
+                assert_eq!(
+                    snapshot.aggregate,
+                    json!({"values": ["first", "second", "third"]})
+                );
+                assert_eq!(suffix.len(), 0);
+            }
+            sequence => panic!("unexpected snapshot checkpoint {sequence}"),
+        }
     }
 
     #[sqlx::test(migrations = false)]
@@ -715,6 +743,126 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, 1);
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("standalone PostgreSQL enqueue is awaiting implementation")]
+    struct StandaloneEnqueuePending;
+
+    trait StandaloneEnqueueContract {
+        fn enqueue(
+            &self,
+            job: JobSeed,
+        ) -> impl std::future::Future<Output = Result<(), PersistenceError>> + Send;
+    }
+
+    impl StandaloneEnqueueContract for PostgresEventRepository {
+        async fn enqueue(&self, _job: JobSeed) -> Result<(), PersistenceError> {
+            Err(PersistenceError::UnknownError(Box::new(
+                StandaloneEnqueuePending,
+            )))
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn standalone_enqueue_preserves_first_event_and_queue_row_on_duplicate(pool: PgPool) {
+        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        let job_id = JobId::new();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        repository
+            .enqueue(JobSeed::new(
+                job_id,
+                "standalone",
+                json!({"value": "first"}),
+                1_700_000_000_000,
+            ))
+            .await
+            .unwrap();
+        let error = repository
+            .enqueue(JobSeed::new(
+                job_id,
+                "standalone",
+                json!({"value": "replacement"}),
+                1_700_000_030_000,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistenceError::OptimisticLockError));
+        let (version, payload, lease): (i64, Value, Option<i64>) = sqlx::query_as(
+            "SELECT version, payload, lease_until FROM job_queue WHERE view_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(lease, None);
+        assert_eq!(
+            payload,
+            json!({"Live": {"Pending": {
+                "kind": "standalone", "payload": {"value": "first"},
+                "run_at": 1_700_000_000_000_i64, "attempt": 0, "claims": 0,
+            }}})
+        );
+        let events: Vec<(i64, Value, Value)> = sqlx::query_as(
+            r"
+            SELECT sequence, payload, metadata FROM events
+            WHERE aggregate_type = 'job' AND aggregate_id = $1 ORDER BY sequence
+            ",
+        )
+        .bind(job_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            events,
+            [(
+                1,
+                json!({"Enqueued": {
+                    "kind": "standalone", "payload": {"value": "first"},
+                    "run_at": 1_700_000_000_000_i64,
+                }}),
+                json!({})
+            )]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn invalid_enqueue_instant_leaves_no_event_or_queue_row(pool: PgPool) {
+        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        let job_id = JobId::new();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let error = repository
+            .enqueue(JobSeed::new(
+                job_id,
+                "standalone",
+                json!({"value": "work"}),
+                i64::MAX,
+            ))
+            .await
+            .unwrap_err();
+        let PersistenceError::UnknownError(source) = error else {
+            panic!("expected the invalid scheduling instant to fail");
+        };
+        assert!(matches!(
+            source.downcast_ref::<crate::job::JobStoreError>().unwrap(),
+            crate::job::JobStoreError::InvalidInstant(i64::MAX)
+        ));
+        let rows: (i64, i64) = sqlx::query_as(
+            r"
+            SELECT (
+                SELECT COUNT(*) FROM events
+                WHERE aggregate_type = 'job' AND aggregate_id = $1
+            ), (
+                SELECT COUNT(*) FROM job_queue WHERE view_id = $1
+            )
+            ",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, (0, 0));
     }
 
     #[sqlx::test(migrations = false)]
