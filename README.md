@@ -22,6 +22,12 @@ Event-sourcing primitives in Rust. A thin, opinionated layer on top of
 `event-sorcery` is the recommended entry point. Use `sqlite-es` directly only if
 you need lower-level control.
 
+`EventSourced` implementations must declare `SNAPSHOT_SIZE` and
+`COMPACTION_POLICY`; `StandaloneJob` implementations must declare
+`TERMINAL_FAILURE_MSG`. These settings have no inherited defaults. See
+[implementing an entity](docs/cqrs.md#3-implement-eventsourced) for
+configuration.
+
 ## Status
 
 Data Clique Software Design FZCO maintains the open-source
@@ -72,6 +78,7 @@ manifest). Run both examples' formatting, linting, tests, and demos with
 nix develop --impure # devenv shell: Rust, GHC, Stack and development tools
 cargo check --workspace
 cargo nextest run --workspace
+cargo test --locked --workspace --all-features --doc
 ```
 
 The flake pins nixpkgs and the Rust overlay directly. Crane builds the Rust

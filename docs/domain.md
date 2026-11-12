@@ -110,12 +110,12 @@ their complete event history may no longer exist.
 ### Compaction
 
 Optional deletion of events at or before a snapshot's sequence number. Trades
-replay latency for storage. Per-aggregate `CompactionPolicy`: `Retain` (default)
-keeps all events; `CompactAfterSnapshot` deletes snapshot-covered events;
-`RetainLast { events }` also preserves the trailing sequence window for each
-aggregate type and ID. Unsnapshotted events survive even when they exceed that
-window. Compaction never crosses snapshot boundaries; streams without snapshots
-retain every event.
+replay latency for storage. Each aggregate explicitly selects its
+`CompactionPolicy`: `Retain` keeps all events; `CompactAfterSnapshot` deletes
+snapshot-covered events; `RetainLast { events }` also preserves the trailing
+sequence window for each aggregate type and ID. Unsnapshotted events survive
+even when they exceed that window. Compaction never crosses snapshot boundaries;
+streams without snapshots retain every event.
 
 ### Reactor
 

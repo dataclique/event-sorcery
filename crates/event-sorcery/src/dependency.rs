@@ -388,7 +388,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::{Effect, uneventful};
+    use crate::{CompactionPolicy, Effect, uneventful};
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Alpha {
@@ -424,7 +424,9 @@ mod tests {
 
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "Alpha";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
         fn originate(event: &AlphaEvent) -> Option<Self> {
             match event {
@@ -481,7 +483,9 @@ mod tests {
 
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "Beta";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
         fn originate(event: &BetaEvent) -> Option<Self> {
             match event {
