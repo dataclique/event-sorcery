@@ -559,6 +559,7 @@ pub async fn compact_events<Entity: EventSourced>(pool: &SqlitePool) -> Result<u
         CompactionPolicy::RetainLast { events } => {
             let window =
                 i64::try_from(events).map_err(|source| sqlx::Error::Encode(Box::new(source)))?;
+
             sqlx::query(
                 "DELETE FROM events \
                  WHERE aggregate_type = ?1 \
@@ -1168,6 +1169,93 @@ mod tests {
             .unwrap()
             .expect("the entity loads from snapshot plus the retained window");
         assert_eq!(entity.name, "fifth");
+    }
+
+    #[tokio::test]
+    async fn windowed_compaction_isolates_streams_and_preserves_unsnapshotted_events() {
+        let pool = test_pool().await;
+        let windowed = testing::test_store::<WindowedWidget<2, 5>>(pool.clone());
+        let unrelated = testing::test_store::<Widget>(pool.clone());
+
+        for (aggregate_id, event_count) in [(7, 6), (8, 11), (9, 4)] {
+            windowed
+                .send(
+                    &NumericId(aggregate_id),
+                    WidgetCommand::Create {
+                        name: "initial".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            for sequence in 2..=event_count {
+                windowed
+                    .send(
+                        &NumericId(aggregate_id),
+                        WidgetCommand::Rename {
+                            name: format!("version-{sequence}"),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        unrelated
+            .send(
+                &NumericId(7),
+                WidgetCommand::Create {
+                    name: "unrelated".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        for sequence in 2..=12 {
+            unrelated
+                .send(
+                    &NumericId(7),
+                    WidgetCommand::Rename {
+                        name: format!("unrelated-{sequence}"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let snapshots: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT aggregate_id, last_sequence FROM snapshots \
+             WHERE aggregate_type = 'WindowedWidget' ORDER BY aggregate_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshots, vec![("7".to_string(), 5), ("8".to_string(), 10)]);
+
+        assert_eq!(
+            compact_events::<WindowedWidget<2, 5>>(&pool).await.unwrap(),
+            13,
+        );
+
+        for (aggregate_type, aggregate_id, expected) in [
+            ("WindowedWidget", "7", vec![5, 6]),
+            ("WindowedWidget", "8", vec![10, 11]),
+            ("WindowedWidget", "9", vec![1, 2, 3, 4]),
+            ("Widget", "7", (1..=12).collect()),
+        ] {
+            let remaining: Vec<i64> = sqlx::query_scalar(
+                "SELECT sequence FROM events \
+                 WHERE aggregate_type = ?1 AND aggregate_id = ?2 \
+                 ORDER BY sequence",
+            )
+            .bind(aggregate_type)
+            .bind(aggregate_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(remaining, expected, "{aggregate_type}/{aggregate_id}");
+        }
     }
 
     #[tokio::test]
