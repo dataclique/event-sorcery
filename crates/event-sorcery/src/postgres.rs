@@ -291,8 +291,10 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use sqlx::PgPool;
+    use sqlx::postgres::PgPoolOptions;
     use std::collections::HashMap;
     use std::convert::Infallible;
+    use std::time::Duration;
 
     use super::{POSTGRES_MIGRATOR, PostgresEventRepository};
     use crate::job::{
@@ -757,6 +759,124 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(version, 1);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn cancelled_enqueue_rolls_back_and_reuses_its_connection(pool: PgPool) {
+        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        let singleton = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&singleton)
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE job_queue_projection IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let job_id = JobId::new();
+        let writer_pool = singleton.clone();
+        let pending = tokio::spawn(async move {
+            let repository = PostgresEventRepository { pool: writer_pool };
+            repository
+                .enqueue(JobSeed::new(
+                    job_id,
+                    "cancel-probe",
+                    json!({"value": "work"}),
+                    1_700_000_000_000,
+                ))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE pid = $1 AND wait_event_type = 'Lock' \
+                     AND query LIKE '%INSERT INTO job_queue_projection%')",
+                )
+                .bind(writer_pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        blocker.rollback().await.unwrap();
+        let mut connection = tokio::time::timeout(Duration::from_secs(5), singleton.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        let ready: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(ready, 1);
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT COUNT(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1), \
+             (SELECT COUNT(*) FROM job_queue_projection WHERE view_id = $1)",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0));
+        drop(connection);
+        singleton.close().await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn queue_write_failure_rolls_back_standalone_event(pool: PgPool) {
+        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        sqlx::query("ALTER TABLE job_queue_projection ADD CONSTRAINT reject_seed CHECK (FALSE)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job_id = JobId::new();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let error = repository
+            .enqueue(JobSeed::new(
+                job_id,
+                "rollback-probe",
+                json!({"value": "work"}),
+                1_700_000_000_000,
+            ))
+            .await
+            .unwrap_err();
+        let PersistenceError::ConnectionError(source) = error else {
+            panic!("expected the injected queue constraint failure");
+        };
+        let database = source
+            .downcast_ref::<sqlx::Error>()
+            .unwrap()
+            .as_database_error()
+            .unwrap();
+        assert_eq!(database.code().as_deref(), Some("23514"));
+        assert_eq!(database.constraint(), Some("reject_seed"));
+
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT COUNT(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1), \
+             (SELECT COUNT(*) FROM job_queue_projection WHERE view_id = $1)",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0));
     }
 
     #[sqlx::test(migrations = false)]
