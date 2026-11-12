@@ -18,8 +18,8 @@ typed language surfaces:
 - an idiomatic Haskell binding over a versioned C ABI.
 
 Data Clique Software Design FZCO maintains the open-source
-`dataclique/event-sorcery` repository governed by this specification. The project
-began as a fork of the ST0x implementation.
+`dataclique/event-sorcery` repository governed by this specification. The
+project began as a fork of the ST0x implementation.
 
 The shared engine MUST be extracted from the implementation already present in
 this repository. It MUST continue to build on:
@@ -31,8 +31,10 @@ this repository. It MUST continue to build on:
 - the existing event-sourced job, dispatch, reactor, projection, schema, and
   delivery implementations.
 
-This is an extraction and binding project. It is not permission to design a
-second event store, queue, workflow engine, or set of storage semantics.
+The binding migration extracts the existing implementation. PostgreSQL command
+persistence extends that same engine with an additive storage backend. Neither
+permits a second event store, queue, workflow engine, or set of storage
+semantics.
 
 ## Goals
 
@@ -57,18 +59,72 @@ The following are explicitly out of scope for 0.4.0:
   snapshot model, or checkpoint model;
 - redesigning `ClaimId`, claim sequence routing, retries, leases, fencing, or
   dispatch settlement;
-- adding a Postgres backend;
 - adding a general broker, transport, or outbox framework;
 - maintaining the standalone Haskell storage implementation; and
 - making Haskell reproduce Rust storage or job decisions.
 
 Any such change requires a separate specification and compatibility decision.
 
+## PostgreSQL command persistence
+
+Database independence follows `cqrs-es`: `PersistedEventStore` is generic over
+`PersistedEventRepository`, concrete database repositories implement
+persistence, and `ViewRepository` defines read-model storage separately.
+PostgreSQL MUST extend these repository contracts and event-sorcery's existing
+backend boundary, not introduce another execution engine or backend-selection
+framework.
+
+SQLite remains supported with its existing constructors, public backend
+implementations, migrations, stored data, and behavior unchanged.
+Database-specific SQL MAY differ; command validation, job-event construction,
+and durable lifecycle decisions MUST NOT be implemented twice.
+
+The PostgreSQL persistence capability MUST:
+
+- Bootstrap library-owned event, snapshot, and job-queue storage through
+  versioned migrations. Reapplying bootstrap MUST preserve existing data.
+- Persist and reload the existing serialized event and snapshot values. Stream
+  identity and sequence remain the event uniqueness key. Numeric conversions
+  MUST fail explicitly rather than truncate or substitute a value.
+- Validate expected stream versions under the transaction's concurrency
+  protection, including an empty stream. Competing writes from one expected
+  version MUST NOT both succeed. Conflict results MUST remain distinguishable
+  from unrelated constraint and infrastructure failures.
+- Commit aggregate events, optional snapshot updates, dispatched-job events, and
+  their queue seeds in one transaction. A standalone enqueue MUST commit its job
+  event and queue seed together through the same storage path.
+- Preserve snapshot version and covered-sequence semantics. An independent
+  snapshot write MUST NOT cover events beyond the committed stream version.
+- Roll back the entire transaction on a pre-commit failure. Dropping a
+  transaction before commit MUST release its database resources safely; no open
+  transaction may return to the connection pool. An uncertain commit result MUST
+  NOT be reported as a confirmed success.
+
+The existing `job` event stream remains the lifecycle authority and `job_queue`
+remains a derived projection. PostgreSQL persistence MUST use the existing
+crate-owned job preparation rather than define another event or queue model. All
+writes belonging to a command MUST join the repository's persistence
+transaction; enqueueing after that transaction commits does not satisfy
+atomicity. Backend implementations MUST expose their supported capabilities
+explicitly and MUST NOT satisfy contracts with success-returning stubs. Existing
+`EventBackend` implementations MUST remain source-compatible.
+
+Real PostgreSQL tests MUST prove event and snapshot reload, optimistic conflict,
+atomic command/enqueue success, rollback after injected write failures, and
+competing writes. SQLite regressions and ordinary project checks remain
+required. PostgreSQL tests MUST fail visibly when their required service is
+unavailable rather than silently skip.
+
+Local integration testing uses devenv's built-in PostgreSQL service, with
+managed state under the existing `.tmp/devenv/` layout and isolated test
+databases. Pure Nix checks MUST provision their own bounded database lifecycle
+rather than depend on the impure developer service.
+
 ## 0.5.0 direction
 
-Release 0.5.0 is intended to add a typed TypeScript binding over the shared
-Rust engine. This records the release direction only; TypeScript implementation
-is outside the 0.4.0 scope and contract.
+Release 0.5.0 is intended to add a typed TypeScript binding over the shared Rust
+engine. This records the release direction only; TypeScript implementation is
+outside the 0.4.0 scope and contract.
 
 The TypeScript binding MUST remain a veneer over the existing engine and MUST
 NOT introduce independent storage or durable protocol decisions. Its runtime
@@ -208,7 +264,7 @@ It MUST NOT be implemented by copying them into a new module or crate.
 The extraction MUST provide language-neutral values for:
 
 - stream identity and expected version;
-- serialized proposed and stored events;
+- serialized events to append and stored events;
 - command commit requests, including the existing optional durable job intent;
 - snapshots and schema versions;
 - job identity, payload, claim handle, attempt, schedule, and settlement;
