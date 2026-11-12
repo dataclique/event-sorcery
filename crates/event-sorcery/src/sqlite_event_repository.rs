@@ -84,24 +84,27 @@ impl PersistedEventRepository for SqliteEventRepository {
             // is returned as stored -- no shape check is needed here, and doing
             // one would only duplicate the deserialize cqrs-es already performs.
             CompactionPolicy::Retain => Ok(Some(snapshot)),
-            // A `CompactAfterSnapshot` aggregate may have lost the events behind
-            // the snapshot, making the snapshot the only durable record of
-            // state. An incompatible payload must surface an error rather than
-            // letting cqrs-es silently rebuild from an incomplete history.
-            CompactionPolicy::CompactAfterSnapshot => match A::deserialize(&snapshot.aggregate) {
-                Ok(_) => Ok(Some(snapshot)),
-                Err(source) => {
-                    warn!(
-                        target: "cqrs",
-                        aggregate_type = A::TYPE,
-                        aggregate_id,
-                        %source,
-                        "Incompatible snapshot for a compactable aggregate cannot be \
-                         safely rebuilt from events; surfacing error"
-                    );
-                    Err(EngineError::Json(source).into())
+            // A compacting aggregate (full or windowed) may have lost the
+            // events behind the snapshot, making the snapshot the only
+            // durable record of state. An incompatible payload must surface
+            // an error rather than letting cqrs-es silently rebuild from an
+            // incomplete history.
+            CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => {
+                match A::deserialize(&snapshot.aggregate) {
+                    Ok(_) => Ok(Some(snapshot)),
+                    Err(source) => {
+                        warn!(
+                            target: "cqrs",
+                            aggregate_type = A::TYPE,
+                            aggregate_id,
+                            %source,
+                            "Incompatible snapshot for a compactable aggregate cannot be \
+                             safely rebuilt from events; surfacing error"
+                        );
+                        Err(EngineError::Json(source).into())
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -148,19 +151,19 @@ mod tests {
 
     use cqrs_es::event_sink::EventSink;
     use cqrs_es::persist::PersistedEventStore;
-    use cqrs_es::{AggregateContext, AggregateError, DomainEvent, EventStore};
+    use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, DomainEvent, EventStore};
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
 
     use sqlite_es::testing::create_test_pool;
 
     use super::*;
-    use crate::SqliteBackend;
     use crate::job::{
         EnqueueRequest, ErasedJob, JobId, JobKind, PendingPush, enqueued_event,
         pending_seed_payload,
     };
     use crate::job_store::EventBackend;
+    use crate::{Effect, EventSourced, Never, Nil, SqliteBackend, compact_events};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     struct TestAggregate {
@@ -223,6 +226,70 @@ mod tests {
 
         fn apply(&mut self, event: Self::Event) {
             self.events.push(event.event_type());
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    struct PreviousSnapshotAggregate {
+        events: String,
+    }
+
+    impl Aggregate for PreviousSnapshotAggregate {
+        const TYPE: &'static str = TestAggregate::TYPE;
+        type Command = ();
+        type Event = TestEvent;
+        type Error = TestError;
+        type Services = ();
+
+        async fn handle(
+            &mut self,
+            _command: Self::Command,
+            _services: &Self::Services,
+            event_sink: &EventSink<Self>,
+        ) -> Result<(), Self::Error> {
+            let mut scratch = self.clone();
+            event_sink.write(TestEvent::Created, &mut scratch).await;
+            Ok(())
+        }
+
+        fn apply(&mut self, event: Self::Event) {
+            self.events.push_str(&event.event_type());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSourced for PreviousSnapshotAggregate {
+        type Id = String;
+        type Error = Never;
+        type Command = ();
+        type Event = TestEvent;
+        type Materialized = Nil;
+        type Jobs = Nil;
+
+        const PROJECTION: Nil = Nil;
+        const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 1;
+        const AGGREGATE_TYPE: &'static str = <Self as Aggregate>::TYPE;
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::RetainLast { events: 2 };
+
+        fn originate(event: &TestEvent) -> Option<Self> {
+            Some(Self {
+                events: event.event_type(),
+            })
+        }
+
+        fn evolve(entity: &Self, event: &TestEvent) -> Result<Option<Self>, Never> {
+            let mut events = entity.events.clone();
+            events.push_str(&event.event_type());
+            Ok(Some(Self { events }))
+        }
+
+        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![TestEvent::Created]))
+        }
+
+        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![TestEvent::Created]))
         }
     }
 
@@ -477,6 +544,74 @@ mod tests {
 
         assert_eq!(aggregate_ids, ["one", "two"]);
         assert!(replay.next::<TestAggregate>(&[]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_window_snapshot_guard_preserves_incompatible_state() {
+        let pool = create_test_pool().await.unwrap();
+        let writer = CqrsFramework::new(
+            PersistedEventStore::<_, PreviousSnapshotAggregate>::new_snapshot_store(
+                SqliteEventRepository::new(
+                    pool.clone(),
+                    CompactionPolicy::RetainLast { events: 2 },
+                ),
+                1,
+            ),
+            vec![],
+            (),
+        );
+        for _ in 0..3 {
+            writer
+                .execute("agg-windowed-incompatible", ())
+                .await
+                .unwrap();
+        }
+
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new(TestAggregate::TYPE, "agg-windowed-incompatible");
+        let version = engine.current_version(&stream).await.unwrap();
+        assert_eq!(version, 3);
+        assert_eq!(
+            compact_events::<PreviousSnapshotAggregate>(&pool)
+                .await
+                .unwrap(),
+            1,
+        );
+        let remaining: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM events \
+             WHERE aggregate_type = ?1 AND aggregate_id = ?2 ORDER BY sequence",
+        )
+        .bind(TestAggregate::TYPE)
+        .bind("agg-windowed-incompatible")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, vec![2, 3]);
+
+        let repo =
+            SqliteEventRepository::new(pool.clone(), CompactionPolicy::RetainLast { events: 2 });
+        let result = repo
+            .get_snapshot::<TestAggregate>("agg-windowed-incompatible")
+            .await;
+        assert!(matches!(
+            result,
+            Err(PersistenceError::DeserializationError(_))
+        ));
+
+        let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(repo, 100);
+        let result = store.load_aggregate("agg-windowed-incompatible").await;
+        assert!(matches!(
+            result,
+            Err(AggregateError::DeserializationError(_))
+        ));
+
+        let snapshot = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        assert_eq!(snapshot.current_sequence, 3);
+        assert_eq!(snapshot.current_snapshot, 3);
+        assert_eq!(
+            snapshot.aggregate,
+            serde_json::json!({"events": "CreatedCreatedCreated"})
+        );
     }
 
     /// For a `Retain` entity, get_snapshot returns the incompatible snapshot
