@@ -27,14 +27,14 @@ this repository. It MUST continue to build on:
 - `cqrs-es` for aggregate execution, event persistence contracts, snapshots, and
   query dispatch;
 - Apalis for native Rust worker hosting and task execution;
-- `sqlite-es`, SQLx, and SQLite for the production persistence path; and
+- `sqlite-es`, SQLx, and SQLite for the existing SQLite persistence path; and
 - the existing event-sourced job, dispatch, reactor, projection, schema, and
   delivery implementations.
 
-The binding migration extracts the existing implementation. PostgreSQL command
-persistence extends that same engine with an additive storage backend. Neither
-permits a second event store, queue, workflow engine, or set of storage
-semantics.
+The binding migration extracts the existing implementation. Additional storage
+backends extend its repository contracts, not its execution or lifecycle
+semantics. Neither permits a second event store, queue, workflow engine, or set
+of durable decisions.
 
 ## Goals
 
@@ -45,7 +45,8 @@ semantics.
 - Provide Haskell users with the same domain capabilities through idiomatic
   Haskell types and a thin FFI adapter.
 - Keep domain folds and handlers in the language where the domain is written.
-- Make cross-language behavior testable against the same real SQLite engine.
+- Make cross-language behavior testable against the same shared engine and
+  persistence implementation.
 - Keep the Nix development and release graph reproducible for both languages.
 
 ## Non-goals
@@ -65,21 +66,24 @@ The following are explicitly out of scope for 0.4.0:
 
 Any such change requires a separate specification and compatibility decision.
 
-## PostgreSQL command persistence
+## Persistence backends
 
 Database independence follows `cqrs-es`: `PersistedEventStore` is generic over
 `PersistedEventRepository`, concrete database repositories implement
 persistence, and `ViewRepository` defines read-model storage separately.
-PostgreSQL MUST extend these repository contracts and event-sorcery's existing
-backend boundary, not introduce another execution engine or backend-selection
-framework.
+Additional backends MUST extend these repository contracts and event-sorcery's
+existing backend boundary, not introduce another execution engine or
+backend-selection framework.
 
-SQLite remains supported with its existing constructors, public backend
-implementations, migrations, stored data, and behavior unchanged.
-Database-specific SQL MAY differ; command validation, job-event construction,
-and durable lifecycle decisions MUST NOT be implemented twice.
+The library MUST provide SQLite and PostgreSQL repositories that satisfy these
+shared persistence contracts.
 
-The PostgreSQL persistence capability MUST:
+Database-specific SQL and transaction mechanisms MAY differ. Command validation,
+job-event construction, and durable lifecycle decisions MUST remain shared
+library code. Adding a backend MUST preserve existing public constructors,
+backend implementations, migrations, stored data, and behavior.
+
+Each persistence implementation MUST:
 
 - Bootstrap library-owned event, snapshot, and job-queue storage through
   versioned migrations. Reapplying bootstrap MUST preserve existing data.
@@ -101,24 +105,19 @@ The PostgreSQL persistence capability MUST:
   NOT be reported as a confirmed success.
 
 The existing `job` event stream remains the lifecycle authority and `job_queue`
-remains a derived projection. PostgreSQL persistence MUST use the existing
-crate-owned job preparation rather than define another event or queue model. All
-writes belonging to a command MUST join the repository's persistence
-transaction; enqueueing after that transaction commits does not satisfy
-atomicity. Backend implementations MUST expose their supported capabilities
-explicitly and MUST NOT satisfy contracts with success-returning stubs. Existing
-`EventBackend` implementations MUST remain source-compatible.
+remains a derived projection. Every backend MUST use the existing crate-owned
+job preparation rather than define another event or queue model. All writes
+belonging to a command MUST join the repository's persistence transaction;
+enqueueing after that transaction commits does not satisfy atomicity. Backend
+implementations MUST expose their supported capabilities explicitly and MUST NOT
+satisfy contracts with success-returning stubs. Existing `EventBackend`
+implementations MUST remain source-compatible.
 
-Real PostgreSQL tests MUST prove event and snapshot reload, optimistic conflict,
-atomic command/enqueue success, rollback after injected write failures, and
-competing writes. SQLite regressions and ordinary project checks remain
-required. PostgreSQL tests MUST fail visibly when their required service is
-unavailable rather than silently skip.
-
-Local integration testing uses devenv's built-in PostgreSQL service, with
-managed state under the existing `.tmp/devenv/` layout and isolated test
-databases. Pure Nix checks MUST provision their own bounded database lifecycle
-rather than depend on the impure developer service.
+Each backend's tests MUST use its real storage implementation to prove event and
+snapshot reload, optimistic conflict, atomic command/enqueue success, rollback
+after injected write failures, and competing writes. Existing backend
+regressions and ordinary project checks remain required. Tests MUST fail visibly
+when required storage is unavailable rather than silently skip.
 
 ## 0.5.0 direction
 
@@ -147,7 +146,9 @@ EventSourced / Store / jobs      type families / Effect / jobs
                   |                    |
                cqrs-es              Apalis
                   |                    |
-                  +-- sqlite-es/SQLx/SQLite
+                  +-- persistence repositories
+                                 |
+                          configured database
 ```
 
 The erased facade is a reusable entry point into the current implementation. It
@@ -482,6 +483,10 @@ The flake pins nixpkgs and rust-overlay directly and builds Rust packages with
 Crane. The devenv development shell is entered with `nix develop --impure` and
 keeps its state under `.tmp/devenv/`. Standalone package and hook checks MUST
 remain evaluable without impure development-shell configuration.
+
+Local PostgreSQL integration testing uses devenv's built-in service with
+isolated test databases. Pure Nix checks MUST provision a bounded database
+lifecycle rather than depend on the impure developer service.
 
 `.envrc` uses nix-direnv. Git hooks are declared with `git-hooks.nix` and run
 through `prek`. Hooks include fast formatting and static file checks only;
