@@ -8,6 +8,7 @@ let
       path: type:
       craneLib.filterCargoSources path type
       || pkgs.lib.hasPrefix (toString ./crates/sqlite-es/migrations) path
+      || pkgs.lib.hasPrefix (toString ./crates/event-sorcery/migrations/postgres) path
       || pkgs.lib.hasPrefix (toString ./.sqlx) path
       || pkgs.lib.hasPrefix (toString ./bindings/haskell/conformance) path;
   };
@@ -42,11 +43,25 @@ let
       platforms = pkgs.lib.platforms.unix;
     };
   };
+  postgresTestArgs = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+    nativeCheckInputs = [
+      pkgs.postgresql
+      pkgs.postgresqlTestHook
+    ];
+    postgresqlTestUserOptions = "LOGIN CREATEDB";
+    postgresqlTestSetupPost = ''
+      export DATABASE_URL="postgresql://test_user@localhost/test_db?host=$PGHOST"
+      export PGPASSWORD=""
+      export PGPASSFILE=/dev/null
+      export PGSSLMODE=disable
+    '';
+  };
   cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { src = depsSrc; });
 in
 {
   package = craneLib.buildPackage (
     commonArgs
+    // postgresTestArgs
     // {
       inherit cargoArtifacts;
       cargoBuildExtraArgs = "--all-targets";
@@ -60,6 +75,7 @@ in
 
   test = craneLib.cargoNextest (
     commonArgs
+    // postgresTestArgs
     // {
       inherit cargoArtifacts;
       cargoNextestExtraArgs = "--all-targets";
