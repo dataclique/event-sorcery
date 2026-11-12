@@ -68,7 +68,7 @@ impl PersistedEventRepository for PostgresEventRepository {
     ) -> Result<(), PersistenceError> {
         let (request, pending_jobs) =
             CommitRequest::prepare_repository(A::TYPE, events, snapshot_update)?;
-        self.commit(request).await?;
+        Box::pin(self.commit(request)).await?;
         pending_jobs.mark_committed();
         Ok(())
     }
