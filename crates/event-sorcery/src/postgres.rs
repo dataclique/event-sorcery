@@ -9,7 +9,8 @@ use serde_json::Value;
 use sqlx::PgConnection;
 
 use crate::engine::{
-    CommitRequest, EngineError, StoredEventRow, StoredSnapshotRow, validate_expected_version,
+    CommitRequest, EngineError, JobSeed, StoredEventRow, StoredSnapshotRow,
+    validate_expected_version,
 };
 
 /// Pool-backed PostgreSQL repository for the CQRS persistence contract.
@@ -86,6 +87,17 @@ impl PersistedEventRepository for PostgresEventRepository {
 }
 
 impl PostgresEventRepository {
+    /// Atomically persists a standalone job's event and queue seed.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed persistence errors for invalid jobs, duplicate identities,
+    /// and storage failures without committing a partial enqueue.
+    pub async fn enqueue(&self, job: JobSeed) -> Result<(), PersistenceError> {
+        Box::pin(self.commit(CommitRequest::for_job(job))).await?;
+        Ok(())
+    }
+
     async fn load_events(
         &self,
         aggregate_type: &str,
@@ -743,25 +755,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, 1);
-    }
-
-    #[derive(Debug, thiserror::Error)]
-    #[error("standalone PostgreSQL enqueue is awaiting implementation")]
-    struct StandaloneEnqueuePending;
-
-    trait StandaloneEnqueueContract {
-        fn enqueue(
-            &self,
-            job: JobSeed,
-        ) -> impl std::future::Future<Output = Result<(), PersistenceError>> + Send;
-    }
-
-    impl StandaloneEnqueueContract for PostgresEventRepository {
-        async fn enqueue(&self, _job: JobSeed) -> Result<(), PersistenceError> {
-            Err(PersistenceError::UnknownError(Box::new(
-                StandaloneEnqueuePending,
-            )))
-        }
     }
 
     #[sqlx::test(migrations = false)]

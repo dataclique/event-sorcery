@@ -293,6 +293,15 @@ impl<'events> CommitRequest<'events> {
         self
     }
 
+    pub(crate) fn for_job(job: JobSeed) -> Self {
+        let JobSeed(request) = job;
+        let stream = StreamIdentity::new(
+            <crate::job::JobState as crate::EventSourced>::AGGREGATE_TYPE,
+            request.job_id.to_string(),
+        );
+        Self::new(stream, &[]).with_jobs(vec![request])
+    }
+
     pub(crate) fn prepare_repository(
         aggregate_type: &str,
         events: &'events [SerializedEvent],
