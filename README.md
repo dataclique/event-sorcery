@@ -80,12 +80,11 @@ Development-shell state lives under `.tmp/devenv/`.
 
 ### Local PostgreSQL
 
-The devenv shell includes a PostgreSQL service managed by the pinned Process
-Compose flake input. Start it and run the service smoke test with:
+The flake pins Process Compose; devenv supplies the local PostgreSQL service.
+For interactive database work, start the service with:
 
 ```bash
-devenv up --detached postgres
-devenv test
+devenv up postgres
 ```
 
 The service accepts private Unix-socket connections only. It creates the

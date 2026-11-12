@@ -12,6 +12,18 @@ from the `.sqlx/` directory instead of connecting to the database. This means:
 - If you add or change a `query!` macro invocation, you must regenerate the
   cache before the change will compile under `SQLX_OFFLINE=true`.
 
+## Local PostgreSQL and flake tests
+
+The development shell uses devenv's flake integration, not the native devenv
+CLI. Its `devenv test` compatibility helper executes the test script without
+starting or stopping configured processes. The upstream
+[flake feature comparison](https://devenv.sh/guides/using-with-flakes/)
+documents this distinction.
+
+Use `devenv up postgres` for an interactive development service. Automated
+PostgreSQL checks must own their database lifecycle through the Nix flake,
+without depending on an already-running developer service.
+
 ## Regenerating the query cache
 
 ```bash
@@ -20,15 +32,11 @@ cargo sqlx prepare --workspace -- --all-targets
 
 Then check the updated `.sqlx/` files into version control.
 
-### Pitfall: `#[cfg(test)]` queries don't work with offline mode
+### Pitfall: missing offline metadata for test-only queries
 
-`cargo sqlx prepare` does NOT collect queries from `#[cfg(test)]` code, even
-with `-- --all-targets`. This is a known limitation -- the `--all-targets` flag
-is supposed to compile test targets during preparation, but in practice the
-test-only queries are silently skipped.
-
-When you then run `cargo nextest run` (which enables `cfg(test)`), the compiler
-sees the query macro, finds no cached metadata, and fails with:
+Test-only query macros need cache entries for the targets and features used by
+the test run. If preparation omits one, `cargo nextest run` can enable a query
+whose metadata is absent and fail with:
 
 ```text
 `SQLX_OFFLINE=true` but there is no cached data for this query
@@ -37,11 +45,11 @@ sees the query macro, finds no cached metadata, and fails with:
 **The fix: use runtime query functions in test code.** Instead of the
 compile-time macro `sqlx::query_scalar!("...")`, use the runtime function
 `sqlx::query_scalar("...")`. The non-macro version doesn't need offline cache
-entries. Since test code runs against a real in-memory database anyway,
-compile-time query verification adds no value.
+entries. Runtime queries avoid compile-time cache requirements; tests still
+execute against their actual storage backend.
 
 ```rust
-// BROKEN in offline mode -- macro needs cache entry that prepare won't generate
+// Requires an offline cache entry when SQLX_OFFLINE=true.
 #[cfg(test)]
 let count = sqlx::query_scalar!("SELECT COUNT(*) FROM my_table")
     .fetch_one(pool).await?;

@@ -17,10 +17,6 @@ typed language surfaces:
 - the current native Rust API; and
 - an idiomatic Haskell binding over a versioned C ABI.
 
-Data Clique Software Design FZCO maintains the open-source
-`dataclique/event-sorcery` repository governed by this specification. The
-project began as a fork of the ST0x implementation.
-
 The shared engine MUST be extracted from the implementation already present in
 this repository. It MUST continue to build on:
 
@@ -99,10 +95,11 @@ Each persistence implementation MUST:
   event and queue seed together through the same storage path.
 - Preserve snapshot version and covered-sequence semantics. An independent
   snapshot write MUST NOT cover events beyond the committed stream version.
-- Roll back the entire transaction on a pre-commit failure. Dropping a
-  transaction before commit MUST release its database resources safely; no open
-  transaction may return to the connection pool. An uncertain commit result MUST
-  NOT be reported as a confirmed success.
+- Roll back the entire transaction on a pre-commit failure. A cancellation-safe
+  guard MUST own the transaction from acquisition through explicit commit or
+  rollback. Dropping it before commit MUST release database resources safely; no
+  open transaction may return to the connection pool. An uncertain commit result
+  MUST NOT be reported as a confirmed success.
 
 The existing `job` event stream remains the lifecycle authority and `job_queue`
 remains a derived projection. Every backend MUST use the existing crate-owned
@@ -239,14 +236,6 @@ Recomputing whether a durable transition is legal is engine work and MUST NOT
 appear in a binding.
 
 ## Domain protocol
-
-Both language surfaces expose the same domain shape:
-
-The SQLite claim transaction is owned by SQLx's transaction guard from
-`BEGIN IMMEDIATE` through its explicit commit or rollback. Cancelling a claim
-future drops that guard, which queues a rollback before the connection can be
-reused by the pool. A cancelled worker must never return an open transaction to
-the pool or retain SQLite's writer lock.
 
 ### Durable jobs
 
@@ -473,7 +462,8 @@ when opened.
 
 ## Build and repository contract
 
-The repository is managed with Nix. The flake consumes the shared external
+The Nix flake is the authoritative build and check interface; devenv supports
+local development. The flake consumes the shared external
 `github:dataclique/but.nix` library rather than vendoring a `but.nix` file. The
 development shell includes the Rust toolchain, Stack, GHC 9.14.1 via the
 Stack-compatible Nix toolchain workaround, cbindgen, Fourmolu, HLint, and the
