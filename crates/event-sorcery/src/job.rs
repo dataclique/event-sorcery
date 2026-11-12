@@ -89,7 +89,7 @@ pub trait StandaloneJob: Serialize + DeserializeOwned + Send + 'static {
 ///
 /// Stable across every retry and re-claim of the job, so it is the correct
 /// root for external-boundary idempotency keys. Converted to a string only at
-/// the storage boundary (the job's aggregate id and `job_queue` view id).
+/// the storage boundary (the job's aggregate id and `job_queue_projection` view id).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobId(Ulid);
 
@@ -353,7 +353,7 @@ impl DomainEvent for JobEvent {
 /// The folded state of a durable job -- the [`EventSourced`] entity.
 ///
 /// `Claimed` carries no `lease_until`: the live lease lives only in the
-/// `job_queue` projection column (D1), so it cannot be folded from the event
+/// `job_queue_projection` projection column (D1), so it cannot be folded from the event
 /// stream. `claims` counts claim attempts (the D5 budget), folded because
 /// `transition` sees only `&self`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -446,7 +446,7 @@ impl EventSourced for JobState {
     type Materialized = Table;
     type Jobs = Nil;
 
-    const PROJECTION: Table = Table("job_queue");
+    const PROJECTION: Table = Table("job_queue_projection");
     // 2: terminal states carry the job kind so queue rows stay
     // attributable after completion or death.
     const SCHEMA_VERSION: u64 = 2;
@@ -644,7 +644,7 @@ pub(crate) fn plan_claim(
     let lifecycle: Lifecycle<JobState> = match serde_json::from_str(&read.payload) {
         Ok(lifecycle) => lifecycle,
         Err(error) => {
-            error!(target: "cqrs", job_id, ?error, "job_queue payload undecodable; needs rebuild");
+            error!(target: "cqrs", job_id, ?error, "job_queue_projection payload undecodable; needs rebuild");
             return ClaimDecision::Skip;
         }
     };
@@ -773,7 +773,7 @@ pub(crate) fn enqueued_event(request: &EnqueueRequest) -> Result<SerializedEvent
     .serialized(&request.job_id.to_string(), 1)?)
 }
 
-/// Builds the seed `job_queue` projection payload (version 1) for an enqueue:
+/// Builds the seed `job_queue_projection` projection payload (version 1) for an enqueue:
 /// `Lifecycle::Live(Pending)`.
 pub(crate) fn pending_seed_payload(request: &EnqueueRequest) -> Result<String, JobStoreError> {
     Ok(serde_json::to_string(&Lifecycle::Live(

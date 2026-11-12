@@ -834,12 +834,12 @@ let monitor = build_supervised_worker!(
 monitor.run().await?;  // polls, claims, runs, delivers, and acks jobs
 ```
 
-Each worker polls the `job_queue` projection for runnable jobs of its `KIND`,
-claims one under a lease, runs the routed execution (submit/reconcile for
-entity-kicked jobs, `perform` for standalone ones), delivers the verdict, and
-durably records the outcome (success, retry with backoff, or dead-letter) -- all
-fenced so a job runs exactly once per successful claim. `JobWorkerConfig` tunes
-poll cadence, concurrency, lease duration, retry budget, backoff, and the
+Each worker polls the `job_queue_projection` projection for runnable jobs of its
+`KIND`, claims one under a lease, runs the routed execution (submit/reconcile
+for entity-kicked jobs, `perform` for standalone ones), delivers the verdict,
+and durably records the outcome (success, retry with backoff, or dead-letter) --
+all fenced so a job runs exactly once per successful claim. `JobWorkerConfig`
+tunes poll cadence, concurrency, lease duration, retry budget, backoff, and the
 verdict-delivery deferrals (`DeliveryPolicy`); `Clock::system()` is the real
 wall clock (use `Clock::from_fn(..)` to drive lease and retry timing
 deterministically in tests).

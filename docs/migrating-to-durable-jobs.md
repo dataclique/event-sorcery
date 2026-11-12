@@ -18,8 +18,8 @@ If your job system uses these, event-sorcery is a clean (often stronger) drop-in
 for the _execution_ side:
 
 - **Durable at-least-once execution** — each job is its own event stream
-  (`Enqueued`) + a `job_queue` projection row, replacing apalis `SqliteStorage`
-  rows.
+  (`Enqueued`) + a `job_queue_projection` projection row, replacing apalis
+  `SqliteStorage` rows.
 - **Retry with exponential backoff** — `max_attempts` + `Backoff` via
   `RetryScheduled`; `attempt` is bumped only by a recorded failure, so a crash
   is not a failed attempt (matches apalis's contract).
@@ -65,7 +65,7 @@ shippable and a no-op until used:
 | **Per-kind terminal-failure (fail-stop) hook** fired on `Dead` (including `DeadReason::Abandoned`)                                                                             | Liquidity crashes the process on a terminal trading/transfer failure and lets systemd restart clean. ES currently dead-letters and keeps idling. A kind that does _not_ install the hook is the best-effort tier — one mechanism covers both.       |
 | **Cancel-by-kind / cancel-by-dedup-key** (a terminal `Cancelled`)                                                                                                              | Discard stale pending work (rebalancing checks captured against pre-rebalance inventory; stale resume rows).                                                                                                                                        |
 | **Lease/timeout sizing guidance** + steer long external waits to _defer_                                                                                                       | A multi-minute CCTP wait inside `perform` would outlive a 30s lease (→ double-claim → double burn) or hit the 300s timeout.                                                                                                                         |
-| **`prune_terminal_jobs`** (already an ADR-0006 follow-up)                                                                                                                      | Replace apalis `spawn_finished_job_cleanup`; bound `job_queue` growth while retaining `Dead` rows for audit.                                                                                                                                        |
+| **`prune_terminal_jobs`** (already an ADR-0006 follow-up)                                                                                                                      | Replace apalis `spawn_finished_job_cleanup`; bound `job_queue_projection` growth while retaining `Dead` rows for audit.                                                                                                                             |
 
 Until at least the standalone-enqueue API, defer, dedup, and the fail-stop hook
 land, a liquidity migration cannot start.
@@ -73,8 +73,9 @@ land, a liquidity migration cannot start.
 ## 3. The safe cutover (per kind)
 
 Both backends can coexist on the **same SQLite file** during the migration
-(apalis `Jobs` table + event-sorcery `events`/`snapshots`/`job_queue`). Run both
-migrators with `set_ignore_missing(true)` against the shared `_sqlx_migrations`.
+(apalis `Jobs` table + event-sorcery
+`events`/`snapshots`/`job_queue_projection`). Run both migrators with
+`set_ignore_missing(true)` against the shared `_sqlx_migrations`.
 
 For each job kind, migrate one kind at a time, leaf-first, with **both workers
 running concurrently**:
@@ -134,10 +135,10 @@ Leaf-first, lowest-risk first:
   event-reconstructed fail-closed `usdc_in_progress` / `equity_in_progress`
   guards (those are the authoritative re-burn defense for real money).
 - **Cross-stack dedup is a no-op during the dual-stack window.** ES
-  `has_in_flight` queries only `job_queue`, never the apalis `Jobs` table. A
-  kind whose only overlap defense is `has_in_flight` (e.g. `BackfillRange`) has
-  no in-memory backstop — migrate it in a single flip and confirm no overlap can
-  occur across the cutover.
+  `has_in_flight` queries only `job_queue_projection`, never the apalis `Jobs`
+  table. A kind whose only overlap defense is `has_in_flight` (e.g.
+  `BackfillRange`) has no in-memory backstop — migrate it in a single flip and
+  confirm no overlap can occur across the cutover.
 - **`max_concurrency = 1` does NOT halt after a dead-letter** the way apalis
   fail-stop does — the ES poll loop moves straight to the next pending
   candidate. The halt depends entirely on the fail-stop hook crashing the
@@ -163,8 +164,11 @@ A consumer owns its migrations. event-sorcery ships the canonical schema; copy
 it into your migration directory (see `examples/simple/migrations/`):
 
 - `…_init.sql` — the `events` + `snapshots` tables (the event-sourcing core).
-- `…_job_queue.sql` — the `job_queue` view table (generated
+- `…_job_queue.sql` — the legacy durable-job projection schema (generated
   `kind`/`status`/`run_at` columns + the projection-only `lease_until`).
+- `…_rename_job_queue_projection.sql` — rename that table to
+  `job_queue_projection`, preserving its rows and leases. Keep the earlier
+  migration unchanged and apply the complete migration chain.
 
 `StoreBuilder::build()` and `JobRuntime::build()` wire over an already-migrated
 pool; neither migrates for you (so they compose with your own view migrations

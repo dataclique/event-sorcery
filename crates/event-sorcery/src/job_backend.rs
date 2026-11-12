@@ -1,7 +1,7 @@
 //! Worker-side durable-job execution: a generic [`apalis_core::Backend`].
 //!
 //! [`JobRuntime`] turns one [`EventBackend`] into the whole durable-jobs
-//! capability -- the job [`Store`] (cqrs/es) and the `job_queue` [`Projection`],
+//! capability -- the job [`Store`] (cqrs/es) and the `job_queue_projection` [`Projection`],
 //! auto-wired by [`StoreBuilder`]. [`EventStoreBackend`] polls that projection
 //! for runnable jobs, claims each via [`EventBackend::claim`], runs it through an
 //! apalis worker, and durably records the outcome as a [`JobCommand`] fenced on
@@ -51,7 +51,7 @@ use crate::{LifecycleError, ReconcileError, SendError, Store, StoreBuilder};
 
 /// The durable-jobs runtime over one [`EventBackend`].
 ///
-/// Holds the job [`Store`] (cqrs/es) and the `job_queue` [`Projection`], built
+/// Holds the job [`Store`] (cqrs/es) and the `job_queue_projection` [`Projection`], built
 /// once per process. Cheap to clone (the store and projection are `Arc`); one
 /// runtime is shared by every job type's worker.
 pub struct JobRuntime<Backend: EventBackend = SqliteBackend> {
@@ -407,7 +407,7 @@ impl<Backend: EventBackend> JobRuntime<Backend> {
     }
 
     /// Standalone durable enqueue (ADR-0007): append `job`'s `Enqueued` event and
-    /// seed its pending `job_queue` row in the backend's own transaction. This is
+    /// seed its pending `job_queue_projection` row in the backend's own transaction. This is
     /// the reactor / poller / job-chain / startup enqueue path -- there is no
     /// command commit for the job to ride. Returns the new job's id.
     ///
@@ -463,8 +463,8 @@ pub enum JobEnqueueError<BackendError> {
 }
 
 impl JobRuntime<SqliteBackend> {
-    /// Wires the SQLite job runtime over `pool`: the job `Store` + `job_queue`
-    /// projection. The canonical schema (events + snapshots + `job_queue`) must
+    /// Wires the SQLite job runtime over `pool`: the job `Store` + `job_queue_projection`
+    /// projection. The canonical schema (events + snapshots + `job_queue_projection`) must
     /// already be applied -- like [`StoreBuilder`], the consumer owns migrations,
     /// so this composes with the consumer's own view migrations instead of
     /// re-running event-sorcery's and conflicting. `pool` MUST satisfy the pool
@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     /// Seeds a job exactly as the enqueue flush does: the `Enqueued` event at
-    /// sequence 1 plus the seed `job_queue` row (version 1, pending, no lease).
+    /// sequence 1 plus the seed `job_queue_projection` row (version 1, pending, no lease).
     async fn enqueue(pool: &SqlitePool, run_at_ms: i64) -> JobId {
         let request = EnqueueRequest {
             job_id: JobId::new(),
@@ -1251,7 +1251,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO job_queue (view_id, version, payload, lease_until) VALUES (?1, 1, ?2, NULL)",
+            "INSERT INTO job_queue_projection (view_id, version, payload, lease_until) VALUES (?1, 1, ?2, NULL)",
         )
         .bind(request.job_id.to_string())
         .bind(&payload)
@@ -1290,12 +1290,14 @@ mod tests {
     }
 
     async fn queue_status(pool: &SqlitePool, job_id: &JobId) -> Option<String> {
-        sqlx::query_scalar::<_, Option<String>>("SELECT status FROM job_queue WHERE view_id = ?1")
-            .bind(job_id.to_string())
-            .fetch_optional(pool)
-            .await
-            .unwrap()
-            .flatten()
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT status FROM job_queue_projection WHERE view_id = ?1",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .flatten()
     }
 
     #[tokio::test]
@@ -1675,7 +1677,7 @@ mod tests {
         assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("dead"));
 
         let payload: String =
-            sqlx::query_scalar("SELECT payload FROM job_queue WHERE view_id = ?1")
+            sqlx::query_scalar("SELECT payload FROM job_queue_projection WHERE view_id = ?1")
                 .bind(job_id.to_string())
                 .fetch_one(&pool)
                 .await
@@ -1716,7 +1718,7 @@ mod tests {
 
         sqlx::query(
             r"
-            DELETE FROM job_queue
+            DELETE FROM job_queue_projection
             WHERE view_id = ?1
             ",
         )
@@ -1837,7 +1839,7 @@ mod tests {
 
         // The claim budget reset to 0 so a poller may defer indefinitely.
         let payload: String =
-            sqlx::query_scalar("SELECT payload FROM job_queue WHERE view_id = ?1")
+            sqlx::query_scalar("SELECT payload FROM job_queue_projection WHERE view_id = ?1")
                 .bind(job_id.to_string())
                 .fetch_one(&pool)
                 .await

@@ -43,13 +43,14 @@ SQL. Enum-typed entities have variant-dependent paths and are unsuitable for
 generated columns; prefer `load_all` + filter-in-Rust there.
 
 **Migrations live inside the example crate.** The canonical event-sorcery schema
-(events + snapshots + the `job_queue` view table) and the view-table SQL are
-committed under `migrations/` and applied with `sqlx::migrate!("./migrations")`.
-This mirrors the real consumer layout: a downstream project copies the
-event-sorcery schema into its own migration directory next to its own view
-tables, rather than depending on a path inside the library's source tree. The
-consumer owns migrations — `StoreBuilder::build()` and `JobRuntime::build()`
-wire over an already-migrated pool and do not migrate themselves.
+(events + snapshots + the `job_queue_projection` view table) and the view-table
+SQL are committed under `migrations/` and applied with
+`sqlx::migrate!("./migrations")`. This mirrors the real consumer layout: a
+downstream project copies the event-sorcery schema into its own migration
+directory next to its own view tables, rather than depending on a path inside
+the library's source tree. The consumer owns migrations —
+`StoreBuilder::build()` and `JobRuntime::build()` wire over an already-migrated
+pool and do not migrate themselves.
 
 **Typed jobs instead of injected services.** Command handlers are pure
 `(state, command) -> events` and take only a `JobQueue<Self::Jobs>` — no service

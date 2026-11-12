@@ -4,7 +4,7 @@
 //! two engine-shaped primitives ([`claim`](EventBackend::claim) and
 //! [`renew`](EventBackend::renew)) -- and gets the whole durable-jobs capability,
 //! built by event-sorcery's own cqrs/es machinery (the job is an
-//! [`crate::EventSourced`] aggregate, the ack is a command, the `job_queue` is a
+//! [`crate::EventSourced`] aggregate, the ack is a command, the `job_queue_projection` is a
 //! projection). The backend never names a job type: the claim *decision* (which
 //! event to append, the new projection payload, the strongly-typed claim result)
 //! is a crate-side closure, and the result rides through the backend as an opaque
@@ -28,7 +28,7 @@ use crate::CompactionPolicy;
 /// projection. Used only as a generic bound, never `dyn`.
 pub trait EventBackend: Clone + Send + Sync + 'static {
     /// The cqrs-es event repository. Its `persist` flushes buffered `Enqueued`
-    /// events AND seeds their `job_queue` rows in the same transaction that
+    /// events AND seeds their `job_queue_projection` rows in the same transaction that
     /// commits the triggering events (the atomic-enqueue guarantee).
     type EventRepo: PersistedEventRepository + Send + Sync + 'static;
 
@@ -38,7 +38,7 @@ pub trait EventBackend: Clone + Send + Sync + 'static {
     /// Builds the flush-aware event repository for `compaction_policy`.
     fn event_repo(&self, compaction_policy: CompactionPolicy) -> Self::EventRepo;
 
-    /// Applies the canonical events + snapshots + `job_queue` schema.
+    /// Applies the canonical events + snapshots + `job_queue_projection` schema.
     fn migrate(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Claims one job in a single write-locked transaction: re-read the row, hand
@@ -68,7 +68,7 @@ pub trait EventBackend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<LeaseRenewal, Self::Error>> + Send;
 
     /// Standalone durable enqueue (ADR-0007): append the `Enqueued` `event` and
-    /// seed its `job_queue` row (`view_id = event.aggregate_id`, version 1,
+    /// seed its `job_queue_projection` row (`view_id = event.aggregate_id`, version 1,
     /// `payload`, no lease) in the backend's OWN transaction -- for enqueues from
     /// reactors, pollers, job-chains, and startup, which have no command commit to
     /// ride. A uniqueness violation on the event (the `view_id` already has a
@@ -80,7 +80,7 @@ pub trait EventBackend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// The `job_queue` row as the claim transaction re-reads it, raw. The crate
+/// The `job_queue_projection` row as the claim transaction re-reads it, raw. The crate
 /// deserializes `payload` into `Lifecycle<JobState>` itself.
 pub struct ClaimRead {
     /// The last applied event sequence (the view version).

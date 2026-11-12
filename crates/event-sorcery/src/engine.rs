@@ -423,7 +423,7 @@ impl Engine {
     ) -> Result<LeaseRenewal, SqliteJobError> {
         let done = sqlx::query!(
             r#"
-            UPDATE job_queue
+            UPDATE job_queue_projection
             SET lease_until = ?1
             WHERE view_id = ?2
               AND version = ?3
@@ -946,7 +946,7 @@ impl Engine {
             let job_id = request.job_id.to_string();
             sqlx::query!(
                 r#"
-                INSERT INTO job_queue (view_id, version, payload, lease_until)
+                INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
                 VALUES (?1, 1, ?2, NULL)
                 "#,
                 job_id,
@@ -1249,7 +1249,7 @@ async fn read_job_projection_for_claim(
         SELECT version,
                payload,
                lease_until AS "lease_until_ms"
-        FROM job_queue
+        FROM job_queue_projection
         WHERE view_id = ?1
         "#,
         job_id,
@@ -1267,7 +1267,7 @@ async fn write_job_projection(
 ) -> Result<(), SqliteJobError> {
     sqlx::query!(
         r#"
-        INSERT INTO job_queue (
+        INSERT INTO job_queue_projection (
             view_id,
             version,
             payload,
@@ -1577,7 +1577,7 @@ mod tests {
         sqlx::query_scalar!(
             r"
             SELECT COUNT(*)
-            FROM job_queue
+            FROM job_queue_projection
             WHERE view_id = ?1
             ",
             job_id,

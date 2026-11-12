@@ -101,14 +101,14 @@ Each persistence implementation MUST:
   open transaction may return to the connection pool. An uncertain commit result
   MUST NOT be reported as a confirmed success.
 
-The existing `job` event stream remains the lifecycle authority and `job_queue`
-remains a derived projection. Every backend MUST use the existing crate-owned
-job preparation rather than define another event or queue model. All writes
-belonging to a command MUST join the repository's persistence transaction;
-enqueueing after that transaction commits does not satisfy atomicity. Backend
-implementations MUST expose their supported capabilities explicitly and MUST NOT
-satisfy contracts with success-returning stubs. Existing `EventBackend`
-implementations MUST remain source-compatible.
+The existing `job` event stream remains the lifecycle authority and
+`job_queue_projection` remains a derived projection. Every backend MUST use the
+existing crate-owned job preparation rather than define another event or queue
+model. All writes belonging to a command MUST join the repository's persistence
+transaction; enqueueing after that transaction commits does not satisfy
+atomicity. Backend implementations MUST expose their supported capabilities
+explicitly and MUST NOT satisfy contracts with success-returning stubs. Existing
+`EventBackend` implementations MUST remain source-compatible.
 
 Each backend's tests MUST use its real storage implementation to prove event and
 snapshot reload, optimistic conflict, atomic command/enqueue success, rollback
@@ -181,8 +181,8 @@ lease renewal, acknowledgement, retry, defer, and dead-letter paths define the
 job protocol.
 
 The `job` aggregate event stream is the sole durable source of job lifecycle
-truth. `job_queue` remains its rebuildable polling projection. A claim appends
-the job event and advances that projection in one transaction. The
+truth. `job_queue_projection` remains its rebuildable polling projection. A
+claim appends the job event and advances that projection in one transaction. The
 projection-only lease is operational coordination state and MUST NOT redefine
 the event-sourced lifecycle.
 

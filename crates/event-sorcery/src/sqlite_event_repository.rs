@@ -266,7 +266,7 @@ mod tests {
         sqlx::query_scalar::<_, i64>(
             r"
             SELECT COUNT(*)
-            FROM job_queue
+            FROM job_queue_projection
             WHERE view_id = ?1
             ",
         )
@@ -295,7 +295,7 @@ mod tests {
         sqlx::query_as::<_, (String, i64, String, Option<i64>)>(
             r"
             SELECT view_id, version, payload, lease_until
-            FROM job_queue
+            FROM job_queue_projection
             WHERE view_id = ?1
             ",
         )

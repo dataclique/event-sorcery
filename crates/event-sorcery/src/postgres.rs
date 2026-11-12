@@ -194,7 +194,7 @@ impl PostgresEventRepository {
             let payload = crate::job::pending_seed_payload(&request)?;
             sqlx::query(
                 r"
-                INSERT INTO job_queue (view_id, version, payload, lease_until)
+                INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
                 VALUES ($1, 1, $2::JSONB, NULL)
                 ",
             )
@@ -679,12 +679,13 @@ mod tests {
         assert_eq!(snapshot.current_snapshot, 1);
         assert_eq!(snapshot.aggregate, json!({"values": ["first"]}));
 
-        let (version, payload, status): (i64, Value, String) =
-            sqlx::query_as("SELECT version, payload, status FROM job_queue WHERE view_id = $1")
-                .bind(job_id.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (version, payload, status): (i64, Value, String) = sqlx::query_as(
+            "SELECT version, payload, status FROM job_queue_projection WHERE view_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(version, 1);
         assert_eq!(status, "pending");
         assert_eq!(payload["Live"]["Pending"]["kind"], json!("recorded-value"));
@@ -749,11 +750,12 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sequence, 1);
-        let version: i64 = sqlx::query_scalar("SELECT version FROM job_queue WHERE view_id = $1")
-            .bind(job_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM job_queue_projection WHERE view_id = $1")
+                .bind(job_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(version, 1);
     }
 
@@ -782,7 +784,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, PersistenceError::OptimisticLockError));
         let (version, payload, lease): (i64, Value, Option<i64>) = sqlx::query_as(
-            "SELECT version, payload, lease_until FROM job_queue WHERE view_id = $1",
+            "SELECT version, payload, lease_until FROM job_queue_projection WHERE view_id = $1",
         )
         .bind(job_id.to_string())
         .fetch_one(&pool)
@@ -847,7 +849,7 @@ mod tests {
                 SELECT COUNT(*) FROM events
                 WHERE aggregate_type = 'job' AND aggregate_id = $1
             ), (
-                SELECT COUNT(*) FROM job_queue WHERE view_id = $1
+                SELECT COUNT(*) FROM job_queue_projection WHERE view_id = $1
             )
             ",
         )
@@ -912,7 +914,7 @@ mod tests {
             let payload = serde_json::to_value(Lifecycle::Live(state)).unwrap();
             sqlx::query(
                 r"
-                INSERT INTO job_queue (view_id, version, payload, lease_until)
+                INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
                 VALUES ($1, $2, $3, $4)
                 ",
             )
@@ -930,7 +932,7 @@ mod tests {
                 (String, String, Option<i64>, i64, Value, Option<i64>) = sqlx::query_as(
                     r"
                     SELECT kind, status, run_at, version, payload, lease_until
-                    FROM job_queue
+                    FROM job_queue_projection
                     WHERE view_id = $1
                     ",
                 )
@@ -964,7 +966,7 @@ mod tests {
             }))
             .unwrap();
             let error = sqlx::query(
-                "INSERT INTO job_queue (view_id, version, payload) VALUES ($1, $2, $3)",
+                "INSERT INTO job_queue_projection (view_id, version, payload) VALUES ($1, $2, $3)",
             )
             .bind(&view_id)
             .bind(version)
@@ -979,7 +981,7 @@ mod tests {
             assert_eq!(error.code().as_deref(), Some("23514"));
         }
 
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_queue")
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_queue_projection")
             .fetch_one(&pool)
             .await
             .unwrap();
