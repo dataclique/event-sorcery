@@ -274,6 +274,7 @@
                 env = {
                   SQLX_OFFLINE = "true";
                   CARGO_INCREMENTAL = "0";
+                  DATABASE_URL = "postgresql://event_sorcery_test@localhost/event_sorcery_test?host=${config.devenv.runtime}/postgres";
                 };
 
                 git-hooks = {

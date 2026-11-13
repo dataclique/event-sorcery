@@ -43,6 +43,9 @@ let
       platforms = pkgs.lib.platforms.unix;
     };
   };
+  testCargoArgs =
+    "--locked --workspace" + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux " --all-features";
+
   postgresTestArgs = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     nativeCheckInputs = [
       pkgs.postgresql
@@ -64,6 +67,7 @@ in
     // postgresTestArgs
     // {
       inherit cargoArtifacts;
+      cargoExtraArgs = testCargoArgs;
       cargoBuildExtraArgs = "--all-targets";
     }
   );
@@ -78,10 +82,11 @@ in
     // postgresTestArgs
     // {
       inherit cargoArtifacts;
+      cargoExtraArgs = testCargoArgs;
       cargoNextestExtraArgs = "--all-targets";
       postCheck = ''
         cargo test ''${CARGO_PROFILE:+--profile $CARGO_PROFILE} \
-          --locked --workspace --all-features --doc
+          ${testCargoArgs} --doc
       '';
     }
   );

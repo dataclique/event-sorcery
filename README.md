@@ -105,7 +105,15 @@ devenv up postgres
 
 The service accepts private Unix-socket connections only. It creates the
 `event_sorcery_test` database and role; that role can create isolated test
-databases. PostgreSQL data lives under `.tmp/devenv/state/postgres/`.
+databases. PostgreSQL data lives under `.tmp/devenv/state/postgres/`. The shell
+sets `DATABASE_URL` to this role and database over the private Unix socket, so
+SQLx fixture tests can run after the service starts.
+
+Linux Nix package and test checks run all features with an isolated PostgreSQL
+service. The pinned PostgreSQL test hook does not support Darwin, so Darwin
+package and test checks run the default features; Clippy still compiles all
+features. To run PostgreSQL tests locally on Darwin, start the service above and
+run `cargo nextest run --workspace --all-features` in the development shell.
 
 See [AGENTS.md](AGENTS.md) for contribution conventions.
 
