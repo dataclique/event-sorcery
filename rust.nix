@@ -79,6 +79,10 @@ in
     // {
       inherit cargoArtifacts;
       cargoNextestExtraArgs = "--all-targets";
+      postCheck = ''
+        cargo test ''${CARGO_PROFILE:+--profile $CARGO_PROFILE} \
+          --locked --workspace --all-features --doc
+      '';
     }
   );
 

@@ -1217,6 +1217,7 @@ mod tests {
 
         const WORKER_NAME: &'static str = "test-worker";
         const KIND: &'static str = "test-job";
+        const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
 
         fn label(&self) -> Label {
             Label::new(format!("test:{}", self.n))
@@ -1599,6 +1600,7 @@ mod tests {
 
         const WORKER_NAME: &'static str = "fallible-worker";
         const KIND: &'static str = "fallible-job";
+        const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
 
         fn label(&self) -> Label {
             Label::new("fallible")

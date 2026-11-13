@@ -60,8 +60,8 @@ pub trait StandaloneJob: Serialize + DeserializeOwned + Send + 'static {
     /// used to route a job to the worker that runs it.
     const KIND: &'static str;
 
-    /// Logged when retries are exhausted.
-    const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
+    /// Message for reporting exhausted retries, selected explicitly by the implementation.
+    const TERMINAL_FAILURE_MSG: &'static str;
 
     /// Human-readable label for structured logging.
     fn label(&self) -> Label;
@@ -452,6 +452,7 @@ impl EventSourced for JobState {
     const SCHEMA_VERSION: u64 = 2;
     const AGGREGATE_TYPE: &'static str = JOB_AGGREGATE_TYPE;
     const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
+    const SNAPSHOT_SIZE: usize = 10;
 
     fn originate(event: &JobEvent) -> Option<Self> {
         match event {
@@ -976,6 +977,7 @@ mod tests {
 
         const WORKER_NAME: &'static str = "send-email";
         const KIND: &'static str = "send-email";
+        const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
 
         fn label(&self) -> Label {
             match self {

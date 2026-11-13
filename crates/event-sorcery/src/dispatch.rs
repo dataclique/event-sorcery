@@ -751,6 +751,7 @@ impl<J: Job> StandaloneJob for J {
 
     const WORKER_NAME: &'static str = <J as Job>::WORKER_NAME;
     const KIND: &'static str = <J as Job>::KIND;
+    const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
 
     fn label(&self) -> Label {
         Job::label(self)
@@ -875,7 +876,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use crate::job::take_pending;
-    use crate::{Effect, Nil};
+    use crate::{CompactionPolicy, Effect, Nil};
 
     use super::*;
 
@@ -948,7 +949,9 @@ mod tests {
 
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "Desk";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
         fn originate(event: &DeskEvent) -> Option<Self> {
             let DeskEvent::Dispatch(dispatch_event) = event;

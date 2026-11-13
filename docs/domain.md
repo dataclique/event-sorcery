@@ -14,9 +14,10 @@ patterns, see [docs/cqrs.md](cqrs.md).
 ### Event
 
 An immutable record of something that happened in the domain. Past tense,
-declarative (`OrderPlaced`, `BalanceCredited`). Once persisted, an event is the
-source of truth — it cannot be edited, deleted, or rewritten. To "undo" an event
-you emit a compensating event.
+declarative (`OrderPlaced`, `BalanceCredited`). Persisted events cannot be
+edited or rewritten; to "undo" one, emit a compensating event. Audit streams
+retain these facts indefinitely. Explicit compaction policies may prune
+snapshot-covered observational history through the framework.
 
 In code: a variant of an `Event` enum on an `EventSourced` type, paired with a
 `DomainEvent` impl that supplies a stable `event_type()` string and an
@@ -101,15 +102,20 @@ to `SqliteViewRepository`. Tests use bespoke in-memory backends. See
 ### Snapshot
 
 A periodic checkpoint of an aggregate's state, stored separately from the event
-log so reload doesn't always replay every event. Snapshots are serialized with a
-`snapshot_version` so a schema bump can invalidate them without touching the
-event log.
+log so reload doesn't always replay every event. A `snapshot_version` fences
+snapshot updates. Schema reconciliation may invalidate snapshots for retained
+streams; compactable streams instead require snapshot-aware migration because
+their complete event history may no longer exist.
 
 ### Compaction
 
 Optional deletion of events at or before a snapshot's sequence number. Trades
-replay latency for storage. Per-aggregate `CompactionPolicy`: `Retain` (default,
-safe) or `CompactAfterSnapshot`. Compaction never crosses snapshot boundaries.
+replay latency for storage. Each aggregate explicitly selects its
+`CompactionPolicy`: `Retain` keeps all events; `CompactAfterSnapshot` deletes
+snapshot-covered events; `RetainLast { events }` also preserves the trailing
+sequence window for each aggregate type and ID. Unsnapshotted events survive
+even when they exceed that window. Compaction never crosses snapshot boundaries;
+streams without snapshots retain every event.
 
 ### Reactor
 
@@ -126,8 +132,9 @@ without retry, leaving its write outcome unknown.
 
 Per-aggregate `u64` (`EventSourced::SCHEMA_VERSION`) bumped whenever the shape
 of state, events, or projections changes. Compared against the persisted version
-in the `schema_registry` table on startup; mismatches clear stale snapshots and
-trigger view rebuilds.
+in the `schema_registry` table on startup. For `Retain`, mismatches clear stale
+snapshots and trigger view rebuilds. Current compaction policies that may delete
+history refuse recorded version changes rather than clearing snapshots.
 
 ### Job
 

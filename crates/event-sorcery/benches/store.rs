@@ -15,9 +15,9 @@ use sqlx::SqlitePool;
 use tokio::runtime::Runtime;
 
 use event_sorcery::{
-    DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect, EventSourced, Job,
-    JobContext, JobFailure, JobOutcome, JobRuntime, Label, Never, Nil, Reconciliation,
-    StandaloneJob, Store, StoreBuilder, fx, jobs,
+    CompactionPolicy, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect,
+    EventSourced, Job, JobContext, JobFailure, JobOutcome, JobRuntime, Label, Never, Nil,
+    Reconciliation, StandaloneJob, Store, StoreBuilder, fx, jobs,
 };
 
 fn ok<Value, Error: Debug>(result: Result<Value, Error>) -> Value {
@@ -91,7 +91,9 @@ impl EventSourced for BenchEntity {
 
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
+    const SNAPSHOT_SIZE: usize = 10;
     const AGGREGATE_TYPE: &'static str = "BenchEntity";
+    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
     fn originate(event: &BenchEvent) -> Option<Self> {
         use BenchEvent::{Dispatch, Noted};
@@ -203,6 +205,7 @@ impl StandaloneJob for BenchSweep {
 
     const WORKER_NAME: &'static str = "bench-sweep";
     const KIND: &'static str = "bench-sweep";
+    const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
 
     fn label(&self) -> Label {
         Label::new("bench-sweep")

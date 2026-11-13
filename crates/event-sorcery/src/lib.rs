@@ -83,6 +83,9 @@
 //! immediately obvious whether code belongs to this crate or
 //! to cqrs-es.
 
+#[cfg(doctest)]
+mod configuration_contracts;
+
 pub(crate) mod dependency;
 mod dispatch;
 mod engine;
@@ -181,6 +184,16 @@ pub enum CompactionPolicy {
     Retain,
     /// Delete events at or before the current snapshot sequence.
     CompactAfterSnapshot,
+    /// Preserve a trailing sequence window independently for each aggregate type and id.
+    ///
+    /// Delete only events both covered by the snapshot and at or below the
+    /// stream's newest sequence minus `events`. Unsnapshotted events survive
+    /// even when they exceed the window. Sparse histories may retain fewer
+    /// rows than the numeric window. Without a snapshot, nothing is deleted.
+    RetainLast {
+        /// Width of the retained sequence interval; zero keeps only unsnapshotted events.
+        events: usize,
+    },
 }
 
 /// The core abstraction for event-sourced domain entities.
@@ -284,23 +297,25 @@ pub trait EventSourced:
     /// Schema version for migration reconciliation. Bump when the
     /// event schema changes.
     const SCHEMA_VERSION: u64;
-    /// How many commands between automatic snapshots.
+    /// How many events between automatic snapshot boundaries.
     ///
-    /// A snapshot of `1` means every command triggers a snapshot
-    /// write -- ideal for compactable aggregates where the snapshot
+    /// A value of `1` triggers a snapshot write for every command that emits
+    /// events -- ideal for compactable aggregates where the snapshot
     /// is the durable source of pre-compaction state. Retained
     /// aggregates with low event counts per instance benefit from a
     /// larger value (e.g., 10-50) to reduce write amplification.
-    const SNAPSHOT_SIZE: usize = 10;
+    ///
+    /// Each implementation must select this interval explicitly.
+    const SNAPSHOT_SIZE: usize;
     /// Unique string identifying this aggregate type in the event
     /// store. Must be stable across deployments.
     const AGGREGATE_TYPE: &'static str;
     /// Event retention policy for this entity.
     ///
-    /// Financial audit aggregates must use the default
+    /// Financial audit aggregates must explicitly select
     /// [`CompactionPolicy::Retain`]. Only observational aggregates
     /// whose old events have no audit value should opt into compaction.
-    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
+    const COMPACTION_POLICY: CompactionPolicy;
 
     /// Create initial state from a genesis event.
     ///
@@ -518,32 +533,59 @@ pub async fn send_command<Entity: EventSourced>(
 
 /// Delete compactable events that are already represented by snapshots.
 ///
-/// This is a no-op for entities with [`CompactionPolicy::Retain`]. For
-/// compactable entities, events with `sequence <= snapshots.last_sequence` are
-/// removed. Snapshot-backed loading can still reconstruct the aggregate from the
-/// snapshot and replay any newer events.
+/// This is a no-op for entities with [`CompactionPolicy::Retain`].
+/// [`CompactionPolicy::CompactAfterSnapshot`] removes snapshot-covered events;
+/// [`CompactionPolicy::RetainLast`] additionally preserves the trailing sequence
+/// window for each aggregate type and id. Neither policy deletes unsnapshotted
+/// events or events from streams without snapshots.
 ///
 /// # Errors
 ///
-/// Returns database errors from the delete query.
+/// Returns database errors from the delete query or an encoding error when the
+/// retention window cannot be represented as a SQLite integer.
 pub async fn compact_events<Entity: EventSourced>(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
-    if Entity::COMPACTION_POLICY == CompactionPolicy::Retain {
-        return Ok(0);
-    }
+    let result = match Entity::COMPACTION_POLICY {
+        CompactionPolicy::Retain => return Ok(0),
+        CompactionPolicy::CompactAfterSnapshot => {
+            sqlx::query(
+                "DELETE FROM events \
+                 WHERE aggregate_type = ?1 \
+                   AND sequence <= COALESCE( \
+                       (SELECT last_sequence FROM snapshots \
+                        WHERE snapshots.aggregate_type = events.aggregate_type \
+                          AND snapshots.aggregate_id = events.aggregate_id), \
+                       0 \
+                   )",
+            )
+            .bind(Entity::AGGREGATE_TYPE)
+            .execute(pool)
+            .await?
+        }
+        CompactionPolicy::RetainLast { events } => {
+            let window =
+                i64::try_from(events).map_err(|source| sqlx::Error::Encode(Box::new(source)))?;
 
-    let result = sqlx::query(
-        "DELETE FROM events \
-         WHERE aggregate_type = ?1 \
-           AND sequence <= COALESCE( \
-               (SELECT last_sequence FROM snapshots \
-                WHERE snapshots.aggregate_type = events.aggregate_type \
-                  AND snapshots.aggregate_id = events.aggregate_id), \
-               0 \
-           )",
-    )
-    .bind(Entity::AGGREGATE_TYPE)
-    .execute(pool)
-    .await?;
+            sqlx::query(
+                "DELETE FROM events \
+                 WHERE aggregate_type = ?1 \
+                   AND sequence <= COALESCE( \
+                       (SELECT last_sequence FROM snapshots \
+                        WHERE snapshots.aggregate_type = events.aggregate_type \
+                          AND snapshots.aggregate_id = events.aggregate_id), \
+                       0 \
+                   ) \
+                   AND sequence <= ( \
+                       SELECT MAX(newest.sequence) FROM events newest \
+                       WHERE newest.aggregate_type = events.aggregate_type \
+                         AND newest.aggregate_id = events.aggregate_id \
+                   ) - ?2",
+            )
+            .bind(Entity::AGGREGATE_TYPE)
+            .bind(window)
+            .execute(pool)
+            .await?
+        }
+    };
 
     Ok(result.rows_affected())
 }
@@ -855,6 +897,65 @@ mod tests {
         }
     }
 
+    /// The same widget under `RetainLast`: compaction keeps the newest
+    /// two events per aggregate instead of deleting to the snapshot.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct WindowedWidget<const EVENTS: usize = 2, const SNAPSHOT_SIZE: usize = 1> {
+        name: String,
+    }
+
+    #[async_trait]
+    impl<const EVENTS: usize, const SNAPSHOT_SIZE: usize> EventSourced
+        for WindowedWidget<EVENTS, SNAPSHOT_SIZE>
+    {
+        type Id = NumericId;
+        type Error = WidgetError;
+        type Command = WidgetCommand;
+        type Event = WidgetEvent;
+        type Materialized = Nil;
+        type Jobs = Nil;
+
+        const PROJECTION: Nil = Nil;
+        const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = SNAPSHOT_SIZE;
+        const AGGREGATE_TYPE: &'static str = "WindowedWidget";
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::RetainLast { events: EVENTS };
+
+        fn originate(event: &WidgetEvent) -> Option<Self> {
+            match event {
+                WidgetEvent::Created { name } => Some(Self { name: name.clone() }),
+                WidgetEvent::Renamed { .. } => None,
+            }
+        }
+
+        fn evolve(_entity: &Self, event: &WidgetEvent) -> Result<Option<Self>, WidgetError> {
+            match event {
+                WidgetEvent::Created { .. } => Ok(None),
+                WidgetEvent::Renamed { name } => Ok(Some(Self { name: name.clone() })),
+            }
+        }
+
+        async fn initialize(command: WidgetCommand) -> Result<Effect<Self>, WidgetError> {
+            match command {
+                WidgetCommand::Create { name } => {
+                    Ok(Effect::Events(vec![WidgetEvent::Created { name }]))
+                }
+                WidgetCommand::Rename { name } => {
+                    Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
+                }
+            }
+        }
+
+        async fn transition(&self, command: WidgetCommand) -> Result<Effect<Self>, WidgetError> {
+            match command {
+                WidgetCommand::Create { .. } => uneventful(),
+                WidgetCommand::Rename { name } => {
+                    Ok(Effect::Events(vec![WidgetEvent::Renamed { name }]))
+                }
+            }
+        }
+    }
+
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlite_es::MIGRATOR.run(&pool).await.unwrap();
@@ -975,6 +1076,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_retention_window_is_rejected() {
+        let pool = test_pool().await;
+        let error = compact_events::<WindowedWidget<{ usize::MAX }>>(&pool)
+            .await
+            .unwrap_err();
+        let sqlx::Error::Encode(source) = error else {
+            panic!("retention window conversion must report an encoding error");
+        };
+        source.downcast::<std::num::TryFromIntError>().unwrap();
+    }
+
+    #[tokio::test]
+    async fn windowed_compaction_preserves_the_unsnapshotted_tail() {
+        let pool = test_pool().await;
+        let store = testing::test_store::<WindowedWidget<1, 3>>(pool.clone());
+        store
+            .send(
+                &NumericId(7),
+                WidgetCommand::Create {
+                    name: "first".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        for name in ["second", "third", "fourth", "fifth"] {
+            store
+                .send(
+                    &NumericId(7),
+                    WidgetCommand::Rename {
+                        name: name.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            compact_events::<WindowedWidget<1, 3>>(&pool).await.unwrap(),
+            3
+        );
+        let remaining: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM events WHERE aggregate_type = 'WindowedWidget' ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, vec![4, 5]);
+        let entity = load_entity::<WindowedWidget<1, 3>>(&pool, &NumericId(7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entity.name, "fifth");
+    }
+
+    #[tokio::test]
+    async fn retain_last_keeps_the_newest_window_and_the_entity_loads() {
+        let pool = test_pool().await;
+        let store = testing::test_store::<WindowedWidget>(pool.clone());
+
+        store
+            .send(
+                &NumericId(7),
+                WidgetCommand::Create {
+                    name: "first".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        for renamed in ["second", "third", "fourth", "fifth"] {
+            store
+                .send(
+                    &NumericId(7),
+                    WidgetCommand::Rename {
+                        name: renamed.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let deleted = compact_events::<WindowedWidget>(&pool).await.unwrap();
+
+        assert_eq!(deleted, 3, "five events minus the two-event window");
+        let remaining: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM events \
+             WHERE aggregate_type = 'WindowedWidget' AND aggregate_id = '7' \
+             ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, vec![4, 5], "the newest window survives");
+
+        let entity = load_entity::<WindowedWidget>(&pool, &NumericId(7))
+            .await
+            .unwrap()
+            .expect("the entity loads from snapshot plus the retained window");
+        assert_eq!(entity.name, "fifth");
+    }
+
+    #[tokio::test]
+    async fn windowed_compaction_isolates_streams_and_preserves_unsnapshotted_events() {
+        let pool = test_pool().await;
+        let windowed = testing::test_store::<WindowedWidget<2, 5>>(pool.clone());
+        let unrelated = testing::test_store::<Widget>(pool.clone());
+
+        for (aggregate_id, event_count) in [(7, 6), (8, 11), (9, 4)] {
+            windowed
+                .send(
+                    &NumericId(aggregate_id),
+                    WidgetCommand::Create {
+                        name: "initial".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            for sequence in 2..=event_count {
+                windowed
+                    .send(
+                        &NumericId(aggregate_id),
+                        WidgetCommand::Rename {
+                            name: format!("version-{sequence}"),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        unrelated
+            .send(
+                &NumericId(7),
+                WidgetCommand::Create {
+                    name: "unrelated".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        for sequence in 2..=12 {
+            unrelated
+                .send(
+                    &NumericId(7),
+                    WidgetCommand::Rename {
+                        name: format!("unrelated-{sequence}"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let snapshots: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT aggregate_id, last_sequence FROM snapshots \
+             WHERE aggregate_type = 'WindowedWidget' ORDER BY aggregate_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshots, vec![("7".to_string(), 5), ("8".to_string(), 10)]);
+
+        assert_eq!(
+            compact_events::<WindowedWidget<2, 5>>(&pool).await.unwrap(),
+            13,
+        );
+
+        for (aggregate_type, aggregate_id, expected) in [
+            ("WindowedWidget", "7", vec![5, 6]),
+            ("WindowedWidget", "8", vec![10, 11]),
+            ("WindowedWidget", "9", vec![1, 2, 3, 4]),
+            ("Widget", "7", (1..=12).collect()),
+        ] {
+            let remaining: Vec<i64> = sqlx::query_scalar(
+                "SELECT sequence FROM events \
+                 WHERE aggregate_type = ?1 AND aggregate_id = ?2 \
+                 ORDER BY sequence",
+            )
+            .bind(aggregate_type)
+            .bind(aggregate_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(remaining, expected, "{aggregate_type}/{aggregate_id}");
+        }
+    }
+
+    #[tokio::test]
     async fn snapshot_version_advances_across_loads() {
         let pool = test_pool().await;
         let store = testing::test_store::<Widget>(pool.clone());
@@ -1050,6 +1339,7 @@ mod tests {
             const SCHEMA_VERSION: u64 = 1;
             const SNAPSHOT_SIZE: usize = 1;
             const AGGREGATE_TYPE: &'static str = "Tally";
+            const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
             fn originate(event: &TallyEvent) -> Option<Self> {
                 match event {
@@ -1136,7 +1426,9 @@ mod tests {
 
             const PROJECTION: Nil = Nil;
             const SCHEMA_VERSION: u64 = 1;
+            const SNAPSHOT_SIZE: usize = 10;
             const AGGREGATE_TYPE: &'static str = "RetainedWidget";
+            const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
             fn originate(event: &WidgetEvent) -> Option<Self> {
                 match event {

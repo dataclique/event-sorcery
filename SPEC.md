@@ -17,6 +17,10 @@ typed language surfaces:
 - the current native Rust API; and
 - an idiomatic Haskell binding over a versioned C ABI.
 
+Data Clique Software Design FZCO maintains the open-source
+`dataclique/event-sorcery` repository governed by this specification. The
+project began as a fork of the ST0x implementation.
+
 The shared engine MUST be extracted from the implementation already present in
 this repository. It MUST continue to build on:
 
@@ -173,6 +177,32 @@ command execution, optimistic concurrency, snapshots, and query dispatch.
 The current SQLite event repository atomically persists the aggregate events,
 snapshot changes, durable job intent, job events, and queue projection that
 already belong to one command. Extraction MUST preserve that atomic boundary.
+
+#### Snapshot-bounded event retention
+
+Each aggregate's `CompactionPolicy` selects its event-retention behavior:
+
+- `Retain` MUST preserve all events.
+- `CompactAfterSnapshot` MAY delete events at or below the current snapshot's
+  covered sequence.
+- `RetainLast { events: window }` MAY delete an event only when its sequence is
+  both covered by the current snapshot and at most `newest_sequence - window`.
+  The newest sequence MUST be computed independently for each aggregate type and
+  ID. The window MUST fit SQLite's signed integer representation; an
+  unrepresentable window MUST fail before deleting events.
+
+A stream without a snapshot MUST retain all events. Unsnapshotted events MUST
+remain even when they exceed the configured window. The window measures a
+sequence interval, not an exact row count for sparse histories; zero retains
+only events newer than the snapshot. Projected entities MUST use `Retain` so
+that their views remain rebuildable from the event log.
+
+When the current policy is `CompactAfterSnapshot` or `RetainLast`, an
+incompatible snapshot MUST produce a typed deserialization error without
+changing the stored snapshot. Reconciliation MUST refuse a recorded schema
+version change under either policy rather than clearing the snapshot. Recovery
+requires an explicit snapshot-aware migration, not replay from a potentially
+compacted prefix.
 
 ### Durable jobs and Apalis
 
@@ -410,6 +440,15 @@ reactor, and projection surfaces remain the native binding.
 not justification to break consumers. The implementation MUST first add
 facade-level characterization tests, then route the native surface through the
 facade while keeping its behavioral suite green.
+
+Starting with Rust workspace version 0.5.0, native configuration MUST be
+explicit: `EventSourced` implementations MUST state `SNAPSHOT_SIZE` and
+`COMPACTION_POLICY`, and `StandaloneJob` implementations MUST state
+`TERMINAL_FAILURE_MSG`. These public trait constants MUST NOT provide default
+values. Existing implementations MUST preserve their selected values during
+migration. This is a Rust source-compatibility change, not a change to persisted
+data, the C ABI, or runtime choices. Test-only const-generic defaults remain
+permitted.
 
 The native worker remains Apalis-hosted. Its adapter consumes the same facade
 claim and settlement operations exported to foreign bindings.
