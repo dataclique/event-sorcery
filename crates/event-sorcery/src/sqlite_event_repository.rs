@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use tracing::warn;
 
 use crate::CompactionPolicy;
-use crate::engine::{CommitRequest, Engine, EngineError, StreamIdentity};
+use crate::engine::{CommitRequest, Engine, EngineError, SnapshotUpdate, StreamIdentity};
 
 /// SQLite implementation of the cqrs-es [`PersistedEventRepository`].
 ///
@@ -26,6 +26,18 @@ impl SqliteEventRepository {
             compaction_policy,
             stream_channel_size: 1000,
         }
+    }
+
+    async fn persist_updates<A: Aggregate>(
+        &self,
+        events: &[SerializedEvent],
+        snapshot_update: Option<(String, SnapshotUpdate)>,
+    ) -> Result<(), PersistenceError> {
+        let (request, pending_jobs) =
+            CommitRequest::prepare_repository(A::TYPE, events, snapshot_update)?;
+        self.engine.commit(request).await?;
+        pending_jobs.mark_committed();
+        Ok(())
     }
 
     /// Stream events from the `events` table for replay.
@@ -110,11 +122,22 @@ impl PersistedEventRepository for SqliteEventRepository {
         events: &[SerializedEvent],
         snapshot_update: Option<(String, Value, usize)>,
     ) -> Result<(), PersistenceError> {
-        let (request, pending_jobs) =
-            CommitRequest::prepare_repository(A::TYPE, events, snapshot_update)?;
-        self.engine.commit(request).await?;
-        pending_jobs.mark_committed();
-        Ok(())
+        let snapshot_update = snapshot_update.map(|(aggregate_id, aggregate, snapshot_version)| {
+            (
+                aggregate_id,
+                SnapshotUpdate::new(aggregate, snapshot_version),
+            )
+        });
+        self.persist_updates::<A>(events, snapshot_update).await
+    }
+
+    async fn persist_with_snapshot<A: Aggregate>(
+        &self,
+        events: &[SerializedEvent],
+        snapshot_update: Option<SerializedSnapshot>,
+    ) -> Result<(), PersistenceError> {
+        self.persist_updates::<A>(events, snapshot_update.map(SnapshotUpdate::from_serialized))
+            .await
     }
 
     async fn stream_events<A: Aggregate>(
@@ -137,6 +160,7 @@ mod tests {
     use cqrs_es::persist::PersistedEventStore;
     use cqrs_es::{AggregateContext, AggregateError, DomainEvent, EventStore};
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
     use std::fmt::{self, Display};
 
     use sqlite_es::testing::create_test_pool;
@@ -211,6 +235,51 @@ mod tests {
         fn apply(&mut self, event: Self::Event) {
             self.events.push(event.event_type());
         }
+    }
+
+    #[tokio::test]
+    async fn prefix_snapshot_preserves_suffix_and_rejects_excess_coverage() {
+        let pool = create_test_pool().await.unwrap();
+        let repository = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+        let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(repository, 2);
+        let context = store.load_aggregate("snapshot-prefix").await.unwrap();
+        store
+            .commit(vec![TestEvent::Created; 3], context, HashMap::new())
+            .await
+            .unwrap();
+
+        let loaded = store.load_aggregate("snapshot-prefix").await.unwrap();
+        assert_eq!(loaded.aggregate.events, ["Created", "Created", "Created"]);
+        assert_eq!(loaded.current_sequence, 3);
+        let repository = SqliteEventRepository::new(pool, CompactionPolicy::Retain);
+        let snapshot = repository
+            .get_snapshot::<TestAggregate>("snapshot-prefix")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.current_sequence, 2);
+        assert_eq!(snapshot.current_snapshot, 1);
+        assert_eq!(
+            snapshot.aggregate,
+            serde_json::json!({"events": ["Created", "Created"]})
+        );
+
+        let (_, invalid) = SnapshotUpdate::from_serialized(SerializedSnapshot {
+            current_sequence: 4,
+            ..snapshot
+        });
+        let events = repository
+            .get_events::<TestAggregate>("snapshot-prefix")
+            .await
+            .unwrap();
+        let error = invalid.sequence_for(&events).unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::SnapshotBeyondCurrentVersion {
+                proposed: 4,
+                current: 3
+            }
+        ));
     }
 
     fn covering_events(aggregate_id: &str, through: usize) -> Vec<SerializedEvent> {

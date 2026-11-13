@@ -141,18 +141,57 @@ impl<'events> OpaqueCommitRequest<'events> {
     }
 }
 
+enum SnapshotCoverage {
+    BatchEnd,
+    Through(usize),
+}
+
 /// Snapshot payload written atomically with the events it covers.
 pub struct SnapshotUpdate {
     pub(crate) aggregate: Value,
     pub(crate) snapshot_version: usize,
+    coverage: SnapshotCoverage,
 }
 
 impl SnapshotUpdate {
-    /// Creates a serialized snapshot update at its aggregate schema version.
+    /// Creates a snapshot update covering the batch at its snapshot-version counter.
     pub fn new(aggregate: Value, snapshot_version: usize) -> Self {
         Self {
             aggregate,
             snapshot_version,
+            coverage: SnapshotCoverage::BatchEnd,
+        }
+    }
+
+    pub(crate) fn from_serialized(snapshot: SerializedSnapshot) -> (String, Self) {
+        let SerializedSnapshot {
+            aggregate_id,
+            aggregate,
+            current_sequence,
+            current_snapshot,
+        } = snapshot;
+        (
+            aggregate_id,
+            Self {
+                aggregate,
+                snapshot_version: current_snapshot,
+                coverage: SnapshotCoverage::Through(current_sequence),
+            },
+        )
+    }
+
+    pub(crate) fn sequence_for(&self, events: &[SerializedEvent]) -> Result<usize, EngineError> {
+        let current = events
+            .last()
+            .ok_or(EngineError::EmptySnapshotUpdate)?
+            .sequence;
+        match self.coverage {
+            SnapshotCoverage::BatchEnd => Ok(current),
+            SnapshotCoverage::Through(sequence) if sequence <= current => Ok(sequence),
+            SnapshotCoverage::Through(sequence) => Err(EngineError::SnapshotBeyondCurrentVersion {
+                proposed: sequence,
+                current,
+            }),
         }
     }
 }
@@ -306,7 +345,7 @@ impl<'events> CommitRequest<'events> {
     pub(crate) fn prepare_repository(
         aggregate_type: &str,
         events: &'events [SerializedEvent],
-        snapshot_update: Option<(String, Value, usize)>,
+        snapshot_update: Option<(String, SnapshotUpdate)>,
     ) -> Result<(Self, PreparedPendingJobs), EngineError> {
         let aggregate_id = snapshot_update
             .as_ref()
@@ -318,8 +357,8 @@ impl<'events> CommitRequest<'events> {
         let stream = StreamIdentity::new(aggregate_type, aggregate_id);
         let mut pending_jobs = crate::job::prepare_pending()?;
         let mut request = Self::new(stream, events).with_jobs(pending_jobs.take_requests());
-        if let Some((_, aggregate, snapshot_version)) = snapshot_update {
-            request = request.with_snapshot(SnapshotUpdate::new(aggregate, snapshot_version))?;
+        if let Some((_, snapshot)) = snapshot_update {
+            request = request.with_snapshot(snapshot)?;
         }
 
         Ok((request, pending_jobs))
@@ -897,11 +936,7 @@ impl Engine {
         sqlite_es::insert_serialized_events_batch(&mut tx, "events", events).await?;
 
         if let Some(snapshot) = snapshot {
-            let last_sequence = events
-                .last()
-                .map(|event| event.sequence)
-                .ok_or(EngineError::EmptySnapshotUpdate)?;
-            let last_sequence = i64::try_from(last_sequence)?;
+            let last_sequence = i64::try_from(snapshot.sequence_for(events)?)?;
             let snapshot_version = i64::try_from(snapshot.snapshot_version)?;
             let aggregate = serde_json::to_string(&snapshot.aggregate)?;
 
@@ -1954,10 +1989,7 @@ mod tests {
         let event_stream = StreamIdentity::new("engine-test", "event");
         let event = serialized_event(&event_stream, 1);
         let request = CommitRequest::new(snapshot_stream, std::slice::from_ref(&event))
-            .with_snapshot(SnapshotUpdate {
-                aggregate: serde_json::json!({ "sequence": 1 }),
-                snapshot_version: 1,
-            })
+            .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 1 }), 1))
             .unwrap();
 
         let result = engine.commit(request).await;

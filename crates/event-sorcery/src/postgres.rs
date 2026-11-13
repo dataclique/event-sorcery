@@ -9,7 +9,7 @@ use serde_json::Value;
 use sqlx::PgConnection;
 
 use crate::engine::{
-    CommitRequest, EngineError, JobSeed, StoredEventRow, StoredSnapshotRow,
+    CommitRequest, EngineError, JobSeed, SnapshotUpdate, StoredEventRow, StoredSnapshotRow,
     validate_expected_version,
 };
 
@@ -67,11 +67,22 @@ impl PersistedEventRepository for PostgresEventRepository {
         events: &[SerializedEvent],
         snapshot_update: Option<(String, Value, usize)>,
     ) -> Result<(), PersistenceError> {
-        let (request, pending_jobs) =
-            CommitRequest::prepare_repository(A::TYPE, events, snapshot_update)?;
-        Box::pin(self.commit(request)).await?;
-        pending_jobs.mark_committed();
-        Ok(())
+        let snapshot_update = snapshot_update.map(|(aggregate_id, aggregate, snapshot_version)| {
+            (
+                aggregate_id,
+                SnapshotUpdate::new(aggregate, snapshot_version),
+            )
+        });
+        self.persist_updates::<A>(events, snapshot_update).await
+    }
+
+    async fn persist_with_snapshot<A: Aggregate>(
+        &self,
+        events: &[SerializedEvent],
+        snapshot_update: Option<SerializedSnapshot>,
+    ) -> Result<(), PersistenceError> {
+        self.persist_updates::<A>(events, snapshot_update.map(SnapshotUpdate::from_serialized))
+            .await
     }
 
     async fn stream_events<A: Aggregate>(
@@ -95,6 +106,18 @@ impl PostgresEventRepository {
     /// and storage failures without committing a partial enqueue.
     pub async fn enqueue(&self, job: JobSeed) -> Result<(), PersistenceError> {
         Box::pin(self.commit(CommitRequest::for_job(job))).await?;
+        Ok(())
+    }
+
+    async fn persist_updates<A: Aggregate>(
+        &self,
+        events: &[SerializedEvent],
+        snapshot_update: Option<(String, SnapshotUpdate)>,
+    ) -> Result<(), PersistenceError> {
+        let (request, pending_jobs) =
+            CommitRequest::prepare_repository(A::TYPE, events, snapshot_update)?;
+        Box::pin(self.commit(request)).await?;
+        pending_jobs.mark_committed();
         Ok(())
     }
 
@@ -158,10 +181,7 @@ impl PostgresEventRepository {
 
         append_events(&mut transaction, events).await?;
         if let Some(snapshot) = snapshot {
-            let last_sequence = events
-                .last()
-                .ok_or(EngineError::EmptySnapshotUpdate)?
-                .sequence;
+            let last_sequence = snapshot.sequence_for(events)?;
             let result = sqlx::query(
                 r"
                 INSERT INTO snapshots
