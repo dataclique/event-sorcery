@@ -315,6 +315,7 @@ mod tests {
     use std::collections::HashMap;
     use std::convert::Infallible;
     use std::time::Duration;
+    use tokio::time::timeout;
 
     use super::{POSTGRES_MIGRATOR, PostgresEventRepository};
     use crate::job::{
@@ -816,6 +817,106 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(version, 1);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn cancelled_command_rolls_back_and_releases_its_pooled_connection(pool: PgPool) {
+        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        let command_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE job_queue_projection IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let job_id = JobId::new();
+        let repository = PostgresEventRepository {
+            pool: command_pool.clone(),
+        };
+        let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
+        let framework = CqrsFramework::new(store, vec![], Some(job_id));
+        let command = tokio::spawn(crate::job::with_pending_scope(async move {
+            framework.execute("cancelled", "before".to_string()).await
+        }));
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    r"
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_locks
+                        WHERE database = (SELECT oid FROM pg_database
+                                          WHERE datname = current_database())
+                          AND relation = 'job_queue_projection'::REGCLASS
+                          AND NOT granted
+                    )
+                    ",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("command must reach the blocked queue write");
+        command.abort();
+        assert!(command.await.unwrap_err().is_cancelled());
+        blocker.rollback().await.unwrap();
+
+        let rows: (i64, i64, i64, i64) = timeout(
+            Duration::from_secs(10),
+            sqlx::query_as(
+                r"
+                SELECT (
+                    SELECT COUNT(*) FROM events
+                    WHERE aggregate_type = 'RecordedValues' AND aggregate_id = 'cancelled'
+                ), (
+                    SELECT COUNT(*) FROM snapshots
+                    WHERE aggregate_type = 'RecordedValues' AND aggregate_id = 'cancelled'
+                ), (
+                    SELECT COUNT(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1
+                ), (
+                    SELECT COUNT(*) FROM job_queue_projection WHERE view_id = $1
+                )
+                ",
+            )
+            .bind(job_id.to_string())
+            .fetch_one(&command_pool),
+        )
+        .await
+        .expect("cancelled transaction must release the only connection")
+        .unwrap();
+        assert_eq!(rows, (0, 0, 0, 0));
+
+        let repository = PostgresEventRepository {
+            pool: command_pool.clone(),
+        };
+        let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
+        let framework = CqrsFramework::new(store, vec![], Some(job_id));
+        crate::job::with_pending_scope(async {
+            framework
+                .execute("cancelled", "after".to_string())
+                .await
+                .unwrap();
+        })
+        .await;
+        let repository = PostgresEventRepository {
+            pool: command_pool.clone(),
+        };
+        let events = repository
+            .get_events::<RecordedValues>("cancelled")
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].payload, json!({"Recorded": {"value": "after"}}));
+        command_pool.close().await;
     }
 
     #[sqlx::test(migrations = false)]
