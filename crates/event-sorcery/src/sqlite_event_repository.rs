@@ -264,22 +264,49 @@ mod tests {
             serde_json::json!({"events": ["Created", "Created"]})
         );
 
-        let (_, invalid) = SnapshotUpdate::from_serialized(SerializedSnapshot {
-            current_sequence: 4,
-            ..snapshot
-        });
         let events = repository
             .get_events::<TestAggregate>("snapshot-prefix")
             .await
             .unwrap();
-        let error = invalid.sequence_for(&events).unwrap_err();
+        let mut next_event = events[0].clone();
+        next_event.sequence = 4;
+        let error = repository
+            .persist_with_snapshot::<TestAggregate>(
+                &[next_event],
+                Some(SerializedSnapshot {
+                    current_sequence: 5,
+                    current_snapshot: 2,
+                    ..snapshot
+                }),
+            )
+            .await
+            .unwrap_err();
+        let PersistenceError::UnknownError(source) = error else {
+            panic!("expected a typed excessive-coverage error");
+        };
         assert!(matches!(
-            error,
+            source.downcast_ref::<EngineError>().unwrap(),
             EngineError::SnapshotBeyondCurrentVersion {
-                proposed: 4,
-                current: 3
+                proposed: 5,
+                current: 4
             }
         ));
+        let after = repository
+            .get_events::<TestAggregate>("snapshot-prefix")
+            .await
+            .unwrap();
+        assert_eq!(after, events);
+        let snapshot = repository
+            .get_snapshot::<TestAggregate>("snapshot-prefix")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.current_sequence, 2);
+        assert_eq!(snapshot.current_snapshot, 1);
+        assert_eq!(
+            snapshot.aggregate,
+            serde_json::json!({"events": ["Created", "Created"]})
+        );
     }
 
     fn covering_events(aggregate_id: &str, through: usize) -> Vec<SerializedEvent> {

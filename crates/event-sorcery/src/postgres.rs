@@ -668,6 +668,43 @@ mod tests {
             }
             sequence => panic!("unexpected snapshot checkpoint {sequence}"),
         }
+
+        let mut next_event = persisted[0].clone();
+        next_event.sequence = 4;
+        let error = repository
+            .persist_with_snapshot::<RecordedValues>(
+                &[next_event],
+                Some(cqrs_es::persist::SerializedSnapshot {
+                    current_sequence: 5,
+                    current_snapshot: snapshot.current_snapshot + 1,
+                    ..snapshot
+                }),
+            )
+            .await
+            .unwrap_err();
+        let PersistenceError::UnknownError(source) = error else {
+            panic!("expected a typed excessive-coverage error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<crate::engine::EngineError>().unwrap(),
+            crate::engine::EngineError::SnapshotBeyondCurrentVersion {
+                proposed: 5,
+                current: 4
+            }
+        ));
+        let after = repository
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap();
+        assert_eq!(after, persisted);
+        let snapshot = repository
+            .get_snapshot::<RecordedValues>("stream")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.current_sequence, 2);
+        assert_eq!(snapshot.current_snapshot, 1);
+        assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
     }
 
     #[sqlx::test(migrations = false)]
