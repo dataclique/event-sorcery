@@ -290,15 +290,26 @@ async fn append_events(
 }
 
 fn write_error(error: sqlx::Error) -> EngineError {
+    use EngineError::{OptimisticLock, Sql};
+
     match error.as_database_error() {
         Some(source)
-            if source.is_unique_violation()
-                || source.code().as_deref() == Some("40001")
+            if source.code().as_deref() == Some("40001")
                 || source.code().as_deref() == Some("40P01") =>
         {
-            EngineError::OptimisticLock
+            OptimisticLock
         }
-        Some(_) | None => EngineError::Sql(error),
+        Some(source) if source.is_unique_violation() => {
+            match (source.table(), source.constraint()) {
+                (Some("events"), Some("events_pkey"))
+                | (Some("snapshots"), Some("snapshots_pkey"))
+                | (Some("job_queue_projection"), Some("job_queue_projection_pkey")) => {
+                    OptimisticLock
+                }
+                _ => Sql(error),
+            }
+        }
+        Some(_) | None => Sql(error),
     }
 }
 
@@ -1187,6 +1198,71 @@ mod tests {
                 }}),
                 json!({})
             )]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn unrelated_unique_constraint_is_not_an_optimistic_conflict(pool: PgPool) {
+        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let retained = JobId::new();
+        let rejected = JobId::new();
+        repository
+            .enqueue(JobSeed::new(
+                retained,
+                "unique-kind",
+                json!({"value": "retained"}),
+                1_700_000_000_000,
+            ))
+            .await
+            .unwrap();
+        sqlx::query("CREATE UNIQUE INDEX one_job_per_kind ON job_queue_projection (kind)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = repository
+            .enqueue(JobSeed::new(
+                rejected,
+                "unique-kind",
+                json!({"value": "rejected"}),
+                1_700_000_000_000,
+            ))
+            .await
+            .unwrap_err();
+        let PersistenceError::ConnectionError(source) = error else {
+            panic!("expected the unrelated unique constraint to remain a storage error: {error:?}");
+        };
+        let source = source.downcast_ref::<sqlx::Error>().unwrap();
+        let source = source.as_database_error().unwrap();
+        assert_eq!(source.code().as_deref(), Some("23505"));
+        assert_eq!(source.table(), Some("job_queue_projection"));
+        assert_eq!(source.constraint(), Some("one_job_per_kind"));
+        assert!(
+            repository
+                .get_events::<Lifecycle<JobState>>(&rejected.to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repository
+                .get_events::<Lifecycle<JobState>>(&retained.to_string())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let rows: Vec<(String, Value)> =
+            sqlx::query_as("SELECT view_id, payload FROM job_queue_projection")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, retained.to_string());
+        assert_eq!(
+            rows[0].1["Live"]["Pending"]["payload"],
+            json!({"value": "retained"})
         );
     }
 
