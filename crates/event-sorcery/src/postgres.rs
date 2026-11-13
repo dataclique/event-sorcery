@@ -14,6 +14,10 @@ use crate::engine::{
 };
 
 /// Pool-backed PostgreSQL repository for the CQRS persistence contract.
+///
+/// Use it through [`cqrs_es::persist::PersistedEventStore`]. It does not provide
+/// a PostgreSQL [`crate::EventBackend`] for [`crate::StoreBuilder`]. The built-in
+/// native store and worker integration remain SQLite-only.
 pub struct PostgresEventRepository {
     /// Application-provisioned PostgreSQL connection pool.
     pub pool: sqlx::PgPool,

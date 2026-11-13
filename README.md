@@ -94,6 +94,13 @@ nix build --no-link .#checks.aarch64-darwin.formatting
 Use your platform's system name for the hook check (`x86_64-linux` in CI).
 Development-shell state lives under `.tmp/devenv/`.
 
+### PostgreSQL persistence boundary
+
+The `postgres` feature exposes `PostgresEventRepository` and `POSTGRES_MIGRATOR`
+through the CQRS repository contract. It does not provide a PostgreSQL
+`EventBackend` for `StoreBuilder`; the built-in native store and worker
+integration remain SQLite-only.
+
 ### Local PostgreSQL
 
 The flake pins Process Compose; devenv supplies the local PostgreSQL service.

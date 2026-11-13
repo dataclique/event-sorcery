@@ -878,6 +878,11 @@ changes.
 
 ## Running Jobs
 
+The worker API below requires a `SqlitePool`. PostgreSQL support currently
+provides the CQRS persistence repository, not a PostgreSQL `EventBackend` for
+`StoreBuilder` or worker execution. Do not use a PostgreSQL pool with
+`JobRuntime::build` or assume its workers can drain PostgreSQL jobs.
+
 Dispatching a job (see **Jobs Pattern** above) only writes a pending row; a
 worker has to drain it. `JobRuntime::build(pool)` wires the durable-jobs runtime
 over the same database, and `build_supervised_worker!` registers one supervised
