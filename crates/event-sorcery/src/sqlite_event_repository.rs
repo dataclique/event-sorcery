@@ -372,6 +372,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_checkpoint_cannot_move_backwards_or_repeat() {
+        let pool = create_test_pool().await.unwrap();
+        let repository = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
+        let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(repository, 2);
+        let context = store.load_aggregate("checkpoint-guard").await.unwrap();
+        store
+            .commit(vec![TestEvent::Created; 3], context, HashMap::new())
+            .await
+            .unwrap();
+        let repository = SqliteEventRepository::new(pool, CompactionPolicy::Retain);
+        let before = repository
+            .get_events::<TestAggregate>("checkpoint-guard")
+            .await
+            .unwrap();
+        let mut next = before[0].clone();
+        next.sequence = 4;
+
+        for (current_sequence, aggregate) in [
+            (1, serde_json::json!({"events": ["Created"]})),
+            (2, serde_json::json!({"events": ["Created", "Created"]})),
+        ] {
+            let result = repository
+                .persist_with_snapshot::<TestAggregate>(
+                    &[next.clone()],
+                    Some(SerializedSnapshot {
+                        aggregate_id: "checkpoint-guard".to_string(),
+                        aggregate,
+                        current_sequence,
+                        current_snapshot: 2,
+                    }),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(PersistenceError::OptimisticLockError)),
+                "{result:?}"
+            );
+            assert_eq!(
+                repository
+                    .get_events::<TestAggregate>("checkpoint-guard")
+                    .await
+                    .unwrap(),
+                before
+            );
+            let snapshot = repository
+                .get_snapshot::<TestAggregate>("checkpoint-guard")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.current_sequence, 2);
+            assert_eq!(snapshot.current_snapshot, 1);
+            assert_eq!(
+                snapshot.aggregate,
+                serde_json::json!({"events": ["Created", "Created"]})
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn prefix_snapshot_preserves_suffix_and_rejects_excess_coverage() {
         let pool = create_test_pool().await.unwrap();
         let repository = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);

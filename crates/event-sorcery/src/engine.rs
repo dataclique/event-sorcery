@@ -947,7 +947,14 @@ impl Engine {
         sqlite_es::insert_serialized_events_batch(&mut tx, "events", events).await?;
 
         if let Some(snapshot) = snapshot {
-            let last_sequence = i64::try_from(snapshot.sequence_for(events)?)?;
+            let last_sequence = snapshot.sequence_for(events)?;
+            if load_snapshot_on(&mut tx, &stream)
+                .await?
+                .is_some_and(|stored| stored.current_sequence >= last_sequence)
+            {
+                return Err(EngineError::OptimisticLock);
+            }
+            let last_sequence = i64::try_from(last_sequence)?;
             let snapshot_version = i64::try_from(snapshot.snapshot_version)?;
             let aggregate = serde_json::to_string(&snapshot.aggregate)?;
 

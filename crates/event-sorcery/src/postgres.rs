@@ -807,6 +807,44 @@ mod tests {
         assert_eq!(snapshot.current_sequence, 2);
         assert_eq!(snapshot.current_snapshot, 1);
         assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
+
+        for (current_sequence, aggregate) in [
+            (1, json!({"values": ["first"]})),
+            (2, json!({"values": ["first", "second"]})),
+        ] {
+            let mut next = persisted[0].clone();
+            next.sequence = 4;
+            let result = repository
+                .persist_with_snapshot::<RecordedValues>(
+                    &[next],
+                    Some(cqrs_es::persist::SerializedSnapshot {
+                        aggregate_id: "stream".to_string(),
+                        aggregate,
+                        current_sequence,
+                        current_snapshot: 2,
+                    }),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(PersistenceError::OptimisticLockError)),
+                "{result:?}"
+            );
+            assert_eq!(
+                repository
+                    .get_events::<RecordedValues>("stream")
+                    .await
+                    .unwrap(),
+                persisted
+            );
+            let snapshot = repository
+                .get_snapshot::<RecordedValues>("stream")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.current_sequence, 2);
+            assert_eq!(snapshot.current_snapshot, 1);
+            assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
+        }
     }
 
     #[sqlx::test(migrations = false)]
