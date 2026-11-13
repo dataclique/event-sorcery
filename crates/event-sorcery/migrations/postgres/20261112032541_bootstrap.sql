@@ -19,7 +19,7 @@ CREATE TABLE snapshots (
     PRIMARY KEY (aggregate_type, aggregate_id)
 );
 
-CREATE TABLE job_queue (
+CREATE TABLE job_queue_projection (
     view_id TEXT NOT NULL PRIMARY KEY,
     version BIGINT NOT NULL CHECK (version > 0),
     payload JSONB NOT NULL,
@@ -49,5 +49,5 @@ CREATE TABLE job_queue (
     ) STORED
 );
 
-CREATE INDEX job_queue_runnable ON job_queue (kind, status, run_at);
-CREATE INDEX job_queue_reclaim ON job_queue (kind, status, lease_until);
+CREATE INDEX job_queue_projection_runnable ON job_queue_projection (kind, status, run_at);
+CREATE INDEX job_queue_projection_reclaim ON job_queue_projection (kind, status, lease_until);
