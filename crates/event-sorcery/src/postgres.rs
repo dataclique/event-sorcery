@@ -755,21 +755,11 @@ mod tests {
             .get_last_events::<RecordedValues>("stream", snapshot.current_sequence)
             .await
             .unwrap();
-        match snapshot.current_sequence {
-            2 => {
-                assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
-                assert_eq!(suffix.len(), 1);
-                assert_eq!(suffix[0].sequence, 3);
-            }
-            3 => {
-                assert_eq!(
-                    snapshot.aggregate,
-                    json!({"values": ["first", "second", "third"]})
-                );
-                assert_eq!(suffix.len(), 0);
-            }
-            sequence => panic!("unexpected snapshot checkpoint {sequence}"),
-        }
+        assert_eq!(snapshot.current_sequence, 2);
+        assert_eq!(snapshot.current_snapshot, 1);
+        assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].sequence, 3);
 
         let mut next_event = persisted[0].clone();
         next_event.sequence = 4;
