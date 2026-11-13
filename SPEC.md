@@ -112,7 +112,12 @@ model. All writes belonging to a command MUST join the repository's persistence
 transaction; enqueueing after that transaction commits does not satisfy
 atomicity. Backend implementations MUST expose their supported capabilities
 explicitly and MUST NOT satisfy contracts with success-returning stubs. Existing
-`EventBackend` implementations MUST remain source-compatible.
+`EventBackend` implementations MUST retain their method contracts. Applications
+MUST resolve the framework and backend to one compatible CQRS package source; a
+matching version number alone does not unify registry and Git identities. For
+registry-based 0.5.0 backends, the pinned checkpoint dependency requires the
+[root Cargo patch migration](docs/cqrs.md#cqrs-dependency-for-external-backends).
+With that dependency alignment, existing backend source remains compatible.
 
 Each backend's tests MUST use its real storage implementation to prove event and
 snapshot reload, optimistic conflict, atomic command/enqueue success, rollback

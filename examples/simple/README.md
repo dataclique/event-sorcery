@@ -12,6 +12,11 @@ cargo run --manifest-path examples/simple/Cargo.toml
 cargo nextest run --manifest-path examples/simple/Cargo.toml
 ```
 
+The example's root manifest keeps a registry `cqrs-es = "=0.5.0"` requirement
+and patches it to the same CQRS fork revision as event-sorcery. This exercises
+[external-backend dependency alignment](../../docs/cqrs.md#cqrs-dependency-for-external-backends)
+without changing the example's domain code.
+
 ## What it covers
 
 | Capability                                            | Where                                        |
