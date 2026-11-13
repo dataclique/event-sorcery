@@ -299,6 +299,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_rejects_gapped_appends_without_writing() {
+        let pool = create_test_pool().await.unwrap();
+        let repository = SqliteEventRepository::new(pool, CompactionPolicy::Retain);
+        let events = covering_events("version-guard", 4);
+        for sequence in [2, 0] {
+            let mut event = events[0].clone();
+            event.sequence = sequence;
+            let result = repository.persist::<TestAggregate>(&[event], None).await;
+            assert!(
+                matches!(result, Err(PersistenceError::OptimisticLockError)),
+                "{result:?}"
+            );
+            assert!(
+                repository
+                    .get_events::<TestAggregate>("version-guard")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        repository
+            .persist::<TestAggregate>(&events[..1], None)
+            .await
+            .unwrap();
+        let before = repository
+            .get_events::<TestAggregate>("version-guard")
+            .await
+            .unwrap();
+        for sequence in [1, 3] {
+            let event = events[sequence - 1].clone();
+            let result = repository.persist::<TestAggregate>(&[event], None).await;
+            assert!(
+                matches!(result, Err(PersistenceError::OptimisticLockError)),
+                "{result:?}"
+            );
+            assert_eq!(
+                repository
+                    .get_events::<TestAggregate>("version-guard")
+                    .await
+                    .unwrap(),
+                before
+            );
+        }
+        let result = repository
+            .persist::<TestAggregate>(&[events[1].clone(), events[3].clone()], None)
+            .await;
+        assert!(
+            matches!(result, Err(PersistenceError::OptimisticLockError)),
+            "{result:?}"
+        );
+        assert_eq!(
+            repository
+                .get_events::<TestAggregate>("version-guard")
+                .await
+                .unwrap(),
+            before
+        );
+        repository
+            .persist::<TestAggregate>(&events[1..2], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_events::<TestAggregate>("version-guard")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn prefix_snapshot_preserves_suffix_and_rejects_excess_coverage() {
         let pool = create_test_pool().await.unwrap();
         let repository = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);

@@ -357,6 +357,13 @@ impl<'events> CommitRequest<'events> {
         let stream = StreamIdentity::new(aggregate_type, aggregate_id);
         let mut pending_jobs = crate::job::prepare_pending()?;
         let mut request = Self::new(stream, events).with_jobs(pending_jobs.take_requests());
+        if let Some(first) = events.first() {
+            let expected = first
+                .sequence
+                .checked_sub(1)
+                .ok_or(EngineError::OptimisticLock)?;
+            request = request.at_expected_version(expected);
+        }
         if let Some((_, snapshot)) = snapshot_update {
             request = request.with_snapshot(snapshot)?;
         }

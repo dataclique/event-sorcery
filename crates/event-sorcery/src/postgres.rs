@@ -306,7 +306,9 @@ fn write_error(error: sqlx::Error) -> EngineError {
 mod tests {
     use chrono::DateTime;
     use cqrs_es::event_sink::EventSink;
-    use cqrs_es::persist::{PersistedEventRepository, PersistedEventStore, PersistenceError};
+    use cqrs_es::persist::{
+        PersistedEventRepository, PersistedEventStore, PersistenceError, SerializedEvent,
+    };
     use cqrs_es::{Aggregate, AggregateError, CqrsFramework, DomainEvent, EventStore};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
@@ -386,6 +388,94 @@ mod tests {
         fn encode(&self) -> Result<Value, serde_json::Error> {
             Ok(json!({"value": "work"}))
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn repository_rejects_gapped_appends_without_writing(pool: PgPool) {
+        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool };
+        let mut event = SerializedEvent {
+            aggregate_type: RecordedValues::TYPE.to_string(),
+            aggregate_id: "version-guard".to_string(),
+            sequence: 1,
+            event_type: "Recorded".to_string(),
+            event_version: "1".to_string(),
+            payload: json!({"Recorded": {"value": "first"}}),
+            metadata: json!({}),
+        };
+        for sequence in [2, 0] {
+            event.sequence = sequence;
+            let result = repository
+                .persist::<RecordedValues>(&[event.clone()], None)
+                .await;
+            assert!(
+                matches!(result, Err(PersistenceError::OptimisticLockError)),
+                "{result:?}"
+            );
+            assert!(
+                repository
+                    .get_events::<RecordedValues>("version-guard")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        event.sequence = 1;
+        repository
+            .persist::<RecordedValues>(&[event.clone()], None)
+            .await
+            .unwrap();
+        let before = repository
+            .get_events::<RecordedValues>("version-guard")
+            .await
+            .unwrap();
+        for sequence in [1, 3] {
+            event.sequence = sequence;
+            let result = repository
+                .persist::<RecordedValues>(&[event.clone()], None)
+                .await;
+            assert!(
+                matches!(result, Err(PersistenceError::OptimisticLockError)),
+                "{result:?}"
+            );
+            assert_eq!(
+                repository
+                    .get_events::<RecordedValues>("version-guard")
+                    .await
+                    .unwrap(),
+                before
+            );
+        }
+        event.sequence = 2;
+        let mut skipped = event.clone();
+        skipped.sequence = 4;
+        let result = repository
+            .persist::<RecordedValues>(&[event.clone(), skipped], None)
+            .await;
+        assert!(
+            matches!(result, Err(PersistenceError::OptimisticLockError)),
+            "{result:?}"
+        );
+        assert_eq!(
+            repository
+                .get_events::<RecordedValues>("version-guard")
+                .await
+                .unwrap(),
+            before
+        );
+        repository
+            .persist::<RecordedValues>(&[event], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_events::<RecordedValues>("version-guard")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[sqlx::test(migrations = false)]
