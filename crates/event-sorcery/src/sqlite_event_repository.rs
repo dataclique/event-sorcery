@@ -38,18 +38,6 @@ impl SqliteEventRepository {
         }
     }
 
-    async fn persist_updates<A: Aggregate>(
-        &self,
-        events: &[SerializedEvent],
-        snapshot_update: Option<(String, SnapshotUpdate)>,
-    ) -> Result<(), PersistenceError> {
-        let (request, pending_jobs) =
-            CommitRequest::prepare_repository(A::TYPE, events, snapshot_update)?;
-        self.engine.commit(request).await?;
-        pending_jobs.mark_committed();
-        Ok(())
-    }
-
     /// Registers the upcasters every load and replay applies, in order.
     ///
     /// Order is the contract, not an implementation detail: a chain that
@@ -60,6 +48,18 @@ impl SqliteEventRepository {
     pub fn with_upcasters(mut self, upcasters: Vec<Arc<dyn EventUpcaster>>) -> Self {
         self.upcasters = Arc::new(upcasters);
         self
+    }
+
+    async fn persist_updates<A: Aggregate>(
+        &self,
+        events: &[SerializedEvent],
+        snapshot_update: Option<(String, SnapshotUpdate)>,
+    ) -> Result<(), PersistenceError> {
+        let (request, pending_jobs) =
+            CommitRequest::prepare_repository(A::TYPE, events, snapshot_update)?;
+        self.engine.commit(request).await?;
+        pending_jobs.mark_committed();
+        Ok(())
     }
 
     /// Stream events from the `events` table for replay.
