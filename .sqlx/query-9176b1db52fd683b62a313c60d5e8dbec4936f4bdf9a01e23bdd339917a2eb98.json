@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO job_queue_projection (\n            view_id,\n            version,\n            payload,\n            lease_until\n        )\n        VALUES (?1, ?2, ?3, ?4)\n        ON CONFLICT(view_id) DO UPDATE SET\n            version = excluded.version,\n            payload = excluded.payload,\n            lease_until = excluded.lease_until\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "9176b1db52fd683b62a313c60d5e8dbec4936f4bdf9a01e23bdd339917a2eb98"
+}

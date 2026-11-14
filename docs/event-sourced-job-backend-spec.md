@@ -33,8 +33,9 @@ A job is its own event stream (`aggregate_type = "job"`). `JobState` is an
 RetryScheduled / Dead; `JobCommand` = Succeed / RetrySchedule / Kill). The whole
 durable-jobs capability is built from one consumer-supplied **`EventBackend`** —
 a cqrs-es event repository plus two job-shaped primitives, `claim` and `renew`.
-`JobRuntime::build(pool)` wires the job `Store` (cqrs/es) and the `job_queue`
-[`Projection`] via `StoreBuilder`; nothing else is required of the consumer.
+`JobRuntime::build(pool)` wires the job `Store` (cqrs/es) and the
+`job_queue_projection` [`Projection`] via `StoreBuilder`; nothing else is
+required of the consumer.
 
 The ack rides cqrs-es `execute` (a `JobCommand`); only the **claim** is a
 backend transaction, because its runnable check must read the projection-only
@@ -43,7 +44,7 @@ lease column, which cqrs-es cannot express.
 ## 2. Keystone decisions (each closes a specific adversarial finding)
 
 - **D1 Lease renewal is a projection-only `UPDATE`, never an event.**
-  `UPDATE job_queue SET lease_until=? WHERE view_id=? AND version=claim_seq AND
+  `UPDATE job_queue_projection SET lease_until=? WHERE view_id=? AND version=claim_seq AND
   status='claimed'`.
   The renewal is invisible to the event stream, so the ack (an `execute`)
   commits at `claim_seq+1` regardless of how many times the lease was renewed.
@@ -53,12 +54,12 @@ lease column, which cqrs-es cannot express.
   field; the claim re-reads the column in-txn (D2). On a projection rebuild the
   column is NULL (reclaimable; rebuild only runs with no live workers).
 - **D2 The claim is one `BEGIN IMMEDIATE` transaction that re-reads the
-  `job_queue` row, lets a crate-side closure (`plan_claim`) decide, and enacts
-  the decision** (events-UNIQUE compare-and-swap append + row write). The in-txn
-  re-read of the renewed lease **column** is why a live lease cannot be stolen —
-  reading a folded event lease would miss intervening renewals. The SQLx
-  transaction guard owns the connection until commit or rollback; cancellation
-  drops the guard and queues rollback before pool reuse.
+  `job_queue_projection` row, lets a crate-side closure (`plan_claim`) decide,
+  and enacts the decision** (events-UNIQUE compare-and-swap append + row write).
+  The in-txn re-read of the renewed lease **column** is why a live lease cannot
+  be stolen — reading a folded event lease would miss intervening renewals. The
+  SQLx transaction guard owns the connection until commit or rollback;
+  cancellation drops the guard and queues rollback before pool reuse.
 - **D3 Concurrency bound is a mandatory `ConcurrencyLimit` layer in
   `middleware()`.** apalis pulls the next stream item only after `poll_ready` is
   `Ready`, and the claim happens inside the stream's `poll_next` -> **a job is
@@ -103,7 +104,7 @@ safeguard — that is the consumer idempotency contract (§12).
 In-memory tests use a single shared connection (`max_connections=1`); a multi-DB
 pool over `:memory:` gives each connection a separate database.
 
-## 5. `job_queue` view table
+## 5. `job_queue_projection` view table
 
 The standard `(view_id, version, payload)` cqrs-es projection of
 `Lifecycle<JobState>`, plus the **projection-only** `lease_until` column (the
@@ -168,16 +169,20 @@ while the lease is still held, then cancel renewal. If the renewal saw 0 rows
 lease steal** (bounded by `max_claims`). Durable retry only; apalis
 `RetryPolicy` is not installed (one execution per claim).
 
-## 8. Enqueue (atomic with the triggering events)
+## 8. Command-born and standalone enqueue
 
-A handler holds a `JobQueue` (in its `Services`) and calls `push` /
-`push_with_delay` synchronously. `Store::send` opens a `PENDING_JOBS` scope
-around `execute`; `push` buffers into that scope; the event repository's
-`persist` drains it (`take_pending`), appending each `Enqueued` event AND
-seeding its `job_queue` row (version 1, pending) in the **same transaction**
-that commits the triggering events. A job is therefore enqueued (and pollable)
-iff that transaction commits. A `push` outside a command scope is a programming
-error, dropped with a warning.
+An entity handler returns `Effect::Dispatch` for work that must commit with its
+command's `Dispatched` event. `Store::send` opens a pending-job scope around
+CQRS execution. The repository appends the buffered `Enqueued` events and seeds
+their `job_queue_projection` rows in the **same transaction** as the command
+events and snapshot. The jobs become pollable only if that transaction commits.
+
+Reactors, pollers, sibling jobs and startup recovery use `JobRuntime::enqueue`,
+or `enqueue_with_delay` for delayed work, outside a command scope. This path
+atomically appends the job's `Enqueued` event and seeds its queue row in its own
+transaction. It is not atomic with a previously committed event or external
+operation that motivated the enqueue; producers must preserve their retry and
+idempotency contracts.
 
 ## 9. Worker wiring
 
@@ -196,12 +201,19 @@ spawned renewal must run during a CPU-heavy `perform`; CPU-bound work uses
 
 Exactly-once _effect_ needs consumer cooperation. Every execution entry point
 (`submit`/`reconcile` for entity-kicked jobs, `perform` for standalone ones)
-receives a `JobContext`; derive the external idempotency key from
-`JobContext::job_id`. **Key on the job id ALONE, never `job_id+attempt`** (the
-latter fails to dedup the crash-after-effect duplicate). The external boundary
-must be success-equivalent under that key: a re-issue of an already-succeeded op
-must replay success, not error. The in-library fenced-ack alarm is monitoring,
-not the safeguard.
+receives a `JobContext`. Its `job_id` is stable across retries and reclaims;
+never include `attempt` in an idempotency key, because doing so fails to dedupe
+a crash-after-effect retry.
+
+A job-ID key deduplicates attempts of that job, not a re-enqueued or cross-stack
+duplicate with a different identity. If the same business operation can arrive
+through multiple job IDs or backends, use a persistent domain-operation key or a
+shared domain guard that covers those paths. The external boundary must be
+success-equivalent under the chosen key: re-issuing an already-succeeded
+operation must replay success, not error. The fenced-ack alarm is monitoring,
+not the safeguard. See the
+[migration safety invariants](migrating-to-durable-jobs.md#4-safety-invariants-audit-each-migrated-job-against-these)
+for cutover requirements.
 
 ## 13. Residual risks (accepted / documented)
 

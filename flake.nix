@@ -10,6 +10,12 @@
     git-hooks.url = "github:cachix/git-hooks.nix";
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
 
+    process-compose.url = "github:F1bonacc1/process-compose";
+    process-compose.inputs = {
+      nixpkgs.follows = "nixpkgs";
+      flake-utils.follows = "flake-utils";
+    };
+
     devenv.url = "github:cachix/devenv";
     devenv.inputs = {
       nixpkgs.follows = "nixpkgs";
@@ -30,6 +36,7 @@
       flake-utils,
       git-hooks,
       devenv,
+      process-compose,
       rust-overlay,
       crane,
       ...
@@ -229,9 +236,45 @@
                   };
                 };
 
+                process.managers.process-compose.package = process-compose.packages.${system}.process-compose;
+
+                services.postgres = {
+                  enable = true;
+                  listen_addresses = "";
+                  initdbArgs = [
+                    "--locale=C"
+                    "--encoding=UTF8"
+                    "--auth-local=trust"
+                    "--auth-host=reject"
+                  ];
+                  settings.unix_socket_permissions = "0700";
+                  initialDatabases = [
+                    {
+                      name = "event_sorcery_test";
+                      user = "event_sorcery_test";
+                    }
+                  ];
+                  initialScript = ''
+                    ALTER ROLE event_sorcery_test CREATEDB;
+                  '';
+                };
+
+                enterTest = ''
+                  wait_for_processes 30
+                  ${pkgs.postgresql}/bin/psql \
+                    --no-psqlrc \
+                    --host '${config.devenv.runtime}/postgres' \
+                    --port 5432 \
+                    --username event_sorcery_test \
+                    --dbname event_sorcery_test \
+                    --set ON_ERROR_STOP=1 \
+                    --command 'SELECT 1'
+                '';
+
                 env = {
                   SQLX_OFFLINE = "true";
                   CARGO_INCREMENTAL = "0";
+                  DATABASE_URL = "postgresql://event_sorcery_test@localhost/event_sorcery_test?host=${config.devenv.runtime}/postgres";
                 };
 
                 git-hooks = {

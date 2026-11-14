@@ -306,6 +306,29 @@
         "type": "github"
       }
     },
+    "process-compose": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793745398,
+        "narHash": "sha256-eXDSUytYweeazmQxNC8RbLiOeEwbTQp3JknFbgoBhsk=",
+        "owner": "F1bonacc1",
+        "repo": "process-compose",
+        "rev": "096b393f40cc8e6b07198b510b90541fd7809ca5",
+        "type": "github"
+      },
+      "original": {
+        "owner": "F1bonacc1",
+        "repo": "process-compose",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "but-nix": "but-nix",
@@ -314,6 +337,7 @@
         "flake-utils": "flake-utils_2",
         "git-hooks": "git-hooks",
         "nixpkgs": "nixpkgs_2",
+        "process-compose": "process-compose",
         "rust-overlay": "rust-overlay_2"
       }
     },

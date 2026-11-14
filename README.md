@@ -94,6 +94,34 @@ nix build --no-link .#checks.aarch64-darwin.formatting
 Use your platform's system name for the hook check (`x86_64-linux` in CI).
 Development-shell state lives under `.tmp/devenv/`.
 
+### PostgreSQL persistence boundary
+
+The `postgres` feature exposes `PostgresEventRepository` and `POSTGRES_MIGRATOR`
+through the CQRS repository contract. It does not provide a PostgreSQL
+`EventBackend` for `StoreBuilder`; the built-in native store and worker
+integration remain SQLite-only.
+
+### Local PostgreSQL
+
+The flake pins Process Compose; devenv supplies the local PostgreSQL service.
+For interactive database work, start the service with:
+
+```bash
+devenv up postgres
+```
+
+The service accepts private Unix-socket connections only. It creates the
+`event_sorcery_test` database and role; that role can create isolated test
+databases. PostgreSQL data lives under `.tmp/devenv/state/postgres/`. The shell
+sets `DATABASE_URL` to this role and database over the private Unix socket, so
+SQLx fixture tests can run after the service starts.
+
+Linux Nix package and test checks run all features with an isolated PostgreSQL
+service. The pinned PostgreSQL test hook does not support Darwin, so Darwin
+package and test checks run the default features; Clippy still compiles all
+features. To run PostgreSQL tests locally on Darwin, start the service above and
+run `cargo nextest run --workspace --all-features` in the development shell.
+
 See [AGENTS.md](AGENTS.md) for contribution conventions.
 
 ## License

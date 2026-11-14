@@ -38,6 +38,46 @@ Consumers implement `EventSourced`. `Lifecycle` bridges to cqrs-es
 automatically. `Store` provides type-safe command dispatch with strongly-typed
 IDs.
 
+## CQRS dependency for external backends
+
+This revision uses a maintained `cqrs-es` fork for explicit snapshot
+checkpoints, pinned to `d61e05290bc7b24af1f615bc828a74ae6fc22f25`. Cargo treats
+registry and Git packages as different identities even when both have version
+`0.5.0`. Mixing them gives different `PersistedEventRepository` traits and
+`SerializedEvent` types at the `EventBackend` boundary.
+
+An application with a registry-based 0.5.0 backend must align its dependency
+graph in its **root** `Cargo.toml`:
+
+```toml
+[dependencies]
+cqrs-es = "=0.5.0"
+
+[patch.crates-io]
+cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "d61e05290bc7b24af1f615bc828a74ae6fc22f25" }
+```
+
+A patch inside a dependency's manifest is ignored by the consuming application.
+Align any direct Git dependencies to the same revision too, update the
+application lockfile, and run `cargo tree -i cqrs-es` from the application root.
+The graph must resolve one CQRS package identity across the framework and
+backend. Existing backend method signatures do not need to change, but this
+manifest migration is required when moving from registry dependencies. The
+[simple example](../examples/simple/Cargo.toml) demonstrates that setup.
+
+Package alignment fixes type identity, not a legacy writer's snapshot semantics.
+The provided `persist_with_snapshot` hook carries a `SerializedSnapshot`:
+`current_sequence` is the covered checkpoint and `current_snapshot` is the
+independent snapshot-version counter. Custom repositories must preserve these
+fields when implementing the hook. Its default adapter retains the old `persist`
+signature but cannot forward the checkpoint through that legacy tuple. The
+event-sorcery SQLite and PostgreSQL repositories override the hook; custom
+repositories must not assume that the Cargo patch alone makes their snapshots
+prefix-aware.
+
+See [ADR-0013](../adrs/0013-snapshot-checkpoint-dependency.md) for the
+dependency and compatibility decision.
+
 ## Implementing a New Entity
 
 ### 1. Define the Domain Type
@@ -838,6 +878,11 @@ changes.
 
 ## Running Jobs
 
+The worker API below requires a `SqlitePool`. PostgreSQL support currently
+provides the CQRS persistence repository, not a PostgreSQL `EventBackend` for
+`StoreBuilder` or worker execution. Do not use a PostgreSQL pool with
+`JobRuntime::build` or assume its workers can drain PostgreSQL jobs.
+
 Dispatching a job (see **Jobs Pattern** above) only writes a pending row; a
 worker has to drain it. `JobRuntime::build(pool)` wires the durable-jobs runtime
 over the same database, and `build_supervised_worker!` registers one supervised
@@ -861,12 +906,12 @@ let monitor = build_supervised_worker!(
 monitor.run().await?;  // polls, claims, runs, delivers, and acks jobs
 ```
 
-Each worker polls the `job_queue` projection for runnable jobs of its `KIND`,
-claims one under a lease, runs the routed execution (submit/reconcile for
-entity-kicked jobs, `perform` for standalone ones), delivers the verdict, and
-durably records the outcome (success, retry with backoff, or dead-letter) -- all
-fenced so a job runs exactly once per successful claim. `JobWorkerConfig` tunes
-poll cadence, concurrency, lease duration, retry budget, backoff, and the
+Each worker polls the `job_queue_projection` projection for runnable jobs of its
+`KIND`, claims one under a lease, runs the routed execution (submit/reconcile
+for entity-kicked jobs, `perform` for standalone ones), delivers the verdict,
+and durably records the outcome (success, retry with backoff, or dead-letter) --
+all fenced so a job runs exactly once per successful claim. `JobWorkerConfig`
+tunes poll cadence, concurrency, lease duration, retry budget, backoff, and the
 verdict-delivery deferrals (`DeliveryPolicy`); `Clock::system()` is the real
 wall clock (use `Clock::from_fn(..)` to drive lease and retry timing
 deterministically in tests).
@@ -927,17 +972,15 @@ Two consequences of the scratch-copy design worth knowing:
   rejects now fails at command time with the root-cause `LifecycleError` and
   nothing is persisted. (Under cqrs-es 0.4 such events were committed and
   poisoned the aggregate on its next load.)
-- **Scope of the exactly-once guarantee.** The pre-command-state invariant
-  guarantees exactly-once application through the
-  `handle -> commit ->
-  snapshot-rebuild` sequence of the Lifecycle adapter. It
-  does NOT cover the snapshot `last_sequence` bookkeeping in the repositories: a
-  multi-event command that crosses a snapshot boundary with `SNAPSHOT_SIZE > 1`
-  records a `last_sequence` past the state the snapshot payload actually folded
-  (pre-existing upstream limitation -- cqrs-es's persist API does not expose the
-  covered sequence), which can drop tail events from rehydrated state. Until
-  that is fixed, keep `SNAPSHOT_SIZE = 1` or emit single-event commands for
-  snapshotted aggregates.
+- **Snapshot coverage is a separate invariant.** The Lifecycle adapter applies
+  events once through `handle -> commit -> snapshot-rebuild`. The native SQLite
+  and PostgreSQL repositories also preserve the explicit covered sequence
+  supplied by the pinned CQRS dependency. With interval two, a three-event batch
+  from an empty stream snapshots through sequence two and reload replays the
+  third event. Multi-event commands do not require reducing the snapshot
+  interval. Custom repositories must honor the
+  [snapshot-aware persistence hook](#cqrs-dependency-for-external-backends)
+  rather than infer coverage from the batch end or snapshot-version counter.
 
 For view tests, use `View::update()` with `EventEnvelope`:
 

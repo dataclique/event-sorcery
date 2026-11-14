@@ -27,12 +27,14 @@ this repository. It MUST continue to build on:
 - `cqrs-es` for aggregate execution, event persistence contracts, snapshots, and
   query dispatch;
 - Apalis for native Rust worker hosting and task execution;
-- `sqlite-es`, SQLx, and SQLite for the production persistence path; and
+- `sqlite-es`, SQLx, and SQLite for the existing SQLite persistence path; and
 - the existing event-sourced job, dispatch, reactor, projection, schema, and
   delivery implementations.
 
-This is an extraction and binding project. It is not permission to design a
-second event store, queue, workflow engine, or set of storage semantics.
+The binding migration extracts the existing implementation. Additional storage
+backends extend its repository contracts, not its execution or lifecycle
+semantics. Neither permits a second event store, queue, workflow engine, or set
+of durable decisions.
 
 ## Goals
 
@@ -43,7 +45,8 @@ second event store, queue, workflow engine, or set of storage semantics.
 - Provide Haskell users with the same domain capabilities through idiomatic
   Haskell types and a thin FFI adapter.
 - Keep domain folds and handlers in the language where the domain is written.
-- Make cross-language behavior testable against the same real SQLite engine.
+- Make cross-language behavior testable against the same shared engine and
+  persistence implementation.
 - Keep the Nix development and release graph reproducible for both languages.
 
 ## Non-goals
@@ -57,12 +60,70 @@ The following are explicitly out of scope for 0.4.0:
   snapshot model, or checkpoint model;
 - redesigning `ClaimId`, claim sequence routing, retries, leases, fencing, or
   dispatch settlement;
-- adding a Postgres backend;
 - adding a general broker, transport, or outbox framework;
 - maintaining the standalone Haskell storage implementation; and
 - making Haskell reproduce Rust storage or job decisions.
 
 Any such change requires a separate specification and compatibility decision.
+
+## Persistence backends
+
+Database independence follows `cqrs-es`: `PersistedEventStore` is generic over
+`PersistedEventRepository`, concrete database repositories implement
+persistence, and `ViewRepository` defines read-model storage separately.
+Additional backends MUST extend these repository contracts and event-sorcery's
+existing backend boundary, not introduce another execution engine or
+backend-selection framework.
+
+The library MUST provide SQLite and PostgreSQL repositories that satisfy these
+shared persistence contracts.
+
+Database-specific SQL and transaction mechanisms MAY differ. Command validation,
+job-event construction, and durable lifecycle decisions MUST remain shared
+library code. Adding a backend MUST preserve existing public constructors,
+backend implementations, migrations, stored data, and behavior.
+
+Each persistence implementation MUST:
+
+- Bootstrap library-owned event, snapshot, and job-queue storage through
+  versioned migrations. Reapplying bootstrap MUST preserve existing data.
+- Persist and reload the existing serialized event and snapshot values. Stream
+  identity and sequence remain the event uniqueness key. Numeric conversions
+  MUST fail explicitly rather than truncate or substitute a value.
+- Validate expected stream versions under the transaction's concurrency
+  protection, including an empty stream. Competing writes from one expected
+  version MUST NOT both succeed. Conflict results MUST remain distinguishable
+  from unrelated constraint and infrastructure failures.
+- Commit aggregate events, optional snapshot updates, dispatched-job events, and
+  their queue seeds in one transaction. A standalone enqueue MUST commit its job
+  event and queue seed together through the same storage path.
+- Preserve snapshot version and covered-sequence semantics. An independent
+  snapshot write MUST NOT cover events beyond the committed stream version.
+- Roll back the entire transaction on a pre-commit failure. A cancellation-safe
+  guard MUST own the transaction from acquisition through explicit commit or
+  rollback. Dropping it before commit MUST release database resources safely; no
+  open transaction may return to the connection pool. An uncertain commit result
+  MUST NOT be reported as a confirmed success.
+
+The existing `job` event stream remains the lifecycle authority and
+`job_queue_projection` remains a derived projection. Every backend MUST use the
+existing crate-owned job preparation rather than define another event or queue
+model. All writes belonging to a command MUST join the repository's persistence
+transaction; enqueueing after that transaction commits does not satisfy
+atomicity. Backend implementations MUST expose their supported capabilities
+explicitly and MUST NOT satisfy contracts with success-returning stubs. Existing
+`EventBackend` implementations MUST retain their method contracts. Applications
+MUST resolve the framework and backend to one compatible CQRS package source; a
+matching version number alone does not unify registry and Git identities. For
+registry-based 0.5.0 backends, the pinned checkpoint dependency requires the
+[root Cargo patch migration](docs/cqrs.md#cqrs-dependency-for-external-backends).
+With that dependency alignment, existing backend source remains compatible.
+
+Each backend's tests MUST use its real storage implementation to prove event and
+snapshot reload, optimistic conflict, atomic command/enqueue success, rollback
+after injected write failures, and competing writes. Existing backend
+regressions and ordinary project checks remain required. Tests MUST fail visibly
+when required storage is unavailable rather than silently skip.
 
 ## 0.5.0 direction
 
@@ -91,7 +152,9 @@ EventSourced / Store / jobs      type families / Effect / jobs
                   |                    |
                cqrs-es              Apalis
                   |                    |
-                  +-- sqlite-es/SQLx/SQLite
+                  +-- persistence repositories
+                                 |
+                          configured database
 ```
 
 The erased facade is a reusable entry point into the current implementation. It
@@ -153,8 +216,8 @@ lease renewal, acknowledgement, retry, defer, and dead-letter paths define the
 job protocol.
 
 The `job` aggregate event stream is the sole durable source of job lifecycle
-truth. `job_queue` remains its rebuildable polling projection. A claim appends
-the job event and advances that projection in one transaction. The
+truth. `job_queue_projection` remains its rebuildable polling projection. A
+claim appends the job event and advances that projection in one transaction. The
 projection-only lease is operational coordination state and MUST NOT redefine
 the event-sourced lifecycle.
 
@@ -209,14 +272,6 @@ appear in a binding.
 
 ## Domain protocol
 
-Both language surfaces expose the same domain shape:
-
-The SQLite claim transaction is owned by SQLx's transaction guard from
-`BEGIN IMMEDIATE` through its explicit commit or rollback. Cancelling a claim
-future drops that guard, which queues a rollback before the connection can be
-reused by the pool. A cancelled worker must never return an open transaction to
-the pool or retain SQLite's writer lock.
-
 ### Durable jobs
 
 Domain event and job payloads are owned by the binding. The engine treats their
@@ -234,7 +289,7 @@ It MUST NOT be implemented by copying them into a new module or crate.
 The extraction MUST provide language-neutral values for:
 
 - stream identity and expected version;
-- serialized proposed and stored events;
+- serialized events to append and stored events;
 - command commit requests, including the existing optional durable job intent;
 - snapshots and schema versions;
 - job identity, payload, claim handle, attempt, schedule, and settlement;
@@ -451,7 +506,8 @@ when opened.
 
 ## Build and repository contract
 
-The repository is managed with Nix. The flake consumes the shared external
+The Nix flake is the authoritative build and check interface; devenv supports
+local development. The flake consumes the shared external
 `github:dataclique/but.nix` library rather than vendoring a `but.nix` file. The
 development shell includes the Rust toolchain, Stack, GHC 9.14.1 via the
 Stack-compatible Nix toolchain workaround, cbindgen, Fourmolu, HLint, and the
@@ -461,6 +517,10 @@ The flake pins nixpkgs and rust-overlay directly and builds Rust packages with
 Crane. The devenv development shell is entered with `nix develop --impure` and
 keeps its state under `.tmp/devenv/`. Standalone package and hook checks MUST
 remain evaluable without impure development-shell configuration.
+
+Local PostgreSQL integration testing uses devenv's built-in service with
+isolated test databases. Pure Nix checks MUST provision a bounded database
+lifecycle rather than depend on the impure developer service.
 
 `.envrc` uses nix-direnv. Git hooks are declared with `git-hooks.nix` and run
 through `prek`. Hooks include fast formatting and static file checks only;

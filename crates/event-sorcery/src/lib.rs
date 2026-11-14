@@ -94,6 +94,8 @@ mod job_backend;
 mod job_sqlite;
 mod job_store;
 mod lifecycle;
+#[cfg(feature = "postgres")]
+mod postgres;
 mod projection;
 mod reactor;
 mod schema_registry;
@@ -144,6 +146,8 @@ pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
+#[cfg(feature = "postgres")]
+pub use postgres::{POSTGRES_MIGRATOR, PostgresEventRepository};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::{
     IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,

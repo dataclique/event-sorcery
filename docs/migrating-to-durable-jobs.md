@@ -6,11 +6,10 @@ or apalis-backed job system (e.g. `st0x.liquidity`'s `conductor::job` over
 (ADR-0006,
 [`docs/event-sourced-job-backend-spec.md`](event-sourced-job-backend-spec.md)).
 
-It is grounded in a full audit of `st0x.liquidity`'s 17 job kinds. The headline:
-event-sorcery **partially** replaces such a system — it owns the _execution_
-machinery cleanly, but a real consumer needs a few enqueue-side capabilities
-that event-sorcery does not ship yet (§2), and the cutover must be done in a
-specific order to avoid losing or double-running in-flight work (§3).
+The examples use job kinds from the legacy `st0x.liquidity` workload.
+event-sorcery provides execution, standalone enqueue and successful deferral; a
+consumer must still satisfy its kind-specific migration requirements (§2) and
+preserve in-flight work across the cutover (§3).
 
 ## 1. What event-sorcery already covers
 
@@ -18,8 +17,16 @@ If your job system uses these, event-sorcery is a clean (often stronger) drop-in
 for the _execution_ side:
 
 - **Durable at-least-once execution** — each job is its own event stream
-  (`Enqueued`) + a `job_queue` projection row, replacing apalis `SqliteStorage`
-  rows.
+  (`Enqueued`) + a `job_queue_projection` projection row, replacing apalis
+  `SqliteStorage` rows.
+- **Standalone durable enqueue** — `JobRuntime::enqueue` appends the job's
+  `Enqueued` event and seeds its queue row in one transaction. Reactors,
+  pollers, sibling jobs and startup recovery can use it without a command
+  handler. It is not atomic with an earlier event or external operation that
+  triggered the enqueue, so producers still need retry and idempotency rules.
+- **Successful deferral** — `Ok(JobOutcome::Defer(delay))` reschedules the job
+  without recording a failed attempt. Use it for polling and external waits
+  rather than keeping a claim open across a long-running `perform`.
 - **Retry with exponential backoff** — `max_attempts` + `Backoff` via
   `RetryScheduled`; `attempt` is bumped only by a recorded failure, so a crash
   is not a failed attempt (matches apalis's contract).
@@ -38,116 +45,132 @@ for the _execution_ side:
   that keeps claiming but never records an outcome (apalis lacked this).
 - **Execution timeout** — `tokio::time::timeout(execution_timeout)` per
   `perform`.
-- **Sub-second pickup** — a fixed 250ms poll cadence (no apalis-style
-  exponential idle backoff), so a low-latency SLO is met out of the box.
+- **Configurable polling** — the default polling interval is 250ms, without
+  apalis-style exponential idle backoff. Validate pickup and execution latency
+  under the consumer's backlog, concurrency limits and database contention; the
+  polling interval alone does not establish an SLO.
 
 Not load-bearing either way: apalis-workflow DAG `Output` composition (liquidity
 sets `Output = ()` everywhere) and the `FailureInjector` (test-only).
 
 ## 2. What event-sorcery does NOT cover yet (prerequisites)
 
-event-sorcery's enqueue model is the **inverse** of a typical job system. ES
-enqueue is **handler-only**: `JobQueue::push` buffers into the `PENDING_JOBS`
-scope that `Store::send` opens around a command, so the job commits atomically
-with the command's events. A push outside that scope is dropped with a warning.
+Command-born work uses `Effect::Dispatch` and commits with the command's
+`Dispatched` event. Work originating in reactors, polling loops, sibling jobs or
+startup recovery uses `JobRuntime::enqueue`; self-rescheduling work can use
+`JobOutcome::Defer`. Neither capability requires reshaping external producers
+into artificial command handlers.
 
-But in `st0x.liquidity`, **all 17 jobs are enqueued from reactors, polling
-loops, sibling jobs (chains), self-reschedules, or startup recovery — zero from
-command handlers.** So the current ES job feature cannot enqueue any of them.
-These capabilities must land in event-sorcery first; each is independently
-shippable and a no-op until used:
+The remaining migration requirements depend on the job kind. Verify these before
+enabling that kind on the new worker:
 
-| Prerequisite                                                                                                                                                                   | Why liquidity needs it                                                                                                                                                                                                                              |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Standalone durable-enqueue API** (append `Enqueued` + seed the row in its own transaction, outside a command)                                                                | The central unblocker — reactor/poller/chain/startup enqueues. Reshaping all of these into command→handler→push is artificial for pollers and chains and should be rejected; keep handler-push as the default only for genuinely command-born jobs. |
-| **Defer / snooze success outcome** (e.g. `Ok(JobOutcome::Defer(delay))` → a `Rescheduled` event that re-arms `run_at` _without_ incrementing `attempt` or recording a failure) | 6 jobs self-reschedule as a success "come back later" (poll-while-pending, CCTP attestation waits, recovery guard contention). On the failure-only path they would exhaust `max_attempts` and dead-letter. Distinct from `RetryScheduled`.          |
-| **Enqueue-time dedup** (optional `Job::dedup_key`) + **`has_in_flight` / pending-count query**                                                                                 | Backfill overlap-skip, per-symbol recovery dedup, direction-independent transfer dedup. ES mints a fresh ULID per push with no unique key.                                                                                                          |
-| **Per-kind terminal-failure (fail-stop) hook** fired on `Dead` (including `DeadReason::Abandoned`)                                                                             | Liquidity crashes the process on a terminal trading/transfer failure and lets systemd restart clean. ES currently dead-letters and keeps idling. A kind that does _not_ install the hook is the best-effort tier — one mechanism covers both.       |
-| **Cancel-by-kind / cancel-by-dedup-key** (a terminal `Cancelled`)                                                                                                              | Discard stale pending work (rebalancing checks captured against pre-rebalance inventory; stale resume rows).                                                                                                                                        |
-| **Lease/timeout sizing guidance** + steer long external waits to _defer_                                                                                                       | A multi-minute CCTP wait inside `perform` would outlive a 30s lease (→ double-claim → double burn) or hit the 300s timeout.                                                                                                                         |
-| **`prune_terminal_jobs`** (already an ADR-0006 follow-up)                                                                                                                      | Replace apalis `spawn_finished_job_cleanup`; bound `job_queue` growth while retaining `Dead` rows for audit.                                                                                                                                        |
+| Prerequisite                                                                                       | Why liquidity needs it                                                                                                                                                                                                                        |
+| -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Enqueue-time dedup** (optional `Job::dedup_key`) + **`has_in_flight` / pending-count query**     | Backfill overlap-skip, per-symbol recovery dedup, direction-independent transfer dedup. ES mints a fresh ULID per push with no unique key.                                                                                                    |
+| **Per-kind terminal-failure (fail-stop) hook** fired on `Dead` (including `DeadReason::Abandoned`) | Liquidity crashes the process on a terminal trading/transfer failure and lets systemd restart clean. ES currently dead-letters and keeps idling. A kind that does _not_ install the hook is the best-effort tier — one mechanism covers both. |
+| **Cancel-by-kind / cancel-by-dedup-key** (a terminal `Cancelled`)                                  | Discard stale pending work (rebalancing checks captured against pre-rebalance inventory; stale resume rows).                                                                                                                                  |
+| **Lease/timeout sizing guidance** + steer long external waits to _defer_                           | Long waits need successful lease renewal and must fit within `execution_timeout`; prefer deferral to holding a claim across an external wait.                                                                                                 |
+| **`prune_terminal_jobs`** (already an ADR-0006 follow-up)                                          | Replace apalis `spawn_finished_job_cleanup`; bound `job_queue_projection` growth while retaining `Dead` rows for audit.                                                                                                                       |
 
-Until at least the standalone-enqueue API, defer, dedup, and the fail-stop hook
-land, a liquidity migration cannot start.
+Standalone enqueue and deferral are available. Migration of kinds requiring
+deduplication or fail-stop behavior must still wait until those requirements are
+satisfied; enqueue availability alone does not establish migration safety.
 
 ## 3. The safe cutover (per kind)
 
 Both backends can coexist on the **same SQLite file** during the migration
-(apalis `Jobs` table + event-sorcery `events`/`snapshots`/`job_queue`). Run both
-migrators with `set_ignore_missing(true)` against the shared `_sqlx_migrations`.
+(apalis `Jobs` table + event-sorcery
+`events`/`snapshots`/`job_queue_projection`). Run both migrators with
+`set_ignore_missing(true)` against the shared `_sqlx_migrations`.
 
-For each job kind, migrate one kind at a time, leaf-first, with **both workers
-running concurrently**:
+For each job kind, migrate one kind at a time, leaf-first, using a producer and
+worker barrier:
 
-1. The apalis worker keeps draining pre-existing apalis `Jobs` rows; the ES
-   worker for that kind runs the newly-enqueued ES work.
-2. **Flip the enqueuer atomically** for that kind: every site that enqueues it
-   switches from `apalis push` to the ES standalone-enqueue API in one deploy.
-3. Because a single logical enqueue lands in **exactly one backend (one
-   table)**, running both workers concurrently does **not** double-execute —
-   each worker only sees its own table's rows.
-4. The apalis worker is removed for that kind only once apalis `has_in_flight()`
-   for it is false (all pre-cutover rows reached a terminal state).
+1. Pause every producer of that kind, including reactors, pollers, job chains,
+   self-reschedules and startup recovery. Preserve incoming work durably or
+   ensure it can be reconstructed; pausing must not silently drop arrivals.
+2. Keep the apalis worker draining its existing rows, with ES execution for that
+   kind disabled. Wait for zero non-terminal apalis rows and no active apalis
+   execution. Reconcile terminal failures with unresolved effects, including
+   ambiguous external outcomes or unaccounted fills, before allowing the
+   affected resource to resume. A row that cannot drain or whose effects cannot
+   be reconciled blocks the cutover; do not delete it or assume safety.
+3. Stop that kind's apalis worker, then switch its enqueue sites atomically. Use
+   `JobRuntime::enqueue` for standalone producers and retain `Effect::Dispatch`
+   for work that must commit with command events.
+4. Enable its ES worker and replay buffered arrivals or run the required
+   reconstruction. Verify that every captured item is represented, preserving
+   its domain identity, before resuming producers. Unaccounted arrivals or
+   unresolved old outcomes block completion. Retain old terminal rows for audit
+   until the whole migration permits decommissioning apalis.
 
-> **Why not "drain first, then spawn the ES worker"?** That ordering looks safer
-> but isn't: if you flip the enqueuer to ES while only the apalis worker runs,
-> the new ES rows have _no_ worker until you spawn it — a live processing outage
-> (and an unhedged-exposure window) for any continuously-arriving kind, and a
-> forced rollback if an apalis row can't drain. Run both workers; the
-> no-double-execution property comes from one-enqueue-one-backend, not from
-> sequencing.
+If arrivals cannot pause, they may be durably buffered in ES while the old
+worker drains, but ES execution must remain disabled until the barrier is
+satisfied. Concurrent execution on both stacks requires an independently
+verified resource-scoped fence or overlap-safe domain semantics. Routing each
+enqueue to one backend does not prevent an old job and a different new job from
+operating on the same resource.
 
 ### Cutover order (liquidity)
 
-Leaf-first, lowest-risk first:
+Before enabling any supervised kind, wire and verify its required fail-stop
+behavior, including `DeadReason::Abandoned`, and its end-to-end failure
+assertions. `ResumeTokenizationAggregate` remains best-effort without that hook.
+The following legacy kind names illustrate ordering, not a certification of a
+consumer's current recovery behavior. Verify its dependency graph, record
+ownership and reconstruction guarantees before migrating leaf-first, lowest-risk
+first:
 
-1. **`ResumeTokenizationAggregate`** — its work is re-derived from the event
-   store, so even total loss of its apalis rows is recovered. Validates the dual
-   stack + standalone-enqueue + recovery end to end. Best-effort (no fail-stop
-   hook).
+1. **Reconstructible work, such as `ResumeTokenizationAggregate`** — first
+   verify that source events can reconstruct every outstanding item. Use this
+   kind to validate standalone enqueue and verified replay of cutover-window
+   arrivals end to end. Keep its best-effort failure policy explicit.
 2. **Chained / idempotent trading queues** — `AccountForDexTrade`,
-   `PollOrderStatus` (needs _defer_), `ReconcileOrderFill`,
+   `PollOrderStatus` (uses deferral), `ReconcileOrderFill`,
    `HandleOrderRejection`, `PlaceHedge`. Pollers (`BackfillRange`,
    `CheckPositions`) re-drive naturally.
-3. **`AccountForDexTrade` is the one cutover-critical queue** — its non-terminal
-   row is the _sole_ record of an observed fill once the backfill checkpoint
-   passes that block. **Never** remove its apalis worker, recreate the DB file,
-   or drop the `Jobs` table while any non-terminal trade-accounting row exists.
-   A permanently-failing row is a hard STOP-and-reconcile, not a skip.
+3. **Trade accounting, such as `AccountForDexTrade`** — determine whether a
+   queued row is the sole remaining record of an observed fill after its
+   backfill checkpoint advances. If so, never remove the worker, recreate the
+   database or drop `Jobs` before that fill is durably accounted for. A failed
+   row is a hard STOP-and-reconcile, even if its queue status is terminal.
 4. **Money-movement + self-rescheduling queues** — USDC/equity transfers,
-   wrapped/unwrapped recovery, `CheckPositions`. Need defer + dedup + cancel.
-5. **Wire the fail-stop hook** to `ConductorExit` for supervised kinds; leave
-   `ResumeTokenizationAggregate` unhooked. Port the e2e fail-stop assertions.
-6. **Decommission apalis** (final, irreversible) — only once every queue is
-   drained to zero non-terminal rows: remove the second pool, the apalis
-   migrations, `JobQueue`/`JobKind`/`FailureInjector`, and the finished-job
-   cleanup.
+   wrapped/unwrapped recovery, `CheckPositions`. Use deferral and verify the
+   required deduplication and cancellation contracts before cutover.
+5. **Decommission apalis** (final, irreversible) — only once every queue has
+   zero non-terminal rows, no active execution and no unresolved terminal
+   failures or ambiguous external outcomes. Retain reconciled rows and domain
+   identities for audit; then remove the second pool, apalis migrations,
+   `JobQueue`/`JobKind`/`FailureInjector`, and the finished-job cleanup.
 
 ## 4. Safety invariants (audit each migrated job against these)
 
 - **Idempotency keys on domain identity, NOT `job_id`.** ES is at-least-once for
-  _every_ `perform`, and re-claim/re-enqueue mints a fresh job identity. The
-  ADR-0006 idempotency contract's `job_id` key does **not** dedupe a re-enqueued
-  or cross-stack duplicate. Liquidity's guards correctly key on
-  `tx_hash`/`log_index`, `symbol`, transfer direction — keep them. The new queue
-  `dedup_key` is _additive_ defense, not a replacement for the
-  event-reconstructed fail-closed `usdc_in_progress` / `equity_in_progress`
-  guards (those are the authoritative re-burn defense for real money).
-- **Cross-stack dedup is a no-op during the dual-stack window.** ES
-  `has_in_flight` queries only `job_queue`, never the apalis `Jobs` table. A
-  kind whose only overlap defense is `has_in_flight` (e.g. `BackfillRange`) has
-  no in-memory backstop — migrate it in a single flip and confirm no overlap can
-  occur across the cutover.
+  _every_ `perform`. Retries and reclaims keep the same `job_id`; re-enqueue
+  creates a new job identity. A `job_id` key can deduplicate attempts of that
+  job, but cannot deduplicate a re-enqueued or cross-stack duplicate. For
+  workloads keyed on `tx_hash`/`log_index`, `symbol` or transfer direction,
+  preserve those domain guards. Any enqueue-time deduplication is _additive_
+  defense, not a replacement for the event-reconstructed fail-closed
+  `usdc_in_progress` / `equity_in_progress` guards (those are the authoritative
+  re-burn defense for real money).
+- **An ES-only in-flight check cannot fence the other stack.** Checking
+  `job_queue_projection` does not see apalis `Jobs` rows. For a kind whose only
+  overlap defense was `has_in_flight` (e.g. `BackfillRange`), use the pause and
+  drain barrier above. An enqueuer flip alone does not establish that old and
+  new work cannot overlap.
 - **`max_concurrency = 1` does NOT halt after a dead-letter** the way apalis
   fail-stop does — the ES poll loop moves straight to the next pending
   candidate. The halt depends entirely on the fail-stop hook crashing the
   process _before_ the next poll claims. Make the hook synchronous/abort-fast,
   and treat the Dead-to-exit window as a real race for kinds that must not run
   with stale state.
-- **Model multi-minute external waits as _defer_, not a long `perform`.** A long
-  blocking `perform` can outlive the lease (second worker claims → double
-  effect) or hit `execution_timeout` → dead-letter. Defer returns fast and
-  re-arms, so no lease is held across the wait.
+- **Model multi-minute external waits as _defer_, not a long `perform`.**
+  Healthy executions renew their leases. Failed renewal or lease loss can expose
+  work to a reclaimer; domain idempotency must still prevent duplicate effects.
+  An execution timeout records a failure and uses the retry budget before
+  dead-lettering. Deferral returns quickly and re-arms without holding a claim
+  across the wait.
 - **Route `DeadReason::Abandoned` (claim-budget) through the fail-stop hook**
   for critical kinds, so a restart-heavy crash-loop escalates loudly instead of
   dying silently.
@@ -163,8 +186,11 @@ A consumer owns its migrations. event-sorcery ships the canonical schema; copy
 it into your migration directory (see `examples/simple/migrations/`):
 
 - `…_init.sql` — the `events` + `snapshots` tables (the event-sourcing core).
-- `…_job_queue.sql` — the `job_queue` view table (generated
+- `…_job_queue.sql` — the legacy durable-job projection schema (generated
   `kind`/`status`/`run_at` columns + the projection-only `lease_until`).
+- `…_rename_job_queue_projection.sql` — rename that table to
+  `job_queue_projection`, preserving its rows and leases. Keep the earlier
+  migration unchanged and apply the complete migration chain.
 
 `StoreBuilder::build()` and `JobRuntime::build()` wire over an already-migrated
 pool; neither migrates for you (so they compose with your own view migrations

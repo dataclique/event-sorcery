@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT version,\n               payload,\n               lease_until AS \"lease_until_ms\"\n        FROM job_queue\n        WHERE view_id = ?1\n        ",
+  "query": "\n        SELECT version,\n               payload,\n               lease_until AS \"lease_until_ms\"\n        FROM job_queue_projection\n        WHERE view_id = ?1\n        ",
   "describe": {
     "columns": [
       {
@@ -9,7 +9,7 @@
         "type_info": "Integer",
         "origin": {
           "Table": {
-            "table": "job_queue",
+            "table": "job_queue_projection",
             "name": "version"
           }
         }
@@ -20,7 +20,7 @@
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "job_queue",
+            "table": "job_queue_projection",
             "name": "payload"
           }
         }
@@ -31,7 +31,7 @@
         "type_info": "Integer",
         "origin": {
           "Table": {
-            "table": "job_queue",
+            "table": "job_queue_projection",
             "name": "lease_until"
           }
         }
@@ -46,5 +46,5 @@
       true
     ]
   },
-  "hash": "31b67e2ad65c58452512ee579c468c0f2fb5b6f061ccce66c0d783643f65cce8"
+  "hash": "887e3ff62412f782ef3abff0914a19aacd981608581c158c5385281c6390c2f3"
 }

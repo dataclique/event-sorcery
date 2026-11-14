@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                INSERT INTO job_queue_projection (view_id, version, payload, lease_until)\n                VALUES (?1, 1, ?2, NULL)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "bffee38cf849f42bfcdc708fe6c38618fdde3436e921ed73b3a980dc03162701"
+}
