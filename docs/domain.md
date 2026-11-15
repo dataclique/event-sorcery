@@ -95,9 +95,11 @@ fold, separate from asynchronous effectful `Reactor` handling; see
 
 A persisted projection used for queries. An aggregate-state materialized view
 mirrors one aggregate instance per row. The current `Projection` API,
-parameterized by entity and backend, implements this specialization (`load`,
-`load_all`, `filter`). Its breaking rename to `MaterializedView` is specified in
-ADR 0014. The general multi-aggregate projection runtime is not yet implemented.
+parameterized by entity and backend, implements this specialization. `load`
+works through the selected view backend; `load_all` and `filter` currently exist
+only for the default SQLite backend. Its breaking rename to `MaterializedView`
+is specified in ADR 0014. The general multi-aggregate projection runtime is not
+yet implemented.
 
 The event store remains authoritative, but additional derived tables are normal
 in CQRS/event sourcing. Their contents must be reconstructible from durable
