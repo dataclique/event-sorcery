@@ -85,11 +85,26 @@ Split into:
 
 ### Projection
 
-A read model derived from events. `Projection<Entity, Backend>` exposes live
-aggregate state by ID. Native SQLite and PostgreSQL projections also support
-loading all rows and filtering on typed columns.
+State derived from events, potentially from several aggregate types. A
+projection may summarize, join or reorganize those facts rather than mirror an
+aggregate. The planned native `Projection` trait is a synchronous deterministic
+fold, separate from asynchronous effectful `Reactor` handling; see
+[ADR 0014](../adrs/0014-replayable-multi-aggregate-projections.md).
 
-Rebuilding a projection requires the event history it derives from.
+### Materialized View
+
+A persisted projection used for queries. An aggregate-state materialized view
+mirrors one aggregate instance per row. The current `Projection` API,
+parameterized by entity and backend, implements this specialization (`load`,
+`load_all`, `filter`). Its breaking rename to `MaterializedView` is specified in
+ADR 0014. The general multi-aggregate projection runtime is not yet implemented.
+
+The event store remains authoritative, but additional derived tables are normal
+in CQRS/event sourcing. Their contents must be reconstructible from durable
+inputs. Record required external observations, adjustments and configuration;
+replay cannot recover facts that were never persisted. Keep required history
+through compaction. Ordered-feed metadata is also authoritative: cross-stream
+order cannot be recovered from aggregate-local sequence numbers alone.
 
 ### View
 
