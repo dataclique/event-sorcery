@@ -16,12 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use apalis_core::backend::Backend as ApalisBackend;
+use apalis_core::backend::finalize::Ephemeral;
+use apalis_core::backend::{Backend as ApalisBackend, BackendConfig};
 use apalis_core::error::BoxDynError;
 use apalis_core::task::Task;
-use apalis_core::task::data::Data;
+use apalis_core::task::builder::TaskBuilder;
+use apalis_core::task::data::{Data, MissingDataError};
+use apalis_core::task::from_request::FromRequest;
 use apalis_core::task::task_id::TaskId;
-use apalis_core::task_fn::FromRequest;
 use apalis_core::worker::context::WorkerContext;
 use chrono::{DateTime, TimeDelta, Utc};
 use cqrs_es::AggregateError;
@@ -487,10 +489,9 @@ impl JobRuntime<SqliteBackend> {
 /// [`EventBackend`].
 pub struct EventStoreBackend<J: StandaloneJob, Backend: EventBackend = SqliteBackend> {
     runtime: JobRuntime<Backend>,
-    worker_id: WorkerId,
     config: JobWorkerConfig,
     clock: Clock,
-    _job: PhantomData<fn() -> J>,
+    tasks: BoxStream<'static, Task<J>>,
 }
 
 impl<J: StandaloneJob, Backend: EventBackend> EventStoreBackend<J, Backend> {
@@ -502,15 +503,29 @@ impl<J: StandaloneJob, Backend: EventBackend> EventStoreBackend<J, Backend> {
         config: JobWorkerConfig,
         clock: Clock,
     ) -> Self {
+        let poller = JobPoller {
+            runtime: runtime.clone(),
+            worker_id: WorkerId::new(worker_name),
+            config: config.clone(),
+            clock: clock.clone(),
+        };
         Self {
             runtime,
-            worker_id: WorkerId::new(worker_name),
             config,
             clock,
-            _job: PhantomData,
+            tasks: poll_jobs::<J, Backend>(poller),
         }
     }
+}
 
+struct JobPoller<Backend: EventBackend> {
+    runtime: JobRuntime<Backend>,
+    worker_id: WorkerId,
+    config: JobWorkerConfig,
+    clock: Clock,
+}
+
+impl<Backend: EventBackend> JobPoller<Backend> {
     /// Claims one candidate through the shared facade claim, reusing this
     /// worker's stable identity rather than minting one per attempt.
     async fn claim_one(
@@ -532,10 +547,7 @@ impl<J: StandaloneJob, Backend: EventBackend> EventStoreBackend<J, Backend> {
 
 /// Decodes a claimed job into an apalis task, or `None` if the stored args no
 /// longer deserialize into `J` (a poison row the worker skips).
-fn build_task<J: StandaloneJob>(
-    claimed: ClaimedJob,
-    config: &JobWorkerConfig,
-) -> Option<Task<J, JobContext, String>> {
+fn build_task<J: StandaloneJob>(claimed: ClaimedJob, config: &JobWorkerConfig) -> Option<Task<J>> {
     let ClaimedJob { handle, payload } = claimed;
     let job_id = handle.job_id;
     let job: J = match serde_json::from_value(payload) {
@@ -545,18 +557,17 @@ fn build_task<J: StandaloneJob>(
             return None;
         }
     };
-    let mut task = Task::new_with_ctx(
-        job,
-        JobContext {
+    let task = TaskBuilder::new(job)
+        .data(JobContext {
             job_id,
             claim_seq: handle.claim_seq,
             claim_id: handle.claim_id,
             attempt: handle.attempt,
             max_attempts: config.max_attempts,
             delivery: config.delivery,
-        },
-    );
-    task.parts.task_id = Some(TaskId::new(job_id.to_string()));
+        })
+        .task_id(TaskId::from_string(job_id.to_string()))
+        .build();
     Some(task)
 }
 
@@ -575,33 +586,57 @@ pub async fn run_job<J: StandaloneJob>(
 
 /// Extracts the claim-time [`JobContext`] into the task handler, so `perform`
 /// receives the job's durable identity alongside its input.
-impl<Args: Sync> FromRequest<Task<Args, Self, String>> for JobContext {
-    type Error = Infallible;
+impl<Args: Sync> FromRequest<Task<Args>> for JobContext {
+    type Error = MissingDataError;
 
-    async fn from_request(task: &Task<Args, Self, String>) -> Result<Self, Infallible> {
-        Ok(task.parts.ctx.clone())
+    async fn from_request(task: &Task<Args>) -> Result<Self, Self::Error> {
+        task.data().get_checked::<Self>().cloned()
     }
 }
 
 impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBackend<J, Backend> {
-    type Args = J;
-    type IdType = String;
-    type Context = JobContext;
-    type Error = BoxDynError;
-    type Stream = BoxStream<'static, Result<Option<Task<J, JobContext, String>>, BoxDynError>>;
-    type Beat = BoxStream<'static, Result<(), BoxDynError>>;
-    type Layer = Stack<AckLayer<J, Backend>, ConcurrencyLimitLayer>;
+    type Task = Task<J>;
+    type Error = Infallible;
 
-    fn heartbeat(&self, _worker: &WorkerContext) -> Self::Beat {
-        let interval = self.config.poll_interval;
-        stream::unfold((), move |()| async move {
-            sleep(interval).await;
-            Some((Ok(()), ()))
-        })
-        .boxed()
+    fn poll_ready(
+        &mut self,
+        _cx: &mut Context<'_>,
+        _worker: &WorkerContext,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
-    fn middleware(&self) -> Self::Layer {
+    fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+        _worker: &WorkerContext,
+    ) -> Poll<Option<Result<Self::Task, Self::Error>>> {
+        self.tasks.poll_next_unpin(cx).map(|task| task.map(Ok))
+    }
+
+    fn poll_close(
+        &mut self,
+        _cx: &mut Context<'_>,
+        _worker: &WorkerContext,
+    ) -> Poll<Result<(), Self::Error>> {
+        self.tasks = stream::empty().boxed();
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<J: StandaloneJob, Backend: EventBackend> BackendConfig for EventStoreBackend<J, Backend> {
+    type Args = J;
+    type Id = String;
+    // Tasks are already decoded; the event store and AckLayer own durability.
+    type Kind = Ephemeral;
+    type Config = JobWorkerConfig;
+    type Layer = Stack<AckLayer<J, Backend>, ConcurrencyLimitLayer>;
+
+    fn config(&self) -> &Self::Config {
+        &self.config
+    }
+
+    fn middleware(&mut self, _worker: &mut WorkerContext) -> Self::Layer {
         Stack::new(
             AckLayer {
                 jobs: self.runtime.jobs.clone(),
@@ -613,9 +648,12 @@ impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBacken
             ConcurrencyLimitLayer::new(self.config.max_concurrency),
         )
     }
+}
 
-    fn poll(self, _worker: &WorkerContext) -> Self::Stream {
-        stream::unfold(self, |backend| async move {
+fn poll_jobs<J: StandaloneJob, Backend: EventBackend>(
+    poller: JobPoller<Backend>,
+) -> BoxStream<'static, Task<J>> {
+    stream::unfold(poller, |backend| async move {
             let now_ms = backend.clock.now().timestamp_millis();
             let predicate = poll_predicate(J::KIND, now_ms);
             let order = poll_order();
@@ -629,7 +667,7 @@ impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBacken
                 Err(error) => {
                     warn!(target: "cqrs", ?error, kind = J::KIND, "job poll failed; idling");
                     sleep(backend.config.poll_interval).await;
-                    return Some((Ok(None), backend));
+                    return Some((None, backend));
                 }
             };
 
@@ -644,7 +682,7 @@ impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBacken
                 match backend.claim_one(job_id, now_ms).await {
                     Ok(JobClaimResult::Claimed(claimed)) => {
                         if let Some(task) = build_task::<J>(claimed, &backend.config) {
-                            return Some((Ok(Some(task)), backend));
+                            return Some((Some(task), backend));
                         }
                     }
                     // An abandoned dead-letter freed the slot; contended/skip move on.
@@ -661,10 +699,10 @@ impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBacken
             }
 
             sleep(backend.config.poll_interval).await;
-            Some((Ok(None), backend))
+            Some((None, backend))
         })
+        .filter_map(|task| async move { task })
         .boxed()
-    }
 }
 
 /// Tuning for a job worker. Defaults target a single-host bot with sub-second
@@ -857,11 +895,11 @@ pub struct AckService<S, J: StandaloneJob, Backend: EventBackend> {
     _job: PhantomData<fn() -> J>,
 }
 
-impl<S, J, Backend> Service<Task<J, JobContext, String>> for AckService<S, J, Backend>
+impl<S, J, Backend> Service<Task<J>> for AckService<S, J, Backend>
 where
     J: StandaloneJob,
     Backend: EventBackend,
-    S: Service<Task<J, JobContext, String>, Response = JobOutcome<J::Output>>,
+    S: Service<Task<J>, Response = JobOutcome<J::Output>>,
     S::Error: Into<BoxDynError> + Send + Sync + 'static,
     S::Future: Send + 'static,
 {
@@ -873,8 +911,14 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, task: Task<J, JobContext, String>) -> Self::Future {
-        let ctx = task.parts.ctx.clone();
+    fn call(&mut self, task: Task<J>) -> Self::Future {
+        let ctx = match task.data().get_checked::<JobContext>().cloned() {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                error!(target: "cqrs", ?error, "job task is missing its claim context");
+                return async move { Err(Box::new(error) as BoxDynError) }.boxed();
+            }
+        };
         let jobs = self.jobs.clone();
         let backend = self.backend.clone();
         let config = self.config.clone();
@@ -2059,21 +2103,22 @@ mod tests {
         let pool = create_test_pool().await.unwrap();
         let runtime = JobRuntime::build(pool.clone()).await.unwrap();
         let job_id = enqueue(&pool, 1_000).await;
-        let worker = EventStoreBackend::<TestJob>::new(
+        let mut worker = EventStoreBackend::<TestJob>::new(
             runtime,
             "native-worker",
             JobWorkerConfig::default(),
-            Clock::system(),
+            Clock::from_fn(|| from_millis(1_000)),
         );
+        let context = WorkerContext::new("native-worker");
+        let task =
+            futures_util::future::poll_fn(|cx| ApalisBackend::poll_next(&mut worker, cx, &context))
+                .await
+                .expect("worker remains live")
+                .unwrap();
+        let claimed = JobContext::from_request(&task).await.unwrap();
 
-        let outcome = worker.claim_one(job_id, 1_000).await.unwrap();
-
-        let JobClaimResult::Claimed(claimed) = outcome else {
-            panic!("expected the native adapter to win the claim");
-        };
-
-        assert_eq!(claimed.handle.job_id(), job_id);
-        assert_eq!(claimed.handle.attempt(), 0);
+        assert_eq!(claimed.job_id, job_id);
+        assert_eq!(claimed.attempt, 0);
         assert_eq!(
             event_types(&pool, &job_id).await,
             ["JobEnqueued", "JobClaimed"]
@@ -2103,6 +2148,59 @@ mod tests {
                 .await
                 .contains(&"JobDead".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn closing_the_native_backend_prevents_further_claims() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = enqueue(&pool, 1_000).await;
+        let mut worker = EventStoreBackend::<TestJob>::new(
+            runtime,
+            "native-worker",
+            JobWorkerConfig::default(),
+            Clock::from_fn(|| from_millis(1_000)),
+        );
+        let context = WorkerContext::new("native-worker");
+
+        futures_util::future::poll_fn(|cx| worker.poll_close(cx, &context))
+            .await
+            .unwrap();
+        let next =
+            futures_util::future::poll_fn(|cx| ApalisBackend::poll_next(&mut worker, cx, &context))
+                .await;
+
+        assert_eq!(next.map(|task| task.unwrap().args.n), None);
+        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
+    }
+
+    #[tokio::test]
+    async fn a_task_without_claim_context_cannot_invoke_the_handler() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool).await.unwrap();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let observed = invoked.clone();
+        let handler = apalis_core::task::task_fn::task_fn(move |_job: TestJob| {
+            observed.store(true, Ordering::SeqCst);
+            async { Ok::<_, Infallible>(JobOutcome::Done(())) }
+        });
+        let mut service = AckLayer::<TestJob, _> {
+            jobs: runtime.jobs.clone(),
+            backend: runtime.backend.clone(),
+            config: JobWorkerConfig::default(),
+            clock: Clock::system(),
+            _job: PhantomData,
+        }
+        .layer(handler);
+
+        let error = service.call(Task::new(TestJob { n: 1 })).await.unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<MissingDataError>(),
+            Some(MissingDataError::NotFound(name))
+                if name == std::any::type_name::<JobContext>()
+        ));
+        assert!(!invoked.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
