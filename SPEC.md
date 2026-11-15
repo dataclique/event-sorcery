@@ -134,6 +134,42 @@ after injected write failures, and competing writes. Existing backend
 regressions and ordinary project checks remain required. Tests MUST fail visibly
 when required storage is unavailable rather than silently skip.
 
+## Projections and materialized views
+
+A projection derives state from events. A materialized view persists that
+projection for queries; mirroring one aggregate instance per row is one
+specialization, not the general projection abstraction. The aggregate-state API
+MUST use `MaterializedView` terminology. Its breaking rename MUST include a
+package version bump without compatibility aliases, while preserving physical
+table names and stored data.
+
+General multi-aggregate projections MUST use a synchronous deterministic fold
+with an associated serializable payload and typed error, separate from the
+asynchronous `Reactor` trait. The empty payload comes from `Default`, not a
+separate initialization method. Replay MUST NOT perform external effects or
+query present-day state as a substitute for recorded inputs.
+
+A durable ordered event feed MUST provide reproducible cross-stream ordering.
+Its entries reference the existing event store and commit atomically with their
+events through the existing writer. Serialized transactional append ordering
+MUST prevent a consumer from checkpointing beyond an earlier event that can
+still commit. Timestamps and uncoordinated sequence allocation are insufficient.
+Ordering metadata is authoritative, not a disposable projection.
+
+Projection storage MUST atomically persist its JSON payload, optimistic version
+and consumed feed position, with a distinct projection schema version. Failure,
+cancellation and competing processing MUST NOT advance a checkpoint without its
+corresponding state. Rebuilds MUST use retained history through a captured
+committed boundary and MUST NOT expose incomplete state as successfully rebuilt.
+Activation over historical events requires an explicit bootstrap policy; missing
+historical cross-stream order MUST NOT be silently fabricated.
+
+Applications MAY create additional derived tables. Such tables MUST remain
+reconstructible from durable inputs: required observations, adjustments and
+configuration must be recorded, and required history must survive compaction.
+Ordinary effectful reactors MUST NOT be replayed during reconstruction. See
+[ADR 0014](adrs/0014-replayable-multi-aggregate-projections.md).
+
 ## 0.5.0 direction
 
 Release 0.5.0 is intended to add a typed TypeScript binding over the shared Rust
