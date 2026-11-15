@@ -12,7 +12,15 @@ from the `.sqlx/` directory instead of connecting to the database. This means:
 - If you add or change a `query!` macro invocation, you must regenerate the
   cache before the change will compile under `SQLX_OFFLINE=true`.
 - PostgreSQL-enabled tests still need a running PostgreSQL database.
-  `SQLX_OFFLINE` controls macro analysis, not runtime connections.
+  `SQLX_OFFLINE` controls macro analysis, not runtime connections. The
+  `postgr-es` crate selects real-database tests with `integration-tests`; Linux
+  flake checks enable all features and provision PostgreSQL through the test
+  hook. Darwin flake tests retain the existing database-test exclusion. Enabled
+  database tests fail normally when storage is unavailable.
+- Keep `#[cfg(test)]` and the integration-test feature gate as separate module
+  attributes. With the pinned compiler, combining them in `cfg(all(...))`
+  prevents Clippy from recognizing test-only helpers for the configured
+  `allow-unwrap-in-tests` exception.
 
 ## Local PostgreSQL and flake tests
 

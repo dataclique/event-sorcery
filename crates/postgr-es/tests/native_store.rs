@@ -1,6 +1,6 @@
 //! Real PostgreSQL coverage for the shared persistence contract.
 
-#![cfg(feature = "postgres")]
+#![cfg(feature = "integration-tests")]
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -12,9 +12,10 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 use event_sorcery::{
-    CompactionPolicy, DomainEvent, Effect, EventSourced, Never, Nil, POSTGRES_MIGRATOR,
-    PersistenceBackend, PostgresBackend, ReconcileError, StoreBuilder,
+    CompactionPolicy, DomainEvent, Effect, EventSourced, Never, Nil, PersistenceBackend,
+    ReconcileError, StoreBuilder,
 };
+use postgr_es::{MIGRATOR, PostgresBackend};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Note<const VERSION: u64> {
@@ -89,7 +90,7 @@ async fn unprojected_builder_preserves_unavailable_storage_error() {
 
 #[sqlx::test(migrations = false)]
 async fn unprojected_builder_restarts_and_reconciles_with_one_connection(pool: PgPool) {
-    POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect_with(pool.connect_options().as_ref().clone())
@@ -149,6 +150,72 @@ async fn unprojected_builder_restarts_and_reconciles_with_one_connection(pool: P
 }
 
 #[sqlx::test(migrations = false)]
+async fn failed_registry_registration_preserves_snapshot_and_allows_upgrade_retry(pool: PgPool) {
+    MIGRATOR.run(&pool).await.unwrap();
+    let backend = PostgresBackend { pool: pool.clone() };
+    let store = StoreBuilder::<Note<1>, PostgresBackend>::with_backend(backend.clone())
+        .build()
+        .await
+        .unwrap();
+    let id = "note".to_string();
+    store.send(&id, "first".to_string()).await.unwrap();
+    store.send(&id, "second".to_string()).await.unwrap();
+    drop(store);
+
+    let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
+                        WHERE aggregate_type = 'NativeNote' AND aggregate_id = 'note'";
+    let before: (i64, i64, serde_json::Value) =
+        sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+    sqlx::query(
+        "ALTER TABLE events ADD CONSTRAINT reject_registry_upgrade CHECK (\
+         aggregate_type <> 'SchemaRegistry' OR \
+         payload <> '{\"VersionUpdated\": {\"name\": \"NativeNote\", \"version\": 2}}'::JSONB)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let result = StoreBuilder::<Note<2>, PostgresBackend>::with_backend(backend.clone())
+        .build()
+        .await;
+    let Err(error) = result else {
+        panic!("registry rejection must prevent startup");
+    };
+    assert!(matches!(error, ReconcileError::Aggregate(_)));
+
+    let after: (i64, i64, serde_json::Value) =
+        sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+    assert_eq!(after, before);
+    let registry_sql = "SELECT payload FROM events WHERE aggregate_type = 'SchemaRegistry' \
+                        AND aggregate_id = 'schema' ORDER BY sequence DESC LIMIT 1";
+    let recorded: serde_json::Value = sqlx::query_scalar(registry_sql)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded,
+        json!({"VersionUpdated": {"name": "NativeNote", "version": 1}})
+    );
+
+    sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_registry_upgrade")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let upgraded = StoreBuilder::<Note<2>, PostgresBackend>::with_backend(backend)
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(upgraded.load(&id).await.unwrap().unwrap().text, "second");
+    let recorded: serde_json::Value = sqlx::query_scalar(registry_sql)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded,
+        json!({"VersionUpdated": {"name": "NativeNote", "version": 2}})
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn bootstrap_initializes_framework_storage(pool: PgPool) {
     let backend = PostgresBackend { pool: pool.clone() };
     backend.bootstrap_persistence().await.unwrap();
@@ -198,11 +265,11 @@ async fn bootstrap_failure_rolls_back_and_can_be_retried(pool: PgPool) {
         .await
         .unwrap();
 
-    let error = POSTGRES_MIGRATOR.run(&pool).await.unwrap_err();
+    let error = MIGRATOR.run(&pool).await.unwrap_err();
     let MigrateError::ExecuteMigration(source, version) = error else {
         panic!("expected the bootstrap migration to fail");
     };
-    assert_eq!(version, POSTGRES_MIGRATOR.iter().next().unwrap().version);
+    assert_eq!(version, MIGRATOR.iter().next().unwrap().version);
     let sqlx::Error::Database(source) = source else {
         panic!("expected a database error for the conflicting table");
     };
@@ -232,7 +299,7 @@ async fn bootstrap_failure_rolls_back_and_can_be_retried(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
 
     let tables: i64 = sqlx::query_scalar(
         r"

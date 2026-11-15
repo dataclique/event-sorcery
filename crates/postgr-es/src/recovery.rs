@@ -185,6 +185,7 @@ impl PersistedEventRepository for RegistryRepository<'_> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "integration-tests")]
 mod tests {
     use serde_json::json;
 

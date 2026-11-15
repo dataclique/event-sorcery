@@ -8,7 +8,7 @@ let
       path: type:
       craneLib.filterCargoSources path type
       || pkgs.lib.hasPrefix (toString ./crates/sqlite-es/migrations) path
-      || pkgs.lib.hasPrefix (toString ./crates/event-sorcery/migrations/postgres) path
+      || pkgs.lib.hasPrefix (toString ./crates/postgr-es/migrations) path
       || pkgs.lib.hasPrefix (toString ./.sqlx) path
       || pkgs.lib.hasPrefix (toString ./bindings/haskell/conformance) path;
   };

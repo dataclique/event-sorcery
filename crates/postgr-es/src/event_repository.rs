@@ -313,6 +313,7 @@ fn write_error(error: sqlx::Error) -> EngineError {
 }
 
 #[cfg(test)]
+#[cfg(feature = "integration-tests")]
 mod tests {
     use cqrs_es::event_sink::EventSink;
     use cqrs_es::persist::{

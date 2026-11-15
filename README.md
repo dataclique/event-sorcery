@@ -1,7 +1,8 @@
 # Event Sorcery
 
 Event-sourcing primitives in Rust. A thin, opinionated layer on top of
-[`cqrs-es`](https://crates.io/crates/cqrs-es) plus a SQLite-backed event store.
+[`cqrs-es`](https://crates.io/crates/cqrs-es), with SQLite and PostgreSQL
+persistence.
 
 ## Crates
 
@@ -18,6 +19,8 @@ Event-sourcing primitives in Rust. A thin, opinionated layer on top of
 - **[`crates/event-sorcery-ffi`](crates/event-sorcery-ffi)** — C ABI over the
   shared Rust engine, with a generated C header and static library for language
   bindings.
+- **[`crates/postgr-es`](crates/postgr-es)** — PostgreSQL repositories,
+  migrations, and native backend integration for `event-sorcery`.
 
 `event-sorcery` is the recommended entry point. Use `sqlite-es` directly only if
 you need lower-level control.
@@ -96,10 +99,12 @@ Development-shell state lives under `.tmp/devenv/`.
 
 ### PostgreSQL persistence boundary
 
-The `postgres` feature exposes `PostgresEventRepository` and `POSTGRES_MIGRATOR`
-through the CQRS repository contract. It does not provide a PostgreSQL
-`EventBackend` for `StoreBuilder`; the built-in native store and worker
-integration remain SQLite-only.
+`postgr-es` owns PostgreSQL repositories and migrations. It exports
+`PostgresBackend`, `PostgresEventRepository`, `PostgresViewRepository`, and
+`MIGRATOR`. After bootstrapping persistence, unprojected entities use
+`StoreBuilder::with_backend`; startup reconciles their schema in one transaction
+before exposing the store. Database-dependent tests use the `integration-tests`
+feature.
 
 ### Local PostgreSQL
 
