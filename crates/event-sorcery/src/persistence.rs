@@ -2,8 +2,11 @@
 
 use std::future::Future;
 
-use cqrs_es::persist::PersistedEventRepository;
+use cqrs_es::Aggregate;
+use cqrs_es::persist::{PersistedEventRepository, PersistenceError, SerializedSnapshot};
+use tracing::warn;
 
+use crate::engine::EngineError;
 use crate::{CompactionPolicy, EventBackend};
 
 /// Storage required to execute and reload native aggregates.
@@ -53,5 +56,31 @@ impl<Backend: EventBackend> PersistenceBackend for Backend {
 
     async fn bootstrap_persistence(&self) -> Result<(), Self::BootstrapError> {
         <Backend as EventBackend>::migrate(self).await
+    }
+}
+
+pub(crate) fn guard_snapshot<AggregateType: Aggregate>(
+    snapshot: SerializedSnapshot,
+    policy: CompactionPolicy,
+) -> Result<SerializedSnapshot, PersistenceError> {
+    // Retained history can rebuild; compacted history may exist only in this snapshot.
+    match policy {
+        CompactionPolicy::Retain => Ok(snapshot),
+        CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => {
+            match AggregateType::deserialize(&snapshot.aggregate) {
+                Ok(_) => Ok(snapshot),
+                Err(source) => {
+                    warn!(
+                        target: "cqrs",
+                        aggregate_type = AggregateType::TYPE,
+                        aggregate_id = snapshot.aggregate_id,
+                        %source,
+                        "Incompatible snapshot for a compactable aggregate cannot be \
+                         safely rebuilt from events; surfacing error"
+                    );
+                    Err(EngineError::Json(source).into())
+                }
+            }
+        }
     }
 }
