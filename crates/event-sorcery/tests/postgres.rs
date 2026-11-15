@@ -5,11 +5,13 @@
 use sqlx::PgPool;
 use sqlx::migrate::MigrateError;
 
-use event_sorcery::POSTGRES_MIGRATOR;
+use event_sorcery::{POSTGRES_MIGRATOR, PersistenceBackend, PostgresBackend};
 
 #[sqlx::test(migrations = false)]
 async fn bootstrap_initializes_framework_storage(pool: PgPool) {
-    POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+    let backend = PostgresBackend { pool: pool.clone() };
+    backend.bootstrap_persistence().await.unwrap();
+    backend.bootstrap_persistence().await.unwrap();
 
     let tables: Vec<String> = sqlx::query_scalar(
         r"
@@ -25,6 +27,21 @@ async fn bootstrap_initializes_framework_storage(pool: PgPool) {
     .unwrap();
 
     assert_eq!(tables, ["events", "job_queue_projection", "snapshots"]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn backend_bootstrap_preserves_an_unavailable_pool_error(pool: PgPool) {
+    let backend = PostgresBackend { pool: pool.clone() };
+    pool.close().await;
+
+    let error = backend.bootstrap_persistence().await.unwrap_err();
+    let sqlx::Error::Migrate(source) = error else {
+        panic!("expected a migration error from the closed pool");
+    };
+    assert!(matches!(
+        *source,
+        MigrateError::Execute(sqlx::Error::PoolClosed)
+    ));
 }
 
 #[sqlx::test(migrations = false)]

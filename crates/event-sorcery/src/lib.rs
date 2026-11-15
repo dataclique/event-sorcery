@@ -97,6 +97,8 @@ mod lifecycle;
 mod persistence;
 #[cfg(feature = "postgres")]
 mod postgres;
+#[cfg(feature = "postgres")]
+mod postgres_backend;
 mod projection;
 mod reactor;
 mod schema_registry;
@@ -150,6 +152,8 @@ pub use lifecycle::{LifecycleError, Never};
 pub use persistence::PersistenceBackend;
 #[cfg(feature = "postgres")]
 pub use postgres::{POSTGRES_MIGRATOR, PostgresEventRepository};
+#[cfg(feature = "postgres")]
+pub use postgres_backend::{PostgresBackend, PostgresStoreRepository};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::{
     IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,

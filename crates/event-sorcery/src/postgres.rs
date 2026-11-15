@@ -338,7 +338,9 @@ mod tests {
     use crate::job::{
         ClaimId, DeadReason, ErasedJob, JobEvent, JobId, JobKind, JobState, PendingPush, WorkerId,
     };
-    use crate::{EventSourced, JobSeed, Lifecycle};
+    use crate::{
+        CompactionPolicy, EventSourced, JobSeed, Lifecycle, PersistenceBackend, PostgresBackend,
+    };
 
     #[derive(Default, Debug, Clone, Serialize, Deserialize)]
     struct RecordedValues {
@@ -403,6 +405,63 @@ mod tests {
         fn encode(&self) -> Result<Value, serde_json::Error> {
             Ok(json!({"value": "work"}))
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn native_factory_guards_compactable_snapshots_without_mutation(pool: PgPool) {
+        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        let backend = PostgresBackend { pool: pool.clone() };
+        let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(
+            backend.persistence_repo(CompactionPolicy::Retain),
+            1,
+        );
+        let framework = CqrsFramework::new(store, vec![], None);
+        framework
+            .execute("guarded", "first".to_string())
+            .await
+            .unwrap();
+        let incompatible = json!({"obsolete_values": ["first"]});
+        sqlx::query("UPDATE snapshots SET payload = $1 WHERE aggregate_id = $2")
+            .bind(&incompatible)
+            .bind("guarded")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for policy in [
+            CompactionPolicy::CompactAfterSnapshot,
+            CompactionPolicy::RetainLast { events: 10 },
+        ] {
+            let repository = backend.persistence_repo(policy);
+            let error = repository
+                .get_snapshot::<RecordedValues>("guarded")
+                .await
+                .unwrap_err();
+            let PersistenceError::DeserializationError(source) = error else {
+                panic!("expected an incompatible compactable snapshot to fail");
+            };
+            let source = source.downcast::<serde_json::Error>().unwrap();
+            assert_eq!(source.classify(), serde_json::error::Category::Data);
+        }
+
+        let repository = backend.persistence_repo(CompactionPolicy::Retain);
+        let snapshot = repository
+            .get_snapshot::<RecordedValues>("guarded")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.aggregate, incompatible);
+        let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
+        let loaded = store.load_aggregate("guarded").await.unwrap();
+        assert_eq!(loaded.aggregate.values, ["first"]);
+        assert_eq!(loaded.current_sequence, 1);
+        let stored: Value =
+            sqlx::query_scalar("SELECT payload FROM snapshots WHERE aggregate_id = $1")
+                .bind("guarded")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, incompatible);
     }
 
     #[sqlx::test(migrations = false)]
