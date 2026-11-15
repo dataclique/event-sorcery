@@ -29,8 +29,10 @@ async fn bootstrap_initializes_framework_storage(pool: PgPool) {
     assert_eq!(tables, ["events", "job_queue_projection", "snapshots"]);
 }
 
-#[sqlx::test(migrations = false)]
-async fn backend_bootstrap_preserves_an_unavailable_pool_error(pool: PgPool) {
+#[tokio::test]
+async fn backend_bootstrap_preserves_an_unavailable_pool_error() {
+    // A closed lazy pool never opens a database connection.
+    let pool = PgPool::connect_lazy("postgresql://localhost/unused").unwrap();
     let backend = PostgresBackend { pool: pool.clone() };
     pool.close().await;
 

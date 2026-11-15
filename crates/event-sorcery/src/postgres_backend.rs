@@ -7,7 +7,8 @@ use cqrs_es::persist::{
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::{CompactionPolicy, PersistenceBackend, PostgresEventRepository};
+use crate::persistence::guard_snapshot;
+use crate::{CompactionPolicy, POSTGRES_MIGRATOR, PersistenceBackend, PostgresEventRepository};
 
 /// Native persistence capability over an application-provisioned pool.
 #[derive(Clone)]
@@ -21,10 +22,6 @@ pub struct PostgresStoreRepository {
     repository: PostgresEventRepository,
     compaction_policy: CompactionPolicy,
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("PostgreSQL native persistence capability is not implemented")]
-struct PostgresPersistencePending;
 
 impl PersistenceBackend for PostgresBackend {
     type PersistenceRepo = PostgresStoreRepository;
@@ -40,9 +37,10 @@ impl PersistenceBackend for PostgresBackend {
     }
 
     async fn bootstrap_persistence(&self) -> Result<(), Self::BootstrapError> {
-        Err(sqlx::Error::Configuration(Box::new(
-            PostgresPersistencePending,
-        )))
+        POSTGRES_MIGRATOR
+            .run(&self.pool)
+            .await
+            .map_err(sqlx::Error::from)
     }
 }
 
@@ -70,16 +68,11 @@ impl PersistedEventRepository for PostgresStoreRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
-        match self.compaction_policy {
-            CompactionPolicy::Retain => {
-                self.repository
-                    .get_snapshot::<AggregateType>(aggregate_id)
-                    .await
-            }
-            CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => Err(
-                PersistenceError::UnknownError(Box::new(PostgresPersistencePending)),
-            ),
-        }
+        self.repository
+            .get_snapshot::<AggregateType>(aggregate_id)
+            .await?
+            .map(|snapshot| guard_snapshot::<AggregateType>(snapshot, self.compaction_policy))
+            .transpose()
     }
 
     async fn persist<AggregateType: Aggregate>(

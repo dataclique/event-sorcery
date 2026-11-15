@@ -15,9 +15,8 @@ use crate::engine::{
 
 /// Pool-backed PostgreSQL repository for the CQRS persistence contract.
 ///
-/// Use it through [`cqrs_es::persist::PersistedEventStore`]. It does not provide
-/// a PostgreSQL [`crate::EventBackend`] for [`crate::StoreBuilder`]. The built-in
-/// native store and worker integration remain SQLite-only.
+/// Use it through [`cqrs_es::persist::PersistedEventStore`]. For native entity
+/// snapshot-policy enforcement, use [`crate::PostgresBackend`]'s persistence factory.
 pub struct PostgresEventRepository {
     /// Application-provisioned PostgreSQL connection pool.
     pub pool: sqlx::PgPool,
@@ -420,6 +419,26 @@ mod tests {
             .execute("guarded", "first".to_string())
             .await
             .unwrap();
+        for policy in [
+            CompactionPolicy::CompactAfterSnapshot,
+            CompactionPolicy::RetainLast { events: 10 },
+        ] {
+            let repository = backend.persistence_repo(policy);
+            let snapshot = repository
+                .get_snapshot::<RecordedValues>("guarded")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.aggregate, json!({"values": ["first"]}));
+            assert_eq!(snapshot.current_sequence, 1);
+            assert_eq!(snapshot.current_snapshot, 1);
+            let missing = repository
+                .get_snapshot::<RecordedValues>("missing")
+                .await
+                .unwrap();
+            assert_eq!(missing.map(|snapshot| snapshot.current_sequence), None);
+        }
+
         let incompatible = json!({"obsolete_values": ["first"]});
         sqlx::query("UPDATE snapshots SET payload = $1 WHERE aggregate_id = $2")
             .bind(&incompatible)

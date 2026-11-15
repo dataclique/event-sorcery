@@ -878,9 +878,9 @@ changes.
 
 ## Running Jobs
 
-The worker API below requires a `SqlitePool`. PostgreSQL support currently
-provides the CQRS persistence repository, not a PostgreSQL `EventBackend` for
-`StoreBuilder` or worker execution. Do not use a PostgreSQL pool with
+The worker API below requires a `SqlitePool`. PostgreSQL persistence uses
+`PostgresBackend` and the CQRS repository contract, not an operational
+`EventBackend` for worker execution. Do not use a PostgreSQL pool with
 `JobRuntime::build` or assume its workers can drain PostgreSQL jobs.
 
 The worker host uses stable Apalis 1.0. Dispatching a job (see **Jobs Pattern**
