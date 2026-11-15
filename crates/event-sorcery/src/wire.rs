@@ -46,7 +46,7 @@ use crate::lifecycle::{Lifecycle, ReactorBridge};
 use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
-use crate::{CompactionPolicy, EsCqrs, EventBackend, EventSourced, SqliteBackend, Store};
+use crate::{CompactionPolicy, EsCqrs, EventSourced, PersistenceBackend, SqliteBackend, Store};
 
 /// Builder for a single CQRS framework.
 ///
@@ -60,7 +60,7 @@ use crate::{CompactionPolicy, EsCqrs, EventBackend, EventSourced, SqliteBackend,
 /// [`.build()`](Self::build) to construct the framework.
 pub struct StoreBuilder<
     Entity: EventSourced,
-    Backend: EventBackend = SqliteBackend,
+    Backend: PersistenceBackend = SqliteBackend,
     Materialized = <Entity as EventSourced>::Materialized,
 > {
     backend: Backend,
@@ -75,8 +75,8 @@ impl<Entity: EventSourced> StoreBuilder<Entity, SqliteBackend> {
     }
 }
 
-impl<Entity: EventSourced, Backend: EventBackend> StoreBuilder<Entity, Backend> {
-    /// Creates a new builder over an arbitrary [`EventBackend`].
+impl<Entity: EventSourced, Backend: PersistenceBackend> StoreBuilder<Entity, Backend> {
+    /// Creates a new builder over an arbitrary [`PersistenceBackend`].
     pub fn with_backend(backend: Backend) -> Self {
         Self {
             backend,
@@ -104,12 +104,12 @@ impl<Entity: EventSourced, Backend: EventBackend> StoreBuilder<Entity, Backend> 
     }
 }
 
-fn es_cqrs<Entity: EventSourced, Backend: EventBackend>(
+fn es_cqrs<Entity: EventSourced, Backend: PersistenceBackend>(
     backend: &Backend,
     queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
 ) -> EsCqrs<Entity, Backend> {
     let store = PersistedEventStore::new_snapshot_store(
-        backend.event_repo(Entity::COMPACTION_POLICY),
+        backend.persistence_repo(Entity::COMPACTION_POLICY),
         Entity::SNAPSHOT_SIZE,
     );
     // `Lifecycle`'s cqrs-es services are unit -- handlers return an `Effect`

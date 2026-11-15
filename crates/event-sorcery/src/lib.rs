@@ -94,6 +94,7 @@ mod job_backend;
 mod job_sqlite;
 mod job_store;
 mod lifecycle;
+mod persistence;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod projection;
@@ -146,6 +147,7 @@ pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
+pub use persistence::PersistenceBackend;
 #[cfg(feature = "postgres")]
 pub use postgres::{POSTGRES_MIGRATOR, PostgresEventRepository};
 pub use projection::{Column, Projection, ProjectionError, Table};
@@ -166,7 +168,7 @@ pub use wire::StoreBuilder;
 
 pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
     Lifecycle<Entity>,
-    PersistedEventStore<<Backend as EventBackend>::EventRepo, Lifecycle<Entity>>,
+    PersistedEventStore<<Backend as PersistenceBackend>::PersistenceRepo, Lifecycle<Entity>>,
 >;
 
 /// apalis items that [`build_supervised_worker!`] expands to, so consumers need
@@ -373,12 +375,12 @@ pub trait EventSourced:
 /// startup. The builder handles CQRS framework construction,
 /// query wiring, and schema reconciliation, returning a
 /// ready-to-use `Store`.
-pub struct Store<Entity: EventSourced, Backend: EventBackend = SqliteBackend> {
+pub struct Store<Entity: EventSourced, Backend: PersistenceBackend = SqliteBackend> {
     cqrs: EsCqrs<Entity, Backend>,
-    event_store: PersistedEventStore<Backend::EventRepo, Lifecycle<Entity>>,
+    event_store: PersistedEventStore<Backend::PersistenceRepo, Lifecycle<Entity>>,
 }
 
-impl<Entity: EventSourced, Backend: EventBackend> Store<Entity, Backend> {
+impl<Entity: EventSourced, Backend: PersistenceBackend> Store<Entity, Backend> {
     /// Wrap an existing CQRS framework built over `backend`.
     ///
     /// Prefer using `StoreBuilder::build()` which handles wiring
@@ -386,7 +388,7 @@ impl<Entity: EventSourced, Backend: EventBackend> Store<Entity, Backend> {
     /// where direct construction is needed (e.g., tests).
     pub(crate) fn new(cqrs: EsCqrs<Entity, Backend>, backend: &Backend) -> Self {
         let event_store = PersistedEventStore::new_snapshot_store(
-            backend.event_repo(Entity::COMPACTION_POLICY),
+            backend.persistence_repo(Entity::COMPACTION_POLICY),
             Entity::SNAPSHOT_SIZE,
         );
         Self { cqrs, event_store }
