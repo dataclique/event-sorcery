@@ -82,6 +82,18 @@ let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM my_table")
 Note the type annotation on the `let` binding -- the runtime function doesn't
 infer return types like the macro does.
 
+## Dynamic PostgreSQL queries
+
+Indexed projection queries use numbered placeholders and `QueryScalar::bind`.
+Parameter indices are checked against the PostgreSQL protocol's `u16` range,
+including the row-limit parameter. Identifiers are quoted separately from bound
+values.
+
+In SQLx 0.9, `QueryBuilder::push_bind` can panic when argument encoding fails.
+`Query::bind` retains encoding errors until execution instead; the indexed-query
+path uses that fallible behavior rather than turning an encoding failure into a
+panic.
+
 ## Cancellation and pooled transactions
 
 Never pair a raw `BEGIN` statement on a `PoolConnection` with a later raw

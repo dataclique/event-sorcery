@@ -6,7 +6,7 @@ use sqlx::{AssertSqlSafe, PgPool};
 use std::fmt::{self, Display};
 use std::marker::PhantomData;
 
-use sqlite_es::{IndexedView, Order, Predicate};
+use sqlite_es::{Cmp, IndexedView, Order, Predicate, Value};
 
 use crate::ViewBackend;
 use crate::engine::EngineError;
@@ -58,9 +58,25 @@ pub enum ProjectionVersionError {
     StoredNonPositive(i64),
 }
 
+/// Invalid indexed-query inputs rejected before executing SQL.
 #[derive(Debug, thiserror::Error)]
-#[error("PostgreSQL indexed projection queries are not implemented")]
-struct PendingViewPersistence;
+pub enum ProjectionQueryError {
+    /// A row limit must not be negative.
+    #[error("indexed projection query limit cannot be negative: {0}")]
+    NegativeLimit(i64),
+    /// Every disjunction arm must contain at least one comparison.
+    #[error("indexed projection query contains an empty conjunction")]
+    EmptyConjunction,
+    /// Binary comparisons require a bound value.
+    #[error("indexed projection comparison requires a bound value")]
+    MissingValue,
+    /// Null comparisons do not accept a bound value.
+    #[error("indexed projection null comparison cannot contain a bound value")]
+    UnexpectedValue,
+    /// No further placeholder fits the PostgreSQL wire representation.
+    #[error("indexed projection query exceeds the PostgreSQL parameter limit")]
+    ParameterLimit,
+}
 
 #[derive(sqlx::FromRow)]
 struct ProjectionRow {
@@ -174,21 +190,110 @@ where
 {
     async fn find(
         &self,
-        _predicate: &Predicate,
-        _order: Option<&Order>,
-        _limit: i64,
+        predicate: &Predicate,
+        order: Option<&Order>,
+        limit: i64,
     ) -> Result<Vec<String>, PersistenceError> {
-        Err(PersistenceError::UnknownError(Box::new(
-            PendingViewPersistence,
-        )))
+        if limit < 0 {
+            return Err(PersistenceError::UnknownError(Box::new(
+                ProjectionQueryError::NegativeLimit(limit),
+            )));
+        }
+        if predicate.any_of.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let (where_clause, bindings) = predicate_sql(predicate)
+            .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
+        let limit_index = next_parameter(bindings.len())
+            .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
+        let order_clause = order.map_or_else(String::new, |order| {
+            let direction = if order.ascending {
+                "ASC NULLS FIRST"
+            } else {
+                "DESC NULLS LAST"
+            };
+            format!(" ORDER BY {} {direction}", QuotedIdentifier(&order.column))
+        });
+        let sql = format!(
+            "SELECT view_id FROM {} WHERE {where_clause}{order_clause} LIMIT ${limit_index}",
+            self.table,
+        );
+        let mut query = sqlx::query_scalar::<_, String>(AssertSqlSafe(sql));
+        for value in bindings {
+            query = match value {
+                Value::Int(integer) => query.bind(integer),
+                Value::Text(text) => query.bind(text),
+            };
+        }
+        Ok(query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(EngineError::from)?)
     }
+}
+
+fn next_parameter(bound: usize) -> Result<u16, ProjectionQueryError> {
+    let bound = u16::try_from(bound).map_err(|_| ProjectionQueryError::ParameterLimit)?;
+    bound
+        .checked_add(1)
+        .ok_or(ProjectionQueryError::ParameterLimit)
+}
+
+fn predicate_sql(predicate: &Predicate) -> Result<(String, Vec<&Value>), ProjectionQueryError> {
+    let mut bindings = vec![];
+    let mut groups = vec![];
+
+    for conjunction in &predicate.any_of {
+        if conjunction.is_empty() {
+            return Err(ProjectionQueryError::EmptyConjunction);
+        }
+
+        let mut terms = vec![];
+        for term in conjunction {
+            let operator = match &term.cmp {
+                Cmp::Eq => "=",
+                Cmp::Lt => "<",
+                Cmp::Le => "<=",
+                Cmp::Gt => ">",
+                Cmp::Ge => ">=",
+                Cmp::IsNull => "IS NULL",
+                Cmp::IsNotNull => "IS NOT NULL",
+            };
+
+            let column = QuotedIdentifier(&term.column);
+            let expression = match (&term.cmp, term.value.as_ref()) {
+                (Cmp::IsNull | Cmp::IsNotNull, None) => format!("{column} {operator}"),
+                (Cmp::Eq | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge, Some(value)) => {
+                    let index = next_parameter(bindings.len())?;
+                    bindings.push(value);
+                    format!("{column} {operator} ${index}")
+                }
+                (Cmp::Eq | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge, None) => {
+                    return Err(ProjectionQueryError::MissingValue);
+                }
+                (Cmp::IsNull | Cmp::IsNotNull, Some(_)) => {
+                    return Err(ProjectionQueryError::UnexpectedValue);
+                }
+            };
+            terms.push(expression);
+        }
+
+        groups.push(format!("({})", terms.join(" AND ")));
+    }
+
+    Ok((groups.join(" OR "), bindings))
 }
 
 #[cfg(test)]
 mod tests {
     use cqrs_es::EventEnvelope;
+    use proptest::prelude::{any, prop_assert_eq, proptest};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+
+    use sqlite_es::{Cmp, Term, Value};
 
     use super::*;
     use crate::schema_registry::SchemaRegistryEvent;
@@ -235,6 +340,305 @@ mod tests {
                 other => panic!("unexpected version failure: {other:?}"),
             }
         }
+    }
+
+    fn query_error(result: Result<Vec<String>, PersistenceError>) -> ProjectionQueryError {
+        let Err(PersistenceError::UnknownError(source)) = result else {
+            panic!("expected a typed projection-query error");
+        };
+        *source.downcast::<ProjectionQueryError>().unwrap()
+    }
+
+    #[tokio::test]
+    async fn malformed_indexed_queries_fail_before_storage_access() {
+        let pool = PgPool::connect_lazy("postgresql://localhost/unused").unwrap();
+        pool.close().await;
+        let repository =
+            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
+                pool,
+                "schema_projection",
+            );
+        assert!(matches!(
+            query_error(
+                repository
+                    .find(&Predicate { any_of: vec![] }, None, -1)
+                    .await
+            ),
+            ProjectionQueryError::NegativeLimit(-1)
+        ));
+        assert!(matches!(
+            query_error(
+                repository
+                    .find(
+                        &Predicate {
+                            any_of: vec![vec![]]
+                        },
+                        None,
+                        1
+                    )
+                    .await
+            ),
+            ProjectionQueryError::EmptyConjunction
+        ));
+        let missing = Predicate {
+            any_of: vec![vec![Term {
+                column: "name".to_string(),
+                cmp: Cmp::Eq,
+                value: None,
+            }]],
+        };
+        assert!(matches!(
+            query_error(repository.find(&missing, None, 1).await),
+            ProjectionQueryError::MissingValue
+        ));
+        let unexpected = Predicate {
+            any_of: vec![vec![Term {
+                column: "name".to_string(),
+                cmp: Cmp::IsNull,
+                value: Some(Value::Int(1)),
+            }]],
+        };
+        assert!(matches!(
+            query_error(repository.find(&unexpected, None, 1).await),
+            ProjectionQueryError::UnexpectedValue
+        ));
+        assert_eq!(
+            repository
+                .find(&Predicate { any_of: vec![] }, None, 1)
+                .await
+                .unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_parameter_limit_fails_before_storage_access() {
+        let pool = PgPool::connect_lazy("postgresql://localhost/unused").unwrap();
+        pool.close().await;
+        let repository =
+            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
+                pool,
+                "schema_projection",
+            );
+        let terms = (0..usize::from(u16::MAX))
+            .map(|_| Term {
+                column: "schema_version".to_string(),
+                cmp: Cmp::Eq,
+                value: Some(Value::Int(1)),
+            })
+            .collect();
+        let predicate = Predicate {
+            any_of: vec![terms],
+        };
+        assert!(matches!(
+            query_error(repository.find(&predicate, None, 1).await),
+            ProjectionQueryError::ParameterLimit
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn query_text_is_independent_of_string_values(value in any::<String>()) {
+            let predicate = Predicate {
+                any_of: vec![vec![Term {
+                    column: "name".to_string(),
+                    cmp: Cmp::Eq,
+                    value: Some(Value::Text(value.clone())),
+                }]],
+            };
+            let (sql, bindings) = predicate_sql(&predicate).unwrap();
+            prop_assert_eq!(sql, r#"("name" = $1)"#);
+            prop_assert_eq!(bindings.len(), 1);
+            let Value::Text(bound) = bindings[0] else {
+                panic!("expected the original text binding");
+            };
+            prop_assert_eq!(bound, &value);
+        }
+    }
+
+    async fn indexed_repository(
+        pool: PgPool,
+    ) -> PostgresViewRepository<RegisteredSchemaView, Lifecycle<SchemaRegistry>> {
+        sqlx::query(
+            "CREATE TABLE schema_projection (view_id TEXT PRIMARY KEY, version BIGINT NOT NULL, \
+             payload JSONB NOT NULL, name TEXT GENERATED ALWAYS AS (payload->>'name') STORED, \
+             schema_version BIGINT GENERATED ALWAYS AS \
+             ((payload->>'schema_version')::BIGINT) STORED, marker TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = PostgresViewRepository::new(pool, "schema_projection");
+        for (id, name, schema_version) in [
+            ("account", "Account", 10),
+            ("invoice", "Invoice", 20),
+            ("other", "Draft", 30),
+        ] {
+            repository
+                .update_view(
+                    RegisteredSchemaView {
+                        name: name.to_string(),
+                        schema_version,
+                    },
+                    ViewContext::new(id.to_string(), 0),
+                )
+                .await
+                .unwrap();
+        }
+        repository
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn indexed_queries_preserve_dnf_order_and_limit(pool: PgPool) {
+        let repository = indexed_repository(pool).await;
+        let predicate = Predicate {
+            any_of: vec![
+                vec![
+                    Term {
+                        column: "schema_version".to_string(),
+                        cmp: Cmp::Le,
+                        value: Some(Value::Int(20)),
+                    },
+                    Term {
+                        column: "name".to_string(),
+                        cmp: Cmp::Eq,
+                        value: Some(Value::Text("Account".to_string())),
+                    },
+                ],
+                vec![Term {
+                    column: "name".to_string(),
+                    cmp: Cmp::Eq,
+                    value: Some(Value::Text("Draft".to_string())),
+                }],
+            ],
+        };
+        let order = Order {
+            column: "name".to_string(),
+            ascending: true,
+        };
+        assert_eq!(
+            repository.find(&predicate, Some(&order), 10).await.unwrap(),
+            ["account", "other"]
+        );
+        assert_eq!(
+            repository.find(&predicate, Some(&order), 1).await.unwrap(),
+            ["account"]
+        );
+        assert_eq!(
+            repository.find(&predicate, Some(&order), 0).await.unwrap(),
+            Vec::<String>::new()
+        );
+        let quoted = Predicate {
+            any_of: vec![vec![Term {
+                column: "name".to_string(),
+                cmp: Cmp::Eq,
+                value: Some(Value::Text("Account' OR 1=1 --".to_string())),
+            }]],
+        };
+        assert_eq!(
+            repository.find(&quoted, None, 10).await.unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn indexed_numeric_comparisons_match_the_requested_operator(pool: PgPool) {
+        let repository = indexed_repository(pool).await;
+        let order = Order {
+            column: "schema_version".to_string(),
+            ascending: true,
+        };
+        for (cmp, expected) in [
+            (Cmp::Eq, vec!["invoice"]),
+            (Cmp::Lt, vec!["account"]),
+            (Cmp::Le, vec!["account", "invoice"]),
+            (Cmp::Gt, vec!["other"]),
+            (Cmp::Ge, vec!["invoice", "other"]),
+        ] {
+            let predicate = Predicate {
+                any_of: vec![vec![Term {
+                    column: "schema_version".to_string(),
+                    cmp,
+                    value: Some(Value::Int(20)),
+                }]],
+            };
+            assert_eq!(
+                repository.find(&predicate, Some(&order), 10).await.unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn indexed_null_order_and_sidecar_columns_are_preserved(pool: PgPool) {
+        let repository = indexed_repository(pool).await;
+        sqlx::query("UPDATE schema_projection SET marker = 'pinned' WHERE view_id = 'account'")
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        repository
+            .update_view(
+                RegisteredSchemaView {
+                    name: "Account".to_string(),
+                    schema_version: 11,
+                },
+                ViewContext::new("account".to_string(), 1),
+            )
+            .await
+            .unwrap();
+        let predicate = Predicate {
+            any_of: vec![vec![Term {
+                column: "schema_version".to_string(),
+                cmp: Cmp::Ge,
+                value: Some(Value::Int(0)),
+            }]],
+        };
+        let order = Order {
+            column: "marker".to_string(),
+            ascending: true,
+        };
+        let rows = repository.find(&predicate, Some(&order), 3).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.last().map(String::as_str), Some("account"));
+        let mut nulls = rows[..2].to_vec();
+        nulls.sort();
+        assert_eq!(nulls, ["invoice", "other"]);
+        let descending = Order {
+            column: "marker".to_string(),
+            ascending: false,
+        };
+        let rows = repository
+            .find(&predicate, Some(&descending), 3)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.first().map(String::as_str), Some("account"));
+        let pinned = Predicate {
+            any_of: vec![vec![Term {
+                column: "marker".to_string(),
+                cmp: Cmp::IsNotNull,
+                value: None,
+            }]],
+        };
+        assert_eq!(
+            repository.find(&pinned, None, 3).await.unwrap(),
+            ["account"]
+        );
+        let unpinned = Predicate {
+            any_of: vec![vec![Term {
+                column: "marker".to_string(),
+                cmp: Cmp::IsNull,
+                value: None,
+            }]],
+        };
+        let by_name = Order {
+            column: "name".to_string(),
+            ascending: true,
+        };
+        assert_eq!(
+            repository.find(&unpinned, Some(&by_name), 3).await.unwrap(),
+            ["other", "invoice"]
+        );
     }
 
     #[sqlx::test(migrations = false)]
