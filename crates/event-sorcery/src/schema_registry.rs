@@ -58,6 +58,31 @@ impl SchemaTarget {
             compaction,
         }
     }
+
+    pub(crate) fn reconciliation(
+        &self,
+        registry: Option<&SchemaRegistry>,
+    ) -> Result<SchemaReconciliation, ReconcileError> {
+        let stored_version = registry.and_then(|state| state.version_of(&self.aggregate_type));
+        if stored_version == Some(self.version) {
+            return Ok(SchemaReconciliation::Unchanged);
+        }
+
+        if stored_version.is_some() {
+            match self.compaction {
+                CompactionPolicy::Retain => {}
+                CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => {
+                    return Err(ReconcileError::CompactedSnapshotClear {
+                        aggregate: self.aggregate_type.clone(),
+                        old_version: stored_version,
+                        new_version: self.version,
+                    });
+                }
+            }
+        }
+
+        Ok(SchemaReconciliation::Changed)
+    }
 }
 
 /// Tracks schema versions for all aggregates.
@@ -69,6 +94,23 @@ pub struct SchemaRegistry {
 impl SchemaRegistry {
     fn version_of(&self, name: &str) -> Option<u64> {
         self.versions.get(name).copied()
+    }
+
+    pub(crate) fn from_payloads(payloads: Vec<String>) -> Result<Option<Self>, ReconcileError> {
+        let mut state: Option<Self> = None;
+
+        for payload in payloads {
+            let event: SchemaRegistryEvent = serde_json::from_str(&payload)?;
+            state = match state {
+                None => Self::originate(&event),
+                Some(current) => {
+                    let evolved = Self::evolve(&current, &event)?;
+                    Some(evolved.unwrap_or(current))
+                }
+            };
+        }
+
+        Ok(state)
     }
 }
 
@@ -184,10 +226,10 @@ impl Reconciler {
         &self,
         target: &SchemaTarget,
     ) -> Result<SchemaReconciliation, ReconcileError> {
-        let stored_version = self
-            .load_registry()
-            .await?
-            .and_then(|registry| registry.version_of(&target.aggregate_type));
+        let registry = self.load_registry().await?;
+        let stored_version = registry
+            .as_ref()
+            .and_then(|state| state.version_of(&target.aggregate_type));
 
         debug!(
             target: "cqrs",
@@ -196,27 +238,16 @@ impl Reconciler {
             "Loaded stored schema version"
         );
 
-        if stored_version == Some(target.version) {
-            debug!(
-                target: "cqrs",
-                aggregate = target.aggregate_type,
-                version = target.version,
-                "Schema version unchanged"
-            );
-
-            return Ok(SchemaReconciliation::Unchanged);
-        }
-
-        if stored_version.is_some() {
-            match target.compaction {
-                CompactionPolicy::Retain => {}
-                CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => {
-                    return Err(ReconcileError::CompactedSnapshotClear {
-                        aggregate: target.aggregate_type.clone(),
-                        old_version: stored_version,
-                        new_version: target.version,
-                    });
-                }
+        match target.reconciliation(registry.as_ref())? {
+            SchemaReconciliation::Changed => {}
+            SchemaReconciliation::Unchanged => {
+                debug!(
+                    target: "cqrs",
+                    aggregate = target.aggregate_type,
+                    version = target.version,
+                    "Schema version unchanged"
+                );
+                return Ok(SchemaReconciliation::Unchanged);
             }
         }
 
@@ -270,21 +301,7 @@ impl Reconciler {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut state: Option<SchemaRegistry> = None;
-
-        for payload in payloads {
-            let event: SchemaRegistryEvent = serde_json::from_str(&payload)?;
-
-            state = match state {
-                None => SchemaRegistry::originate(&event),
-                Some(current) => {
-                    let evolved = SchemaRegistry::evolve(&current, &event)?;
-                    Some(evolved.unwrap_or(current))
-                }
-            };
-        }
-
-        Ok(state)
+        SchemaRegistry::from_payloads(payloads)
     }
 
     /// Clears version-mismatched snapshots for `Entity` and reports whether the
@@ -365,8 +382,38 @@ impl From<Never> for ReconcileError {
 mod tests {
     use cqrs_es::Aggregate;
     use cqrs_es::event_sink::EventSink;
+    use proptest::prelude::{any, prop_assert_eq, proptest};
+    use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn registry_replay_rejects_incompatible_event_payloads() {
+        let error =
+            SchemaRegistry::from_payloads(vec![json!({"obsolete": true}).to_string()]).unwrap_err();
+        let ReconcileError::Json(source) = error else {
+            panic!("expected a typed registry payload error");
+        };
+        assert_eq!(source.classify(), serde_json::error::Category::Data);
+    }
+
+    proptest! {
+        #[test]
+        fn registry_replay_keeps_the_latest_version_for_each_name(
+            registrations in proptest::collection::vec(("[a-z]{1,3}", any::<u64>()), 0..32)
+        ) {
+            let payloads = registrations.iter().map(|(name, version)| {
+                json!({"VersionUpdated": {"name": name, "version": version}}).to_string()
+            }).collect();
+
+            let registry = SchemaRegistry::from_payloads(payloads).unwrap();
+
+            let expected: BTreeMap<String, u64> = registrations.iter().cloned().collect();
+            let expected = if registrations.is_empty() { None } else { Some(expected) };
+
+            prop_assert_eq!(registry.map(|state| state.versions), expected);
+        }
+    }
 
     #[tokio::test]
     async fn register_new_aggregate_emits_event() {
