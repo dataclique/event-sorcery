@@ -35,8 +35,7 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::persist::PersistenceError;
+use cqrs_es::persist::{PersistedEventRepository, PersistedEventStore, PersistenceError};
 use cqrs_es::{CqrsFramework, Query};
 use sqlx::SqlitePool;
 
@@ -46,7 +45,7 @@ use crate::lifecycle::{Lifecycle, ReactorBridge};
 use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
-use crate::{CompactionPolicy, EsCqrs, EventSourced, PersistenceBackend, SqliteBackend, Store};
+use crate::{CompactionPolicy, EventSourced, PersistenceBackend, SqliteBackend, Store};
 
 /// Builder for a single CQRS framework.
 ///
@@ -104,14 +103,10 @@ impl<Entity: EventSourced, Backend: PersistenceBackend> StoreBuilder<Entity, Bac
     }
 }
 
-fn es_cqrs<Entity: EventSourced, Backend: PersistenceBackend>(
-    backend: &Backend,
+pub(crate) fn es_cqrs<Entity: EventSourced, Repository: PersistedEventRepository>(
+    store: PersistedEventStore<Repository, Lifecycle<Entity>>,
     queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
-) -> EsCqrs<Entity, Backend> {
-    let store = PersistedEventStore::new_snapshot_store(
-        backend.persistence_repo(Entity::COMPACTION_POLICY),
-        Entity::SNAPSHOT_SIZE,
-    );
+) -> CqrsFramework<Lifecycle<Entity>, PersistedEventStore<Repository, Lifecycle<Entity>>> {
     // `Lifecycle`'s cqrs-es services are unit -- handlers return an `Effect`
     // instead of calling out through injected services.
     #[allow(clippy::disallowed_methods)]
@@ -186,7 +181,11 @@ where
         let Self {
             backend, queries, ..
         } = self;
-        let cqrs = es_cqrs(&backend, queries);
+        let event_store = PersistedEventStore::new_snapshot_store(
+            backend.persistence_repo(Entity::COMPACTION_POLICY),
+            Entity::SNAPSHOT_SIZE,
+        );
+        let cqrs = es_cqrs(event_store, queries);
         Ok((Arc::new(Store::new(cqrs, &backend)), projection))
     }
 }
@@ -204,7 +203,11 @@ impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, SqliteBacken
         let Self {
             backend, queries, ..
         } = self;
-        let cqrs = es_cqrs(&backend, queries);
+        let event_store = PersistedEventStore::new_snapshot_store(
+            backend.persistence_repo(Entity::COMPACTION_POLICY),
+            Entity::SNAPSHOT_SIZE,
+        );
+        let cqrs = es_cqrs(event_store, queries);
         Ok(Arc::new(Store::new(cqrs, &backend)))
     }
 }
