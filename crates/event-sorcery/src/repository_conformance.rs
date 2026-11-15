@@ -8,7 +8,9 @@ mod tests {
         EventUpcaster, PersistedEventRepository, PersistedEventStore, PersistenceError,
         SerializedEvent, SerializedSnapshot,
     };
-    use cqrs_es::{Aggregate, AggregateContext, AggregateError, CqrsFramework, DomainEvent, EventStore};
+    use cqrs_es::{
+        Aggregate, AggregateContext, AggregateError, CqrsFramework, DomainEvent, EventStore,
+    };
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
     use std::collections::HashMap;
