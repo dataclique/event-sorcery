@@ -1238,10 +1238,14 @@ macro_rules! build_supervised_worker {
 
 #[cfg(test)]
 mod tests {
+    use apalis_core::worker::event::Event;
     use serde::{Deserialize, Serialize};
+    use sqlx::SqlitePool;
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
     use sqlite_es::insert_serialized_events_batch;
     use sqlite_es::testing::create_test_pool;
-    use sqlx::SqlitePool;
 
     use crate::job::{
         EnqueueRequest, JobEvent, JobKind, Label, WonClaim, enqueued_event, pending_seed_payload,
@@ -1272,6 +1276,34 @@ mod tests {
             _ctx: &JobContext,
             _input: &(),
         ) -> Result<JobOutcome<()>, JobFailure<std::convert::Infallible>> {
+            Ok(JobOutcome::Done(()))
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct WorkerProbe {
+        value: u32,
+    }
+
+    impl StandaloneJob for WorkerProbe {
+        type Input = tokio::sync::mpsc::UnboundedSender<(JobId, u32)>;
+        type Output = ();
+        type Error = Infallible;
+
+        const WORKER_NAME: &'static str = "worker-probe";
+        const KIND: &'static str = "worker-probe";
+        const TERMINAL_FAILURE_MSG: &'static str = "Worker probe failed";
+
+        fn label(&self) -> Label {
+            Label::new("worker-probe")
+        }
+
+        async fn perform(
+            &self,
+            context: &JobContext,
+            input: &Self::Input,
+        ) -> Result<JobOutcome<()>, JobFailure<Infallible>> {
+            input.send((context.job_id(), self.value)).unwrap();
             Ok(JobOutcome::Done(()))
         }
     }
@@ -2123,6 +2155,59 @@ mod tests {
             event_types(&pool, &job_id).await,
             ["JobEnqueued", "JobClaimed"]
         );
+    }
+
+    #[tokio::test]
+    async fn native_worker_runs_the_handler_and_durably_acknowledges_success() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = JobId::new();
+        runtime
+            .enqueue_job_payload(
+                job_id,
+                WorkerProbe::KIND.to_string(),
+                serde_json::json!({"value": 7}),
+                1_000,
+            )
+            .await
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<(JobId, u32)>();
+        let worker_errors = Arc::new(Mutex::new(Vec::new()));
+        let captured_errors = worker_errors.clone();
+        let task_finished = Arc::new(Notify::new());
+        let event_finished = task_finished.clone();
+        let monitor = crate::build_supervised_worker!(
+            runtime,
+            JobWorkerConfig::default(),
+            Clock::from_fn(|| from_millis(1_000)),
+            { WorkerProbe => sender }
+        )
+        .on_event(move |_context, event| {
+            if matches!(event, Event::Success(_)) {
+                event_finished.notify_one();
+            }
+            if let Some(error) = event.as_error() {
+                captured_errors.lock().unwrap().push(error.to_string());
+            }
+        });
+        let signal = async move {
+            task_finished.notified().await;
+            Ok::<(), std::io::Error>(())
+        };
+
+        let completion = timeout(Duration::from_secs(5), monitor.run_with_signal(signal)).await;
+
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobSucceeded"],
+            "worker completion: {completion:?}; worker errors: {:?}",
+            worker_errors.lock().unwrap()
+        );
+        completion
+            .expect("worker must execute and finish its durable acknowledgement")
+            .unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), (job_id, 7));
+        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("done"));
     }
 
     #[tokio::test]
