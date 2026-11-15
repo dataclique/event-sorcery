@@ -5,7 +5,7 @@ use cqrs_es::persist::{
     PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot,
 };
 use serde_json::Value;
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use std::marker::PhantomData;
 use tokio::sync::Mutex;
 
@@ -15,10 +15,11 @@ use event_sorcery::{
     validate_expected_version,
 };
 
-use crate::event_repository::{append_events, load_events};
+use crate::PostgresEventRepository;
 
 pub(crate) struct PostgresRecovery<Entity: EventSourced> {
     transaction: Transaction<'static, Postgres>,
+    repository: PostgresEventRepository,
     _entity: PhantomData<fn() -> Entity>,
 }
 
@@ -37,14 +38,19 @@ impl<Entity: EventSourced> PostgresRecovery<Entity> {
             .bind(i32::from_be_bytes(*b"SCMA"))
             .execute(&mut *transaction)
             .await?;
-        let payloads = sqlx::query_scalar::<_, String>(
-            "SELECT payload::TEXT FROM events \
-             WHERE aggregate_type = $1 AND aggregate_id = $2 ORDER BY sequence",
-        )
-        .bind(SchemaRegistry::AGGREGATE_TYPE)
-        .bind(SCHEMA_REGISTRY_ID)
-        .fetch_all(&mut *transaction)
-        .await?;
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let events = repository
+            .official()
+            .get_serialized_events_in(
+                &mut transaction,
+                SchemaRegistry::AGGREGATE_TYPE,
+                SCHEMA_REGISTRY_ID,
+            )
+            .await?;
+        let payloads = events
+            .into_iter()
+            .map(|event| serde_json::to_string(&event.payload))
+            .collect::<Result<Vec<_>, _>>()?;
         let reconciliation = reconcile_schema::<Entity>(payloads)?;
 
         match reconciliation {
@@ -60,6 +66,7 @@ impl<Entity: EventSourced> PostgresRecovery<Entity> {
         Ok((
             Self {
                 transaction,
+                repository,
                 _entity: PhantomData,
             },
             reconciliation,
@@ -69,7 +76,8 @@ impl<Entity: EventSourced> PostgresRecovery<Entity> {
     pub(crate) async fn finish(mut self) -> Result<(), ReconcileError> {
         {
             let repository = RegistryRepository {
-                connection: Mutex::new(&mut *self.transaction),
+                transaction: Mutex::new(&mut self.transaction),
+                repository: &self.repository,
             };
             register_schema::<Entity, _>(repository).await?;
         }
@@ -79,7 +87,8 @@ impl<Entity: EventSourced> PostgresRecovery<Entity> {
 }
 
 struct RegistryRepository<'connection> {
-    connection: Mutex<&'connection mut PgConnection>,
+    transaction: Mutex<&'connection mut Transaction<'static, Postgres>>,
+    repository: &'connection PostgresEventRepository,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,8 +104,11 @@ impl PersistedEventRepository for RegistryRepository<'_> {
         &self,
         aggregate_id: &str,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        let mut connection = self.connection.lock().await;
-        Ok(load_events(&mut **connection, AggregateType::TYPE, aggregate_id, 0).await?)
+        let mut transaction = self.transaction.lock().await;
+        self.repository
+            .official()
+            .get_events_in::<AggregateType>(&mut transaction, aggregate_id)
+            .await
     }
 
     async fn get_last_events<AggregateType: Aggregate>(
@@ -104,14 +116,11 @@ impl PersistedEventRepository for RegistryRepository<'_> {
         aggregate_id: &str,
         last_sequence: usize,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        let mut connection = self.connection.lock().await;
-        Ok(load_events(
-            &mut **connection,
-            AggregateType::TYPE,
-            aggregate_id,
-            last_sequence,
-        )
-        .await?)
+        let mut transaction = self.transaction.lock().await;
+        self.repository
+            .official()
+            .get_last_events_in::<AggregateType>(&mut transaction, aggregate_id, last_sequence)
+            .await
     }
 
     async fn get_snapshot<AggregateType: Aggregate>(
@@ -147,22 +156,26 @@ impl PersistedEventRepository for RegistryRepository<'_> {
         .at_expected_version(expected);
         let _ = request.prepare()?;
 
-        let mut connection = self.connection.lock().await;
+        let mut transaction = self.transaction.lock().await;
         let current: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence), 0) FROM events \
              WHERE aggregate_type = $1 AND aggregate_id = $2",
         )
         .bind(AggregateType::TYPE)
         .bind(&first.aggregate_id)
-        .fetch_one(&mut **connection)
+        .fetch_one(&mut ***transaction)
         .await
         .map_err(EngineError::from)?;
         validate_expected_version(
             expected,
             usize::try_from(current).map_err(EngineError::from)?,
         )?;
-        append_events(&mut connection, events).await?;
-        drop(connection);
+        self.repository
+            .official()
+            .append_serialized_events_in(&mut transaction, AggregateType::TYPE, events)
+            .await
+            .map_err(PersistenceError::from)?;
+        drop(transaction);
         Ok(())
     }
 
@@ -202,9 +215,11 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn registry_repository_enforces_event_only_storage(pool: PgPool) {
         let mut transaction = pool.begin().await.unwrap();
+        let official = PostgresEventRepository { pool: pool.clone() };
         {
             let repository = RegistryRepository {
-                connection: Mutex::new(&mut *transaction),
+                transaction: Mutex::new(&mut transaction),
+                repository: &official,
             };
             assert!(matches!(
                 mode_error(

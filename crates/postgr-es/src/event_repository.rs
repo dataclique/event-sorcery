@@ -4,13 +4,10 @@ use cqrs_es::Aggregate;
 use cqrs_es::persist::{
     PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot,
 };
-use futures_util::TryStreamExt;
 use serde_json::Value;
-use sqlx::{Executor, PgConnection, Postgres};
 
 use event_sorcery::{
-    CommitRequest, EngineError, JobSeed, PreparedCommit, SnapshotUpdate, StoredEventRow,
-    StoredSnapshotRow, validate_expected_version,
+    CommitRequest, EngineError, JobSeed, PreparedCommit, SnapshotUpdate, validate_expected_version,
 };
 
 /// Pool-backed PostgreSQL repository for the CQRS persistence contract.
@@ -33,7 +30,7 @@ impl PersistedEventRepository for PostgresEventRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        Ok(load_events(&self.pool, A::TYPE, aggregate_id, 0).await?)
+        self.official().get_events::<A>(aggregate_id).await
     }
 
     async fn get_last_events<A: Aggregate>(
@@ -41,26 +38,16 @@ impl PersistedEventRepository for PostgresEventRepository {
         aggregate_id: &str,
         last_sequence: usize,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        Ok(load_events(&self.pool, A::TYPE, aggregate_id, last_sequence).await?)
+        self.official()
+            .get_last_events::<A>(aggregate_id, last_sequence)
+            .await
     }
 
     async fn get_snapshot<A: Aggregate>(
         &self,
         aggregate_id: &str,
     ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
-        let row = sqlx::query_as::<_, StoredSnapshotRow>(
-            r"
-            SELECT aggregate_id, last_sequence, snapshot_version, payload::TEXT AS payload
-            FROM snapshots
-            WHERE aggregate_type = $1 AND aggregate_id = $2
-            ",
-        )
-        .bind(A::TYPE)
-        .bind(aggregate_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(EngineError::from)?;
-        Ok(row.map(SerializedSnapshot::try_from).transpose()?)
+        self.official().get_snapshot::<A>(aggregate_id).await
     }
 
     async fn persist<A: Aggregate>(
@@ -90,15 +77,20 @@ impl PersistedEventRepository for PostgresEventRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<ReplayStream, PersistenceError> {
-        Ok(self.replay(A::TYPE, Some(aggregate_id.to_string())))
+        self.official().stream_events::<A>(aggregate_id).await
     }
 
     async fn stream_all_events<A: Aggregate>(&self) -> Result<ReplayStream, PersistenceError> {
-        Ok(self.replay(A::TYPE, None))
+        self.official().stream_all_events::<A>().await
     }
 }
 
 impl PostgresEventRepository {
+    pub(crate) fn official(&self) -> postgres_es::PostgresEventRepository {
+        let repository = postgres_es::PostgresEventRepository::new(self.pool.clone());
+        repository.with_tables_and_snapshot_counter("events", "snapshots", "snapshot_version")
+    }
+
     /// Atomically persists a standalone job's event and queue seed.
     ///
     /// # Errors
@@ -122,7 +114,7 @@ impl PostgresEventRepository {
         Ok(())
     }
 
-    async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
+    async fn commit(&self, request: CommitRequest<'_>) -> Result<(), PersistenceError> {
         let PreparedCommit {
             aggregate_type,
             aggregate_id,
@@ -132,10 +124,11 @@ impl PostgresEventRepository {
             jobs,
             ..
         } = request.prepare()?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin().await.map_err(EngineError::from)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .execute(&mut *transaction)
-            .await?;
+            .await
+            .map_err(EngineError::from)?;
 
         if let Some(expected_version) = expected_version {
             let actual: i64 = sqlx::query_scalar(
@@ -153,40 +146,61 @@ impl PostgresEventRepository {
             .fetch_one(&mut *transaction)
             .await
             .map_err(write_error)?;
-            validate_expected_version(expected_version, usize::try_from(actual)?)?;
+            validate_expected_version(
+                expected_version,
+                usize::try_from(actual).map_err(EngineError::from)?,
+            )?;
         }
 
-        append_events(&mut transaction, events).await?;
+        let repository = self.official();
+        repository
+            .append_serialized_events_in(&mut transaction, &aggregate_type, events)
+            .await
+            .map_err(PersistenceError::from)
+            .map_err(adapter_error)?;
         if let Some(snapshot) = snapshot {
-            let last_sequence = snapshot.last_sequence;
-            let result = sqlx::query(
-                r"
-                INSERT INTO snapshots
-                    (aggregate_type, aggregate_id, last_sequence, snapshot_version, payload)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (aggregate_type, aggregate_id) DO UPDATE SET
-                    last_sequence = EXCLUDED.last_sequence,
-                    snapshot_version = EXCLUDED.snapshot_version,
-                    payload = EXCLUDED.payload,
-                    timestamp = CURRENT_TIMESTAMP
-                WHERE snapshots.last_sequence < EXCLUDED.last_sequence
-                ",
+            let previous = repository
+                .get_snapshot_in(&mut transaction, &aggregate_type, &aggregate_id)
+                .await?;
+            if previous.is_some_and(|previous| previous.current_sequence >= snapshot.last_sequence)
+            {
+                return Err(EngineError::OptimisticLock.into());
+            }
+            let snapshot = SerializedSnapshot {
+                aggregate_id: aggregate_id.clone(),
+                aggregate: snapshot.aggregate,
+                current_sequence: snapshot.last_sequence,
+                current_snapshot: snapshot.snapshot_version,
+            };
+            let rows = repository
+                .persist_snapshot_in(&mut transaction, &aggregate_type, &snapshot)
+                .await
+                .map_err(PersistenceError::from)
+                .map_err(adapter_error)?;
+            if rows != 1 {
+                return Err(EngineError::OptimisticLock.into());
+            }
+            sqlx::query(
+                "UPDATE snapshots SET timestamp = CURRENT_TIMESTAMP \
+                WHERE aggregate_type = $1 AND aggregate_id = $2",
             )
             .bind(&aggregate_type)
             .bind(&aggregate_id)
-            .bind(i64::try_from(last_sequence)?)
-            .bind(i64::try_from(snapshot.snapshot_version)?)
-            .bind(snapshot.aggregate)
             .execute(&mut *transaction)
             .await
             .map_err(write_error)?;
-            if result.rows_affected() != 1 {
-                return Err(EngineError::OptimisticLock);
-            }
         }
 
         for job in jobs {
-            append_events(&mut transaction, std::slice::from_ref(&job.event)).await?;
+            repository
+                .append_serialized_events_in(
+                    &mut transaction,
+                    &job.event.aggregate_type,
+                    std::slice::from_ref(&job.event),
+                )
+                .await
+                .map_err(PersistenceError::from)
+                .map_err(adapter_error)?;
             sqlx::query(
                 r"
                 INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
@@ -203,89 +217,16 @@ impl PostgresEventRepository {
         transaction.commit().await.map_err(write_error)?;
         Ok(())
     }
-
-    fn replay(&self, aggregate_type: &'static str, aggregate_id: Option<String>) -> ReplayStream {
-        let (mut feed, stream) = ReplayStream::new(1000);
-        let pool = self.pool.clone();
-        tokio::spawn(async move {
-            let mut rows = sqlx::query_as::<_, StoredEventRow>(
-                r"
-                SELECT aggregate_type, aggregate_id, sequence, event_type, event_version,
-                       payload::TEXT AS payload, metadata::TEXT AS metadata
-                FROM events
-                WHERE aggregate_type = $1 AND ($2::TEXT IS NULL OR aggregate_id = $2)
-                ORDER BY aggregate_id, sequence
-                ",
-            )
-            .bind(aggregate_type)
-            .bind(aggregate_id)
-            .fetch(&pool);
-
-            loop {
-                let event = match rows.try_next().await {
-                    Ok(Some(row)) => SerializedEvent::try_from(row).map_err(PersistenceError::from),
-                    Ok(None) => return,
-                    Err(error) => Err(EngineError::Sql(error).into()),
-                };
-                match event {
-                    Ok(event) => {
-                        if feed.push(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = feed.push(Err(error)).await;
-                        return;
-                    }
-                }
-            }
-        });
-        stream
-    }
 }
 
-pub(crate) async fn load_events<'connection>(
-    connection: impl Executor<'connection, Database = Postgres>,
-    aggregate_type: &str,
-    aggregate_id: &str,
-    last_sequence: usize,
-) -> Result<Vec<SerializedEvent>, EngineError> {
-    let last_sequence = i64::try_from(last_sequence)?;
-    let rows = sqlx::query_as::<_, StoredEventRow>(
-        r"
-        SELECT aggregate_type, aggregate_id, sequence, event_type, event_version,
-               payload::TEXT AS payload, metadata::TEXT AS metadata
-        FROM events
-        WHERE aggregate_type = $1 AND aggregate_id = $2 AND sequence > $3
-        ORDER BY sequence
-        ",
-    )
-    .bind(aggregate_type)
-    .bind(aggregate_id)
-    .bind(last_sequence)
-    .fetch_all(connection)
-    .await?;
-    rows.into_iter().map(SerializedEvent::try_from).collect()
-}
-
-pub(crate) async fn append_events(
-    connection: &mut PgConnection,
-    events: &[SerializedEvent],
-) -> Result<(), EngineError> {
-    for event in events {
-        sqlx::query(
-            r"
-            INSERT INTO events
-                (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ",
-        ).bind(&event.aggregate_type).bind(&event.aggregate_id)
-            .bind(i64::try_from(event.sequence)?)
-            .bind(&event.event_type).bind(&event.event_version)
-            .bind(&event.payload).bind(&event.metadata)
-            .execute(&mut *connection).await.map_err(write_error)?;
+pub(crate) fn adapter_error(error: PersistenceError) -> PersistenceError {
+    match error {
+        PersistenceError::UnknownError(source) => match source.downcast::<sqlx::Error>() {
+            Ok(source) => write_error(*source).into(),
+            Err(source) => PersistenceError::UnknownError(source),
+        },
+        other => other,
     }
-    Ok(())
 }
 
 fn write_error(error: sqlx::Error) -> EngineError {
@@ -1325,19 +1266,25 @@ mod tests {
         assert_eq!(source.code().as_deref(), Some("23505"));
         assert_eq!(source.table(), Some("job_queue_projection"));
         assert_eq!(source.constraint(), Some("one_job_per_kind"));
+        let mut transaction = pool.begin().await.unwrap();
         assert!(
-            super::load_events(&pool, "job", &rejected.to_string(), 0)
+            repository
+                .official()
+                .get_serialized_events_in(&mut transaction, "job", &rejected.to_string())
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            super::load_events(&pool, "job", &retained.to_string(), 0)
+            repository
+                .official()
+                .get_serialized_events_in(&mut transaction, "job", &retained.to_string())
                 .await
                 .unwrap()
                 .len(),
             1
         );
+        transaction.rollback().await.unwrap();
         let rows: Vec<(String, Value)> =
             sqlx::query_as("SELECT view_id, payload FROM job_queue_projection")
                 .fetch_all(&pool)

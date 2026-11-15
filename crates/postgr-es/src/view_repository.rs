@@ -4,11 +4,12 @@ use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use cqrs_es::{Aggregate, View};
 use sqlx::{AssertSqlSafe, PgPool};
 use std::fmt::{self, Display};
-use std::marker::PhantomData;
 
 use sqlite_es::{Cmp, IndexedView, Order, Predicate, Value};
 
 use event_sorcery::{EngineError, ViewBackend};
+
+use crate::event_repository::adapter_error;
 
 /// PostgreSQL repositories for the existing materialized-view capability.
 #[derive(Debug, Clone, Copy)]
@@ -29,16 +30,23 @@ impl ViewBackend for PostgresViewBackend {
 pub struct PostgresViewRepository<ViewState, AggregateType> {
     pool: PgPool,
     table: String,
-    _types: PhantomData<fn() -> (ViewState, AggregateType)>,
+    repository: postgres_es::PostgresViewRepository<ViewState, AggregateType>,
 }
 
-impl<ViewState, AggregateType> PostgresViewRepository<ViewState, AggregateType> {
+impl<ViewState, AggregateType> PostgresViewRepository<ViewState, AggregateType>
+where
+    ViewState: View<AggregateType>,
+    AggregateType: Aggregate,
+{
     /// Constructs storage for an application-owned projection table.
     pub fn new(pool: PgPool, table: &str) -> Self {
+        let table = format!("{}", QuotedIdentifier(table));
+        let repository =
+            postgres_es::PostgresViewRepository::new(AssertSqlSafe(table.clone()), pool.clone());
         Self {
             pool,
-            table: format!("{}", QuotedIdentifier(table)),
-            _types: PhantomData,
+            table,
+            repository,
         }
     }
 }
@@ -77,13 +85,6 @@ pub enum ProjectionQueryError {
     ParameterLimit,
 }
 
-#[derive(sqlx::FromRow)]
-struct ProjectionRow {
-    view_id: String,
-    version: i64,
-    payload: String,
-}
-
 struct QuotedIdentifier<'name>(&'name str);
 
 impl Display for QuotedIdentifier<'_> {
@@ -107,25 +108,19 @@ where
         &self,
         view_id: &str,
     ) -> Result<Option<(ViewState, ViewContext)>, PersistenceError> {
-        let query = format!(
-            "SELECT view_id, version, payload::TEXT AS payload FROM {} WHERE view_id = $1",
-            self.table,
-        );
-        let row = sqlx::query_as::<_, ProjectionRow>(AssertSqlSafe(query))
-            .bind(view_id)
-            .fetch_optional(&self.pool)
+        let stored = self
+            .repository
+            .load_with_context(view_id)
             .await
-            .map_err(EngineError::from)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        if row.version <= 0 {
+            .map_err(adapter_error)?;
+        if let Some((_, context)) = &stored
+            && context.version <= 0
+        {
             return Err(PersistenceError::UnknownError(Box::new(
-                ProjectionVersionError::StoredNonPositive(row.version),
+                ProjectionVersionError::StoredNonPositive(context.version),
             )));
         }
-        let view = serde_json::from_str(&row.payload)?;
-        Ok(Some((view, ViewContext::new(row.view_id, row.version))))
+        Ok(stored)
     }
 
     async fn update_view(
@@ -138,46 +133,15 @@ where
                 ProjectionVersionError::Negative(context.version),
             )));
         }
-        let next_version = context.version.checked_add(1).ok_or_else(|| {
+        context.version.checked_add(1).ok_or_else(|| {
             PersistenceError::UnknownError(Box::new(ProjectionVersionError::Overflow(
                 context.version,
             )))
         })?;
-        let payload = serde_json::to_value(&view)
-            .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
-        drop(view);
-
-        let result = if context.version == 0 {
-            let query = format!(
-                "INSERT INTO {} (view_id, version, payload) VALUES ($1, $2, $3) \
-                 ON CONFLICT (view_id) DO NOTHING",
-                self.table,
-            );
-            sqlx::query(AssertSqlSafe(query))
-                .bind(&context.view_instance_id)
-                .bind(next_version)
-                .bind(payload)
-                .execute(&self.pool)
-                .await
-        } else {
-            let query = format!(
-                "UPDATE {} SET version = $1, payload = $2 WHERE view_id = $3 AND version = $4",
-                self.table,
-            );
-            sqlx::query(AssertSqlSafe(query))
-                .bind(next_version)
-                .bind(payload)
-                .bind(&context.view_instance_id)
-                .bind(context.version)
-                .execute(&self.pool)
-                .await
-        }
-        .map_err(EngineError::from)?;
-
-        if result.rows_affected() != 1 {
-            return Err(PersistenceError::OptimisticLockError);
-        }
-        Ok(())
+        self.repository
+            .update_view(view, context)
+            .await
+            .map_err(adapter_error)
     }
 }
 
