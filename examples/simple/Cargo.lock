@@ -202,7 +202,7 @@ dependencies = [
 [[package]]
 name = "cqrs-es"
 version = "0.5.0"
-source = "git+https://github.com/0xgleb/cqrs?rev=d61e05290bc7b24af1f615bc828a74ae6fc22f25#d61e05290bc7b24af1f615bc828a74ae6fc22f25"
+source = "git+https://github.com/0xgleb/cqrs?rev=82e0af2473db1c6ba486de350dcaef5d148df6f1#82e0af2473db1c6ba486de350dcaef5d148df6f1"
 dependencies = [
  "async-trait",
  "serde",
@@ -1266,6 +1266,7 @@ version = "0.5.0"
 dependencies = [
  "chrono",
  "cqrs-es",
+ "futures-util",
  "serde",
  "serde_json",
  "sqlx",

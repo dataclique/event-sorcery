@@ -25,7 +25,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 
 [patch.crates-io]
-cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "d61e05290bc7b24af1f615bc828a74ae6fc22f25" }
+cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "82e0af2473db1c6ba486de350dcaef5d148df6f1" }
 
 [lints.rust]
 unsafe_code = "forbid"
