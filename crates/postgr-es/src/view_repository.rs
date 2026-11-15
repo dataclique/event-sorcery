@@ -8,8 +8,7 @@ use std::marker::PhantomData;
 
 use sqlite_es::{Cmp, IndexedView, Order, Predicate, Value};
 
-use crate::ViewBackend;
-use crate::engine::EngineError;
+use event_sorcery::{EngineError, ViewBackend};
 
 /// PostgreSQL repositories for the existing materialized-view capability.
 #[derive(Debug, Clone, Copy)]

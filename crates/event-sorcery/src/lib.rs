@@ -95,14 +95,6 @@ mod job_sqlite;
 mod job_store;
 mod lifecycle;
 mod persistence;
-#[cfg(feature = "postgres")]
-mod postgres;
-#[cfg(feature = "postgres")]
-mod postgres_backend;
-#[cfg(feature = "postgres")]
-mod postgres_recovery;
-#[cfg(feature = "postgres")]
-mod postgres_view;
 mod projection;
 mod reactor;
 mod schema_registry;
@@ -139,11 +131,13 @@ pub use dispatch::{
 };
 pub use engine::{
     CommitRequest, Engine, EngineError, JobSeed, OpaqueCommitRequest, OpaqueProposedEvent,
-    OpaqueStoredEvent, SnapshotUpdate, SnapshotWrite, StreamIdentity, decode_opaque_payload,
-    encode_opaque_payload,
+    OpaqueStoredEvent, PreparedCommit, PreparedJob, PreparedSnapshot, SnapshotUpdate,
+    SnapshotWrite, StoredEventRow, StoredSnapshotRow, StreamIdentity, decode_opaque_payload,
+    encode_opaque_payload, validate_expected_version,
 };
 pub use job::{
-    DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,
+    DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label,
+    PreparedPendingJobs, StandaloneJob,
 };
 pub use job_backend::{
     Backoff, ClaimedJob, Clock, EventStoreBackend, JobClaimHandle, JobClaimResult, JobEnqueueError,
@@ -153,14 +147,9 @@ pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
-pub use persistence::PersistenceBackend;
-#[cfg(feature = "postgres")]
-pub use postgres::{POSTGRES_MIGRATOR, PostgresEventRepository};
-#[cfg(feature = "postgres")]
-pub use postgres_backend::{PostgresBackend, PostgresStoreRepository};
-#[cfg(feature = "postgres")]
-pub use postgres_view::{
-    PostgresViewBackend, PostgresViewRepository, ProjectionQueryError, ProjectionVersionError,
+pub use persistence::{
+    PersistenceBackend, SCHEMA_REGISTRY_ID, UnmaterializedStoreBackend, guard_snapshot,
+    reconcile_schema, register_schema,
 };
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::{

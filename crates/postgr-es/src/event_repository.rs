@@ -8,9 +8,9 @@ use futures_util::TryStreamExt;
 use serde_json::Value;
 use sqlx::{Executor, PgConnection, Postgres};
 
-use crate::engine::{
-    CommitRequest, EngineError, JobSeed, SnapshotUpdate, StoredEventRow, StoredSnapshotRow,
-    validate_expected_version,
+use event_sorcery::{
+    CommitRequest, EngineError, JobSeed, PreparedCommit, SnapshotUpdate, StoredEventRow,
+    StoredSnapshotRow, validate_expected_version,
 };
 
 /// Pool-backed PostgreSQL repository for the CQRS persistence contract.
@@ -26,7 +26,7 @@ pub struct PostgresEventRepository {
 ///
 /// Applications apply these migrations to their PostgreSQL pool before using
 /// framework persistence. Existing SQLite migrations remain in `sqlite-es`.
-pub static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 impl PersistedEventRepository for PostgresEventRepository {
     async fn get_events<A: Aggregate>(
@@ -123,15 +123,15 @@ impl PostgresEventRepository {
     }
 
     async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
-        request.validate_metadata()?;
-        request.validate_stream()?;
-        let CommitRequest {
-            stream,
+        let PreparedCommit {
+            aggregate_type,
+            aggregate_id,
             expected_version,
             events,
             snapshot,
             jobs,
-        } = request;
+            ..
+        } = request.prepare()?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .execute(&mut *transaction)
@@ -148,8 +148,8 @@ impl PostgresEventRepository {
                 )
                 ",
             )
-            .bind(&stream.aggregate_type)
-            .bind(&stream.aggregate_id)
+            .bind(&aggregate_type)
+            .bind(&aggregate_id)
             .fetch_one(&mut *transaction)
             .await
             .map_err(write_error)?;
@@ -158,7 +158,7 @@ impl PostgresEventRepository {
 
         append_events(&mut transaction, events).await?;
         if let Some(snapshot) = snapshot {
-            let last_sequence = snapshot.sequence_for(events)?;
+            let last_sequence = snapshot.last_sequence;
             let result = sqlx::query(
                 r"
                 INSERT INTO snapshots
@@ -172,8 +172,8 @@ impl PostgresEventRepository {
                 WHERE snapshots.last_sequence < EXCLUDED.last_sequence
                 ",
             )
-            .bind(&stream.aggregate_type)
-            .bind(&stream.aggregate_id)
+            .bind(&aggregate_type)
+            .bind(&aggregate_id)
             .bind(i64::try_from(last_sequence)?)
             .bind(i64::try_from(snapshot.snapshot_version)?)
             .bind(snapshot.aggregate)
@@ -185,18 +185,16 @@ impl PostgresEventRepository {
             }
         }
 
-        for request in jobs {
-            let event = crate::job::enqueued_event(&request)?;
-            append_events(&mut transaction, std::slice::from_ref(&event)).await?;
-            let payload = crate::job::pending_seed_payload(&request)?;
+        for job in jobs {
+            append_events(&mut transaction, std::slice::from_ref(&job.event)).await?;
             sqlx::query(
                 r"
                 INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
                 VALUES ($1, 1, $2::JSONB, NULL)
                 ",
             )
-            .bind(request.job_id.to_string())
-            .bind(payload)
+            .bind(&job.event.aggregate_id)
+            .bind(job.queue_payload)
             .execute(&mut *transaction)
             .await
             .map_err(write_error)?;

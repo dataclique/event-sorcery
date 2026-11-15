@@ -7,7 +7,11 @@ use cqrs_es::persist::{PersistedEventRepository, PersistenceError, SerializedSna
 use tracing::warn;
 
 use crate::engine::EngineError;
-use crate::{CompactionPolicy, EventBackend};
+use crate::schema_registry::{REGISTRY_ID, SchemaRegistryCommand};
+use crate::{
+    CompactionPolicy, EventBackend, EventSourced, Nil, ReconcileError, SchemaReconciliation,
+    SchemaRegistry, SchemaTarget, SqliteBackend,
+};
 
 /// Storage required to execute and reload native aggregates.
 ///
@@ -46,6 +50,57 @@ pub trait PersistenceBackend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::BootstrapError>> + Send;
 }
 
+/// Native startup capability for entities without materialized state.
+pub trait UnmaterializedStoreBackend: PersistenceBackend {
+    fn reconcile_unmaterialized<Entity: EventSourced<Materialized = Nil>>(
+        &self,
+    ) -> impl Future<Output = Result<(), ReconcileError>> + Send;
+}
+
+impl UnmaterializedStoreBackend for SqliteBackend {
+    async fn reconcile_unmaterialized<Entity: EventSourced<Materialized = Nil>>(
+        &self,
+    ) -> Result<(), ReconcileError> {
+        let reconciler = crate::Reconciler::new(self.pool().clone());
+        let _ = reconciler.reconcile::<Entity>().await?;
+        reconciler.record_version::<Entity>().await
+    }
+}
+
+/// Stable identity of the singleton schema authority's event stream.
+pub const SCHEMA_REGISTRY_ID: &str = REGISTRY_ID;
+
+/// Replays schema authority and applies the shared entity compatibility policy.
+pub fn reconcile_schema<Entity: EventSourced>(
+    payloads: Vec<String>,
+) -> Result<SchemaReconciliation, ReconcileError> {
+    let registry = SchemaRegistry::from_payloads(payloads)?;
+    let target = SchemaTarget::new(
+        Entity::AGGREGATE_TYPE,
+        Entity::SCHEMA_VERSION,
+        Entity::COMPACTION_POLICY,
+    );
+    target.reconciliation(registry.as_ref())
+}
+
+/// Records reconciliation through the existing registry command on a caller-owned repository.
+pub async fn register_schema<Entity: EventSourced, Repository: PersistedEventRepository>(
+    repository: Repository,
+) -> Result<(), ReconcileError> {
+    let store = cqrs_es::persist::PersistedEventStore::new_event_store(repository);
+    let framework = crate::wire::es_cqrs::<SchemaRegistry, _>(store, vec![]);
+    framework
+        .execute(
+            REGISTRY_ID,
+            SchemaRegistryCommand::Register {
+                name: Entity::AGGREGATE_TYPE.to_string(),
+                version: Entity::SCHEMA_VERSION,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 impl<Backend: EventBackend> PersistenceBackend for Backend {
     type PersistenceRepo = <Backend as EventBackend>::EventRepo;
     type BootstrapError = <Backend as EventBackend>::Error;
@@ -59,7 +114,8 @@ impl<Backend: EventBackend> PersistenceBackend for Backend {
     }
 }
 
-pub(crate) fn guard_snapshot<AggregateType: Aggregate>(
+/// Applies the shared retention policy to a repository's decoded snapshot.
+pub fn guard_snapshot<AggregateType: Aggregate>(
     snapshot: SerializedSnapshot,
     policy: CompactionPolicy,
 ) -> Result<SerializedSnapshot, PersistenceError> {

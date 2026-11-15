@@ -40,16 +40,15 @@ use cqrs_es::{CqrsFramework, Query};
 use sqlx::SqlitePool;
 
 use crate::Nil;
-#[cfg(feature = "postgres")]
-use crate::PostgresBackend;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
-#[cfg(feature = "postgres")]
-use crate::postgres_recovery::PostgresRecovery;
 use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
-use crate::{CompactionPolicy, EventSourced, PersistenceBackend, SqliteBackend, Store};
+use crate::{
+    CompactionPolicy, EventSourced, PersistenceBackend, SqliteBackend, Store,
+    UnmaterializedStoreBackend,
+};
 
 /// Builder for a single CQRS framework.
 ///
@@ -195,32 +194,11 @@ where
 }
 
 /// Non-projected entities: returns just `Store`.
-impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, SqliteBackend, Nil> {
-    pub async fn build(self) -> Result<Arc<Store<Entity>>, ReconcileError> {
-        // A non-projected entity has no views to rebuild, so the reconciliation
-        // outcome does not change recovery; reconcile still clears stale
-        // snapshots and record_version marks the version handled.
-        let reconciler = Reconciler::new(self.backend.pool().clone());
-        let _ = reconciler.reconcile::<Entity>().await?;
-        reconciler.record_version::<Entity>().await?;
-
-        let Self {
-            backend, queries, ..
-        } = self;
-        let event_store = PersistedEventStore::new_snapshot_store(
-            backend.persistence_repo(Entity::COMPACTION_POLICY),
-            Entity::SNAPSHOT_SIZE,
-        );
-        let cqrs = es_cqrs(event_store, queries);
-        Ok(Arc::new(Store::new(cqrs, &backend)))
-    }
-}
-
-#[cfg(feature = "postgres")]
-impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, PostgresBackend, Nil> {
-    pub async fn build(self) -> Result<Arc<Store<Entity, PostgresBackend>>, ReconcileError> {
-        let (recovery, _) = PostgresRecovery::<Entity>::begin(&self.backend.pool).await?;
-        recovery.finish().await?;
+impl<Entity: EventSourced<Materialized = Nil>, Backend: UnmaterializedStoreBackend>
+    StoreBuilder<Entity, Backend, Nil>
+{
+    pub async fn build(self) -> Result<Arc<Store<Entity, Backend>>, ReconcileError> {
+        self.backend.reconcile_unmaterialized::<Entity>().await?;
 
         let Self {
             backend, queries, ..

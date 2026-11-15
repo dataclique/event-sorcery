@@ -13,6 +13,7 @@ use cqrs_es::event_sink::EventSink;
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
 use std::fmt::Debug;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -21,6 +22,38 @@ use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
 use crate::reactor::Reactor;
 use crate::{EventBackend, EventSourced, SqliteBackend, Store};
+
+struct EncodedTestJob {
+    kind: crate::job::JobKind,
+    payload: serde_json::Value,
+}
+
+impl crate::job::ErasedJob for EncodedTestJob {
+    fn kind(&self) -> crate::job::JobKind {
+        self.kind.clone()
+    }
+
+    fn encode(&self) -> Result<serde_json::Value, serde_json::Error> {
+        Ok(self.payload.clone())
+    }
+}
+
+/// Buffers a serialized job for a repository's atomic command-write tests.
+pub fn buffer_pending_job(
+    job_id: crate::JobId,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<(), crate::JobStoreError> {
+    let job = EncodedTestJob { kind: crate::job::JobKind::new(kind), payload };
+    crate::job::buffer(crate::job::PendingPush {
+        job_id, job: Box::new(job), delay: None,
+    })
+}
+
+/// Runs repository conformance tests in the same pending-job scope as Store::send.
+pub async fn with_pending_jobs<Execution: Future>(execution: Execution) -> Execution::Output {
+    crate::job::with_pending_scope(execution).await
+}
 
 /// Replay events through EventSourced to reconstruct entity state.
 ///

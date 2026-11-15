@@ -798,7 +798,7 @@ pub(crate) struct PendingPush {
 }
 
 /// Encoded pending jobs whose source buffer remains intact until commit.
-pub(crate) struct PreparedPendingJobs {
+pub struct PreparedPendingJobs {
     requests: Vec<EnqueueRequest>,
     prepared_count: Option<usize>,
 }
@@ -828,7 +828,7 @@ impl PreparedPendingJobs {
     }
 
     /// Removes the retained source pushes included in a successful database commit.
-    pub(crate) fn mark_committed(self) {
+    pub fn mark_committed(self) {
         if let Some(prepared_count) = self.prepared_count {
             PENDING_JOBS.with(|pending| {
                 drop(pending.borrow_mut().drain(..prepared_count));

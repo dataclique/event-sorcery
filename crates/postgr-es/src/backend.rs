@@ -7,8 +7,13 @@ use cqrs_es::persist::{
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::persistence::guard_snapshot;
-use crate::{CompactionPolicy, POSTGRES_MIGRATOR, PersistenceBackend, PostgresEventRepository};
+use event_sorcery::{
+    CompactionPolicy, EventSourced, Nil, PersistenceBackend, ReconcileError,
+    UnmaterializedStoreBackend, guard_snapshot,
+};
+
+use crate::recovery::PostgresRecovery;
+use crate::{MIGRATOR, PostgresEventRepository};
 
 /// Native persistence capability over an application-provisioned pool.
 #[derive(Clone)]
@@ -37,10 +42,16 @@ impl PersistenceBackend for PostgresBackend {
     }
 
     async fn bootstrap_persistence(&self) -> Result<(), Self::BootstrapError> {
-        POSTGRES_MIGRATOR
-            .run(&self.pool)
-            .await
-            .map_err(sqlx::Error::from)
+        MIGRATOR.run(&self.pool).await.map_err(sqlx::Error::from)
+    }
+}
+
+impl UnmaterializedStoreBackend for PostgresBackend {
+    async fn reconcile_unmaterialized<Entity: EventSourced<Materialized = Nil>>(
+        &self,
+    ) -> Result<(), ReconcileError> {
+        let (recovery, _) = PostgresRecovery::<Entity>::begin(&self.pool).await?;
+        recovery.finish().await
     }
 }
 

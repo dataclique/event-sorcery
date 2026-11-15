@@ -1,0 +1,25 @@
+[package]
+name = "postgr-es"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+cqrs-es.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sqlx = { workspace = true, features = ["sqlite", "runtime-tokio", "tls-rustls", "postgres"] }
+chrono = "0.4.45"
+tokio = { version = "1.52.3", features = ["rt", "sync"] }
+event-sorcery.workspace = true
+sqlite-es.workspace = true
+futures-util = "0.3.32"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }

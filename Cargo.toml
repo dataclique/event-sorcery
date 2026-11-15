@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/sqlite-es",
+  "crates/postgr-es",
   "crates/event-sorcery",
   "crates/event-sorcery-ffi",
 ]

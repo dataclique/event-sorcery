@@ -2,20 +2,20 @@
 
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{
-    PersistedEventRepository, PersistedEventStore, PersistenceError, ReplayStream, SerializedEvent,
-    SerializedSnapshot,
+    PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot,
 };
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::marker::PhantomData;
 use tokio::sync::Mutex;
 
-use crate::engine::{CommitRequest, EngineError, StreamIdentity, validate_expected_version};
-use crate::postgres::{append_events, load_events};
-use crate::schema_registry::{REGISTRY_ID, SchemaRegistryCommand};
-use crate::{
-    EventSourced, ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, wire,
+use event_sorcery::{
+    CommitRequest, EngineError, EventSourced, ReconcileError, SCHEMA_REGISTRY_ID,
+    SchemaReconciliation, SchemaRegistry, StreamIdentity, reconcile_schema, register_schema,
+    validate_expected_version,
 };
+
+use crate::event_repository::{append_events, load_events};
 
 pub(crate) struct PostgresRecovery<Entity: EventSourced> {
     transaction: Transaction<'static, Postgres>,
@@ -42,16 +42,10 @@ impl<Entity: EventSourced> PostgresRecovery<Entity> {
              WHERE aggregate_type = $1 AND aggregate_id = $2 ORDER BY sequence",
         )
         .bind(SchemaRegistry::AGGREGATE_TYPE)
-        .bind(REGISTRY_ID)
+        .bind(SCHEMA_REGISTRY_ID)
         .fetch_all(&mut *transaction)
         .await?;
-        let registry = SchemaRegistry::from_payloads(payloads)?;
-        let target = SchemaTarget::new(
-            Entity::AGGREGATE_TYPE,
-            Entity::SCHEMA_VERSION,
-            Entity::COMPACTION_POLICY,
-        );
-        let reconciliation = target.reconciliation(registry.as_ref())?;
+        let reconciliation = reconcile_schema::<Entity>(payloads)?;
 
         match reconciliation {
             SchemaReconciliation::Changed => {
@@ -77,17 +71,7 @@ impl<Entity: EventSourced> PostgresRecovery<Entity> {
             let repository = RegistryRepository {
                 connection: Mutex::new(&mut *self.transaction),
             };
-            let store = PersistedEventStore::new_event_store(repository);
-            let framework = wire::es_cqrs::<SchemaRegistry, _>(store, vec![]);
-            framework
-                .execute(
-                    REGISTRY_ID,
-                    SchemaRegistryCommand::Register {
-                        name: Entity::AGGREGATE_TYPE.to_string(),
-                        version: Entity::SCHEMA_VERSION,
-                    },
-                )
-                .await?;
+            register_schema::<Entity, _>(repository).await?;
         }
         self.transaction.commit().await?;
         Ok(())
@@ -161,8 +145,7 @@ impl PersistedEventRepository for RegistryRepository<'_> {
             events,
         )
         .at_expected_version(expected);
-        request.validate_metadata()?;
-        request.validate_stream()?;
+        let _ = request.prepare()?;
 
         let mut connection = self.connection.lock().await;
         let current: i64 = sqlx::query_scalar(
