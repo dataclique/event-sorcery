@@ -329,8 +329,7 @@ mod tests {
     use tokio::time::timeout;
 
     use event_sorcery::{
-        CompactionPolicy, JobId, JobSeed, PersistenceBackend, buffer_pending_job,
-        with_pending_jobs,
+        CompactionPolicy, JobId, JobSeed, PersistenceBackend, buffer_pending_job, with_pending_jobs,
     };
 
     use super::{MIGRATOR, PostgresEventRepository};
