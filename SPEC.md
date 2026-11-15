@@ -161,13 +161,18 @@ Its entries reference the existing event store and commit atomically with their
 events through the existing writer. Serialized transactional append ordering
 MUST prevent a consumer from checkpointing beyond an earlier event that can
 still commit. Timestamps and uncoordinated sequence allocation are insufficient.
-Ordering metadata is authoritative, not a disposable projection.
+Feed order MUST preserve each aggregate stream's sequence, including events
+written in the same transaction. Ordering metadata is authoritative, not a
+disposable projection.
 
 Projection storage MUST atomically persist its JSON payload, optimistic version
 and consumed feed position, with a distinct projection schema version. Failure,
 cancellation and competing processing MUST NOT advance a checkpoint without its
 corresponding state. Rebuilds MUST use retained history through a captured
 committed boundary and MUST NOT expose incomplete state as successfully rebuilt.
+Publication MUST use the same competing-processor fence as live processing and
+MUST NOT replace a newer consumed position with an older one. A stale rebuild
+must catch up or retry before publication rather than regress visible state.
 Activation over historical events requires an explicit bootstrap policy; missing
 historical cross-stream order MUST NOT be silently fabricated.
 
