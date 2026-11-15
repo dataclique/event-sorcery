@@ -101,6 +101,8 @@ mod postgres;
 mod postgres_backend;
 #[cfg(feature = "postgres")]
 mod postgres_recovery;
+#[cfg(feature = "postgres")]
+mod postgres_view;
 mod projection;
 mod reactor;
 mod schema_registry;
@@ -156,6 +158,8 @@ pub use persistence::PersistenceBackend;
 pub use postgres::{POSTGRES_MIGRATOR, PostgresEventRepository};
 #[cfg(feature = "postgres")]
 pub use postgres_backend::{PostgresBackend, PostgresStoreRepository};
+#[cfg(feature = "postgres")]
+pub use postgres_view::{PostgresViewBackend, PostgresViewRepository, ProjectionVersionError};
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use reactor::{
     IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,
