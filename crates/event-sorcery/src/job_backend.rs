@@ -777,7 +777,7 @@ impl Backoff {
     }
 }
 
-/// Injectable wall clock, so tests drive lease/retry timing deterministically.
+/// Injectable timestamp source for job eligibility, lease and retry decisions.
 #[derive(Clone)]
 pub struct Clock(Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>);
 

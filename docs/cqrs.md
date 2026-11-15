@@ -883,12 +883,12 @@ provides the CQRS persistence repository, not a PostgreSQL `EventBackend` for
 `StoreBuilder` or worker execution. Do not use a PostgreSQL pool with
 `JobRuntime::build` or assume its workers can drain PostgreSQL jobs.
 
-Dispatching a job (see **Jobs Pattern** above) only writes a pending row; a
-worker has to drain it. `JobRuntime::build(pool)` wires the durable-jobs runtime
-over the same database, and `build_supervised_worker!` registers one supervised
-worker per job type -- entity-kicked jobs get a `JobInput` (their dependencies
-plus the origin store verdicts are delivered through), standalone jobs get their
-plain input:
+The worker host uses stable Apalis 1.0. Dispatching a job (see **Jobs Pattern**
+above) only writes a pending row; a worker has to drain it.
+`JobRuntime::build(pool)` wires the durable-jobs runtime over the same database,
+and `build_supervised_worker!` registers one supervised worker per job type --
+entity-kicked jobs get a `JobInput` (their dependencies plus the origin store
+verdicts are delivered through), standalone jobs get their plain input:
 
 ```rust
 let runtime = JobRuntime::build(pool.clone()).await?;
@@ -912,9 +912,9 @@ for entity-kicked jobs, `perform` for standalone ones), delivers the verdict,
 and durably records the outcome (success, retry with backoff, or dead-letter) --
 all fenced so a job runs exactly once per successful claim. `JobWorkerConfig`
 tunes poll cadence, concurrency, lease duration, retry budget, backoff, and the
-verdict-delivery deferrals (`DeliveryPolicy`); `Clock::system()` is the real
-wall clock (use `Clock::from_fn(..)` to drive lease and retry timing
-deterministically in tests).
+verdict-delivery deferrals (`DeliveryPolicy`). `Clock::system()` reads real wall
+time; `Clock::from_fn(..)` supplies timestamp reads for eligibility and lease
+decisions.
 
 ## Testing Aggregates
 
