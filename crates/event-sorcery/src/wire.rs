@@ -32,8 +32,6 @@
 //! time, not by the wiring infrastructure.
 
 use std::fmt::Debug;
-#[cfg(feature = "postgres")]
-use std::future::{Ready, ready};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -46,6 +44,8 @@ use crate::Nil;
 use crate::PostgresBackend;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
+#[cfg(feature = "postgres")]
+use crate::postgres_recovery::PostgresRecovery;
 use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
@@ -217,17 +217,20 @@ impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, SqliteBacken
 }
 
 #[cfg(feature = "postgres")]
-#[derive(Debug, thiserror::Error)]
-#[error("PostgreSQL schema startup is not implemented")]
-struct PendingPostgresRecovery;
-
-#[cfg(feature = "postgres")]
 impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, PostgresBackend, Nil> {
-    pub fn build(self) -> Ready<Result<Arc<Store<Entity, PostgresBackend>>, ReconcileError>> {
-        drop(self);
-        ready(Err(ReconcileError::Persistence(
-            PersistenceError::UnknownError(Box::new(PendingPostgresRecovery)),
-        )))
+    pub async fn build(self) -> Result<Arc<Store<Entity, PostgresBackend>>, ReconcileError> {
+        let (recovery, _) = PostgresRecovery::<Entity>::begin(&self.backend.pool).await?;
+        recovery.finish().await?;
+
+        let Self {
+            backend, queries, ..
+        } = self;
+        let event_store = PersistedEventStore::new_snapshot_store(
+            backend.persistence_repo(Entity::COMPACTION_POLICY),
+            Entity::SNAPSHOT_SIZE,
+        );
+        let cqrs = es_cqrs(event_store, queries);
+        Ok(Arc::new(Store::new(cqrs, &backend)))
     }
 }
 

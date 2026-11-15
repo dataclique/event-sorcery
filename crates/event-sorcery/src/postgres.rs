@@ -6,7 +6,7 @@ use cqrs_es::persist::{
 };
 use futures_util::TryStreamExt;
 use serde_json::Value;
-use sqlx::PgConnection;
+use sqlx::{Executor, PgConnection, Postgres};
 
 use crate::engine::{
     CommitRequest, EngineError, JobSeed, SnapshotUpdate, StoredEventRow, StoredSnapshotRow,
@@ -33,7 +33,7 @@ impl PersistedEventRepository for PostgresEventRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        Ok(self.load_events(A::TYPE, aggregate_id, 0).await?)
+        Ok(load_events(&self.pool, A::TYPE, aggregate_id, 0).await?)
     }
 
     async fn get_last_events<A: Aggregate>(
@@ -41,9 +41,7 @@ impl PersistedEventRepository for PostgresEventRepository {
         aggregate_id: &str,
         last_sequence: usize,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        Ok(self
-            .load_events(A::TYPE, aggregate_id, last_sequence)
-            .await?)
+        Ok(load_events(&self.pool, A::TYPE, aggregate_id, last_sequence).await?)
     }
 
     async fn get_snapshot<A: Aggregate>(
@@ -122,30 +120,6 @@ impl PostgresEventRepository {
         Box::pin(self.commit(request)).await?;
         pending_jobs.mark_committed();
         Ok(())
-    }
-
-    async fn load_events(
-        &self,
-        aggregate_type: &str,
-        aggregate_id: &str,
-        last_sequence: usize,
-    ) -> Result<Vec<SerializedEvent>, EngineError> {
-        let last_sequence = i64::try_from(last_sequence)?;
-        let rows = sqlx::query_as::<_, StoredEventRow>(
-            r"
-            SELECT aggregate_type, aggregate_id, sequence, event_type, event_version,
-                   payload::TEXT AS payload, metadata::TEXT AS metadata
-            FROM events
-            WHERE aggregate_type = $1 AND aggregate_id = $2 AND sequence > $3
-            ORDER BY sequence
-            ",
-        )
-        .bind(aggregate_type)
-        .bind(aggregate_id)
-        .bind(last_sequence)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(SerializedEvent::try_from).collect()
     }
 
     async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
@@ -272,7 +246,31 @@ impl PostgresEventRepository {
     }
 }
 
-async fn append_events(
+pub(crate) async fn load_events<'connection>(
+    connection: impl Executor<'connection, Database = Postgres>,
+    aggregate_type: &str,
+    aggregate_id: &str,
+    last_sequence: usize,
+) -> Result<Vec<SerializedEvent>, EngineError> {
+    let last_sequence = i64::try_from(last_sequence)?;
+    let rows = sqlx::query_as::<_, StoredEventRow>(
+        r"
+        SELECT aggregate_type, aggregate_id, sequence, event_type, event_version,
+               payload::TEXT AS payload, metadata::TEXT AS metadata
+        FROM events
+        WHERE aggregate_type = $1 AND aggregate_id = $2 AND sequence > $3
+        ORDER BY sequence
+        ",
+    )
+    .bind(aggregate_type)
+    .bind(aggregate_id)
+    .bind(last_sequence)
+    .fetch_all(connection)
+    .await?;
+    rows.into_iter().map(SerializedEvent::try_from).collect()
+}
+
+pub(crate) async fn append_events(
     connection: &mut PgConnection,
     events: &[SerializedEvent],
 ) -> Result<(), EngineError> {

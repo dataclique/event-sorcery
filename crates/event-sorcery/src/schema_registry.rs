@@ -35,7 +35,7 @@ use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::{DomainEvent, Effect, EventSourced, Nil, uneventful};
 
 /// Singleton aggregate ID for the schema registry.
-const REGISTRY_ID: &str = "schema";
+pub(crate) const REGISTRY_ID: &str = "schema";
 
 /// Language-neutral aggregate schema metadata used during startup recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]

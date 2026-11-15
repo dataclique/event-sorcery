@@ -99,6 +99,8 @@ mod persistence;
 mod postgres;
 #[cfg(feature = "postgres")]
 mod postgres_backend;
+#[cfg(feature = "postgres")]
+mod postgres_recovery;
 mod projection;
 mod reactor;
 mod schema_registry;
