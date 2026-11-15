@@ -32,6 +32,8 @@
 //! time, not by the wiring infrastructure.
 
 use std::fmt::Debug;
+#[cfg(feature = "postgres")]
+use std::future::{Ready, ready};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -40,6 +42,8 @@ use cqrs_es::{CqrsFramework, Query};
 use sqlx::SqlitePool;
 
 use crate::Nil;
+#[cfg(feature = "postgres")]
+use crate::PostgresBackend;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
 use crate::projection::{Projection, ProjectionError, Table};
@@ -209,6 +213,21 @@ impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, SqliteBacken
         );
         let cqrs = es_cqrs(event_store, queries);
         Ok(Arc::new(Store::new(cqrs, &backend)))
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Debug, thiserror::Error)]
+#[error("PostgreSQL schema startup is not implemented")]
+struct PendingPostgresRecovery;
+
+#[cfg(feature = "postgres")]
+impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, PostgresBackend, Nil> {
+    pub fn build(self) -> Ready<Result<Arc<Store<Entity, PostgresBackend>>, ReconcileError>> {
+        drop(self);
+        ready(Err(ReconcileError::Persistence(
+            PersistenceError::UnknownError(Box::new(PendingPostgresRecovery)),
+        )))
     }
 }
 
