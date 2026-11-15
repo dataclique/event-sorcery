@@ -1,6 +1,6 @@
 # 0014. Replayable multi-aggregate projections
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-15
 - Issues: [#133](https://github.com/dataclique/event-sorcery/issues/133),
   [#134](https://github.com/dataclique/event-sorcery/issues/134),
