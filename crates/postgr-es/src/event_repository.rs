@@ -314,7 +314,6 @@ fn write_error(error: sqlx::Error) -> EngineError {
 
 #[cfg(test)]
 mod tests {
-    use chrono::DateTime;
     use cqrs_es::event_sink::EventSink;
     use cqrs_es::persist::{
         PersistedEventRepository, PersistedEventStore, PersistenceError, SerializedEvent,
@@ -329,13 +328,13 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    use super::{POSTGRES_MIGRATOR, PostgresEventRepository};
-    use crate::job::{
-        ClaimId, DeadReason, ErasedJob, JobEvent, JobId, JobKind, JobState, PendingPush, WorkerId,
+    use event_sorcery::{
+        CompactionPolicy, JobId, JobSeed, PersistenceBackend, buffer_pending_job,
+        with_pending_jobs,
     };
-    use crate::{
-        CompactionPolicy, EventSourced, JobSeed, Lifecycle, PersistenceBackend, PostgresBackend,
-    };
+
+    use super::{MIGRATOR, PostgresEventRepository};
+    use crate::PostgresBackend;
 
     #[derive(Default, Debug, Clone, Serialize, Deserialize)]
     struct RecordedValues {
@@ -374,12 +373,7 @@ mod tests {
             sink.write(ValueEvent::Recorded { value }, &mut scratch)
                 .await;
             if let Some(job_id) = services {
-                crate::job::buffer(PendingPush {
-                    job_id: *job_id,
-                    job: Box::new(RecordedJob),
-                    delay: None,
-                })
-                .unwrap();
+                buffer_pending_job(*job_id, "recorded-value", json!({"value": "work"})).unwrap();
             }
             Ok(())
         }
@@ -390,21 +384,9 @@ mod tests {
         }
     }
 
-    struct RecordedJob;
-
-    impl ErasedJob for RecordedJob {
-        fn kind(&self) -> JobKind {
-            JobKind::new("recorded-value")
-        }
-
-        fn encode(&self) -> Result<Value, serde_json::Error> {
-            Ok(json!({"value": "work"}))
-        }
-    }
-
     #[sqlx::test(migrations = false)]
     async fn native_factory_guards_compactable_snapshots_without_mutation(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let backend = PostgresBackend { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(
             backend.persistence_repo(CompactionPolicy::Retain),
@@ -481,7 +463,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn repository_rejects_gapped_appends_without_writing(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool };
         let mut event = SerializedEvent {
             aggregate_type: RecordedValues::TYPE.to_string(),
@@ -569,7 +551,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn repository_reloads_commands_through_the_generic_cqrs_store(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_event_store(repository);
         let framework = CqrsFramework::new(store, vec![], None);
@@ -600,7 +582,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn repository_restores_snapshot_and_suffix_with_distinct_counters(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 2);
         let framework = CqrsFramework::new(store, vec![], None);
@@ -643,7 +625,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn replay_preserves_stream_order_and_aggregate_isolation(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_event_store(repository);
         let framework = CqrsFramework::new(store, vec![], None);
@@ -705,7 +687,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn competing_commands_preserve_one_winning_snapshot(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
         CqrsFramework::new(store, vec![], None)
@@ -751,7 +733,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn unavailable_pool_surfaces_read_and_replay_errors(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         pool.close().await;
         let repository = PostgresEventRepository { pool };
         let error = repository
@@ -792,7 +774,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn snapshot_mid_batch_reloads_every_committed_event(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 2);
         let context = store.load_aggregate("stream").await.unwrap();
@@ -856,8 +838,8 @@ mod tests {
             panic!("expected a typed excessive-coverage error");
         };
         assert!(matches!(
-            source.downcast_ref::<crate::engine::EngineError>().unwrap(),
-            crate::engine::EngineError::SnapshotBeyondCurrentVersion {
+            source.downcast_ref::<event_sorcery::EngineError>().unwrap(),
+            event_sorcery::EngineError::SnapshotBeyondCurrentVersion {
                 proposed: 5,
                 current: 4
             }
@@ -917,12 +899,12 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn dispatched_job_and_snapshot_commit_with_the_domain_event(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let job_id = JobId::new();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
         let framework = CqrsFramework::new(store, vec![], Some(job_id));
-        crate::job::with_pending_scope(async {
+        with_pending_jobs(async {
             framework
                 .execute("stream", "first".to_string())
                 .await
@@ -983,23 +965,22 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn duplicate_dispatch_rolls_back_domain_event_and_snapshot(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let job_id = JobId::new();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
         let framework = CqrsFramework::new(store, vec![], Some(job_id));
-        crate::job::with_pending_scope(async {
+        with_pending_jobs(async {
             framework
                 .execute("stream", "first".to_string())
                 .await
                 .unwrap();
         })
         .await;
-        let error = crate::job::with_pending_scope(async {
-            framework.execute("stream", "second".to_string()).await
-        })
-        .await
-        .unwrap_err();
+        let error =
+            with_pending_jobs(async { framework.execute("stream", "second".to_string()).await })
+                .await
+                .unwrap_err();
         assert!(matches!(error, AggregateError::AggregateConflict));
 
         let repository = PostgresEventRepository { pool: pool.clone() };
@@ -1028,7 +1009,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn cancelled_command_rolls_back_and_releases_its_pooled_connection(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let command_pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_with(pool.connect_options().as_ref().clone())
@@ -1045,7 +1026,7 @@ mod tests {
         };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
         let framework = CqrsFramework::new(store, vec![], Some(job_id));
-        let command = tokio::spawn(crate::job::with_pending_scope(async move {
+        let command = tokio::spawn(with_pending_jobs(async move {
             framework.execute("cancelled", "before".to_string()).await
         }));
         timeout(Duration::from_secs(10), async {
@@ -1106,7 +1087,7 @@ mod tests {
         };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
         let framework = CqrsFramework::new(store, vec![], Some(job_id));
-        crate::job::with_pending_scope(async {
+        with_pending_jobs(async {
             framework
                 .execute("cancelled", "after".to_string())
                 .await
@@ -1128,7 +1109,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn cancelled_enqueue_rolls_back_and_reuses_its_connection(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let singleton = PgPoolOptions::new()
             .max_connections(1)
             .connect_with((*pool.connect_options()).clone())
@@ -1205,7 +1186,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn queue_write_failure_rolls_back_standalone_event(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         sqlx::query("ALTER TABLE job_queue_projection ADD CONSTRAINT reject_seed CHECK (FALSE)")
             .execute(&pool)
             .await
@@ -1246,7 +1227,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn standalone_enqueue_preserves_first_event_and_queue_row_on_duplicate(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let job_id = JobId::new();
         let repository = PostgresEventRepository { pool: pool.clone() };
         repository
@@ -1309,7 +1290,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn unrelated_unique_constraint_is_not_an_optimistic_conflict(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let retained = JobId::new();
         let rejected = JobId::new();
@@ -1345,15 +1326,13 @@ mod tests {
         assert_eq!(source.table(), Some("job_queue_projection"));
         assert_eq!(source.constraint(), Some("one_job_per_kind"));
         assert!(
-            repository
-                .get_events::<Lifecycle<JobState>>(&rejected.to_string())
+            super::load_events(&pool, "job", &rejected.to_string(), 0)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            repository
-                .get_events::<Lifecycle<JobState>>(&retained.to_string())
+            super::load_events(&pool, "job", &retained.to_string(), 0)
                 .await
                 .unwrap()
                 .len(),
@@ -1374,7 +1353,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn invalid_enqueue_instant_leaves_no_event_or_queue_row(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         let job_id = JobId::new();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let error = repository
@@ -1390,8 +1369,10 @@ mod tests {
             panic!("expected the invalid scheduling instant to fail");
         };
         assert!(matches!(
-            source.downcast_ref::<crate::job::JobStoreError>().unwrap(),
-            crate::job::JobStoreError::InvalidInstant(i64::MAX)
+            source
+                .downcast_ref::<event_sorcery::JobStoreError>()
+                .unwrap(),
+            event_sorcery::JobStoreError::InvalidInstant(i64::MAX)
         ));
         let rows: (i64, i64) = sqlx::query_as(
             r"
@@ -1412,38 +1393,21 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn bootstrap_preserves_job_rows_and_generated_poll_columns(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
 
-        let run_at = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let lease_until = DateTime::from_timestamp_millis(1_700_000_030_000).unwrap();
-        let pending = JobState::originate(&JobEvent::Enqueued {
-            kind: JobKind::new("bootstrap-job"),
-            payload: json!({ "opaque": true }),
-            run_at,
-        })
-        .unwrap();
-        let claimed = JobState::evolve(
-            &pending,
-            &JobEvent::Claimed {
-                worker: WorkerId::new("bootstrap-worker"),
-                claim_id: ClaimId::new(),
-                lease_until,
-            },
-        )
-        .unwrap()
-        .unwrap();
-        let done = JobState::evolve(&claimed, &JobEvent::Succeeded)
-            .unwrap()
-            .unwrap();
-        let dead = JobState::evolve(
-            &claimed,
-            &JobEvent::Dead {
-                reason: DeadReason::Rejected,
-                error: "rejected".to_string(),
-            },
-        )
-        .unwrap()
-        .unwrap();
+        let pending = json!({"Live": {"Pending": {
+            "kind": "bootstrap-job", "payload": {"opaque": true},
+            "run_at": 1_700_000_000_000_i64, "attempt": 0, "claims": 0,
+        }}});
+        let claimed = json!({"Live": {"Claimed": {
+            "kind": "bootstrap-job", "payload": {"opaque": true},
+            "worker": "bootstrap-worker", "claim_id": JobId::new().to_string(),
+            "run_at": 1_700_000_000_000_i64, "attempt": 0, "claims": 1,
+        }}});
+        let done = json!({"Live": {"Done": {"kind": "bootstrap-job"}}});
+        let dead = json!({"Live": {"Dead": {
+            "kind": "bootstrap-job", "reason": "Rejected",
+        }}});
         let cases = [
             (pending, "pending", Some(1_700_000_000_000_i64), 1_i64, None),
             (
@@ -1461,7 +1425,7 @@ mod tests {
             cases
         {
             let view_id = JobId::new().to_string();
-            let payload = serde_json::to_value(Lifecycle::Live(state)).unwrap();
+            let payload = state;
             sqlx::query(
                 r"
                 INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
@@ -1476,7 +1440,7 @@ mod tests {
             .await
             .unwrap();
 
-            POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+            MIGRATOR.run(&pool).await.unwrap();
 
             let (stored_kind, status, stored_run_at, stored_version, stored_payload, stored_lease):
                 (String, String, Option<i64>, i64, Value, Option<i64>) = sqlx::query_as(
@@ -1503,18 +1467,14 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn queue_rejects_nonpositive_projection_versions(pool: PgPool) {
-        POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
 
         for version in [0_i64, -1] {
             let view_id = JobId::new().to_string();
-            let payload = serde_json::to_value(Lifecycle::Live(JobState::Pending {
-                kind: JobKind::new("bootstrap-job"),
-                payload: json!({ "opaque": true }),
-                run_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
-                attempt: 0,
-                claims: 0,
-            }))
-            .unwrap();
+            let payload = json!({"Live": {"Pending": {
+                "kind": "bootstrap-job", "payload": {"opaque": true},
+                "run_at": 1_700_000_000_000_i64, "attempt": 0, "claims": 0,
+            }}});
             let error = sqlx::query(
                 "INSERT INTO job_queue_projection (view_id, version, payload) VALUES ($1, $2, $3)",
             )

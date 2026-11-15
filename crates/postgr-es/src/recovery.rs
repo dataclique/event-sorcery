@@ -189,7 +189,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::Lifecycle;
+    use crate::view_repository::tests::RegisteredSchemaView;
 
     fn mode_error<Success>(result: Result<Success, PersistenceError>) -> RegistryStorageModeError {
         let Err(PersistenceError::UnknownError(source)) = result else {
@@ -208,7 +208,7 @@ mod tests {
             assert!(matches!(
                 mode_error(
                     repository
-                        .get_snapshot::<Lifecycle<SchemaRegistry>>(REGISTRY_ID)
+                        .get_snapshot::<RegisteredSchemaView>(SCHEMA_REGISTRY_ID)
                         .await
                 ),
                 RegistryStorageModeError::Snapshot
@@ -216,9 +216,9 @@ mod tests {
             assert!(matches!(
                 mode_error(
                     repository
-                        .persist::<Lifecycle<SchemaRegistry>>(
+                        .persist::<RegisteredSchemaView>(
                             &[],
-                            Some((REGISTRY_ID.to_string(), json!({}), 1)),
+                            Some((SCHEMA_REGISTRY_ID.to_string(), json!({}), 1)),
                         )
                         .await
                 ),
@@ -227,21 +227,17 @@ mod tests {
             assert!(matches!(
                 mode_error(
                     repository
-                        .stream_events::<Lifecycle<SchemaRegistry>>(REGISTRY_ID)
+                        .stream_events::<RegisteredSchemaView>(SCHEMA_REGISTRY_ID)
                         .await
                 ),
                 RegistryStorageModeError::Streaming
             ));
             assert!(matches!(
-                mode_error(
-                    repository
-                        .stream_all_events::<Lifecycle<SchemaRegistry>>()
-                        .await
-                ),
+                mode_error(repository.stream_all_events::<RegisteredSchemaView>().await),
                 RegistryStorageModeError::Streaming
             ));
             repository
-                .persist::<Lifecycle<SchemaRegistry>>(&[], None)
+                .persist::<RegisteredSchemaView>(&[], None)
                 .await
                 .unwrap();
         }

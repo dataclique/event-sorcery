@@ -162,7 +162,8 @@ pub use schema_registry::{
 pub use sqlite_event_repository::SqliteEventRepository;
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
-    ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, replay, test_store,
+    ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, buffer_pending_job, replay,
+    test_store, with_pending_jobs,
 };
 pub use view_backend::{SqliteViewBackend, ViewBackend};
 pub use wire::StoreBuilder;

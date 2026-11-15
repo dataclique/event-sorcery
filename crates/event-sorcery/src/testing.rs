@@ -43,10 +43,15 @@ pub fn buffer_pending_job(
     job_id: crate::JobId,
     kind: &str,
     payload: serde_json::Value,
-) -> Result<(), crate::JobStoreError> {
-    let job = EncodedTestJob { kind: crate::job::JobKind::new(kind), payload };
+) -> Result<(), crate::job::DispatchNotBuffered> {
+    let job = EncodedTestJob {
+        kind: crate::job::JobKind::new(kind),
+        payload,
+    };
     crate::job::buffer(crate::job::PendingPush {
-        job_id, job: Box::new(job), delay: None,
+        job_id,
+        job: Box::new(job),
+        delay: None,
     })
 }
 

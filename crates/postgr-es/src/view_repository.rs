@@ -286,27 +286,66 @@ fn predicate_sql(predicate: &Predicate) -> Result<(String, Vec<&Value>), Project
 }
 
 #[cfg(test)]
-mod tests {
-    use cqrs_es::EventEnvelope;
+pub(crate) mod tests {
+    use cqrs_es::event_sink::EventSink;
+    use cqrs_es::{DomainEvent, EventEnvelope};
     use proptest::prelude::{any, prop_assert_eq, proptest};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use std::convert::Infallible;
 
     use sqlite_es::{Cmp, Term, Value};
 
     use super::*;
-    use crate::schema_registry::SchemaRegistryEvent;
-    use crate::{Lifecycle, SchemaRegistry};
 
     #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-    struct RegisteredSchemaView {
+    pub(crate) struct RegisteredSchemaView {
         name: String,
         schema_version: u64,
     }
 
-    impl View<Lifecycle<SchemaRegistry>> for RegisteredSchemaView {
-        fn update(&mut self, event: &EventEnvelope<Lifecycle<SchemaRegistry>>) {
-            let SchemaRegistryEvent::VersionUpdated { name, version } = &event.payload;
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub(crate) enum RegisteredSchemaEvent {
+        VersionUpdated { name: String, version: u64 },
+    }
+
+    impl DomainEvent for RegisteredSchemaEvent {
+        fn event_type(&self) -> String {
+            "VersionUpdated".to_string()
+        }
+        fn event_version(&self) -> String {
+            "1".to_string()
+        }
+    }
+
+    impl Aggregate for RegisteredSchemaView {
+        const TYPE: &'static str = "RegisteredSchema";
+        type Command = RegisteredSchemaEvent;
+        type Event = RegisteredSchemaEvent;
+        type Error = Infallible;
+        type Services = ();
+
+        async fn handle(
+            &mut self,
+            event: Self::Event,
+            _services: &(),
+            sink: &EventSink<Self>,
+        ) -> Result<(), Self::Error> {
+            let mut scratch = self.clone();
+            sink.write(event, &mut scratch).await;
+            Ok(())
+        }
+
+        fn apply(&mut self, event: Self::Event) {
+            let RegisteredSchemaEvent::VersionUpdated { name, version } = event;
+            self.name = name;
+            self.schema_version = version;
+        }
+    }
+
+    impl View<RegisteredSchemaView> for RegisteredSchemaView {
+        fn update(&mut self, event: &EventEnvelope<RegisteredSchemaView>) {
+            let RegisteredSchemaEvent::VersionUpdated { name, version } = &event.payload;
             self.name.clone_from(name);
             self.schema_version = *version;
         }
@@ -316,11 +355,10 @@ mod tests {
     async fn view_version_validation_precedes_storage_access() {
         let pool = PgPool::connect_lazy("postgresql://localhost/unused").unwrap();
         pool.close().await;
-        let repository =
-            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
-                pool,
-                "schema_projection",
-            );
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            pool,
+            "schema_projection",
+        );
         for version in [-1, i64::MAX] {
             let error = repository
                 .update_view(
@@ -352,11 +390,10 @@ mod tests {
     async fn malformed_indexed_queries_fail_before_storage_access() {
         let pool = PgPool::connect_lazy("postgresql://localhost/unused").unwrap();
         pool.close().await;
-        let repository =
-            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
-                pool,
-                "schema_projection",
-            );
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            pool,
+            "schema_projection",
+        );
         assert!(matches!(
             query_error(
                 repository
@@ -414,11 +451,10 @@ mod tests {
     async fn indexed_parameter_limit_fails_before_storage_access() {
         let pool = PgPool::connect_lazy("postgresql://localhost/unused").unwrap();
         pool.close().await;
-        let repository =
-            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
-                pool,
-                "schema_projection",
-            );
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            pool,
+            "schema_projection",
+        );
         let terms = (0..usize::from(u16::MAX))
             .map(|_| Term {
                 column: "schema_version".to_string(),
@@ -457,7 +493,7 @@ mod tests {
 
     async fn indexed_repository(
         pool: PgPool,
-    ) -> PostgresViewRepository<RegisteredSchemaView, Lifecycle<SchemaRegistry>> {
+    ) -> PostgresViewRepository<RegisteredSchemaView, RegisteredSchemaView> {
         sqlx::query(
             "CREATE TABLE schema_projection (view_id TEXT PRIMARY KEY, version BIGINT NOT NULL, \
              payload JSONB NOT NULL, name TEXT GENERATED ALWAYS AS (payload->>'name') STORED, \
@@ -649,11 +685,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let repository =
-            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
-                pool,
-                "schema_projection",
-            );
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            pool,
+            "schema_projection",
+        );
         assert_eq!(repository.load("schema").await.unwrap(), None);
         repository
             .update_view(
@@ -715,11 +750,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let repository =
-            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
-                pool,
-                "schema_projection",
-            );
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            pool,
+            "schema_projection",
+        );
         let results = tokio::join!(
             repository.update_view(
                 RegisteredSchemaView {
@@ -760,11 +794,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let repository =
-            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
-                pool,
-                "quoted\"_projection",
-            );
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            pool,
+            "quoted\"_projection",
+        );
         repository
             .update_view(
                 RegisteredSchemaView {
@@ -796,11 +829,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let repository =
-            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
-                pool,
-                "schema_projection",
-            );
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            pool,
+            "schema_projection",
+        );
         let view = RegisteredSchemaView {
             name: "Account".to_string(),
             schema_version: 10,
@@ -846,11 +878,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let repository =
-            PostgresViewRepository::<RegisteredSchemaView, Lifecycle<SchemaRegistry>>::new(
-                pool,
-                "schema_projection",
-            );
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            pool,
+            "schema_projection",
+        );
         let error = repository.load("invalid-version").await.unwrap_err();
         let PersistenceError::UnknownError(source) = error else {
             panic!("expected an invalid stored-version error");

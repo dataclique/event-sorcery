@@ -1290,6 +1290,7 @@ dependencies = [
  "cqrs-es",
  "event-sorcery",
  "futures-util",
+ "proptest",
  "serde",
  "serde_json",
  "sqlite-es",
