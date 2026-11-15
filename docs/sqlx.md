@@ -22,6 +22,11 @@ from the `.sqlx/` directory instead of connecting to the database. This means:
   prevents Clippy from recognizing test-only helpers for the configured
   `allow-unwrap-in-tests` exception.
 
+`migrate!` can otherwise leave a stale embedded migration after SQL-only edits
+on the pinned stable toolchain. Both backend crates have build scripts watching
+their `migrations/` directories so Cargo rebuilds the owning migrator when SQL
+inputs change.
+
 ## Local PostgreSQL and flake tests
 
 The development shell uses devenv's flake integration, not the native devenv
