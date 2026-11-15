@@ -98,8 +98,9 @@ mod persistence;
 mod projection;
 mod projection_recovery;
 mod reactor;
+#[cfg(test)]
+mod repository_conformance;
 mod schema_registry;
-mod sqlite_event_repository;
 mod sqlite_projection;
 #[cfg(any(test, feature = "test-support"))]
 mod testing;
@@ -150,8 +151,8 @@ pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseR
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use persistence::{
-    PersistenceBackend, ProjectedStoreBackend, SCHEMA_REGISTRY_ID, UnmaterializedStoreBackend,
-    guard_snapshot, reconcile_schema, register_schema,
+    NativeRepositoryPolicy, PersistenceBackend, ProjectedStoreBackend, SCHEMA_REGISTRY_ID,
+    UnmaterializedStoreBackend, guard_snapshot, reconcile_schema, register_schema,
 };
 pub use projection::{Column, Projection, ProjectionError, Table};
 pub use projection_recovery::{
@@ -166,7 +167,7 @@ pub use schema_registry::{
     ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry, SchemaTarget,
     validate_snapshot_history,
 };
-pub use sqlite_event_repository::SqliteEventRepository;
+use sqlite_es::NativeRepository;
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, buffer_pending_job, replay,
@@ -451,12 +452,11 @@ impl<Entity: EventSourced> Store<Entity, SqliteBackend> {
         pool: SqlitePool,
         id: &Entity::Id,
     ) -> Result<Option<Entity>, SendError<Entity>> {
-        let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
-        let event_store =
-            PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-                repo,
-                Entity::SNAPSHOT_SIZE,
-            );
+        let repo = NativeRepository::<NativeRepositoryPolicy>::new(pool, Entity::COMPACTION_POLICY);
+        let event_store = PersistedEventStore::<
+            NativeRepository<NativeRepositoryPolicy>,
+            Lifecycle<Entity>,
+        >::new_snapshot_store(repo, Entity::SNAPSHOT_SIZE);
         let context = event_store.load_aggregate(&id.to_string()).await?;
 
         Ok(context.aggregate.into_result()?)
@@ -508,12 +508,12 @@ pub async fn load_entity<Entity: EventSourced>(
     pool: &SqlitePool,
     id: &Entity::Id,
 ) -> Result<Option<Entity>, SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
-    let event_store =
-        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-            repo,
-            Entity::SNAPSHOT_SIZE,
-        );
+    let repo =
+        NativeRepository::<NativeRepositoryPolicy>::new(pool.clone(), Entity::COMPACTION_POLICY);
+    let event_store = PersistedEventStore::<
+        NativeRepository<NativeRepositoryPolicy>,
+        Lifecycle<Entity>,
+    >::new_snapshot_store(repo, Entity::SNAPSHOT_SIZE);
 
     let context = event_store.load_aggregate(&id.to_string()).await?;
 
@@ -533,8 +533,9 @@ pub async fn send_command<Entity: EventSourced>(
     id: &Entity::Id,
     command: Entity::Command,
 ) -> Result<(), SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
-    let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
+    let repo =
+        NativeRepository::<NativeRepositoryPolicy>::new(pool.clone(), Entity::COMPACTION_POLICY);
+    let store = PersistedEventStore::<NativeRepository<NativeRepositoryPolicy>, Lifecycle<Entity>>::new_snapshot_store(
         repo,
         Entity::SNAPSHOT_SIZE,
     );

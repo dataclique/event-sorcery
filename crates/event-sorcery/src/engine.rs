@@ -6,8 +6,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use cqrs_es::persist::{PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot};
-use futures_util::TryStreamExt;
+use cqrs_es::persist::{PersistenceError, SerializedEvent, SerializedSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{SqliteConnection, SqlitePool};
@@ -290,6 +289,25 @@ pub enum EngineError {
     Schema(#[from] ReconcileError),
 }
 
+impl From<sqlite_es::SqliteAggregateError> for EngineError {
+    fn from(error: sqlite_es::SqliteAggregateError) -> Self {
+        use sqlite_es::SqliteAggregateError::{
+            Connection, Deserialization, EmptySnapshotUpdate, OptimisticLock,
+            SnapshotBeyondCurrentVersion, TryFromInt,
+        };
+        match error {
+            OptimisticLock => Self::OptimisticLock,
+            Connection(source) => Self::Sql(source),
+            Deserialization(source) => Self::Json(source),
+            TryFromInt(source) => Self::Integer(source),
+            EmptySnapshotUpdate => Self::EmptySnapshotUpdate,
+            SnapshotBeyondCurrentVersion { proposed, current } => {
+                Self::SnapshotBeyondCurrentVersion { proposed, current }
+            }
+        }
+    }
+}
+
 /// An erased durable-job intent committed atomically with domain events.
 pub struct JobSeed(EnqueueRequest);
 
@@ -402,6 +420,10 @@ impl<'events> CommitRequest<'events> {
     /// Validates and serializes shared domain decisions before database-specific SQL.
     pub fn prepare(self) -> Result<PreparedCommit<'events>, EngineError> {
         self.validate_metadata()?;
+        self.prepare_trusted()
+    }
+
+    fn prepare_trusted(self) -> Result<PreparedCommit<'events>, EngineError> {
         self.validate_stream()?;
         let snapshot = self
             .snapshot
@@ -866,90 +888,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Replays matching events through a bounded feed without materializing the full result.
-    pub(crate) fn stream_events<Transform>(
-        &self,
-        aggregate_type: &'static str,
-        aggregate_id: Option<String>,
-        channel_size: usize,
-        transform: Transform,
-    ) -> ReplayStream
-    where
-        Transform: Fn(SerializedEvent) -> SerializedEvent + Send + 'static,
-    {
-        let (mut feed, stream) = ReplayStream::new(channel_size);
-        let pool = self.pool.clone();
-
-        tokio::spawn(async move {
-            let mut rows = aggregate_id.as_ref().map_or_else(
-                || {
-                    sqlx::query_as!(
-                        StoredEventRow,
-                        r#"
-                        SELECT aggregate_type,
-                               aggregate_id,
-                               sequence,
-                               event_type,
-                               event_version,
-                               payload AS "payload: String",
-                               metadata AS "metadata: String"
-                        FROM events
-                        WHERE aggregate_type = ?1
-                        ORDER BY sequence
-                        "#,
-                        aggregate_type,
-                    )
-                    .fetch(&pool)
-                },
-                |aggregate_id| {
-                    sqlx::query_as!(
-                        StoredEventRow,
-                        r#"
-                        SELECT aggregate_type,
-                               aggregate_id,
-                               sequence,
-                               event_type,
-                               event_version,
-                               payload AS "payload: String",
-                               metadata AS "metadata: String"
-                        FROM events
-                        WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                        ORDER BY sequence
-                        "#,
-                        aggregate_type,
-                        aggregate_id,
-                    )
-                    .fetch(&pool)
-                },
-            );
-
-            loop {
-                let row = match rows.try_next().await {
-                    Ok(Some(row)) => row,
-                    Ok(None) => return,
-                    Err(error) => {
-                        let error = EngineError::Sql(error);
-                        let _ = feed.push(Err(PersistenceError::from(error))).await;
-                        return;
-                    }
-                };
-                let event = match SerializedEvent::try_from(row) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        let _ = feed.push(Err(PersistenceError::from(error))).await;
-                        return;
-                    }
-                };
-
-                if feed.push(Ok(transform(event))).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        stream
-    }
-
     /// Atomically persists a validated event, snapshot, and durable-job batch.
     pub async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
         request.validate_metadata()?;
@@ -993,87 +931,8 @@ impl Engine {
     }
 
     async fn commit_serialized(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
-        request.validate_stream()?;
-        let CommitRequest {
-            stream,
-            expected_version,
-            events,
-            snapshot,
-            jobs,
-        } = request;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(expected) = expected_version {
-            let actual = committed_stream_version(&mut tx, &stream).await?;
-            validate_expected_version(expected, actual)?;
-        }
-
-        sqlite_es::insert_serialized_events_batch(&mut tx, "events", events).await?;
-
-        if let Some(snapshot) = snapshot {
-            let last_sequence = snapshot.sequence_for(events)?;
-            if load_snapshot_on(&mut tx, &stream)
-                .await?
-                .is_some_and(|stored| stored.current_sequence >= last_sequence)
-            {
-                return Err(EngineError::OptimisticLock);
-            }
-            let last_sequence = i64::try_from(last_sequence)?;
-            let snapshot_version = i64::try_from(snapshot.snapshot_version)?;
-            let aggregate = serde_json::to_string(&snapshot.aggregate)?;
-
-            sqlx::query!(
-                r#"
-                INSERT OR REPLACE INTO snapshots (
-                    aggregate_type,
-                    aggregate_id,
-                    last_sequence,
-                    snapshot_version,
-                    payload,
-                    timestamp
-                )
-                VALUES (
-                    ?1,
-                    ?2,
-                    ?3,
-                    ?4,
-                    ?5,
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                )
-                "#,
-                stream.aggregate_type,
-                stream.aggregate_id,
-                last_sequence,
-                snapshot_version,
-                aggregate,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        for request in jobs {
-            let event = crate::job::enqueued_event(&request)?;
-            sqlite_es::insert_serialized_events_batch(
-                &mut tx,
-                "events",
-                std::slice::from_ref(&event),
-            )
-            .await?;
-
-            let payload = crate::job::pending_seed_payload(&request)?;
-            let job_id = request.job_id.to_string();
-            sqlx::query!(
-                r#"
-                INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
-                VALUES (?1, 1, ?2, NULL)
-                "#,
-                job_id,
-                payload,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
+        let commit = request.prepare_trusted()?;
+        sqlite_es::commit_atomic(&self.pool, commit.into()).await?;
         Ok(())
     }
 }
@@ -1423,18 +1282,6 @@ impl From<EngineError> for PersistenceError {
             Integer(source) => Self::UnknownError(Box::new(source)),
             JobFlush(source) => Self::UnknownError(Box::new(source)),
             Schema(source) => Self::UnknownError(Box::new(source)),
-        }
-    }
-}
-
-impl From<sqlite_es::SqliteAggregateError> for EngineError {
-    fn from(error: sqlite_es::SqliteAggregateError) -> Self {
-        match error {
-            sqlite_es::SqliteAggregateError::OptimisticLock => Self::OptimisticLock,
-            sqlite_es::SqliteAggregateError::Connection(source) => Self::Sql(source),
-            sqlite_es::SqliteAggregateError::Deserialization(source) => Self::Json(source),
-            sqlite_es::SqliteAggregateError::TryFromInt(source) => Self::Integer(source),
-            sqlite_es::SqliteAggregateError::EmptySnapshotUpdate => Self::EmptySnapshotUpdate,
         }
     }
 }
