@@ -41,7 +41,7 @@ IDs.
 ## CQRS dependency for external backends
 
 This revision uses a maintained `cqrs-es` fork for explicit snapshot
-checkpoints, pinned to `d61e05290bc7b24af1f615bc828a74ae6fc22f25`. Cargo treats
+checkpoints, pinned to `c65e492ec7af67b9e9f996d7491cfbec3664562b`. Cargo treats
 registry and Git packages as different identities even when both have version
 `0.5.0`. Mixing them gives different `PersistedEventRepository` traits and
 `SerializedEvent` types at the `EventBackend` boundary.
@@ -54,7 +54,7 @@ graph in its **root** `Cargo.toml`:
 cqrs-es = "=0.5.0"
 
 [patch.crates-io]
-cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "d61e05290bc7b24af1f615bc828a74ae6fc22f25" }
+cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "c65e492ec7af67b9e9f996d7491cfbec3664562b" }
 ```
 
 A patch inside a dependency's manifest is ignored by the consuming application.
