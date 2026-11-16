@@ -178,7 +178,10 @@ pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
 #[doc(hidden)]
 pub mod __worker {
     pub use apalis_core::monitor::Monitor;
+    pub use apalis_core::task::data::Data;
     pub use apalis_core::worker::builder::WorkerBuilder;
+
+    pub use crate::job_backend::JobInput;
 }
 
 /// Whether old events may be deleted after they are captured in a snapshot.

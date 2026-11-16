@@ -10,7 +10,7 @@
 //! Deployment is single-process, multiple in-process workers, one database.
 
 use std::convert::Infallible;
-use std::future::{Future, poll_fn};
+use std::future::{Future, ready};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -587,11 +587,23 @@ pub async fn run_job<J: StandaloneJob>(
 
 /// Extracts the claim-time [`JobContext`] into the task handler, so `perform`
 /// receives the job's durable identity alongside its input.
-impl<Args: Sync> FromRequest<Task<Args>> for JobContext {
+impl<Args> FromRequest<Task<Args>> for JobContext {
     type Error = MissingDataError;
 
     fn from_request(task: &Task<Args>) -> impl Future<Output = Result<Self, Self::Error>> + Send {
-        poll_fn(move |_| Poll::Ready(task.data().get_checked::<Self>().cloned()))
+        ready(task.data().get_checked::<Self>().cloned())
+    }
+}
+
+/// Owned dependency extraction without requiring the task's job to be `Sync`.
+#[doc(hidden)]
+pub struct JobInput<Input>(pub Arc<Input>);
+
+impl<Args, Input: Send + Sync + 'static> FromRequest<Task<Args>> for JobInput<Input> {
+    type Error = MissingDataError;
+
+    fn from_request(task: &Task<Args>) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(task.data().get_checked::<Arc<Input>>().cloned().map(Self))
     }
 }
 
@@ -1229,7 +1241,11 @@ macro_rules! build_supervised_worker {
                     $crate::__worker::WorkerBuilder::new(name)
                         .backend(backend)
                         .data(::std::clone::Clone::clone(&input))
-                        .build($crate::run_job::<$job>)
+                        .build(|job, context, input: $crate::__worker::JobInput<
+                            <$job as $crate::StandaloneJob>::Input,
+                        >| {
+                            $crate::run_job(job, context, $crate::__worker::Data::new(input.0))
+                        })
                 })
             };
         )+
@@ -1242,7 +1258,8 @@ mod tests {
     use apalis_core::worker::event::Event;
     use serde::{Deserialize, Serialize};
     use sqlx::SqlitePool;
-    use std::future::ready;
+    use std::cell::Cell;
+    use std::future::{poll_fn, ready};
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
@@ -1285,7 +1302,7 @@ mod tests {
 
     #[derive(Serialize, Deserialize)]
     struct WorkerProbe {
-        value: u32,
+        value: Cell<u32>,
     }
 
     impl StandaloneJob for WorkerProbe {
@@ -1306,8 +1323,9 @@ mod tests {
             context: &JobContext,
             input: &Self::Input,
         ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<Infallible>>> + Send {
+            let value = self.value.get();
             poll_fn(move |_| {
-                input.send((context.job_id(), self.value)).unwrap();
+                input.send((context.job_id(), value)).unwrap();
                 Poll::Ready(Ok(JobOutcome::Done(())))
             })
         }
@@ -2164,7 +2182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_worker_runs_the_handler_and_durably_acknowledges_success() {
+    async fn native_worker_runs_a_send_only_job_and_durably_acknowledges_success() {
         let pool = create_test_pool().await.unwrap();
         let runtime = JobRuntime::build(pool.clone()).await.unwrap();
         let job_id = JobId::new();
@@ -2353,6 +2371,28 @@ mod tests {
                 if name == std::any::type_name::<JobContext>()
         ));
         assert!(!invoked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn send_only_worker_extractors_preserve_missing_data_errors() {
+        let task = Task::new(WorkerProbe {
+            value: Cell::new(1),
+        });
+        let Err(context_error) = JobContext::from_request(&task).await else {
+            panic!("missing claim context must be rejected");
+        };
+        assert_eq!(
+            context_error,
+            MissingDataError::NotFound(std::any::type_name::<JobContext>().to_string())
+        );
+
+        let Err(input_error) = JobInput::<()>::from_request(&task).await else {
+            panic!("missing worker input must be rejected");
+        };
+        assert_eq!(
+            input_error,
+            MissingDataError::NotFound(std::any::type_name::<Arc<()>>().to_string())
+        );
     }
 
     #[tokio::test]
