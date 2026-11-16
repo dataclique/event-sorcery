@@ -184,6 +184,6 @@ mod tests {
             0,
             "low-stock alerts should only fire on Initialized at/below threshold"
         );
-        assert!(recorder.messages().await.is_empty());
+        assert_eq!(recorder.messages().await, Vec::<String>::new());
     }
 }

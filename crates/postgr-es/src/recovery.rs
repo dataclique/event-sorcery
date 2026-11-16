@@ -6,6 +6,7 @@ use cqrs_es::persist::{
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
+use std::future::{Future, ready};
 use std::marker::PhantomData;
 use tokio::sync::Mutex;
 
@@ -151,13 +152,13 @@ impl PersistedEventRepository for RegistryRepository<'_> {
             .await
     }
 
-    async fn get_snapshot<AggregateType: Aggregate>(
+    fn get_snapshot<AggregateType: Aggregate>(
         &self,
         _aggregate_id: &str,
-    ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
-        Err(PersistenceError::UnknownError(Box::new(
+    ) -> impl Future<Output = Result<Option<SerializedSnapshot>, PersistenceError>> + Send {
+        ready(Err(PersistenceError::UnknownError(Box::new(
             RegistryStorageModeError::Snapshot,
-        )))
+        ))))
     }
 
     async fn persist<AggregateType: Aggregate>(
@@ -207,21 +208,21 @@ impl PersistedEventRepository for RegistryRepository<'_> {
         Ok(())
     }
 
-    async fn stream_events<AggregateType: Aggregate>(
+    fn stream_events<AggregateType: Aggregate>(
         &self,
         _aggregate_id: &str,
-    ) -> Result<ReplayStream, PersistenceError> {
-        Err(PersistenceError::UnknownError(Box::new(
+    ) -> impl Future<Output = Result<ReplayStream, PersistenceError>> + Send {
+        ready(Err(PersistenceError::UnknownError(Box::new(
             RegistryStorageModeError::Streaming,
-        )))
+        ))))
     }
 
-    async fn stream_all_events<AggregateType: Aggregate>(
+    fn stream_all_events<AggregateType: Aggregate>(
         &self,
-    ) -> Result<ReplayStream, PersistenceError> {
-        Err(PersistenceError::UnknownError(Box::new(
+    ) -> impl Future<Output = Result<ReplayStream, PersistenceError>> + Send {
+        ready(Err(PersistenceError::UnknownError(Box::new(
             RegistryStorageModeError::Streaming,
-        )))
+        ))))
     }
 }
 

@@ -874,6 +874,8 @@ macro_rules! jobs {
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
+    use std::future::{Future, poll_fn, ready};
+    use std::task::Poll;
 
     use crate::job::take_pending;
     use crate::{CompactionPolicy, Effect, Nil};
@@ -1000,20 +1002,22 @@ mod tests {
             self.origin
         }
 
-        async fn submit(
+        fn submit(
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<JobOutcome<String>, JobFailure<OrderRejected>> {
-            Ok(JobOutcome::Done("filled".to_string()))
+        ) -> impl Future<Output = Result<JobOutcome<String>, JobFailure<OrderRejected>>> + Send
+        {
+            ready(Ok(JobOutcome::Done("filled".to_string())))
         }
 
-        async fn reconcile(
+        fn reconcile(
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<Reconciliation<String>, JobFailure<OrderRejected>> {
-            Ok(Reconciliation::Settled("filled".to_string()))
+        ) -> impl Future<Output = Result<Reconciliation<String>, JobFailure<OrderRejected>>> + Send
+        {
+            ready(Ok(Reconciliation::Settled("filled".to_string())))
         }
     }
 
@@ -1232,36 +1236,42 @@ mod tests {
             1
         }
 
-        async fn submit(
+        fn submit(
             &self,
             _ctx: &JobContext,
             input: &Self::Input,
-        ) -> Result<JobOutcome<String>, JobFailure<OrderRejected>> {
-            input.lock().unwrap().push("submit");
-            match self.submit {
-                ProbeSubmit::Succeed => Ok(JobOutcome::Done("submitted".to_string())),
-                ProbeSubmit::RejectTerminal => Err(JobFailure::Terminal(OrderRejected {
-                    reason: "no funds".to_string(),
-                })),
-                ProbeSubmit::FailTransient => Err(JobFailure::Transient(OrderRejected {
-                    reason: "timeout".to_string(),
-                })),
-            }
+        ) -> impl Future<Output = Result<JobOutcome<String>, JobFailure<OrderRejected>>> + Send
+        {
+            poll_fn(move |_| {
+                input.lock().unwrap().push("submit");
+                Poll::Ready(match self.submit {
+                    ProbeSubmit::Succeed => Ok(JobOutcome::Done("submitted".to_string())),
+                    ProbeSubmit::RejectTerminal => Err(JobFailure::Terminal(OrderRejected {
+                        reason: "no funds".to_string(),
+                    })),
+                    ProbeSubmit::FailTransient => Err(JobFailure::Transient(OrderRejected {
+                        reason: "timeout".to_string(),
+                    })),
+                })
+            })
         }
 
-        async fn reconcile(
+        fn reconcile(
             &self,
             _ctx: &JobContext,
             input: &Self::Input,
-        ) -> Result<Reconciliation<String>, JobFailure<OrderRejected>> {
-            input.lock().unwrap().push("reconcile");
-            match self.verdict {
-                ProbeVerdict::Settled => Ok(Reconciliation::Settled("reconciled".to_string())),
-                ProbeVerdict::NotSubmitted => Ok(Reconciliation::NotSubmitted),
-                ProbeVerdict::Indeterminate => {
-                    Ok(Reconciliation::Indeterminate(Duration::from_mins(1)))
-                }
-            }
+        ) -> impl Future<Output = Result<Reconciliation<String>, JobFailure<OrderRejected>>> + Send
+        {
+            poll_fn(move |_| {
+                input.lock().unwrap().push("reconcile");
+                Poll::Ready(match self.verdict {
+                    ProbeVerdict::Settled => Ok(Reconciliation::Settled("reconciled".to_string())),
+                    ProbeVerdict::NotSubmitted => Ok(Reconciliation::NotSubmitted),
+                    ProbeVerdict::Indeterminate => {
+                        Ok(Reconciliation::Indeterminate(Duration::from_mins(1)))
+                    }
+                })
+            })
         }
     }
 

@@ -3611,7 +3611,7 @@ mod tests {
         assert_eq!(*second_cursor, (MAX_LIST_ITEMS + 1) as u64);
 
         let ended = load_page(&mut store, "list-limit-test", "one", Some(*second_cursor));
-        assert!(ended.is_empty());
+        assert_eq!(ended.len(), 0, "{ended:?}");
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
     }
 

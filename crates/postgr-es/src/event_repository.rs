@@ -519,13 +519,11 @@ mod tests {
                 matches!(result, Err(PersistenceError::OptimisticLockError)),
                 "{result:?}"
             );
-            assert!(
-                repository
-                    .get_events::<RecordedValues>("version-guard")
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+            let events = repository
+                .get_events::<RecordedValues>("version-guard")
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 0, "{events:?}");
         }
 
         event.sequence = 1;
@@ -1362,14 +1360,12 @@ mod tests {
         assert_eq!(source.table(), Some("job_queue_projection"));
         assert_eq!(source.constraint(), Some("one_job_per_kind"));
         let mut transaction = pool.begin().await.unwrap();
-        assert!(
-            repository
-                .official()
-                .get_serialized_events_in(&mut transaction, "job", &rejected.to_string())
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let rejected_events = repository
+            .official()
+            .get_serialized_events_in(&mut transaction, "job", &rejected.to_string())
+            .await
+            .unwrap();
+        assert_eq!(rejected_events.len(), 0, "{rejected_events:?}");
         assert_eq!(
             repository
                 .official()
