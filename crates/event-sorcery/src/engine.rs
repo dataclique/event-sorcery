@@ -1817,16 +1817,15 @@ mod tests {
 
     #[tokio::test]
     async fn retained_schema_change_preserves_snapshots_with_incomplete_history() {
-        for removed_through in [1, 2] {
+        for (policy, removed_through) in [
+            (CompactionPolicy::RetainLast { events: 1 }, 1),
+            (CompactionPolicy::CompactAfterSnapshot, 2),
+        ] {
             for registered in [false, true] {
                 let pool = create_test_pool().await.unwrap();
                 let engine = Engine::new(pool.clone());
                 let stream = StreamIdentity::new("engine-retention-transition", "one");
-                let original = SchemaTarget::new(
-                    "engine-retention-transition",
-                    1,
-                    CompactionPolicy::RetainLast { events: 1 },
-                );
+                let original = SchemaTarget::new("engine-retention-transition", 1, policy);
                 if registered {
                     engine.record_schema(&original).await.unwrap();
                 }

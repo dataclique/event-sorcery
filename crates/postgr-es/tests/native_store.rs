@@ -50,7 +50,7 @@ impl<const VERSION: u64, const COMPACT: bool> EventSourced for Note<VERSION, COM
     const SCHEMA_VERSION: u64 = VERSION;
     const SNAPSHOT_SIZE: usize = 2;
     const COMPACTION_POLICY: CompactionPolicy = if COMPACT {
-        CompactionPolicy::CompactAfterSnapshot
+        CompactionPolicy::RetainLast { events: 1 }
     } else {
         CompactionPolicy::Retain
     };
