@@ -22,7 +22,7 @@ tokio = { version = "1.52.3", features = ["rt", "sync"] }
 event-sorcery.workspace = true
 sqlite-es.workspace = true
 futures-util = "0.3.32"
-postgres-es = { git = "https://github.com/0xgleb/cqrs", rev = "fb85293abb44675679f48e261949574bfb532af8", version = "0.5.0" }
+postgres-es = { git = "https://github.com/0xgleb/cqrs", rev = "92672b23c4ad9b91458281933290cd9cfccfe8cf", version = "0.5.0" }
 
 [features]
 integration-tests = []

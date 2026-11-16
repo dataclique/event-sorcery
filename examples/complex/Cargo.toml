@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 async-trait = "0.1.89"
-cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "fb85293abb44675679f48e261949574bfb532af8", version = "0.5.0" }
+cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "92672b23c4ad9b91458281933290cd9cfccfe8cf", version = "0.5.0" }
 event-sorcery = { path = "../../crates/event-sorcery", features = [
   "test-support",
 ] }

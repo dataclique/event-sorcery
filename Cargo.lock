@@ -401,7 +401,7 @@ dependencies = [
 [[package]]
 name = "cqrs-es"
 version = "0.5.0"
-source = "git+https://github.com/0xgleb/cqrs?rev=fb85293abb44675679f48e261949574bfb532af8#fb85293abb44675679f48e261949574bfb532af8"
+source = "git+https://github.com/0xgleb/cqrs?rev=92672b23c4ad9b91458281933290cd9cfccfe8cf#92672b23c4ad9b91458281933290cd9cfccfe8cf"
 dependencies = [
  "async-trait",
  "serde",
@@ -1321,7 +1321,7 @@ dependencies = [
 [[package]]
 name = "postgres-es"
 version = "0.5.0"
-source = "git+https://github.com/0xgleb/cqrs?rev=fb85293abb44675679f48e261949574bfb532af8#fb85293abb44675679f48e261949574bfb532af8"
+source = "git+https://github.com/0xgleb/cqrs?rev=92672b23c4ad9b91458281933290cd9cfccfe8cf#92672b23c4ad9b91458281933290cd9cfccfe8cf"
 dependencies = [
  "cqrs-es",
  "futures",

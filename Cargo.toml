@@ -42,7 +42,7 @@ apalis-core = "=1.0.0"
 async-trait = "0.1.89"
 cbindgen = "=0.29.2"
 ciborium = "0.2.2"
-cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "fb85293abb44675679f48e261949574bfb532af8", version = "0.5.0" }
+cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "92672b23c4ad9b91458281933290cd9cfccfe8cf", version = "0.5.0" }
 event-sorcery = { path = "crates/event-sorcery" }
 getrandom = "0.3.4"
 serde = { version = "1.0.228", features = ["derive"] }
