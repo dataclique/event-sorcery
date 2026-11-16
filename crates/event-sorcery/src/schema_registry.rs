@@ -32,7 +32,7 @@ use tracing::{debug, info};
 
 use crate::CompactionPolicy;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::{DomainEvent, Effect, EventSourced, Nil, uneventful};
+use crate::{DomainEvent, Effect, EventSourced, Nil, StreamIdentity, uneventful};
 
 /// Singleton aggregate ID for the schema registry.
 pub(crate) const REGISTRY_ID: &str = "schema";
@@ -265,15 +265,30 @@ impl Reconciler {
             return Ok(reconciliation);
         }
 
-        sqlx::query!(
-            r#"
-            DELETE FROM snapshots
-            WHERE aggregate_type = ?1
-            "#,
-            target.aggregate_type,
+        let mut transaction = self.pool.begin().await?;
+        let histories: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT s.aggregate_id, s.last_sequence, \
+             (SELECT COUNT(*) FROM events e \
+              WHERE e.aggregate_type = s.aggregate_type \
+                AND e.aggregate_id = s.aggregate_id \
+                AND e.sequence BETWEEN 1 AND s.last_sequence) \
+             FROM snapshots s WHERE s.aggregate_type = ?1",
         )
-        .execute(&self.pool)
+        .bind(&target.aggregate_type)
+        .fetch_all(&mut *transaction)
         .await?;
+        for (aggregate_id, covered_sequence, retained_events) in histories {
+            validate_snapshot_history(
+                StreamIdentity::new(&target.aggregate_type, aggregate_id),
+                covered_sequence,
+                retained_events,
+            )?;
+        }
+        sqlx::query("DELETE FROM snapshots WHERE aggregate_type = ?1")
+            .bind(&target.aggregate_type)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
 
         info!(
             target: "cqrs",
@@ -357,9 +372,39 @@ impl Reconciler {
     }
 }
 
+/// Proves that every positive sequence covered by a snapshot remains available.
+///
+/// Counts must include only this stream and sequences in `1..=covered_sequence`.
+/// Sparse or compacted histories without this proof require an explicit migration.
+pub fn validate_snapshot_history(
+    stream: StreamIdentity,
+    covered_sequence: i64,
+    retained_events: i64,
+) -> Result<(), ReconcileError> {
+    if covered_sequence <= 0 || retained_events != covered_sequence {
+        return Err(ReconcileError::UnprovenSnapshotHistory {
+            stream,
+            covered_sequence,
+            retained_events,
+        });
+    }
+    Ok(())
+}
+
 /// Errors from schema reconciliation during startup.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
+    /// Snapshot clearing requires proof that its entire covered history is retained.
+    #[error(
+        "Cannot clear snapshot for {stream:?}: covered sequence {covered_sequence}, \
+         retained covered events {retained_events}; complete history is unproven. \
+         An explicit snapshot-preserving migration is required."
+    )]
+    UnprovenSnapshotHistory {
+        stream: StreamIdentity,
+        covered_sequence: i64,
+        retained_events: i64,
+    },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]

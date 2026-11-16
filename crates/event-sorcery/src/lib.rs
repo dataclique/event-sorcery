@@ -158,6 +158,7 @@ pub use reactor::{
 };
 pub use schema_registry::{
     ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry, SchemaTarget,
+    validate_snapshot_history,
 };
 pub use sqlite_event_repository::SqliteEventRepository;
 #[cfg(any(test, feature = "test-support"))]

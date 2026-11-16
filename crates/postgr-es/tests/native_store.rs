@@ -18,7 +18,7 @@ use event_sorcery::{
 use postgr_es::{MIGRATOR, PostgresBackend};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Note<const VERSION: u64> {
+struct Note<const VERSION: u64, const COMPACT: bool = false> {
     text: String,
 }
 
@@ -38,7 +38,7 @@ impl DomainEvent for NoteEvent {
 }
 
 #[async_trait]
-impl<const VERSION: u64> EventSourced for Note<VERSION> {
+impl<const VERSION: u64, const COMPACT: bool> EventSourced for Note<VERSION, COMPACT> {
     type Id = String;
     type Command = String;
     type Event = NoteEvent;
@@ -49,7 +49,11 @@ impl<const VERSION: u64> EventSourced for Note<VERSION> {
     const AGGREGATE_TYPE: &'static str = "NativeNote";
     const SCHEMA_VERSION: u64 = VERSION;
     const SNAPSHOT_SIZE: usize = 2;
-    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
+    const COMPACTION_POLICY: CompactionPolicy = if COMPACT {
+        CompactionPolicy::CompactAfterSnapshot
+    } else {
+        CompactionPolicy::Retain
+    };
     const PROJECTION: Nil = Nil;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -147,6 +151,73 @@ async fn unprojected_builder_restarts_and_reconciles_with_one_connection(pool: P
         recorded,
         json!({"VersionUpdated": {"name": "NativeNote", "version": 2}})
     );
+}
+
+#[sqlx::test(migrations = false)]
+async fn retained_startup_refuses_a_snapshot_with_missing_covered_history(pool: PgPool) {
+    MIGRATOR.run(&pool).await.unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let backend = PostgresBackend { pool: pool.clone() };
+    let store = StoreBuilder::<Note<1, true>, PostgresBackend>::with_backend(backend.clone())
+        .build()
+        .await
+        .unwrap();
+    let id = "compacted-note".to_string();
+    store.send(&id, "first".to_string()).await.unwrap();
+    store.send(&id, "second".to_string()).await.unwrap();
+    drop(store);
+    let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
+                        WHERE aggregate_type = 'NativeNote' AND aggregate_id = 'compacted-note'";
+    let before: (i64, i64, serde_json::Value) =
+        sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+    assert_eq!((before.0, before.1), (2, 1));
+    sqlx::query("DELETE FROM events WHERE aggregate_type = 'NativeNote' AND sequence = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        StoreBuilder::<Note<2>, PostgresBackend>::with_backend(backend).build(),
+    )
+    .await
+    .expect("history validation must use the startup transaction's connection");
+    let Err(error) = result else {
+        panic!("incomplete history must not allow retained-schema startup");
+    };
+    assert!(matches!(
+        error,
+        ReconcileError::UnprovenSnapshotHistory {
+            covered_sequence: 2,
+            retained_events: 1,
+            ..
+        }
+    ));
+    let after: (i64, i64, serde_json::Value) =
+        sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+    assert_eq!(after, before);
+    let registered: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM events WHERE aggregate_type = 'SchemaRegistry' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        registered,
+        json!({"VersionUpdated": {"name": "NativeNote", "version": 1}})
+    );
+    let remaining: Vec<i64> = sqlx::query_scalar(
+        "SELECT sequence FROM events WHERE aggregate_type = 'NativeNote' ORDER BY sequence",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, [2]);
 }
 
 #[sqlx::test(migrations = false)]

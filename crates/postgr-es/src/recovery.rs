@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use event_sorcery::{
     CommitRequest, EngineError, EventSourced, ReconcileError, SCHEMA_REGISTRY_ID,
     SchemaReconciliation, SchemaRegistry, StreamIdentity, reconcile_schema, register_schema,
-    validate_expected_version,
+    validate_expected_version, validate_snapshot_history,
 };
 
 use crate::PostgresEventRepository;
@@ -54,6 +54,24 @@ impl<Entity: EventSourced> PostgresRecovery<Entity> {
         let reconciliation = reconcile_schema::<Entity>(payloads)?;
 
         if reconciliation.clears_snapshots(Entity::COMPACTION_POLICY) {
+            let histories: Vec<(String, i64, i64)> = sqlx::query_as(
+                "SELECT s.aggregate_id, s.last_sequence, \
+                 (SELECT COUNT(*) FROM events e \
+                  WHERE e.aggregate_type = s.aggregate_type \
+                    AND e.aggregate_id = s.aggregate_id \
+                    AND e.sequence BETWEEN 1 AND s.last_sequence) \
+                 FROM snapshots s WHERE s.aggregate_type = $1",
+            )
+            .bind(Entity::AGGREGATE_TYPE)
+            .fetch_all(&mut *transaction)
+            .await?;
+            for (aggregate_id, covered_sequence, retained_events) in histories {
+                validate_snapshot_history(
+                    StreamIdentity::new(Entity::AGGREGATE_TYPE, aggregate_id),
+                    covered_sequence,
+                    retained_events,
+                )?;
+            }
             sqlx::query("DELETE FROM snapshots WHERE aggregate_type = $1")
                 .bind(Entity::AGGREGATE_TYPE)
                 .execute(&mut *transaction)

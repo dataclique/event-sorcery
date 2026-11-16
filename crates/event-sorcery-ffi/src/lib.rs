@@ -1769,6 +1769,9 @@ impl From<EngineError> for AbiError {
             EngineError::Schema(ReconcileError::CompactedSnapshotClear { .. }) => {
                 Self::State("compacted snapshot retention cannot be cleared")
             }
+            EngineError::Schema(ReconcileError::UnprovenSnapshotHistory { .. }) => {
+                Self::State("snapshot history cannot be proven complete")
+            }
             other => Self::Engine(other),
         }
     }
@@ -4955,6 +4958,18 @@ mod tests {
         );
         assert_eq!(reconciliation, 1);
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn unproven_snapshot_history_is_a_nonretryable_state_error() {
+        let error = AbiError::from(EngineError::Schema(
+            ReconcileError::UnprovenSnapshotHistory {
+                stream: StreamIdentity::new("ffi-schema", "one"),
+                covered_sequence: 2,
+                retained_events: 1,
+            },
+        ));
+        assert_eq!(error.code(), ES_ERR_STATE);
     }
 
     #[test]

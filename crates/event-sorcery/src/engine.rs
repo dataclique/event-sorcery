@@ -1816,6 +1816,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_schema_change_preserves_snapshots_with_incomplete_history() {
+        for removed_through in [1, 2] {
+            for registered in [false, true] {
+                let pool = create_test_pool().await.unwrap();
+                let engine = Engine::new(pool.clone());
+                let stream = StreamIdentity::new("engine-retention-transition", "one");
+                let original = SchemaTarget::new(
+                    "engine-retention-transition",
+                    1,
+                    CompactionPolicy::RetainLast { events: 1 },
+                );
+                if registered {
+                    engine.record_schema(&original).await.unwrap();
+                }
+                let events = [serialized_event(&stream, 1), serialized_event(&stream, 2)];
+                engine
+                    .commit(
+                        CommitRequest::new(stream.clone(), &events)
+                            .with_snapshot(SnapshotUpdate::new(serde_json::json!({"value": 42}), 1))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let preserved = engine.load_snapshot(&stream).await.unwrap().unwrap();
+                sqlx::query("DELETE FROM events WHERE aggregate_type = ?1 AND sequence <= ?2")
+                    .bind("engine-retention-transition")
+                    .bind(removed_through)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let remaining = engine.load_events(&stream, None).await.unwrap();
+                let changed =
+                    SchemaTarget::new("engine-retention-transition", 2, CompactionPolicy::Retain);
+
+                let error = engine.reconcile_schema(&changed).await.unwrap_err();
+                assert!(matches!(
+                    error,
+                    EngineError::Schema(ReconcileError::UnprovenSnapshotHistory {
+                        stream: rejected,
+                        covered_sequence: 2,
+                        retained_events,
+                    }) if rejected == stream && retained_events == 2 - removed_through
+                ));
+                assert_eq!(
+                    engine.load_snapshot(&stream).await.unwrap(),
+                    Some(preserved)
+                );
+                assert_eq!(engine.load_events(&stream, None).await.unwrap(), remaining);
+                assert_eq!(
+                    engine.reconcile_schema(&original).await.unwrap(),
+                    if registered {
+                        SchemaReconciliation::Unchanged
+                    } else {
+                        SchemaReconciliation::Changed
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn schema_version_change_preserves_compacted_snapshots_by_refusing_recovery() {
         let engine = Engine::new(create_test_pool().await.unwrap());
         let stream = StreamIdentity::new("engine-schema-compact", "one");
