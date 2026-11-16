@@ -10,6 +10,7 @@
 //! Deployment is single-process, multiple in-process workers, one database.
 
 use std::convert::Infallible;
+use std::future::{Future, poll_fn};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -589,8 +590,8 @@ pub async fn run_job<J: StandaloneJob>(
 impl<Args: Sync> FromRequest<Task<Args>> for JobContext {
     type Error = MissingDataError;
 
-    async fn from_request(task: &Task<Args>) -> Result<Self, Self::Error> {
-        task.data().get_checked::<Self>().cloned()
+    fn from_request(task: &Task<Args>) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        poll_fn(move |_| Poll::Ready(task.data().get_checked::<Self>().cloned()))
     }
 }
 
@@ -1241,6 +1242,7 @@ mod tests {
     use apalis_core::worker::event::Event;
     use serde::{Deserialize, Serialize};
     use sqlx::SqlitePool;
+    use std::future::ready;
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
@@ -1271,12 +1273,13 @@ mod tests {
             Label::new(format!("test:{}", self.n))
         }
 
-        async fn perform(
+        fn perform(
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<JobOutcome<()>, JobFailure<std::convert::Infallible>> {
-            Ok(JobOutcome::Done(()))
+        ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<std::convert::Infallible>>> + Send
+        {
+            ready(Ok(JobOutcome::Done(())))
         }
     }
 
@@ -1298,13 +1301,15 @@ mod tests {
             Label::new("worker-probe")
         }
 
-        async fn perform(
+        fn perform(
             &self,
             context: &JobContext,
             input: &Self::Input,
-        ) -> Result<JobOutcome<()>, JobFailure<Infallible>> {
-            input.send((context.job_id(), self.value)).unwrap();
-            Ok(JobOutcome::Done(()))
+        ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<Infallible>>> + Send {
+            poll_fn(move |_| {
+                input.send((context.job_id(), self.value)).unwrap();
+                Poll::Ready(Ok(JobOutcome::Done(())))
+            })
         }
     }
 
@@ -1474,13 +1479,13 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, JobRuntimeError::InvalidInstant(i64::MAX)));
-        assert!(event_types(&pool, &job_id).await.is_empty());
-        assert!(
+        assert_eq!(event_types(&pool, &job_id).await, Vec::<String>::new());
+        assert_eq!(
             runtime
                 .poll_jobs(TestJob::KIND, i64::MAX, 10)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            Vec::<String>::new()
         );
     }
 
@@ -1682,12 +1687,13 @@ mod tests {
             Label::new("fallible")
         }
 
-        async fn perform(
+        fn perform(
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<JobOutcome<()>, JobFailure<TestPerformError>> {
-            Err(JobFailure::Terminal(TestPerformError))
+        ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<TestPerformError>>> + Send
+        {
+            ready(Err(JobFailure::Terminal(TestPerformError)))
         }
     }
 
@@ -1976,7 +1982,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(found.is_empty());
+        assert_eq!(found, Vec::<String>::new());
     }
 
     #[tokio::test]
