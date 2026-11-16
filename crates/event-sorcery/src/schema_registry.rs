@@ -97,20 +97,14 @@ impl SchemaRegistry {
     }
 
     pub(crate) fn from_payloads(payloads: Vec<String>) -> Result<Option<Self>, ReconcileError> {
-        let mut state: Option<Self> = None;
-
-        for payload in payloads {
+        payloads.into_iter().try_fold(None, |state, payload| {
             let event: SchemaRegistryEvent = serde_json::from_str(&payload)?;
-            state = match state {
+            let next = match state {
                 None => Self::originate(&event),
-                Some(current) => {
-                    let evolved = Self::evolve(&current, &event)?;
-                    Some(evolved.unwrap_or(current))
-                }
+                Some(current) => Some(Self::evolve(&current, &event)?.unwrap_or(current)),
             };
-        }
-
-        Ok(state)
+            Ok(next)
+        })
     }
 }
 
