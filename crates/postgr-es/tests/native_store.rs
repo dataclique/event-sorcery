@@ -256,6 +256,13 @@ async fn backend_bootstrap_preserves_an_unavailable_pool_error() {
 
 #[sqlx::test(migrations = false)]
 async fn bootstrap_failure_rolls_back_and_can_be_retried(pool: PgPool) {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
     sqlx::query("CREATE TABLE snapshots (marker TEXT NOT NULL)")
         .execute(&pool)
         .await
