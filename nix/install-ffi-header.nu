@@ -3,10 +3,14 @@ def main [build_log: path, package_id: string, output: path] {
     let directories = (
         open --raw $build_log
         | lines
-        | each { from json }
-        | where reason? == 'build-script-executed'
-        | where package_id? == $package_id
-        | get out_dir
+        | each { |line|
+            let message = (try { $line | from json } catch { null })
+            match $message {
+                {reason: 'build-script-executed', package_id: $identity, out_dir: $directory}
+                    if $identity == $package_id => $directory
+                _ => null
+            }
+        }
         | uniq
     )
     let count = ($directories | length)
