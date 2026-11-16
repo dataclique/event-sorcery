@@ -493,9 +493,13 @@ explicitly.
 
 Bump `SCHEMA_VERSION` when the entity's state, event, or projection schema
 changes. On startup, the wiring infrastructure (via `StoreBuilder::build()`)
-detects version mismatches and clears stale snapshots for `Retain` entities. For
-current policies that may delete history, it refuses a recorded schema version
-change instead; those entities require snapshot-aware migration.
+detects version mismatches and clears stale snapshots for `Retain` entities only
+when every positive sequence through each snapshot's covered boundary is
+present. Missing or sparse covered history returns `UnprovenSnapshotHistory`
+without clearing snapshots or advancing the registry. Such streams require an
+explicit snapshot-preserving migration; switching to `Retain` does not restore
+previously compacted events. Current policies that may delete history also
+refuse recorded schema version changes.
 
 ### Adding Optional Fields to Events
 
@@ -711,9 +715,11 @@ as a replay starting point so hot aggregates do not reload their full event
 history on every command.
 
 For `Retain` entities, bump `SCHEMA_VERSION` after changing aggregate struct
-layout so startup clears stale snapshots through the schema reconciler. Manual
-snapshot deletion is safe only for retained event streams where the full event
-history remains available for replay.
+layout so startup validates covered history before clearing stale snapshots
+through the schema reconciler. The validation and deletion share a database
+transaction. An unproven history leaves snapshots intact and requires explicit
+migration. Manual snapshot deletion is safe only where the full event history
+remains available for replay, regardless of the current retention policy.
 
 ```sql
 -- Retained streams only: reset snapshots when full event replay is available.
