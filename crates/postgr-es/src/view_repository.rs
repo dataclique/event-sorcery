@@ -2,7 +2,8 @@
 
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use cqrs_es::{Aggregate, View};
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::postgres::PgArguments;
+use sqlx::{Arguments, AssertSqlSafe, PgPool, Postgres, QueryBuilder};
 use std::fmt::{self, Display};
 
 use sqlite_es::{Cmp, IndexedView, Order, Predicate, Value};
@@ -68,6 +69,12 @@ pub enum ProjectionVersionError {
 /// Invalid indexed-query inputs rejected before executing SQL.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectionQueryError {
+    /// The PostgreSQL driver could not encode a query argument.
+    #[error("indexed projection argument encoding failed")]
+    Encoding(#[source] sqlx::error::BoxDynError),
+    /// The driver could not format its own placeholder.
+    #[error("indexed projection placeholder formatting failed")]
+    Placeholder(#[from] fmt::Error),
     /// A row limit must not be negative.
     #[error("indexed projection query limit cannot be negative: {0}")]
     NegativeLimit(i64),
@@ -166,72 +173,85 @@ where
             return Ok(vec![]);
         }
 
-        let (where_clause, bindings) = predicate_sql(predicate)
+        let mut query =
+            QueryBuilder::<Postgres>::new(format!("SELECT view_id FROM {} WHERE ", self.table));
+        let mut arguments = PgArguments::default();
+        push_predicate(&mut query, &mut arguments, predicate)
             .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
-        let limit_index = next_parameter(bindings.len())
-            .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
-        let order_clause = order.map_or_else(String::new, |order| {
+        if let Some(order) = order {
             let direction = if order.ascending {
-                "ASC NULLS FIRST"
+                " ASC NULLS FIRST"
             } else {
-                "DESC NULLS LAST"
+                " DESC NULLS LAST"
             };
-            format!(" ORDER BY {} {direction}", QuotedIdentifier(&order.column))
-        });
-        let sql = format!(
-            "SELECT view_id FROM {} WHERE {where_clause}{order_clause} LIMIT ${limit_index}",
-            self.table,
-        );
-        let mut query = sqlx::query_scalar::<_, String>(AssertSqlSafe(sql));
-        for value in bindings {
-            query = match value {
-                Value::Int(integer) => query.bind(integer),
-                Value::Text(text) => query.bind(text),
-            };
+            query
+                .push(" ORDER BY ")
+                .push(QuotedIdentifier(&order.column))
+                .push(direction);
         }
+        query.push(" LIMIT ");
+        push_argument(&mut query, &mut arguments, &Value::Int(limit))
+            .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
+        let mut query =
+            QueryBuilder::<Postgres>::with_arguments(query.sql().as_str().to_owned(), arguments);
         Ok(query
-            .bind(limit)
+            .build_query_scalar::<String>()
             .fetch_all(&self.pool)
             .await
             .map_err(EngineError::from)?)
     }
 }
 
-fn next_parameter(bound: usize) -> Result<u16, ProjectionQueryError> {
-    let bound = u16::try_from(bound).map_err(|_| ProjectionQueryError::ParameterLimit)?;
-    bound
-        .checked_add(1)
-        .ok_or(ProjectionQueryError::ParameterLimit)
+fn push_argument(
+    query: &mut QueryBuilder<Postgres>,
+    arguments: &mut PgArguments,
+    value: &Value,
+) -> Result<(), ProjectionQueryError> {
+    if arguments.len() >= usize::from(u16::MAX) {
+        return Err(ProjectionQueryError::ParameterLimit);
+    }
+    match value {
+        Value::Int(integer) => arguments.add(*integer),
+        Value::Text(text) => arguments.add(text.as_str()),
+    }
+    .map_err(ProjectionQueryError::Encoding)?;
+    let mut placeholder = String::new();
+    arguments.format_placeholder(&mut placeholder)?;
+    query.push(placeholder);
+    Ok(())
 }
 
-fn predicate_sql(predicate: &Predicate) -> Result<(String, Vec<&Value>), ProjectionQueryError> {
-    let mut bindings = vec![];
-    let mut groups = vec![];
-
-    for conjunction in &predicate.any_of {
+fn push_predicate(
+    query: &mut QueryBuilder<Postgres>,
+    arguments: &mut PgArguments,
+    predicate: &Predicate,
+) -> Result<(), ProjectionQueryError> {
+    for (group_index, conjunction) in predicate.any_of.iter().enumerate() {
         if conjunction.is_empty() {
             return Err(ProjectionQueryError::EmptyConjunction);
         }
-
-        let mut terms = vec![];
-        for term in conjunction {
+        if group_index != 0 {
+            query.push(" OR ");
+        }
+        query.push("(");
+        for (term_index, term) in conjunction.iter().enumerate() {
+            if term_index != 0 {
+                query.push(" AND ");
+            }
             let operator = match &term.cmp {
-                Cmp::Eq => "=",
-                Cmp::Lt => "<",
-                Cmp::Le => "<=",
-                Cmp::Gt => ">",
-                Cmp::Ge => ">=",
-                Cmp::IsNull => "IS NULL",
-                Cmp::IsNotNull => "IS NOT NULL",
+                Cmp::Eq => " = ",
+                Cmp::Lt => " < ",
+                Cmp::Le => " <= ",
+                Cmp::Gt => " > ",
+                Cmp::Ge => " >= ",
+                Cmp::IsNull => " IS NULL",
+                Cmp::IsNotNull => " IS NOT NULL",
             };
-
-            let column = QuotedIdentifier(&term.column);
-            let expression = match (&term.cmp, term.value.as_ref()) {
-                (Cmp::IsNull | Cmp::IsNotNull, None) => format!("{column} {operator}"),
+            query.push(QuotedIdentifier(&term.column)).push(operator);
+            match (&term.cmp, term.value.as_ref()) {
+                (Cmp::IsNull | Cmp::IsNotNull, None) => {}
                 (Cmp::Eq | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge, Some(value)) => {
-                    let index = next_parameter(bindings.len())?;
-                    bindings.push(value);
-                    format!("{column} {operator} ${index}")
+                    push_argument(query, arguments, value)?;
                 }
                 (Cmp::Eq | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge, None) => {
                     return Err(ProjectionQueryError::MissingValue);
@@ -239,14 +259,11 @@ fn predicate_sql(predicate: &Predicate) -> Result<(String, Vec<&Value>), Project
                 (Cmp::IsNull | Cmp::IsNotNull, Some(_)) => {
                     return Err(ProjectionQueryError::UnexpectedValue);
                 }
-            };
-            terms.push(expression);
+            }
         }
-
-        groups.push(format!("({})", terms.join(" AND ")));
+        query.push(")");
     }
-
-    Ok((groups.join(" OR "), bindings))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -446,13 +463,15 @@ pub(crate) mod tests {
                     value: Some(Value::Text(value.clone())),
                 }]],
             };
-            let (sql, bindings) = predicate_sql(&predicate).unwrap();
-            prop_assert_eq!(sql, r#"("name" = $1)"#);
-            prop_assert_eq!(bindings.len(), 1);
-            let Value::Text(bound) = bindings[0] else {
-                panic!("expected the original text binding");
-            };
-            prop_assert_eq!(bound, &value);
+            let mut query = QueryBuilder::<Postgres>::default();
+            let mut arguments = PgArguments::default();
+            push_predicate(&mut query, &mut arguments, &predicate).unwrap();
+            let sql = query.sql();
+            prop_assert_eq!(sql.as_str(), r#"("name" = $1)"#);
+            prop_assert_eq!(arguments.len(), 1);
+            let mut expected = PgArguments::default();
+            expected.add(value.as_str()).unwrap();
+            prop_assert_eq!(format!("{arguments:?}"), format!("{expected:?}"));
         }
     }
 

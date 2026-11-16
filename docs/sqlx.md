@@ -97,15 +97,16 @@ infer return types like the macro does.
 
 ## Dynamic PostgreSQL queries
 
-Indexed projection queries use numbered placeholders and `QueryScalar::bind`.
-Parameter indices are checked against the PostgreSQL protocol's `u16` range,
-including the row-limit parameter. Identifiers are quoted separately from bound
-values.
+Indexed projection queries use SQLx `QueryBuilder` and `PgArguments`. The
+PostgreSQL driver encodes values and formats its own numbered placeholders;
+there is no separate placeholder allocator or binding list. Argument counts are
+checked against the protocol's `u16` range, including the row limit. Identifiers
+are quoted separately from bound values.
 
 In SQLx 0.9, `QueryBuilder::push_bind` can panic when argument encoding fails.
-`Query::bind` retains encoding errors until execution instead; the indexed-query
-path uses that fallible behavior rather than turning an encoding failure into a
-panic.
+The indexed-query extension instead uses fallible `Arguments::add`, then passes
+the encoded arguments to `QueryBuilder::with_arguments`. Encoding failures
+return typed errors without executing SQL.
 
 ## Cancellation and pooled transactions
 
