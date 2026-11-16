@@ -215,7 +215,7 @@ dependencies = [
 [[package]]
 name = "cqrs-es"
 version = "0.5.0"
-source = "git+https://github.com/0xgleb/cqrs?rev=cb0020add5dcff06f1ece3816fce9e4319004b87#cb0020add5dcff06f1ece3816fce9e4319004b87"
+source = "git+https://github.com/dataclique/cqrs?rev=cb0020add5dcff06f1ece3816fce9e4319004b87#cb0020add5dcff06f1ece3816fce9e4319004b87"
 dependencies = [
  "async-trait",
  "serde",

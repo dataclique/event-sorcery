@@ -54,7 +54,7 @@ graph in its **root** `Cargo.toml`:
 cqrs-es = "=0.5.0"
 
 [patch.crates-io]
-cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87" }
+cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87" }
 ```
 
 A patch inside a dependency's manifest is ignored by the consuming application.
