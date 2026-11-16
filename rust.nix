@@ -43,8 +43,7 @@ let
       platforms = pkgs.lib.platforms.unix;
     };
   };
-  testCargoArgs =
-    "--locked --workspace" + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux " --all-features";
+  testCargoArgs = commonArgs.cargoExtraArgs;
 
   postgresTestArgs = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     nativeCheckInputs = [

@@ -272,7 +272,7 @@ pub(crate) mod tests {
     use cqrs_es::{DomainEvent, EventEnvelope};
     use proptest::prelude::{any, prop_assert_eq, proptest};
     use serde::{Deserialize, Serialize};
-    #[cfg(feature = "integration-tests")]
+
     use serde_json::json;
     use std::convert::Infallible;
 
@@ -475,7 +475,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(feature = "integration-tests")]
     async fn indexed_repository(
         pool: PgPool,
     ) -> PostgresViewRepository<RegisteredSchemaView, RegisteredSchemaView> {
@@ -508,7 +507,6 @@ pub(crate) mod tests {
         repository
     }
 
-    #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
     async fn indexed_queries_preserve_dnf_order_and_limit(pool: PgPool) {
         let repository = indexed_repository(pool).await;
@@ -562,7 +560,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
     async fn indexed_numeric_comparisons_match_the_requested_operator(pool: PgPool) {
         let repository = indexed_repository(pool).await;
@@ -591,7 +588,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
     async fn indexed_null_order_and_sidecar_columns_are_preserved(pool: PgPool) {
         let repository = indexed_repository(pool).await;
@@ -664,7 +660,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
     async fn view_storage_round_trips_and_fences_stale_writers(pool: PgPool) {
         sqlx::query(
@@ -730,7 +725,6 @@ pub(crate) mod tests {
         assert_eq!(context.version, 2);
     }
 
-    #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
     async fn competing_initial_views_have_one_optimistic_winner(pool: PgPool) {
         sqlx::query(
@@ -774,7 +768,6 @@ pub(crate) mod tests {
         assert_eq!(context.version, 1);
     }
 
-    #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
     async fn table_identifiers_are_quoted_as_literals(pool: PgPool) {
         sqlx::query(
@@ -805,7 +798,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
     async fn unrelated_unique_failures_remain_storage_errors(pool: PgPool) {
         sqlx::query(
@@ -847,7 +839,6 @@ pub(crate) mod tests {
         assert_eq!(source.code().as_deref(), Some("23505"));
     }
 
-    #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
     async fn incompatible_view_storage_returns_a_typed_error_without_panicking(pool: PgPool) {
         sqlx::query(
@@ -880,7 +871,6 @@ pub(crate) mod tests {
         ));
     }
 
-    #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
     async fn malformed_projection_rows_return_typed_errors(pool: PgPool) {
         sqlx::query(

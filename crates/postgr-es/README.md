@@ -81,24 +81,15 @@ the embedded migrator.
 
 ## Testing
 
-From the repository root, run database-independent validation and
-query-construction tests with:
+Real PostgreSQL tests run in the normal crate suite. Start PostgreSQL and
+configure `DATABASE_URL` for a role that can create isolated test databases:
 
 ```sh
-cargo nextest run -p postgr-es --lib
+cargo nextest run -p postgr-es
 ```
 
-With PostgreSQL available and `DATABASE_URL` configured for a role that can
-create isolated test databases, run the complete crate suite with:
-
-```sh
-cargo nextest run -p postgr-es --all-features
-```
-
-The `integration-tests` feature enables real-database tests. Linux flake checks
-enable all features and provision PostgreSQL through the test hook. Darwin flake
-tests retain the database-dependent test exclusion. Enabled database tests fail
-when storage is unavailable; `SQLX_OFFLINE` does not replace a runtime database.
+Database tests fail when storage is unavailable; `SQLX_OFFLINE` does not replace
+a runtime database.
 
 See [SQLx development notes](../../docs/sqlx.md) for database setup and
 [the domain glossary](../../docs/domain.md) for terminology.
