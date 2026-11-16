@@ -1112,7 +1112,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(ids.is_empty());
+        assert_eq!(ids, Vec::<NumericId>::new());
     }
 
     #[tokio::test]

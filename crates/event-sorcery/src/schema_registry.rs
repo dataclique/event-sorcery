@@ -411,7 +411,7 @@ mod tests {
 
         let events = sink.collect().await;
 
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::<SchemaRegistryEvent>::new());
     }
 
     #[tokio::test]

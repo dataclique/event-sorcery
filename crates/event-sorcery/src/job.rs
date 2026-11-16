@@ -971,6 +971,7 @@ fn resolve_run_at_ms(delay: Option<Duration>) -> Result<i64, JobStoreError> {
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
+    use std::future::ready;
 
     use proptest::prelude::*;
     use serde::{Deserialize, Serialize};
@@ -1011,12 +1012,12 @@ mod tests {
             }
         }
 
-        async fn perform(
+        fn perform(
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<JobOutcome<()>, JobFailure<Infallible>> {
-            Ok(JobOutcome::Done(()))
+        ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<Infallible>>> + Send {
+            ready(Ok(JobOutcome::Done(())))
         }
     }
 
