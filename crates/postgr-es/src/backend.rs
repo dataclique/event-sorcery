@@ -6,6 +6,7 @@ use cqrs_es::persist::{
 };
 use serde_json::Value;
 use sqlx::PgPool;
+use sqlx::migrate::MigrateError;
 
 use event_sorcery::{
     CompactionPolicy, EventSourced, Nil, PersistenceBackend, ReconcileError,
@@ -42,7 +43,12 @@ impl PersistenceBackend for PostgresBackend {
     }
 
     async fn bootstrap_persistence(&self) -> Result<(), Self::BootstrapError> {
-        MIGRATOR.run(&self.pool).await.map_err(sqlx::Error::from)
+        let mut connection = self.pool.acquire().await.map_err(MigrateError::from)?;
+        connection.close_on_drop();
+        MIGRATOR
+            .run_direct(None, &mut *connection, false)
+            .await
+            .map_err(sqlx::Error::from)
     }
 }
 

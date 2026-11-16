@@ -256,6 +256,7 @@ fn write_error(error: sqlx::Error) -> EngineError {
 #[cfg(test)]
 #[cfg(feature = "integration-tests")]
 mod tests {
+    use async_trait::async_trait;
     use cqrs_es::event_sink::EventSink;
     use cqrs_es::persist::{
         PersistedEventRepository, PersistedEventStore, PersistenceError, SerializedEvent,
@@ -326,7 +327,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait]
     impl EventSourced for RecordedValues {
         type Id = String;
         type Command = String;
