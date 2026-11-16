@@ -17,7 +17,11 @@ def main [installer: path, work: path] {
             {reason: 'compiler-artifact', package_id: $package}
             {reason: 'build-script-executed', package_id: 'other-package', out_dir: '/unused'}
             {reason: 'build-script-executed', package_id: $package, out_dir: $generated}
-        ] | each { to json --raw } | str join (char newline) | save --force $log
+        ]
+        | each { to json --raw }
+        | prepend ['procedural macro output' '123' '"scalar"' '[]' 'null']
+        | str join (char newline)
+        | save --force $log
         let output = ($root | path join 'installed')
 
         let result = (^nu $installer $log $package $output | complete)
