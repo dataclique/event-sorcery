@@ -1,8 +1,10 @@
 # postgr-es
 
-PostgreSQL repositories, migrations, and native persistence integration for
-`event-sorcery`. Database-specific storage lives here; entity definitions,
-schema policy, and store construction remain in `event-sorcery`.
+PostgreSQL persistence integration for `event-sorcery`, built on the maintained
+CQRS fork's `postgres-es` adapter. Event, snapshot, replay, and ordinary view
+I/O delegate to that adapter. This crate adds atomic job writes, startup
+recovery, and indexed view queries; entity definitions and shared
+schema/snapshot policy remain in `event-sorcery`.
 
 ## Public API
 

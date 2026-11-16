@@ -99,7 +99,9 @@ Development-shell state lives under `.tmp/devenv/`.
 
 ### PostgreSQL persistence boundary
 
-`postgr-es` owns PostgreSQL repositories and migrations. It exports
+`postgr-es` extends the maintained CQRS fork's official `postgres-es` adapter
+with atomic job writes, recovery policy, and indexed queries. Ordinary event,
+snapshot, replay, and view persistence delegate to that adapter. It exports
 `PostgresBackend`, `PostgresEventRepository`, `PostgresViewRepository`, and
 `MIGRATOR`. After bootstrapping persistence, unprojected entities use
 `StoreBuilder::with_backend`; startup reconciles their schema in one transaction

@@ -1303,10 +1303,8 @@ name = "postgr-es"
 version = "0.5.0"
 dependencies = [
  "async-trait",
- "chrono",
  "cqrs-es",
  "event-sorcery",
- "futures-util",
  "postgres-es",
  "proptest",
  "serde",
@@ -1315,7 +1313,6 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
