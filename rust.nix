@@ -83,7 +83,7 @@ in
     // {
       inherit cargoArtifacts;
       cargoExtraArgs = testCargoArgs;
-      cargoNextestExtraArgs = "--all-targets";
+      cargoNextestExtraArgs = "--all-targets --no-fail-fast";
       postCheck = ''
         cargo test ''${CARGO_PROFILE:+--profile $CARGO_PROFILE} \
           ${testCargoArgs} --doc

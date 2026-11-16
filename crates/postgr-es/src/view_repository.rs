@@ -830,6 +830,39 @@ pub(crate) mod tests {
 
     #[cfg(feature = "integration-tests")]
     #[sqlx::test(migrations = false)]
+    async fn incompatible_view_storage_returns_a_typed_error_without_panicking(pool: PgPool) {
+        sqlx::query(
+            "CREATE TABLE schema_projection \
+            (view_id TEXT PRIMARY KEY, version TEXT NOT NULL, payload JSONB NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO schema_projection VALUES ($1, $2, $3)")
+            .bind("schema")
+            .bind("not-a-version")
+            .bind(json!({"name": "Account", "schema_version": 10}))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            pool,
+            "schema_projection",
+        );
+        let Err(error) = repository.load_with_context("schema").await else {
+            panic!("incompatible storage must not decode successfully");
+        };
+        let PersistenceError::ConnectionError(source) = error else {
+            panic!("incompatible storage must return a typed SQL error: {error:?}");
+        };
+        assert!(matches!(
+            *source.downcast::<sqlx::Error>().unwrap(),
+            sqlx::Error::ColumnDecode { .. }
+        ));
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[sqlx::test(migrations = false)]
     async fn malformed_projection_rows_return_typed_errors(pool: PgPool) {
         sqlx::query(
             "CREATE TABLE schema_projection (view_id TEXT PRIMARY KEY, \
