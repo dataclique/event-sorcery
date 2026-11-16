@@ -124,6 +124,18 @@ the pooled connection is reused. The durable-job claim uses
 `begin_with("BEGIN IMMEDIATE")` because it needs the write lock at transaction
 start.
 
+## PostgreSQL migration connections
+
+SQLx 0.9 migrations hold a session advisory lock; an error can return before
+unlocking it. PostgreSQL bootstrap acquires a connection and marks it
+`close_on_drop` before migrating, so failure or cancellation cannot return a
+lock-holding session to the pool.
+
+`Migrator::run` delegates to `run_direct(None, connection, false)`. The
+bootstrap uses that same pipeline directly because the generic `Acquire` wrapper
+fails lifetime inference for the borrowed connection in its required `Send`
+future. Locking, migration validation, and execution remain enabled.
+
 ## `SQLITE_BUSY` vs `SQLITE_BUSY_SNAPSHOT`
 
 `sqlx-sqlite` surfaces both as the _extended_ result code via
