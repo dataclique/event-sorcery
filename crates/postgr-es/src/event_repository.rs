@@ -254,7 +254,6 @@ fn write_error(error: sqlx::Error) -> EngineError {
 }
 
 #[cfg(test)]
-
 mod tests {
     use async_trait::async_trait;
     use cqrs_es::event_sink::EventSink;
