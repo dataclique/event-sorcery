@@ -265,8 +265,12 @@ async fn bootstrap_failure_rolls_back_and_can_be_retried(pool: PgPool) {
         .await
         .unwrap();
 
-    let error = MIGRATOR.run(&pool).await.unwrap_err();
-    let MigrateError::ExecuteMigration(source, version) = error else {
+    let backend = PostgresBackend { pool: pool.clone() };
+    let error = backend.bootstrap_persistence().await.unwrap_err();
+    let sqlx::Error::Migrate(error) = error else {
+        panic!("expected bootstrap to preserve its migration error");
+    };
+    let MigrateError::ExecuteMigration(source, version) = *error else {
         panic!("expected the bootstrap migration to fail");
     };
     assert_eq!(version, MIGRATOR.iter().next().unwrap().version);
@@ -299,7 +303,18 @@ async fn bootstrap_failure_rolls_back_and_can_be_retried(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    MIGRATOR.run(&pool).await.unwrap();
+    let independent = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    timeout(
+        Duration::from_secs(10),
+        PostgresBackend { pool: independent }.bootstrap_persistence(),
+    )
+    .await
+    .expect("retry must not wait for a migration lock leaked by the still-open original pool")
+    .unwrap();
 
     let tables: i64 = sqlx::query_scalar(
         r"

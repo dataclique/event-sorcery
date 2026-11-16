@@ -476,6 +476,25 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, incompatible);
+
+        let framework = CqrsFramework::new(store, vec![], None);
+        framework
+            .execute("guarded", "second".to_string())
+            .await
+            .unwrap();
+        let repository = backend.persistence_repo(CompactionPolicy::Retain);
+        let snapshot = repository
+            .get_snapshot::<RecordedValues>("guarded")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.current_sequence, 2);
+        assert_eq!(snapshot.current_snapshot, 2);
+        assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
+        let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
+        let reloaded = store.load_aggregate("guarded").await.unwrap();
+        assert_eq!(reloaded.aggregate.values, ["first", "second"]);
+        assert_eq!(reloaded.current_sequence, 2);
     }
 
     #[sqlx::test(migrations = false)]
