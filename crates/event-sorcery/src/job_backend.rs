@@ -2211,6 +2211,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_worker_remains_live_after_an_empty_scan() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let job_id = JobId::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<(JobId, u32)>();
+        let empty_scan = Arc::new(Notify::new());
+        let poll_completed = empty_scan.clone();
+        let poll_started = AtomicBool::new(false);
+        let clock = Clock::from_fn(move || {
+            // The next tick begins only after the first empty scan and idle delay.
+            if poll_started.swap(true, Ordering::SeqCst) {
+                poll_completed.notify_one();
+            }
+            from_millis(1_000)
+        });
+        let task_finished = Arc::new(Notify::new());
+        let event_finished = task_finished.clone();
+        let monitor = crate::build_supervised_worker!(
+            runtime.clone(),
+            JobWorkerConfig::default(),
+            clock,
+            { WorkerProbe => sender }
+        )
+        .on_event(move |_context, event| {
+            if matches!(event, Event::Success(_)) {
+                event_finished.notify_one();
+            }
+        });
+        let signal = async move {
+            task_finished.notified().await;
+            Ok::<(), std::io::Error>(())
+        };
+        let enqueue_after_empty_scan = async {
+            empty_scan.notified().await;
+            runtime
+                .enqueue_job_payload(
+                    job_id,
+                    WorkerProbe::KIND.to_string(),
+                    serde_json::json!({"value": 9}),
+                    1_000,
+                )
+                .await
+                .unwrap();
+        };
+
+        let (completed, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(monitor.run_with_signal(signal), enqueue_after_empty_scan)
+        })
+        .await
+        .expect("an empty scan must not terminate the worker stream");
+
+        completed.unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), (job_id, 9));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobSucceeded"]
+        );
+        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
     async fn claim_budget_dead_letters_a_crash_loop() {
         let pool = create_test_pool().await.unwrap();
         let backend = SqliteBackend::new(pool.clone());
