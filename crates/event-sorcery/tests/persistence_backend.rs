@@ -7,15 +7,14 @@ use sqlx::sqlite::SqlitePoolOptions;
 
 use event_sorcery::{
     ClaimDecision, ClaimOutcome, ClaimRead, CompactionPolicy, EventBackend, LeaseRenewal,
-    PersistenceBackend, SchemaRegistry, SqliteBackend, SqliteEventRepository, SqliteJobError,
-    Store, StoreBuilder,
+    PersistenceBackend, SchemaRegistry, SqliteBackend, SqliteJobError, Store, StoreBuilder,
 };
 
 #[derive(Clone)]
 struct LegacyBackend(SqliteBackend);
 
 impl EventBackend for LegacyBackend {
-    type EventRepo = SqliteEventRepository;
+    type EventRepo = <SqliteBackend as EventBackend>::EventRepo;
     type Error = SqliteJobError;
 
     fn event_repo(&self, policy: CompactionPolicy) -> Self::EventRepo {
@@ -61,7 +60,7 @@ impl EventBackend for LegacyBackend {
 struct NarrowBackend(SqliteBackend);
 
 impl PersistenceBackend for NarrowBackend {
-    type PersistenceRepo = SqliteEventRepository;
+    type PersistenceRepo = <SqliteBackend as EventBackend>::EventRepo;
     type BootstrapError = SqliteJobError;
 
     fn persistence_repo(&self, policy: CompactionPolicy) -> Self::PersistenceRepo {
@@ -93,8 +92,10 @@ async fn legacy_backends_gain_persistence_without_new_required_members() {
     let backend = LegacyBackend(SqliteBackend::new(pool.clone()));
 
     backend.bootstrap_persistence().await.unwrap();
-    let _: SqliteEventRepository = legacy_contract(&backend, None).await.unwrap();
-    let _: SqliteEventRepository = backend.persistence_repo(CompactionPolicy::Retain);
+    let _: <SqliteBackend as EventBackend>::EventRepo =
+        legacy_contract(&backend, None).await.unwrap();
+    let _: <SqliteBackend as EventBackend>::EventRepo =
+        backend.persistence_repo(CompactionPolicy::Retain);
 
     let _store = StoreBuilder::<SchemaRegistry>::new(pool.clone())
         .build()
@@ -123,7 +124,8 @@ async fn narrow_backend_types_do_not_require_worker_capabilities() {
     let backend = NarrowBackend(SqliteBackend::new(pool.clone()));
 
     backend.bootstrap_persistence().await.unwrap();
-    let _: SqliteEventRepository = backend.persistence_repo(CompactionPolicy::Retain);
+    let _: <SqliteBackend as EventBackend>::EventRepo =
+        backend.persistence_repo(CompactionPolicy::Retain);
     let _: Option<Store<SchemaRegistry, NarrowBackend>> = None;
     let _builder = StoreBuilder::<SchemaRegistry, NarrowBackend>::with_backend(backend);
 
