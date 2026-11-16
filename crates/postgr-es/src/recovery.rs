@@ -53,14 +53,11 @@ impl<Entity: EventSourced> PostgresRecovery<Entity> {
             .collect::<Result<Vec<_>, _>>()?;
         let reconciliation = reconcile_schema::<Entity>(payloads)?;
 
-        match reconciliation {
-            SchemaReconciliation::Changed => {
-                sqlx::query("DELETE FROM snapshots WHERE aggregate_type = $1")
-                    .bind(Entity::AGGREGATE_TYPE)
-                    .execute(&mut *transaction)
-                    .await?;
-            }
-            SchemaReconciliation::Unchanged => {}
+        if reconciliation.clears_snapshots(Entity::COMPACTION_POLICY) {
+            sqlx::query("DELETE FROM snapshots WHERE aggregate_type = $1")
+                .bind(Entity::AGGREGATE_TYPE)
+                .execute(&mut *transaction)
+                .await?;
         }
 
         Ok((

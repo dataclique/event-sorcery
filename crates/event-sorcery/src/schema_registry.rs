@@ -196,11 +196,26 @@ impl EventSourced for SchemaRegistry {
               recovery; dropping the outcome usually means that call was forgotten, leaving the \
               schema version unadvanced and the recovery re-running on every startup"]
 pub enum SchemaReconciliation {
-    /// The stored version did not match the current code version; any existing
-    /// snapshots were cleared.
+    /// The stored version did not match the current code version. Retained-history
+    /// snapshots are cleared; compactable snapshots survive first registration.
     Changed,
     /// The stored version matched the code version; nothing was cleared.
     Unchanged,
+}
+
+impl SchemaReconciliation {
+    /// Only retained history can rebuild snapshots invalidated during reconciliation.
+    #[must_use]
+    pub fn clears_snapshots(self, policy: CompactionPolicy) -> bool {
+        use CompactionPolicy::{CompactAfterSnapshot, Retain, RetainLast};
+        use SchemaReconciliation::{Changed, Unchanged};
+
+        match (self, policy) {
+            (Changed, Retain) => true,
+            (Changed, CompactAfterSnapshot | RetainLast { .. })
+            | (Unchanged, Retain | CompactAfterSnapshot | RetainLast { .. }) => false,
+        }
+    }
 }
 
 /// Handles schema version reconciliation at startup.
@@ -238,17 +253,16 @@ impl Reconciler {
             "Loaded stored schema version"
         );
 
-        match target.reconciliation(registry.as_ref())? {
-            SchemaReconciliation::Changed => {}
-            SchemaReconciliation::Unchanged => {
-                debug!(
-                    target: "cqrs",
-                    aggregate = target.aggregate_type,
-                    version = target.version,
-                    "Schema version unchanged"
-                );
-                return Ok(SchemaReconciliation::Unchanged);
-            }
+        let reconciliation = target.reconciliation(registry.as_ref())?;
+        if !reconciliation.clears_snapshots(target.compaction) {
+            debug!(
+                target: "cqrs",
+                aggregate = target.aggregate_type,
+                version = target.version,
+                ?stored_version,
+                "Schema reconciliation preserves snapshots"
+            );
+            return Ok(reconciliation);
         }
 
         sqlx::query!(
@@ -304,9 +318,9 @@ impl Reconciler {
         SchemaRegistry::from_payloads(payloads)
     }
 
-    /// Clears version-mismatched snapshots for `Entity` and reports whether the
-    /// schema version [`Changed`](SchemaReconciliation::Changed) (snapshots
-    /// cleared) or was [`Unchanged`](SchemaReconciliation::Unchanged).
+    /// Reconciles `Entity`'s schema and clears mismatched retained-history snapshots.
+    /// First registration preserves compactable snapshots; recorded compactable
+    /// version changes are refused.
     ///
     /// Does NOT record the new version. The caller must call
     /// [`Reconciler::record_version`] only after every version-change recovery
@@ -601,7 +615,7 @@ mod tests {
 
         const PROJECTION: Nil = Nil;
         const SCHEMA_VERSION: u64 = 2;
-        const SNAPSHOT_SIZE: usize = 10;
+        const SNAPSHOT_SIZE: usize = 1;
         const AGGREGATE_TYPE: &'static str = "CompactableWidget";
         const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
 
@@ -634,6 +648,40 @@ mod tests {
         let outcome = reconciler.reconcile::<CompactableWidget>().await.unwrap();
 
         assert_eq!(outcome, SchemaReconciliation::Changed);
+    }
+
+    #[tokio::test]
+    async fn first_registration_preserves_existing_compactable_snapshots() {
+        for policy in [
+            CompactionPolicy::CompactAfterSnapshot,
+            CompactionPolicy::RetainLast { events: 2 },
+        ] {
+            let pool = sqlite_es::testing::create_test_pool().await.unwrap();
+            let store = crate::testing::test_store::<CompactableWidget>(pool.clone());
+            let id = "legacy-widget".to_string();
+            store.send(&id, ()).await.unwrap();
+            let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
+                                WHERE aggregate_type = 'CompactableWidget'";
+            let before: (i64, i64, String) =
+                sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+            assert_eq!((before.0, before.1), (1, 1));
+            let reconciler = Reconciler::new(pool.clone());
+            assert_eq!(reconciler.load_registry().await.unwrap(), None);
+            let target = SchemaTarget::new("CompactableWidget", 2, policy);
+
+            assert_eq!(
+                reconciler.reconcile_target(&target).await.unwrap(),
+                SchemaReconciliation::Changed
+            );
+            reconciler.record_target(&target).await.unwrap();
+
+            let after: (i64, i64, String) =
+                sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+            assert_eq!(after, before);
+            let registry = reconciler.load_registry().await.unwrap().unwrap();
+            assert_eq!(registry.version_of("CompactableWidget"), Some(2));
+            store.load(&id).await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]

@@ -271,7 +271,8 @@ mod tests {
     use tokio::time::timeout;
 
     use event_sorcery::{
-        CompactionPolicy, JobId, JobSeed, PersistenceBackend, buffer_pending_job, with_pending_jobs,
+        CompactionPolicy, Effect, EventSourced, JobId, JobSeed, Never, Nil, PersistenceBackend,
+        StoreBuilder, buffer_pending_job, with_pending_jobs,
     };
 
     use super::{MIGRATOR, PostgresEventRepository};
@@ -323,6 +324,81 @@ mod tests {
             let ValueEvent::Recorded { value } = event;
             self.values.push(value);
         }
+    }
+
+    #[async_trait::async_trait]
+    impl EventSourced for RecordedValues {
+        type Id = String;
+        type Command = String;
+        type Event = ValueEvent;
+        type Error = Never;
+        type Materialized = Nil;
+        type Jobs = Nil;
+
+        const AGGREGATE_TYPE: &'static str = "RecordedValues";
+        const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 1;
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
+        const PROJECTION: Nil = Nil;
+
+        fn originate(event: &ValueEvent) -> Option<Self> {
+            let ValueEvent::Recorded { value } = event;
+            Some(Self {
+                values: vec![value.clone()],
+            })
+        }
+
+        fn evolve(entity: &Self, event: &ValueEvent) -> Result<Option<Self>, Never> {
+            let ValueEvent::Recorded { value } = event;
+            let mut next = entity.clone();
+            next.values.push(value.clone());
+            Ok(Some(next))
+        }
+
+        async fn initialize(value: String) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![ValueEvent::Recorded { value }]))
+        }
+
+        async fn transition(&self, value: String) -> Result<Effect<Self>, Never> {
+            Self::initialize(value).await
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn first_native_registration_preserves_a_preregistry_snapshot(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let backend = PostgresBackend { pool: pool.clone() };
+        let event_store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(
+            backend.persistence_repo(CompactionPolicy::CompactAfterSnapshot),
+            1,
+        );
+        let framework = CqrsFramework::new(event_store, vec![], None);
+        framework
+            .execute("legacy", "first".to_string())
+            .await
+            .unwrap();
+        let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
+                            WHERE aggregate_type = 'RecordedValues' AND aggregate_id = 'legacy'";
+        let before: (i64, i64, Value) =
+            sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+        let registry_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'SchemaRegistry'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(registry_count, 0);
+
+        let store = StoreBuilder::<RecordedValues, PostgresBackend>::with_backend(backend)
+            .build()
+            .await
+            .unwrap();
+
+        let after: (i64, i64, Value) = sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+        assert_eq!(after, before);
+        let fresh = "fresh".to_string();
+        store.send(&fresh, "new".to_string()).await.unwrap();
+        assert_eq!(store.load(&fresh).await.unwrap().unwrap().values, ["new"]);
     }
 
     #[sqlx::test(migrations = false)]
