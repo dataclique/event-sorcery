@@ -97,9 +97,9 @@ A persisted projection used for queries. An aggregate-state materialized view
 mirrors one aggregate instance per row. The current `Projection` API,
 parameterized by entity and backend, implements this specialization. `load`
 works through the selected view backend; `load_all` and `filter` currently exist
-only for the default SQLite backend. Its breaking rename to `MaterializedView`
-is specified in ADR 0014. The general multi-aggregate projection runtime is not
-yet implemented.
+only for the SQLite backend. Its breaking rename to `MaterializedView` is
+specified in ADR 0014. The general multi-aggregate projection runtime is not yet
+implemented.
 
 The event store remains authoritative, but additional derived tables are normal
 in CQRS/event sourcing. Their contents must be reconstructible from durable
@@ -231,7 +231,8 @@ not part of the library's public API and must not appear in any public bound.
 
 `Store<Entity, Backend>` sends commands to typed entity IDs.
 `StoreBuilder<Entity, Backend>` wires the store, its projection when declared,
-and any registered reactors at startup.
+and any registered reactors at startup. Backend type parameters have no database
+default; SQLite convenience constructors can still infer their backend.
 
 ## Naming Conventions
 
