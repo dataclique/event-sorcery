@@ -1305,6 +1305,7 @@ dependencies = [
  "async-trait",
  "cqrs-es",
  "event-sorcery",
+ "futures-util",
  "postgres-es",
  "proptest",
  "serde",

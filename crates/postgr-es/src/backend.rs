@@ -133,11 +133,19 @@ mod tests {
     //! Real PostgreSQL coverage for the shared persistence contract.
 
     use async_trait::async_trait;
+    use cqrs_es::mem_store::MemStore;
+    use cqrs_es::persist::{
+        PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent,
+        SerializedSnapshot,
+    };
+    use cqrs_es::{CqrsFramework, EventStore};
+    use futures_util::{TryStreamExt, stream};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use sqlx::PgPool;
     use sqlx::migrate::MigrateError;
     use sqlx::postgres::PgPoolOptions;
+    use std::collections::BTreeMap;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -146,7 +154,48 @@ mod tests {
         ReconcileError, StoreBuilder,
     };
 
+    use crate::view_repository::tests::{RegisteredSchemaEvent, RegisteredSchemaView};
     use crate::{MIGRATOR, PostgresBackend};
+
+    async fn command_events(aggregate_id: &str, versions: &[u64]) -> Vec<SerializedEvent> {
+        let memory = MemStore::<RegisteredSchemaView>::default();
+        let framework = CqrsFramework::new(memory.clone(), vec![], ());
+        for version in versions {
+            framework
+                .execute(
+                    aggregate_id,
+                    RegisteredSchemaEvent::VersionUpdated {
+                        name: aggregate_id.to_string(),
+                        version: *version,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        memory
+            .load_events(aggregate_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(SerializedEvent::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    async fn replay_events(replay: ReplayStream) -> Vec<SerializedEvent> {
+        stream::unfold(replay, |mut replay| async move {
+            replay
+                .next::<RegisteredSchemaView>(&[])
+                .await
+                .map(|result| {
+                    let event = result.and_then(|event| SerializedEvent::try_from(&event));
+                    (event, replay)
+                })
+        })
+        .try_collect()
+        .await
+        .unwrap()
+    }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     struct Note<const VERSION: u64, const COMPACT: bool = false> {
@@ -541,5 +590,184 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(tables, 3);
+    }
+
+    #[tokio::test]
+    async fn native_snapshot_reads_preserve_closed_pool_errors() {
+        let pool = PgPool::connect_lazy("postgresql://localhost/unused").unwrap();
+        let repository =
+            PostgresBackend { pool: pool.clone() }.persistence_repo(CompactionPolicy::Retain);
+        pool.close().await;
+
+        let error = repository
+            .get_snapshot::<RegisteredSchemaView>("alpha")
+            .await
+            .unwrap_err();
+        let PersistenceError::ConnectionError(source) = error else {
+            panic!("expected the snapshot storage error, got {error:?}");
+        };
+        assert!(matches!(
+            source.downcast_ref::<sqlx::Error>().unwrap(),
+            sqlx::Error::PoolClosed,
+        ));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn native_repository_round_trips_legacy_snapshots_and_every_read_path(pool: PgPool) {
+        let backend = PostgresBackend { pool };
+        backend.bootstrap_persistence().await.unwrap();
+        let repository = backend.persistence_repo(CompactionPolicy::Retain);
+        let alpha = command_events("alpha", &[1, 2]).await;
+        let beta = command_events("beta", &[1]).await;
+
+        repository
+            .persist::<RegisteredSchemaView>(
+                &alpha,
+                Some((
+                    "alpha".to_string(),
+                    json!({"name": "alpha", "schema_version": 2}),
+                    1,
+                )),
+            )
+            .await
+            .unwrap();
+        repository
+            .persist::<RegisteredSchemaView>(&beta, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .get_events::<RegisteredSchemaView>("alpha")
+                .await
+                .unwrap(),
+            alpha
+        );
+        assert_eq!(
+            repository
+                .get_events::<RegisteredSchemaView>("beta")
+                .await
+                .unwrap(),
+            beta
+        );
+        assert_eq!(
+            repository
+                .get_last_events::<RegisteredSchemaView>("alpha", 1)
+                .await
+                .unwrap(),
+            alpha[1..],
+        );
+        assert_eq!(
+            repository
+                .get_last_events::<RegisteredSchemaView>("beta", 1)
+                .await
+                .unwrap(),
+            [],
+        );
+        assert_eq!(
+            repository
+                .get_snapshot::<RegisteredSchemaView>("alpha")
+                .await
+                .unwrap(),
+            Some(SerializedSnapshot {
+                aggregate_id: "alpha".to_string(),
+                aggregate: json!({"name": "alpha", "schema_version": 2}),
+                current_sequence: 2,
+                current_snapshot: 1,
+            }),
+        );
+        assert_eq!(
+            repository
+                .get_snapshot::<RegisteredSchemaView>("beta")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            replay_events(
+                repository
+                    .stream_events::<RegisteredSchemaView>("alpha")
+                    .await
+                    .unwrap()
+            )
+            .await,
+            alpha,
+        );
+        assert_eq!(
+            replay_events(
+                repository
+                    .stream_events::<RegisteredSchemaView>("beta")
+                    .await
+                    .unwrap()
+            )
+            .await,
+            beta,
+        );
+        let replayed = replay_events(
+            repository
+                .stream_all_events::<RegisteredSchemaView>()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(replayed.len(), 3);
+        let replayed: BTreeMap<_, _> = replayed
+            .into_iter()
+            .map(|event| ((event.aggregate_id.clone(), event.sequence), event))
+            .collect();
+        let expected: BTreeMap<_, _> = alpha
+            .into_iter()
+            .chain(beta)
+            .map(|event| ((event.aggregate_id.clone(), event.sequence), event))
+            .collect();
+        assert_eq!(replayed, expected);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn native_covered_snapshot_keeps_its_prefix_and_replays_the_tail(pool: PgPool) {
+        let backend = PostgresBackend { pool };
+        backend.bootstrap_persistence().await.unwrap();
+        let repository = backend.persistence_repo(CompactionPolicy::Retain);
+        let events = command_events("covered", &[1, 2, 3]).await;
+
+        repository
+            .persist_with_snapshot::<RegisteredSchemaView>(
+                &events,
+                Some(SerializedSnapshot {
+                    aggregate_id: "covered".to_string(),
+                    aggregate: json!({"name": "covered", "schema_version": 2}),
+                    current_sequence: events[1].sequence,
+                    current_snapshot: 1,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .get_events::<RegisteredSchemaView>("covered")
+                .await
+                .unwrap(),
+            events,
+        );
+        assert_eq!(
+            repository
+                .get_snapshot::<RegisteredSchemaView>("covered")
+                .await
+                .unwrap(),
+            Some(SerializedSnapshot {
+                aggregate_id: "covered".to_string(),
+                aggregate: json!({"name": "covered", "schema_version": 2}),
+                current_sequence: 2,
+                current_snapshot: 1,
+            }),
+        );
+        assert_eq!(
+            repository
+                .get_last_events::<RegisteredSchemaView>("covered", 2)
+                .await
+                .unwrap(),
+            events[2..],
+        );
     }
 }

@@ -44,6 +44,7 @@ cbindgen = "=0.29.2"
 ciborium = "0.2.2"
 cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87", version = "0.5.0" }
 event-sorcery = { path = "crates/event-sorcery" }
+futures-util = "0.3.34"
 getrandom = "0.3.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
