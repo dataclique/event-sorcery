@@ -8,7 +8,7 @@
 
 use cqrs_es::Aggregate;
 use cqrs_es::persist::ViewRepository;
-use query_es::IndexedView;
+use indexed_query::IndexedView;
 use sqlite_es::SqliteViewRepository;
 
 /// Pluggable storage backend for materialized views, supplying a

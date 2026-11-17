@@ -4,10 +4,9 @@ use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use cqrs_es::{Aggregate, View};
 use sqlx::postgres::PgArguments;
 use sqlx::{Arguments, AssertSqlSafe, PgPool, Postgres, QueryBuilder};
-use std::fmt::{self, Display};
 
 use event_sorcery::{EngineError, ViewBackend};
-use query_es::{Cmp, IndexedView, Order, Predicate, ProjectionQueryError, Value};
+use indexed_query::{IndexedView, Order, Predicate, ProjectionQueryError, Value};
 
 use crate::event_repository::adapter_error;
 
@@ -40,12 +39,13 @@ where
 {
     /// Constructs storage for an application-owned projection table.
     pub fn new(pool: PgPool, table: &str) -> Self {
-        let table = format!("{}", QuotedIdentifier(table));
-        let repository =
-            postgres_es::PostgresViewRepository::new(AssertSqlSafe(table.clone()), pool.clone());
+        let repository = postgres_es::PostgresViewRepository::new(
+            AssertSqlSafe(indexed_query::quote_identifier(table)),
+            pool.clone(),
+        );
         Self {
             pool,
-            table,
+            table: table.to_owned(),
             repository,
         }
     }
@@ -63,15 +63,6 @@ pub enum ProjectionVersionError {
     /// A persisted row has an invalid optimistic checkpoint.
     #[error("stored optimistic projection version must be positive: {0}")]
     StoredNonPositive(i64),
-}
-
-struct QuotedIdentifier<'name>(&'name str);
-
-impl Display for QuotedIdentifier<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(name) = self;
-        write!(formatter, "\"{}\"", name.replace('"', "\"\""))
-    }
 }
 
 impl<ViewState, AggregateType> ViewRepository<ViewState, AggregateType>
@@ -137,36 +128,20 @@ where
         order: Option<&Order>,
         limit: i64,
     ) -> Result<Vec<String>, PersistenceError> {
-        if limit < 0 {
-            return Err(PersistenceError::UnknownError(Box::new(
-                ProjectionQueryError::NegativeLimit(limit),
-            )));
-        }
-        if predicate.any_of.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let mut query =
-            QueryBuilder::<Postgres>::new(format!("SELECT view_id FROM {} WHERE ", self.table));
         let mut arguments = PgArguments::default();
-        push_predicate(&mut query, &mut arguments, predicate)
-            .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
-        if let Some(order) = order {
-            let direction = if order.ascending {
-                " ASC NULLS FIRST"
-            } else {
-                " DESC NULLS LAST"
-            };
-            query
-                .push(" ORDER BY ")
-                .push(QuotedIdentifier(&order.column))
-                .push(direction);
-        }
-        query.push(" LIMIT ");
-        push_argument(&mut query, &mut arguments, &Value::Int(limit))
-            .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
-        let mut query =
-            QueryBuilder::<Postgres>::with_arguments(query.sql().as_str().to_owned(), arguments);
+        let sql = indexed_query::compile_query(
+            &self.table,
+            indexed_query::IdentifierMode::Literal,
+            predicate,
+            order,
+            limit,
+            |value| encode_argument(&mut arguments, value),
+        )
+        .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
+        let Some(sql) = sql else {
+            return Ok(vec![]);
+        };
+        let mut query = QueryBuilder::<Postgres>::with_arguments(sql, arguments);
         Ok(query
             .build_query_scalar::<String>()
             .fetch_all(&self.pool)
@@ -175,11 +150,10 @@ where
     }
 }
 
-fn push_argument(
-    query: &mut QueryBuilder<Postgres>,
+fn encode_argument(
     arguments: &mut PgArguments,
     value: &Value,
-) -> Result<(), ProjectionQueryError> {
+) -> Result<String, ProjectionQueryError> {
     if arguments.len() >= usize::from(u16::MAX) {
         return Err(ProjectionQueryError::ParameterLimit);
     }
@@ -190,53 +164,7 @@ fn push_argument(
     .map_err(ProjectionQueryError::Encoding)?;
     let mut placeholder = String::new();
     arguments.format_placeholder(&mut placeholder)?;
-    query.push(placeholder);
-    Ok(())
-}
-
-fn push_predicate(
-    query: &mut QueryBuilder<Postgres>,
-    arguments: &mut PgArguments,
-    predicate: &Predicate,
-) -> Result<(), ProjectionQueryError> {
-    for (group_index, conjunction) in predicate.any_of.iter().enumerate() {
-        if conjunction.is_empty() {
-            return Err(ProjectionQueryError::EmptyConjunction);
-        }
-        if group_index != 0 {
-            query.push(" OR ");
-        }
-        query.push("(");
-        for (term_index, term) in conjunction.iter().enumerate() {
-            if term_index != 0 {
-                query.push(" AND ");
-            }
-            let operator = match &term.cmp {
-                Cmp::Eq => " = ",
-                Cmp::Lt => " < ",
-                Cmp::Le => " <= ",
-                Cmp::Gt => " > ",
-                Cmp::Ge => " >= ",
-                Cmp::IsNull => " IS NULL",
-                Cmp::IsNotNull => " IS NOT NULL",
-            };
-            query.push(QuotedIdentifier(&term.column)).push(operator);
-            match (&term.cmp, term.value.as_ref()) {
-                (Cmp::IsNull | Cmp::IsNotNull, None) => {}
-                (Cmp::Eq | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge, Some(value)) => {
-                    push_argument(query, arguments, value)?;
-                }
-                (Cmp::Eq | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge, None) => {
-                    return Err(ProjectionQueryError::MissingValue);
-                }
-                (Cmp::IsNull | Cmp::IsNotNull, Some(_)) => {
-                    return Err(ProjectionQueryError::UnexpectedValue);
-                }
-            }
-        }
-        query.push(")");
-    }
-    Ok(())
+    Ok(placeholder)
 }
 
 #[cfg(test)]
@@ -249,7 +177,7 @@ pub(crate) mod tests {
     use serde_json::json;
     use std::convert::Infallible;
 
-    use query_es::{Cmp, Term, Value};
+    use indexed_query::{Cmp, Term, Value};
 
     use super::*;
 
@@ -382,6 +310,24 @@ pub(crate) mod tests {
             query_error(repository.find(&missing, None, 1).await),
             ProjectionQueryError::MissingValue
         ));
+        let late_missing = Predicate {
+            any_of: vec![vec![
+                Term {
+                    column: "schema_version".to_string(),
+                    cmp: Cmp::Eq,
+                    value: Some(Value::Int(1)),
+                },
+                Term {
+                    column: "name".to_string(),
+                    cmp: Cmp::Eq,
+                    value: None,
+                },
+            ]],
+        };
+        assert!(matches!(
+            query_error(repository.find(&late_missing, None, 1).await),
+            ProjectionQueryError::MissingValue
+        ));
         let unexpected = Predicate {
             any_of: vec![vec![Term {
                 column: "name".to_string(),
@@ -426,6 +372,34 @@ pub(crate) mod tests {
         ));
     }
 
+    #[test]
+    fn native_arguments_accept_the_exact_parameter_boundary_including_limit() {
+        let predicate = Predicate {
+            any_of: vec![
+                (0..65_534)
+                    .map(|_| Term {
+                        column: "schema_version".to_string(),
+                        cmp: Cmp::Eq,
+                        value: Some(Value::Int(1)),
+                    })
+                    .collect(),
+            ],
+        };
+        let mut arguments = PgArguments::default();
+        let sql = indexed_query::compile_query(
+            "schema_projection",
+            indexed_query::IdentifierMode::Literal,
+            &predicate,
+            None,
+            1,
+            |value| encode_argument(&mut arguments, value),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(arguments.len(), usize::from(u16::MAX));
+        assert_eq!(sql.rsplit_once(" LIMIT ").unwrap().1, "$65535");
+    }
+
     proptest! {
         #[test]
         fn query_text_is_independent_of_string_values(value in any::<String>()) {
@@ -436,14 +410,15 @@ pub(crate) mod tests {
                     value: Some(Value::Text(value.clone())),
                 }]],
             };
-            let mut query = QueryBuilder::<Postgres>::default();
             let mut arguments = PgArguments::default();
-            push_predicate(&mut query, &mut arguments, &predicate).unwrap();
-            let sql = query.sql();
-            prop_assert_eq!(sql.as_str(), r#"("name" = $1)"#);
-            prop_assert_eq!(arguments.len(), 1);
+            let sql = indexed_query::compile_query("test_projection", indexed_query::IdentifierMode::Literal, &predicate, None, 1, |value| {
+                encode_argument(&mut arguments, value)
+            }).unwrap().unwrap();
+            prop_assert_eq!(sql, r#"SELECT view_id FROM "test_projection" WHERE ("name" = $1) LIMIT $2"#);
+            prop_assert_eq!(arguments.len(), 2);
             let mut expected = PgArguments::default();
             expected.add(value.as_str()).unwrap();
+            expected.add(1_i64).unwrap();
             prop_assert_eq!(format!("{arguments:?}"), format!("{expected:?}"));
         }
     }
@@ -478,6 +453,33 @@ pub(crate) mod tests {
                 .unwrap();
         }
         repository
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn literal_dotted_quoted_columns_are_bound_filtered_and_ordered(pool: PgPool) {
+        let repository = indexed_repository(pool.clone()).await;
+        sqlx::query(
+            r#"ALTER TABLE schema_projection ADD COLUMN "rank.""value" BIGINT
+               GENERATED ALWAYS AS ((payload->>'schema_version')::BIGINT) STORED"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let predicate = Predicate {
+            any_of: vec![vec![Term {
+                column: "rank.\"value".to_string(),
+                cmp: Cmp::Gt,
+                value: Some(Value::Int(15)),
+            }]],
+        };
+        let order = Order {
+            column: "rank.\"value".to_string(),
+            ascending: false,
+        };
+        assert_eq!(
+            repository.find(&predicate, Some(&order), 1).await.unwrap(),
+            vec!["other".to_string()],
+        );
     }
 
     #[sqlx::test(migrations = false)]

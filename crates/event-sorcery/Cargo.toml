@@ -24,7 +24,7 @@ tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tower = { version = "0.5.3", features = ["limit"] }
 futures-util = "0.3.32"
-query-es.workspace = true
+indexed-query.workspace = true
 
 [features]
 test-support = []

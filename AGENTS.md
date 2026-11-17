@@ -205,8 +205,8 @@ visible conversation, treat the change as unjustified and revert it.
 `event-sorcery` is an event-sourcing library on top of `cqrs-es`. The Cargo
 workspace has five crates and no application binaries:
 
-- **`crates/query-es`** — backend-neutral indexed-view query contracts and
-  validation errors shared by the storage adapters.
+- **`crates/indexed-query`** — shared indexed-view query contracts, SQL lowering
+  and validation errors. Storage adapters retain native encoding and execution.
 
 - **`crates/sqlite-es`** — SQLite implementation of `cqrs-es`'s event/view
   repository traits. Standalone; usable wherever a `cqrs-es` backend is needed.

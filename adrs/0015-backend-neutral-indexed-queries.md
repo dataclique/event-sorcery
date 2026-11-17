@@ -19,10 +19,10 @@ for separately evolving query features.
 
 ## Decision
 
-Introduce one focused neutral workspace crate, `query-es`, owning the existing
-indexed-query contracts and their shared SQL lowering. Both storage adapters
-consume it. Keep execution, connection pools, transactions and storage-error
-adaptation in the existing repositories.
+Introduce one focused neutral workspace crate, `indexed-query`, owning the
+existing indexed-query contracts and their shared SQL lowering. Both storage
+adapters consume it. Keep execution, connection pools, transactions and
+storage-error adaptation in the existing repositories.
 
 Preserve existing SQLite query import paths with reexports of the shared
 implementations, not duplicate types or wrapper traits. Share predicate

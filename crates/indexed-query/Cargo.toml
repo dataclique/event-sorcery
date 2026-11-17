@@ -1,5 +1,5 @@
 [package]
-name = "query-es"
+name = "indexed-query"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
