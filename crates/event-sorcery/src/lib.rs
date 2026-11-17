@@ -96,9 +96,11 @@ mod job_store;
 mod lifecycle;
 mod persistence;
 mod projection;
+mod projection_recovery;
 mod reactor;
 mod schema_registry;
 mod sqlite_event_repository;
+mod sqlite_projection;
 #[cfg(any(test, feature = "test-support"))]
 mod testing;
 mod view_backend;
@@ -148,10 +150,14 @@ pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseR
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
 pub use persistence::{
-    PersistenceBackend, SCHEMA_REGISTRY_ID, UnmaterializedStoreBackend, guard_snapshot,
-    reconcile_schema, register_schema,
+    PersistenceBackend, ProjectedStoreBackend, SCHEMA_REGISTRY_ID, UnmaterializedStoreBackend,
+    guard_snapshot, reconcile_schema, register_schema,
 };
 pub use projection::{Column, Projection, ProjectionError, Table};
+pub use projection_recovery::{
+    ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow,
+    recover_projection,
+};
 pub use reactor::{
     IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,
     RetryOnBusy, is_retryable_sqlite_busy, retry_with_backoff,
@@ -166,7 +172,7 @@ pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, buffer_pending_job, replay,
     test_store, with_pending_jobs,
 };
-pub use view_backend::{SqliteViewBackend, ViewBackend};
+pub use view_backend::{NativeProjectionBackend, SqliteViewBackend, ViewBackend};
 pub use wire::StoreBuilder;
 
 pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
