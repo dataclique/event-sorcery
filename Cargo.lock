@@ -623,6 +623,7 @@ dependencies = [
  "criterion",
  "futures-util",
  "proptest",
+ "query-es",
  "serde",
  "serde_json",
  "sqlite-es",
@@ -1308,9 +1309,9 @@ dependencies = [
  "futures-util",
  "postgres-es",
  "proptest",
+ "query-es",
  "serde",
  "serde_json",
- "sqlite-es",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1384,6 +1385,14 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "query-es"
+version = "0.5.0"
+dependencies = [
+ "cqrs-es",
+ "thiserror",
 ]
 
 [[package]]
@@ -1761,6 +1770,7 @@ version = "0.5.0"
 dependencies = [
  "chrono",
  "cqrs-es",
+ "query-es",
  "serde",
  "serde_json",
  "sqlx",

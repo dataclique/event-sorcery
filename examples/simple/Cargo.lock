@@ -362,6 +362,7 @@ dependencies = [
  "chrono",
  "cqrs-es",
  "futures-util",
+ "query-es",
  "serde",
  "serde_json",
  "sqlite-es",
@@ -979,6 +980,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "query-es"
+version = "0.5.0"
+dependencies = [
+ "cqrs-es",
+ "thiserror",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1266,6 +1275,7 @@ version = "0.5.0"
 dependencies = [
  "chrono",
  "cqrs-es",
+ "query-es",
  "serde",
  "serde_json",
  "sqlx",
