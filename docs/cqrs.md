@@ -501,6 +501,10 @@ explicit snapshot-preserving migration; switching to `Retain` does not restore
 previously compacted events. Current policies that may delete history also
 refuse recorded schema version changes.
 
+First registration of a `Retain` entity follows the same snapshot validation and
+clearing path when no version is registered. Incomplete covered history can
+therefore block first registration even without a recorded version mismatch.
+
 ### Adding Optional Fields to Events
 
 When adding a new field to an existing event variant that has a sensible default
