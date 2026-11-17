@@ -2,6 +2,7 @@
 
 mod backend;
 mod event_repository;
+mod projection_recovery;
 mod recovery;
 mod view_repository;
 

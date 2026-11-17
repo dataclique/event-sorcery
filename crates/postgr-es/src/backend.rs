@@ -9,12 +9,13 @@ use sqlx::PgPool;
 use sqlx::migrate::MigrateError;
 
 use event_sorcery::{
-    CompactionPolicy, EventSourced, Nil, PersistenceBackend, ReconcileError,
+    CompactionPolicy, EventSourced, Nil, PersistenceBackend, ProjectedStoreBackend, Projection,
+    ProjectionError, ProjectionRecoveryMode, ReconcileError, SchemaReconciliation, Table,
     UnmaterializedStoreBackend, guard_snapshot,
 };
 
 use crate::recovery::PostgresRecovery;
-use crate::{MIGRATOR, PostgresEventRepository};
+use crate::{MIGRATOR, PostgresEventRepository, PostgresViewBackend};
 
 /// Native persistence capability over an application-provisioned pool.
 #[derive(Clone)]
@@ -58,6 +59,37 @@ impl UnmaterializedStoreBackend for PostgresBackend {
     ) -> Result<(), ReconcileError> {
         let (recovery, _) = PostgresRecovery::<Entity>::begin(&self.pool).await?;
         recovery.finish().await
+    }
+}
+
+impl ProjectedStoreBackend for PostgresBackend {
+    type ViewBackend = PostgresViewBackend;
+
+    async fn reconcile_projected<Entity>(
+        &self,
+    ) -> Result<Projection<Entity, PostgresViewBackend>, ReconcileError>
+    where
+        Entity: EventSourced<Materialized = Table> + 'static,
+    {
+        use SchemaReconciliation::{Changed, Unchanged};
+
+        let (mut recovery, decision) = PostgresRecovery::<Entity>::begin(&self.pool).await?;
+        let mode = match decision {
+            Changed => ProjectionRecoveryMode::RebuildAll,
+            Unchanged => ProjectionRecoveryMode::CatchUp,
+        };
+        recovery
+            .recover_projection(&mode)
+            .await
+            .map_err(|error| match error {
+                ProjectionError::Sqlx(source) => ReconcileError::Sqlx(source),
+                ProjectionError::Persistence(source) => ReconcileError::Persistence(source),
+                other => {
+                    ReconcileError::Persistence(PersistenceError::UnknownError(Box::new(other)))
+                }
+            })?;
+        recovery.finish().await?;
+        Ok(Projection::with_backend(self.pool.clone()))
     }
 }
 
@@ -150,8 +182,8 @@ pub(crate) mod tests {
     use tokio::time::timeout;
 
     use event_sorcery::{
-        CompactionPolicy, DomainEvent, Effect, EventSourced, Never, Nil, PersistenceBackend,
-        ReconcileError, StoreBuilder,
+        Column, CompactionPolicy, DomainEvent, Effect, EventSourced, Never, Nil,
+        PersistenceBackend, ReconcileError, StoreBuilder, Table,
     };
 
     use crate::view_repository::tests::{RegisteredSchemaEvent, RegisteredSchemaView};
@@ -254,6 +286,129 @@ pub(crate) mod tests {
         async fn transition(&self, text: String) -> Result<Effect<Self>, Never> {
             Self::initialize(text).await
         }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct ProjectedNote<const VERSION: u64> {
+        text: String,
+        history: Vec<String>,
+    }
+
+    #[async_trait]
+    impl<const VERSION: u64> EventSourced for ProjectedNote<VERSION> {
+        type Id = String;
+        type Command = String;
+        type Event = NoteEvent;
+        type Error = Never;
+        type Materialized = Table;
+        type Jobs = Nil;
+
+        const AGGREGATE_TYPE: &'static str = "ProjectedNote";
+        const SCHEMA_VERSION: u64 = VERSION;
+        const SNAPSHOT_SIZE: usize = 2;
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
+        const PROJECTION: Table = Table("note_projection");
+
+        fn originate(event: &Self::Event) -> Option<Self> {
+            let NoteEvent::Written { text } = event;
+            Some(Self {
+                text: text.clone(),
+                history: vec![text.clone()],
+            })
+        }
+
+        fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Never> {
+            let NoteEvent::Written { text } = event;
+            Ok(Some(Self {
+                text: text.clone(),
+                history: entity
+                    .history
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(text.clone()))
+                    .collect(),
+            }))
+        }
+
+        async fn initialize(text: String) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![NoteEvent::Written { text }]))
+        }
+
+        async fn transition(&self, text: String) -> Result<Effect<Self>, Never> {
+            Self::initialize(text).await
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn projected_builder_queries_and_recovers_with_one_connection(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE note_projection (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSONB NOT NULL,
+                text_value TEXT GENERATED ALWAYS AS (payload->'Live'->>'text') STORED
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let backend = PostgresBackend { pool: pool.clone() };
+        let (store, projection) = timeout(
+            Duration::from_secs(10),
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(backend.clone())
+                .build(),
+        )
+        .await
+        .expect("projected startup must use its one connection")
+        .unwrap();
+        let id = "projected".to_string();
+        store.send(&id, "first".to_string()).await.unwrap();
+        store.send(&id, "second".to_string()).await.unwrap();
+        assert_eq!(
+            projection.load(&id).await.unwrap().unwrap().history,
+            vec!["first", "second"]
+        );
+        assert_eq!(projection.load_all().await.unwrap().len(), 1);
+        assert_eq!(
+            projection
+                .filter(Column("text_value"), &"second".to_string())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        drop((store, projection));
+        sqlx::query("DELETE FROM note_projection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (store, projection) = timeout(
+            Duration::from_secs(10),
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(backend).build(),
+        )
+        .await
+        .expect("projected restart must not acquire a second connection")
+        .unwrap();
+        assert_eq!(
+            projection.load(&id).await.unwrap().unwrap().history,
+            vec!["first", "second"]
+        );
+        projection.rebuild(&id).await.unwrap();
+        projection.rebuild_all().await.unwrap();
+        assert_eq!(
+            projection.load(&id).await.unwrap().unwrap().history,
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().history,
+            vec!["first", "second"]
+        );
     }
 
     #[tokio::test]

@@ -88,6 +88,19 @@ impl<Entity: EventSourced> PostgresRecovery<Entity> {
         ))
     }
 
+    pub(crate) async fn recover_projection(
+        &mut self,
+        mode: &event_sorcery::ProjectionRecoveryMode,
+    ) -> Result<(), event_sorcery::ProjectionError<Entity>>
+    where
+        Entity: EventSourced<Materialized = event_sorcery::Table>,
+    {
+        let mut storage = crate::projection_recovery::PostgresProjectionRecovery {
+            connection: &mut self.transaction,
+        };
+        event_sorcery::recover_projection::<Entity>(&mut storage, mode).await
+    }
+
     pub(crate) async fn finish(mut self) -> Result<(), ReconcileError> {
         {
             let repository = RegistryRepository {

@@ -5,7 +5,10 @@ use cqrs_es::{Aggregate, View};
 use sqlx::postgres::PgArguments;
 use sqlx::{Arguments, AssertSqlSafe, PgPool, Postgres, QueryBuilder};
 
-use event_sorcery::{EngineError, ViewBackend};
+use event_sorcery::{
+    Column, EngineError, EventSourced, NativeProjectionBackend, ProjectionError,
+    ProjectionRecoveryMode, Table, ViewBackend, recover_projection,
+};
 use indexed_query::{IndexedView, Order, Predicate, ProjectionQueryError, Value};
 
 use crate::event_repository::adapter_error;
@@ -32,6 +35,12 @@ pub struct PostgresViewRepository<ViewState, AggregateType> {
     repository: postgres_es::PostgresViewRepository<ViewState, AggregateType>,
 }
 
+impl<ViewState, AggregateType> AsRef<PgPool> for PostgresViewRepository<ViewState, AggregateType> {
+    fn as_ref(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
 impl<ViewState, AggregateType> PostgresViewRepository<ViewState, AggregateType>
 where
     ViewState: View<AggregateType>,
@@ -48,6 +57,111 @@ where
             table: table.to_owned(),
             repository,
         }
+    }
+}
+
+impl NativeProjectionBackend for PostgresViewBackend {
+    type Source = PgPool;
+    type Database = Postgres;
+
+    fn repository<ViewState, AggregateType>(
+        source: PgPool,
+        Table(table): Table,
+    ) -> Self::Repo<ViewState, AggregateType>
+    where
+        ViewState: View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static,
+    {
+        PostgresViewRepository::new(source, table)
+    }
+
+    fn source<ViewState, AggregateType>(
+        repository: &Self::Repo<ViewState, AggregateType>,
+    ) -> &PgPool
+    where
+        ViewState: View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static,
+    {
+        repository.as_ref()
+    }
+
+    async fn rows(
+        source: &PgPool,
+        Table(table): Table,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let table = indexed_query::quote_identifier(table);
+        sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT view_id, payload::text FROM {table}"
+        )))
+        .fetch_all(source)
+        .await
+    }
+
+    async fn filter<Entity, Value>(
+        source: &PgPool,
+        Table(table): Table,
+        column: Column,
+        value: &Value,
+    ) -> Result<Vec<(String, String)>, ProjectionError<Entity>>
+    where
+        Entity: EventSourced,
+        for<'query> &'query Value: sqlx::Encode<'query, Postgres>,
+        Value: sqlx::Type<Postgres> + Send + Sync,
+    {
+        let quoted_table = indexed_query::quote_identifier(table);
+        let Column(column_name) = &column;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_attribute
+             WHERE attrelid = to_regclass($1) AND attname = $2 AND NOT attisdropped)",
+        )
+        .bind(&quoted_table)
+        .bind(column_name)
+        .fetch_one(source)
+        .await?;
+        if !exists {
+            return Err(ProjectionError::ColumnNotFound {
+                column,
+                table: table.to_string(),
+            });
+        }
+        let quoted_column = indexed_query::quote_identifier(column_name);
+        let (rows, non_null): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT COUNT(*), COUNT({quoted_column}) FROM {quoted_table}"
+        )))
+        .fetch_one(source)
+        .await?;
+        if rows > 0 && non_null == 0 {
+            return Err(ProjectionError::StaleColumn {
+                column,
+                table: table.to_string(),
+                row_count: rows,
+            });
+        }
+        Ok(sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT view_id, payload::text FROM {quoted_table}
+             WHERE {quoted_column} = $1 ORDER BY view_id"
+        )))
+        .bind(value)
+        .fetch_all(source)
+        .await?)
+    }
+
+    async fn recover<Entity>(
+        source: &PgPool,
+        mode: &ProjectionRecoveryMode,
+    ) -> Result<(), ProjectionError<Entity>>
+    where
+        Entity: EventSourced<Materialized = Table>,
+    {
+        let mut transaction = source.begin().await?;
+        {
+            let mut storage = crate::projection_recovery::PostgresProjectionRecovery {
+                connection: &mut transaction,
+            };
+            recover_projection::<Entity>(&mut storage, mode).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 }
 
