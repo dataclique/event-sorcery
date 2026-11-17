@@ -182,13 +182,17 @@ where
         if context.version == 0 {
             let insert_query = SqlQueryFactory::insert_view(&self.view_table);
 
-            sqlx::query(AssertSqlSafe(insert_query))
+            let result = sqlx::query(AssertSqlSafe(insert_query))
                 .bind(&context.view_instance_id)
                 .bind(new_version)
                 .bind(&payload)
                 .execute(&self.pool)
                 .await
                 .map_err(SqliteViewError::Connection)?;
+
+            if result.rows_affected() == 0 {
+                return Err(SqliteViewError::OptimisticLock.into());
+            }
         } else {
             let update_query = SqlQueryFactory::update_view(&self.view_table);
 
@@ -846,6 +850,57 @@ mod tests {
         assert_eq!(loaded1, view1);
         assert_eq!(loaded2, view2);
         assert_eq!(loaded3, view3);
+    }
+
+    #[tokio::test]
+    async fn initial_identity_conflicts_are_retryable_but_other_unique_failures_are_not() {
+        let pool = create_test_pool().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL,
+                unique_count INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.count')) STORED UNIQUE
+            )",
+        ).execute(&pool).await.unwrap();
+        let repo =
+            SqliteViewRepository::<TestView, TestAggregate>::new(pool, "test_view".to_string());
+        let initial = TestView {
+            count: 1,
+            values: vec!["winner".to_string()],
+        };
+        repo.update_view(initial.clone(), ViewContext::new("same".to_string(), 0))
+            .await
+            .unwrap();
+        let rejected = TestView {
+            count: 2,
+            values: vec!["loser".to_string()],
+        };
+        let error = repo
+            .update_view(rejected, ViewContext::new("same".to_string(), 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistenceError::OptimisticLockError));
+        let error = repo
+            .update_view(initial.clone(), ViewContext::new("same".to_string(), 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistenceError::OptimisticLockError));
+        let error = repo
+            .update_view(initial.clone(), ViewContext::new("other".to_string(), 0))
+            .await
+            .unwrap_err();
+        let PersistenceError::ConnectionError(source) = error else {
+            panic!("unrelated unique constraints must retain the database error");
+        };
+        let sqlx::Error::Database(source) = source.downcast_ref::<sqlx::Error>().unwrap() else {
+            panic!("connection error must retain its SQLx database source");
+        };
+        assert_eq!(source.kind(), sqlx::error::ErrorKind::UniqueViolation);
+        let (view, context) = repo.load_with_context("same").await.unwrap().unwrap();
+        assert_eq!(view, initial);
+        assert_eq!(context.version, 1);
+        assert_eq!(repo.load("other").await.unwrap(), None);
     }
 
     #[tokio::test]
