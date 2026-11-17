@@ -622,8 +622,8 @@ dependencies = [
  "cqrs-es",
  "criterion",
  "futures-util",
+ "indexed-query",
  "proptest",
- "query-es",
  "serde",
  "serde_json",
  "sqlite-es",
@@ -1055,6 +1055,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "indexed-query"
+version = "0.5.0"
+dependencies = [
+ "cqrs-es",
+ "thiserror",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1307,9 +1315,9 @@ dependencies = [
  "cqrs-es",
  "event-sorcery",
  "futures-util",
+ "indexed-query",
  "postgres-es",
  "proptest",
- "query-es",
  "serde",
  "serde_json",
  "sqlx",
@@ -1385,14 +1393,6 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
-]
-
-[[package]]
-name = "query-es"
-version = "0.5.0"
-dependencies = [
- "cqrs-es",
- "thiserror",
 ]
 
 [[package]]
@@ -1770,7 +1770,7 @@ version = "0.5.0"
 dependencies = [
  "chrono",
  "cqrs-es",
- "query-es",
+ "indexed-query",
  "serde",
  "serde_json",
  "sqlx",
