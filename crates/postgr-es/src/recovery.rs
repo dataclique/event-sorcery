@@ -367,6 +367,100 @@ mod tests {
         );
     }
 
+    #[sqlx::test(migrations = false)]
+    async fn competing_startups_observe_the_committed_registry_version_once(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        seed_snapshot(&pool).await;
+        let winner_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let loser_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let losing_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&loser_pool)
+            .await
+            .unwrap();
+        let history_sql = "SELECT sequence, payload FROM events
+                           WHERE aggregate_type = 'NativeNote' ORDER BY sequence";
+        let before: Vec<(i64, Value)> = sqlx::query_as(history_sql).fetch_all(&pool).await.unwrap();
+        let (mut winner, decision) = PostgresRecovery::<Note<2>>::begin(&winner_pool)
+            .await
+            .unwrap();
+        assert_eq!(decision, SchemaReconciliation::Changed);
+        let winning_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *winner.transaction)
+            .await
+            .unwrap();
+        let loser = tokio::spawn(async move {
+            let (recovery, decision) = PostgresRecovery::<Note<2>>::begin(&loser_pool)
+                .await
+                .unwrap();
+            recovery.finish().await.unwrap();
+            decision
+        });
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let blocking: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+                    .bind(losing_pid)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                if blocking == vec![winning_pid] {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("independent startup must actually contend on the winner's registry lock");
+        let registry_sql = "SELECT payload FROM events
+                            WHERE aggregate_type = 'SchemaRegistry' ORDER BY sequence";
+        let during: Vec<Value> = sqlx::query_scalar(registry_sql)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            during,
+            vec![json!({"VersionUpdated": {"name": "NativeNote", "version": 1}})]
+        );
+        let snapshots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM snapshots")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(snapshots, 1);
+        winner.finish().await.unwrap();
+        let loser_decision = timeout(Duration::from_secs(10), loser)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loser_decision, SchemaReconciliation::Unchanged);
+        let recorded: Vec<Value> = sqlx::query_scalar(registry_sql)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded,
+            vec![
+                json!({"VersionUpdated": {"name": "NativeNote", "version": 1}}),
+                json!({"VersionUpdated": {"name": "NativeNote", "version": 2}}),
+            ]
+        );
+        let after: Vec<(i64, Value)> = sqlx::query_as(history_sql).fetch_all(&pool).await.unwrap();
+        assert_eq!(after, before);
+        let snapshots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM snapshots")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(snapshots, 0);
+    }
+
     fn mode_error<Success>(result: Result<Success, PersistenceError>) -> RegistryStorageModeError {
         let Err(PersistenceError::UnknownError(source)) = result else {
             panic!("expected an explicit registry storage-mode error");
