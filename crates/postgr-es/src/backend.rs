@@ -129,7 +129,7 @@ impl PersistedEventRepository for PostgresStoreRepository {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Real PostgreSQL coverage for the shared persistence contract.
 
     use async_trait::async_trait;
@@ -198,12 +198,14 @@ mod tests {
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
-    struct Note<const VERSION: u64, const COMPACT: bool = false> {
+    /// Command-driven entity shared by backend and recovery protocol tests.
+    pub(crate) struct Note<const VERSION: u64, const COMPACT: bool = false> {
         text: String,
     }
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-    enum NoteEvent {
+    /// Event emitted through the shared note fixture's commands.
+    pub(crate) enum NoteEvent {
         Written { text: String },
     }
 

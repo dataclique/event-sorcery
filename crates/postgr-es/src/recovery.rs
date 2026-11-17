@@ -215,9 +215,144 @@ impl PersistedEventRepository for RegistryRepository<'_> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+    use std::future::pending;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    use event_sorcery::StoreBuilder;
 
     use super::*;
+    use crate::backend::tests::Note;
     use crate::view_repository::tests::RegisteredSchemaView;
+    use crate::{MIGRATOR, PostgresBackend};
+
+    async fn seed_snapshot(pool: &PgPool) {
+        let store = StoreBuilder::<Note<1>, PostgresBackend>::with_backend(PostgresBackend {
+            pool: pool.clone(),
+        })
+        .build()
+        .await
+        .unwrap();
+        let id = "recovery-note".to_string();
+        store.send(&id, "first".to_string()).await.unwrap();
+        store.send(&id, "second".to_string()).await.unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn dropping_recovery_restores_snapshot_and_releases_its_only_connection(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        seed_snapshot(&pool).await;
+        let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
+                            WHERE aggregate_type = 'NativeNote' AND aggregate_id = 'recovery-note'";
+        let before: (i64, i64, Value) =
+            sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+        let (recovery, decision) = PostgresRecovery::<Note<2>>::begin(&pool).await.unwrap();
+        assert_eq!(decision, SchemaReconciliation::Changed);
+        drop(recovery);
+        let after: (i64, i64, Value) = timeout(
+            Duration::from_secs(10),
+            sqlx::query_as(snapshot_sql).fetch_one(&pool),
+        )
+        .await
+        .expect("dropping recovery must release the connection after rollback")
+        .unwrap();
+        assert_eq!(after, before);
+        let recorded: Vec<Value> = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_type = 'SchemaRegistry' ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded,
+            vec![json!({"VersionUpdated": {"name": "NativeNote", "version": 1}})]
+        );
+        let (retry, decision) = timeout(
+            Duration::from_secs(10),
+            PostgresRecovery::<Note<2>>::begin(&pool),
+        )
+        .await
+        .expect("rollback must release the schema lock")
+        .unwrap();
+        assert_eq!(decision, SchemaReconciliation::Changed);
+        retry.finish().await.unwrap();
+        let snapshots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM snapshots")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(snapshots, 0);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn cancelling_recovery_preserves_history_and_allows_a_clean_retry(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        seed_snapshot(&pool).await;
+        let (started, waiting) = oneshot::channel();
+        let recovering_pool = pool.clone();
+        let recovering = tokio::spawn(async move {
+            let (recovery, decision) = PostgresRecovery::<Note<2>>::begin(&recovering_pool)
+                .await
+                .unwrap();
+            assert_eq!(decision, SchemaReconciliation::Changed);
+            started.send(()).unwrap();
+            pending::<()>().await;
+            drop(recovery);
+        });
+        timeout(Duration::from_secs(10), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        recovering.abort();
+        assert!(recovering.await.unwrap_err().is_cancelled());
+        let snapshots: i64 = timeout(
+            Duration::from_secs(10),
+            sqlx::query_scalar("SELECT COUNT(*) FROM snapshots").fetch_one(&pool),
+        )
+        .await
+        .expect("cancelled recovery must roll back before pool reuse")
+        .unwrap();
+        assert_eq!(snapshots, 1);
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE aggregate_type = 'NativeNote'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(events, 2);
+        let (retry, decision) = timeout(
+            Duration::from_secs(10),
+            PostgresRecovery::<Note<2>>::begin(&pool),
+        )
+        .await
+        .expect("cancellation must release the registry lock")
+        .unwrap();
+        assert_eq!(decision, SchemaReconciliation::Changed);
+        retry.finish().await.unwrap();
+        let recorded: Vec<Value> = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_type = 'SchemaRegistry' ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded,
+            vec![
+                json!({"VersionUpdated": {"name": "NativeNote", "version": 1}}),
+                json!({"VersionUpdated": {"name": "NativeNote", "version": 2}}),
+            ]
+        );
+    }
 
     fn mode_error<Success>(result: Result<Success, PersistenceError>) -> RegistryStorageModeError {
         let Err(PersistenceError::UnknownError(source)) = result else {
