@@ -17,7 +17,7 @@ use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, trace, warn};
 
 use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
@@ -108,324 +108,86 @@ impl<Entity: EventSourced> From<LifecycleError<Entity>> for ProjectionError<Enti
 /// directly in CLI/test code.
 pub struct Projection<Entity: EventSourced, Backend: ViewBackend> {
     repo: Arc<Backend::Repo<Lifecycle<Entity>, Lifecycle<Entity>>>,
-    pool: Option<SqlitePool>,
-    table_name: Option<String>,
+    table: Option<Table>,
     _entity: PhantomData<Entity>,
 }
 
 impl<Entity: EventSourced<Materialized = Table>> Projection<Entity, SqliteViewBackend> {
-    /// Creates a SQLite-backed projection for an entity that
-    /// declares `type Materialized = Table`.
-    ///
-    /// Uses `Entity::PROJECTION` directly to determine the view
-    /// table name. Only callable on entities with a materialized
-    /// view.
+    /// Constructs the SQLite materialized view using the caller-owned pool.
     pub fn sqlite(pool: SqlitePool) -> Self {
-        let Table(table) = Entity::PROJECTION;
-        let repo = Arc::new(
-            SqliteViewRepository::<Lifecycle<Entity>, Lifecycle<Entity>>::new(
-                pool.clone(),
-                table.to_string(),
-            ),
-        );
+        Self::with_backend(pool)
+    }
+}
 
+impl<Entity, Backend> Projection<Entity, Backend>
+where
+    Entity: EventSourced<Materialized = Table>,
+    Backend: crate::NativeProjectionBackend,
+{
+    /// Constructs a native projection without applying migrations or recording schema.
+    pub fn with_backend(source: Backend::Source) -> Self {
+        let table = Entity::PROJECTION;
         Self {
-            repo,
-            pool: Some(pool),
-            table_name: Some(table.to_string()),
+            repo: Arc::new(Backend::repository::<Lifecycle<Entity>, Lifecycle<Entity>>(
+                source, table,
+            )),
+            table: Some(table),
             _entity: PhantomData,
         }
     }
 
-    /// Load all live entities from the view table.
-    ///
-    /// Returns every entity in `Live` state, skipping
-    /// non-live aggregates with a warning.
+    /// Reads all live entities through the native storage source.
     pub async fn load_all(&self) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError<Entity>>
     where
         <Entity::Id as FromStr>::Err: Debug,
     {
-        let (pool, table) = self.sqlite_backing()?;
-
-        trace!(target: "cqrs", %table, "Loading all views");
-
-        let query = format!(
-            "SELECT view_id, payload FROM {table}
-             ORDER BY view_id ASC"
-        );
-
-        let rows: Vec<(String, String)> =
-            sqlx::query_as(AssertSqlSafe(query)).fetch_all(pool).await?;
-
-        Ok(Self::parse_rows(rows))
+        let (source, table) = self.native_backing()?;
+        Ok(Self::parse_rows(Backend::rows(source, table).await?))
     }
 
-    /// Load all live entities where a generated column matches
-    /// a typed value.
-    ///
-    /// The value can be any domain type that implements
-    /// `sqlx::Type<Sqlite>` and `sqlx::Encode<Sqlite>` (e.g.,
-    /// `OrderStatus`), so callers pass typed values rather than
-    /// raw strings.
-    ///
-    /// Validates that the column exists in the table schema
-    /// and has at least one non-NULL value (catches stale
-    /// generated columns whose JSON paths drifted from the
-    /// actual serialization format).
-    pub async fn filter<V>(
+    /// Validates a generated column and binds its domain value with the native driver.
+    pub async fn filter<Value>(
         &self,
         column: Column,
-        value: &V,
+        value: &Value,
     ) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError<Entity>>
     where
-        for<'q> &'q V: sqlx::Encode<'q, Sqlite>,
-        V: sqlx::Type<Sqlite> + Send + Sync,
+        for<'query> &'query Value: sqlx::Encode<'query, Backend::Database>,
+        Value: sqlx::Type<Backend::Database> + Send + Sync,
         <Entity::Id as FromStr>::Err: Debug,
     {
-        let (pool, table) = self.sqlite_backing()?;
-
-        trace!(target: "cqrs", %table, column = %column, "Filtering views by column");
-
-        validate_column(pool, table, &column).await?;
-
-        let column_name = column.0;
-        let query = format!(
-            "SELECT view_id, payload FROM {table}
-             WHERE {column_name} = ?1
-             ORDER BY view_id ASC"
-        );
-
-        let rows: Vec<(String, String)> = sqlx::query_as(AssertSqlSafe(query))
-            .bind(value)
-            .fetch_all(pool)
-            .await?;
-
+        let (source, table) = self.native_backing()?;
+        let rows = Backend::filter::<Entity, Value>(source, table, column, value).await?;
         Ok(Self::parse_rows(rows))
     }
 
-    /// Replays any events the view missed due to a crash between
-    /// event persistence and view update.
-    ///
-    /// For each view row, compares its `version` against the max
-    /// event `sequence` for that aggregate. If behind, fetches the
-    /// missed events and applies them incrementally.
-    ///
-    /// On a normal startup (no crash), this is a cheap version
-    /// comparison query with no replay.
-    ///
-    /// Only views that are *behind* on event sequence are revisited. A view
-    /// that is current (`version == max_seq`) but holds a payload in an old
-    /// wire format is not healed here -- that case is handled at startup by
-    /// `StoreBuilder::build`, which calls `rebuild_all` when the reconciler
-    /// reports a schema-version change. Changing a view's wire format therefore
-    /// requires bumping the entity's `SCHEMA_VERSION`; without it a
-    /// current-but-incompatible view stays unhealed and reads surface a
-    /// deserialization error until an event advances `max_seq` or an operator
-    /// calls `rebuild`/`rebuild_all`.
+    /// Replays missing events through a captured per-stream checkpoint.
     pub async fn catch_up(&self) -> Result<(), ProjectionError<Entity>> {
-        let (pool, table) = self.sqlite_backing()?;
-        let aggregate_type = <Lifecycle<Entity> as Aggregate>::TYPE;
-
-        // Drive from events table (LEFT JOIN) so we also detect aggregates
-        // with persisted events but no view row (crash before initial view write).
-        // view_version is NULL when the view row is missing.
-        let stale_aggregates: Vec<(String, Option<i64>, i64)> =
-            sqlx::query_as(AssertSqlSafe(format!(
-                "SELECT e.aggregate_id, v.version, e.max_seq \
-             FROM ( \
-                 SELECT aggregate_id, MAX(sequence) as max_seq \
-                 FROM events \
-                 WHERE aggregate_type = ?1 \
-                 GROUP BY aggregate_id \
-             ) e \
-             LEFT JOIN {table} v ON v.view_id = e.aggregate_id \
-             WHERE v.version IS NULL OR e.max_seq > v.version"
-            )))
-            .bind(aggregate_type)
-            .fetch_all(pool)
-            .await?;
-
-        if stale_aggregates.is_empty() {
-            debug!(target: "cqrs", %aggregate_type, "All views up to date, nothing to replay");
-            return Ok(());
-        }
-
-        for (aggregate_id, view_version, max_seq) in &stale_aggregates {
-            let view_version = view_version.unwrap_or(0);
-
-            self.replay_missed_events(
-                pool,
-                table,
-                aggregate_type,
-                aggregate_id,
-                view_version,
-                *max_seq,
-            )
-            .await?;
-        }
-
-        Ok(())
+        let (source, _) = self.native_backing()?;
+        Backend::recover::<Entity>(source, &crate::ProjectionRecoveryMode::CatchUp).await
     }
 
-    /// Rebuild a single view by deleting its row and replaying
-    /// all events from scratch via `catch_up`.
-    ///
-    /// Use as an escape hatch when a view becomes corrupted due
-    /// to lost updates.
-    pub async fn rebuild(&self, id: &Entity::Id) -> Result<(), ProjectionError<Entity>>
-    where
-        <Entity::Id as FromStr>::Err: Debug,
-    {
-        let (pool, table) = self.sqlite_backing()?;
-        let view_id = id.to_string();
-
-        info!(target: "cqrs", %view_id, %table, "Rebuilding view from event history");
-
-        sqlx::query(AssertSqlSafe(format!(
-            "DELETE FROM {table} WHERE view_id = ?1"
-        )))
-        .bind(&view_id)
-        .execute(pool)
-        .await?;
-
-        self.catch_up().await
-    }
-
-    /// Rebuild all views by deleting every row and replaying
-    /// all events from scratch via `catch_up`.
-    pub async fn rebuild_all(&self) -> Result<(), ProjectionError<Entity>>
-    where
-        <Entity::Id as FromStr>::Err: Debug,
-    {
-        let (pool, table) = self.sqlite_backing()?;
-
-        info!(target: "cqrs", %table, "Rebuilding all views from event history");
-
-        sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
-            .execute(pool)
-            .await?;
-
-        self.catch_up().await
-    }
-
-    #[allow(clippy::cognitive_complexity)]
-    async fn replay_missed_events(
-        &self,
-        pool: &SqlitePool,
-        table: &str,
-        aggregate_type: &str,
-        view_id: &str,
-        view_version: i64,
-        max_seq: i64,
-    ) -> Result<(), ProjectionError<Entity>> {
-        // A missing or incompatible stored payload resets the in-memory
-        // lifecycle to default, so replay must restart from the first event
-        // rather than the stale view version -- otherwise creation events at or
-        // below that version are skipped and the rebuilt view is wrong.
-        let (mut lifecycle, replay_from) = match self.repo.load_with_context(view_id).await {
-            Ok(Some((lifecycle, _context))) => (lifecycle, view_version),
-            Ok(None) => (Lifecycle::default(), 0),
-            Err(PersistenceError::DeserializationError(source)) => {
-                warn!(
-                    target: "cqrs",
-                    aggregate_type,
-                    view_id,
-                    %source,
-                    "Discarding incompatible view payload; replaying from events"
-                );
-                (Lifecycle::default(), 0)
-            }
-            Err(error) => return Err(error.into()),
-        };
-
-        let behind = max_seq - replay_from;
-
-        info!(
-            target: "cqrs",
-            %view_id, %view_version, %replay_from, %max_seq, %behind, %aggregate_type,
-            "View is behind, replaying missed events"
-        );
-
-        let missed_payloads: Vec<(String,)> = sqlx::query_as(
-            "SELECT payload FROM events \
-             WHERE aggregate_type = ?1 \
-               AND aggregate_id = ?2 \
-               AND sequence > ?3 \
-             ORDER BY sequence ASC",
-        )
-        .bind(aggregate_type)
-        .bind(view_id)
-        .bind(replay_from)
-        .fetch_all(pool)
-        .await?;
-
-        let actual = missed_payloads.len();
-        // A contiguous per-aggregate sequence would yield exactly `behind`
-        // events. Not every event store guarantees that: some assign sequences
-        // from a counter shared across aggregates (so a single aggregate's
-        // sequences are sparse, never 1..N), and historical stores can carry
-        // pre-existing sequence holes from an earlier framework. The aggregate
-        // load path already tolerates this -- it replays whatever events exist
-        // in `sequence` order without asserting contiguity -- so catch-up does
-        // the same here. We still WARN on a mismatch so gaps stay observable,
-        // but we do not abort startup over them. `behind` is always positive
-        // (SQL WHERE max_seq > version), so the comparison is safe.
-        if !usize::try_from(behind).is_ok_and(|expected| actual == expected) {
-            warn!(
-                target: "cqrs",
-                %view_id, %replay_from, expected = %behind, %actual,
-                "Event sequence gap detected; replaying available events in sequence order"
-            );
-        }
-
-        for (payload_json,) in &missed_payloads {
-            let event: Entity::Event = serde_json::from_str(payload_json).map_err(|source| {
-                ProjectionError::<Entity>::Serde {
-                    aggregate_id: view_id.to_string(),
-                    source,
-                }
-            })?;
-
-            lifecycle.apply(event);
-        }
-
-        lifecycle.clone().into_result()?;
-
-        let payload = serde_json::to_string(&lifecycle).map_err(|source| ProjectionError::<
-            Entity,
-        >::Serde {
-            aggregate_id: view_id.to_string(),
+    /// Rebuilds one materialized row from retained history.
+    pub async fn rebuild(&self, id: &Entity::Id) -> Result<(), ProjectionError<Entity>> {
+        let (source, _) = self.native_backing()?;
+        Backend::recover::<Entity>(
             source,
-        })?;
-
-        // Write directly with version = max_seq, bypassing the view repo's
-        // optimistic lock (which expects version + 1 increments). This is
-        // safe because catch_up runs once at startup before the main loop.
-        sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO {table} (view_id, version, payload) \
-             VALUES (?1, ?2, ?3) \
-             ON CONFLICT(view_id) DO UPDATE SET version = ?2, payload = ?3"
-        )))
-        .bind(view_id)
-        .bind(max_seq)
-        .bind(&payload)
-        .execute(pool)
-        .await?;
-
-        info!(target: "cqrs", %view_id, %behind, "View caught up successfully");
-
-        Ok(())
+            &crate::ProjectionRecoveryMode::RebuildOne {
+                aggregate_id: id.to_string(),
+            },
+        )
+        .await
     }
 
-    fn sqlite_backing(&self) -> Result<(&SqlitePool, &str), ProjectionError<Entity>> {
-        let pool = self.pool.as_ref().ok_or(ProjectionError::NotSqliteBacked)?;
+    /// Rebuilds all materialized rows from retained history.
+    pub async fn rebuild_all(&self) -> Result<(), ProjectionError<Entity>> {
+        let (source, _) = self.native_backing()?;
+        Backend::recover::<Entity>(source, &crate::ProjectionRecoveryMode::RebuildAll).await
+    }
 
-        let table = self
-            .table_name
-            .as_deref()
-            .ok_or(ProjectionError::NotSqliteBacked)?;
-
-        Ok((pool, table))
+    fn native_backing(&self) -> Result<(&Backend::Source, Table), ProjectionError<Entity>> {
+        let table = self.table.ok_or(ProjectionError::NotSqliteBacked)?;
+        Ok((Backend::source(self.repo.as_ref()), table))
     }
 
     fn parse_rows(rows: Vec<(String, String)>) -> Vec<(Entity::Id, Entity)>
@@ -466,8 +228,7 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
     pub(crate) fn new(repo: Arc<Backend::Repo<Lifecycle<Entity>, Lifecycle<Entity>>>) -> Self {
         Self {
             repo,
-            pool: None,
-            table_name: None,
+            table: None,
             _entity: PhantomData,
         }
     }
@@ -507,8 +268,7 @@ impl<Entity: EventSourced, Backend: ViewBackend> Clone for Projection<Entity, Ba
     fn clone(&self) -> Self {
         Self {
             repo: Arc::clone(&self.repo),
-            pool: self.pool.clone(),
-            table_name: self.table_name.clone(),
+            table: self.table,
             _entity: PhantomData,
         }
     }
@@ -619,6 +379,82 @@ where
             }
         }
 
+        Ok(())
+    }
+}
+
+impl crate::NativeProjectionBackend for SqliteViewBackend {
+    type Source = SqlitePool;
+    type Database = Sqlite;
+
+    fn repository<ViewState, AggregateType>(
+        source: SqlitePool,
+        Table(table): Table,
+    ) -> Self::Repo<ViewState, AggregateType>
+    where
+        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static,
+    {
+        SqliteViewRepository::new(source, table.to_string())
+    }
+
+    fn source<ViewState, AggregateType>(
+        repository: &Self::Repo<ViewState, AggregateType>,
+    ) -> &SqlitePool
+    where
+        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static,
+    {
+        repository.as_ref()
+    }
+
+    async fn rows(
+        source: &SqlitePool,
+        Table(table): Table,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT view_id, payload FROM {table}"
+        )))
+        .fetch_all(source)
+        .await
+    }
+
+    async fn filter<Entity, Value>(
+        source: &SqlitePool,
+        Table(table): Table,
+        column: Column,
+        value: &Value,
+    ) -> Result<Vec<(String, String)>, ProjectionError<Entity>>
+    where
+        Entity: EventSourced,
+        for<'query> &'query Value: sqlx::Encode<'query, Sqlite>,
+        Value: sqlx::Type<Sqlite> + Send + Sync,
+    {
+        validate_column::<Entity>(source, table, &column).await?;
+        let Column(column) = column;
+        Ok(sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT view_id, payload FROM {table} WHERE {column} = ?1 ORDER BY view_id"
+        )))
+        .bind(value)
+        .fetch_all(source)
+        .await?)
+    }
+
+    async fn recover<Entity>(
+        source: &SqlitePool,
+        mode: &crate::ProjectionRecoveryMode,
+    ) -> Result<(), ProjectionError<Entity>>
+    where
+        Entity: EventSourced<Materialized = Table>,
+    {
+        let mut transaction = source.begin().await?;
+        {
+            let mut storage = crate::sqlite_projection::SqliteProjectionRecovery {
+                connection: &mut transaction,
+            };
+            crate::recover_projection::<Entity>(&mut storage, mode).await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 }

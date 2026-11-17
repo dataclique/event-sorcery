@@ -74,6 +74,17 @@ where
     _phantom: PhantomData<(V, A)>,
 }
 
+impl<ViewState, AggregateType> AsRef<Pool<Sqlite>>
+    for SqliteViewRepository<ViewState, AggregateType>
+where
+    ViewState: View<AggregateType>,
+    AggregateType: Aggregate,
+{
+    fn as_ref(&self) -> &Pool<Sqlite> {
+        &self.pool
+    }
+}
+
 impl<V, A> SqliteViewRepository<V, A>
 where
     V: View<A>,

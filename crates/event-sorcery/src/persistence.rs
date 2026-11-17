@@ -8,8 +8,8 @@ use tracing::warn;
 use crate::engine::EngineError;
 use crate::schema_registry::{REGISTRY_ID, SchemaRegistryCommand};
 use crate::{
-    CompactionPolicy, EventBackend, EventSourced, Nil, ReconcileError, SchemaReconciliation,
-    SchemaRegistry, SchemaTarget, SqliteBackend,
+    CompactionPolicy, EventBackend, EventSourced, NativeProjectionBackend, Nil, Projection,
+    ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, SqliteBackend, Table,
 };
 
 /// Storage required to execute and reload native aggregates.
@@ -73,6 +73,19 @@ impl UnmaterializedStoreBackend for SqliteBackend {
         let _ = reconciler.reconcile::<Entity>().await?;
         reconciler.record_version::<Entity>().await
     }
+}
+
+/// Native startup for entities with a materialized view, independent of workers.
+pub trait ProjectedStoreBackend: PersistenceBackend {
+    /// View repository family used by the returned, fully recovered projection.
+    type ViewBackend: NativeProjectionBackend;
+
+    /// Recovers view state and records the schema before publishing a projection.
+    fn reconcile_projected<Entity>(
+        &self,
+    ) -> impl Future<Output = Result<Projection<Entity, Self::ViewBackend>, ReconcileError>> + Send
+    where
+        Entity: EventSourced<Materialized = Table> + 'static;
 }
 
 /// Stable identity of the singleton schema authority's event stream.

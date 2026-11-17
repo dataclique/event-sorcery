@@ -46,8 +46,8 @@ use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
 use crate::{
-    CompactionPolicy, EventSourced, PersistenceBackend, SqliteBackend, SqliteViewBackend, Store,
-    UnmaterializedStoreBackend,
+    CompactionPolicy, EventSourced, PersistenceBackend, ProjectedStoreBackend, SqliteBackend,
+    SqliteViewBackend, Store, UnmaterializedStoreBackend,
 };
 
 /// Builder for a single CQRS framework.
@@ -116,42 +116,20 @@ pub(crate) fn es_cqrs<Entity: EventSourced, Repository: PersistedEventRepository
     CqrsFramework::new(store, queries, ())
 }
 
-/// Projected entities: auto-creates and wires a [`Projection`],
-/// returning `(Arc<Store>, Arc<Projection>)`.
-impl<Entity: EventSourced<Materialized = Table> + 'static>
-    StoreBuilder<Entity, SqliteBackend, Table>
-where
-    Entity::Id: Clone,
-    Entity::Event: Clone,
-    <Entity::Id as FromStr>::Err: Debug,
-{
-    pub async fn build(
-        mut self,
-    ) -> Result<
-        (
-            Arc<Store<Entity, SqliteBackend>>,
-            Arc<Projection<Entity, SqliteViewBackend>>,
-        ),
-        ReconcileError,
-    > {
-        // Projected entities must retain all events so that
-        // `catch_up`/`rebuild_all` can replay the full history.
-        // Compacted aggregates lose events after snapshot, making
-        // projection rebuilds silently incomplete.
-        const {
-            assert!(
-                matches!(Entity::COMPACTION_POLICY, CompactionPolicy::Retain),
-                "CompactAfterSnapshot entities must not have table projections -- \
-                 rebuild_all only reads the events table and would miss \
-                 compacted snapshot-only aggregates"
-            );
-        }
+impl crate::ProjectedStoreBackend for SqliteBackend {
+    type ViewBackend = SqliteViewBackend;
 
-        let pool = self.backend.pool().clone();
+    async fn reconcile_projected<Entity>(
+        &self,
+    ) -> Result<Projection<Entity, SqliteViewBackend>, ReconcileError>
+    where
+        Entity: EventSourced<Materialized = Table> + 'static,
+    {
+        let pool = self.pool().clone();
         let reconciler = Reconciler::new(pool.clone());
         let reconciliation = reconciler.reconcile::<Entity>().await?;
 
-        let projection = Arc::new(Projection::sqlite(pool.clone()));
+        let projection = Projection::sqlite(pool.clone());
 
         // A schema version change can leave stored view payloads in an
         // incompatible format. `catch_up` only revisits views that are behind
@@ -182,6 +160,44 @@ where
         // reconcile -- including rebuild_all -- instead of recording a version
         // whose view rebuild never finished.
         reconciler.record_version::<Entity>().await?;
+
+        Ok(projection)
+    }
+}
+
+/// Projected entities: auto-creates and wires a [`Projection`],
+/// returning `(Arc<Store>, Arc<Projection>)`.
+impl<Entity, Backend> StoreBuilder<Entity, Backend, Table>
+where
+    Entity: EventSourced<Materialized = Table> + 'static,
+    Backend: ProjectedStoreBackend,
+    Entity::Id: Clone,
+    Entity::Event: Clone,
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    pub async fn build(
+        mut self,
+    ) -> Result<
+        (
+            Arc<Store<Entity, Backend>>,
+            Arc<Projection<Entity, Backend::ViewBackend>>,
+        ),
+        ReconcileError,
+    > {
+        // Projected entities must retain all events so that
+        // `catch_up`/`rebuild_all` can replay the full history.
+        // Compacted aggregates lose events after snapshot, making
+        // projection rebuilds silently incomplete.
+        const {
+            assert!(
+                matches!(Entity::COMPACTION_POLICY, CompactionPolicy::Retain),
+                "CompactAfterSnapshot entities must not have table projections -- \
+                 rebuild_all only reads the events table and would miss \
+                 compacted snapshot-only aggregates"
+            );
+        }
+
+        let projection = Arc::new(self.backend.reconcile_projected::<Entity>().await?);
 
         self.queries.push(Box::new(ReactorBridge {
             reactor: projection.clone(),
