@@ -389,6 +389,8 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity, SqliteViewBa
             lifecycle.apply(event);
         }
 
+        lifecycle.clone().into_result()?;
+
         let payload = serde_json::to_string(&lifecycle).map_err(|source| ProjectionError::<
             Entity,
         >::Serde {
@@ -693,7 +695,92 @@ mod tests {
     use super::*;
     use crate::Nil;
     use crate::lifecycle::Never;
-    use crate::{CompactionPolicy, Effect, uneventful};
+    use crate::{CompactionPolicy, Effect, SqliteBackend, StoreBuilder, uneventful};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct RecoveryEntity<const ACCEPT_HISTORY: bool>;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum RecoveryEvent {
+        Created,
+    }
+
+    impl DomainEvent for RecoveryEvent {
+        fn event_type(&self) -> String {
+            "RecoveryCreated".to_string()
+        }
+
+        fn event_version(&self) -> String {
+            "1".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl<const ACCEPT_HISTORY: bool> EventSourced for RecoveryEntity<ACCEPT_HISTORY> {
+        type Id = String;
+        type Command = ();
+        type Event = RecoveryEvent;
+        type Error = Never;
+        type Materialized = Table;
+        type Jobs = Nil;
+
+        const AGGREGATE_TYPE: &'static str = "RecoveryEntity";
+        const SCHEMA_VERSION: u64 = if ACCEPT_HISTORY { 1 } else { 2 };
+        const SNAPSHOT_SIZE: usize = 2;
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
+        const PROJECTION: Table = Table("recovery_projection");
+
+        fn originate(_event: &Self::Event) -> Option<Self> {
+            ACCEPT_HISTORY.then_some(Self)
+        }
+
+        fn evolve(_entity: &Self, _event: &Self::Event) -> Result<Option<Self>, Never> {
+            Ok(None)
+        }
+
+        async fn initialize((): ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![RecoveryEvent::Created]))
+        }
+
+        async fn transition(&self, (): ()) -> Result<Effect<Self>, Never> {
+            uneventful()
+        }
+    }
+
+    #[tokio::test]
+    async fn catch_up_rejects_history_that_enters_a_failed_lifecycle() {
+        let pool = sqlite_es::testing::create_test_pool().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE recovery_projection (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (store, _) = StoreBuilder::<RecoveryEntity<true>, SqliteBackend>::new(pool.clone())
+            .build()
+            .await
+            .unwrap();
+        store.send(&"legacy".to_string(), ()).await.unwrap();
+        drop(store);
+        sqlx::query("DELETE FROM recovery_projection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let projection =
+            Projection::<RecoveryEntity<false>, SqliteViewBackend>::sqlite(pool.clone());
+        let error = projection.catch_up().await.unwrap_err();
+        assert!(matches!(error, ProjectionError::Lifecycle(source)
+            if matches!(*source, LifecycleError::EventCantOriginate { event: RecoveryEvent::Created })));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM recovery_projection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct TestEntity {
