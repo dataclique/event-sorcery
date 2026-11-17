@@ -22,6 +22,7 @@ pub enum ProjectionRecoveryMode {
 }
 
 /// Stored state selected consistently with an event-stream maximum.
+#[derive(Debug)]
 pub struct ProjectionCheckpoint {
     /// Event sequence covered by the stored materialized state, not schema version.
     pub sequence: u64,
@@ -30,6 +31,7 @@ pub struct ProjectionCheckpoint {
 }
 
 /// One stream selected for recovery by an events-to-views left join.
+#[derive(Debug)]
 pub struct ProjectionReplayRow {
     /// Persisted aggregate identity of the authoritative event stream.
     pub aggregate_id: String,
@@ -76,8 +78,9 @@ impl TryFrom<(String, Option<i64>, Option<String>, i64)> for ProjectionReplayRow
 
 /// Database operations performed inside the caller's recovery transaction.
 ///
-/// Implementations never commit. Startup records the reconciled schema version
-/// after replay succeeds, then commits the complete recovery operation.
+/// Implementations never commit through this interface. The caller owns commit
+/// and schema-registration ordering; schema versions must not advance over
+/// failed replay. A backend may include registration in the same transaction.
 pub trait ProjectionRecoveryStorage: Send {
     /// Deletes only rows selected by an explicit rebuild; catch-up keeps rows.
     fn reset(
@@ -167,4 +170,49 @@ pub async fn recover_projection<Entity: EventSourced<Materialized = Table>>(
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_row_decodes_missing_and_present_checkpoints() {
+        let missing =
+            ProjectionReplayRow::try_from(("missing".to_string(), None, None, 7)).unwrap();
+        assert_eq!(missing.aggregate_id, "missing");
+        assert_eq!(missing.maximum_sequence.get(), 7);
+        let None = missing.checkpoint else {
+            panic!("a missing view must retain its absent checkpoint");
+        };
+        let present = ProjectionReplayRow::try_from((
+            "present".to_string(),
+            Some(3),
+            Some("{}".to_string()),
+            7,
+        ))
+        .unwrap();
+        let Some(checkpoint) = present.checkpoint else {
+            panic!("stored state and sequence must be retained together");
+        };
+        assert_eq!(present.maximum_sequence.get(), 7);
+        assert_eq!(checkpoint.sequence, 3);
+        assert_eq!(checkpoint.payload, "{}");
+    }
+
+    #[test]
+    fn replay_row_rejects_partial_checkpoints_and_invalid_counters() {
+        for (sequence, payload, maximum) in [
+            (Some(1), None, 2),
+            (None, Some("{}".to_string()), 2),
+            (Some(-1), Some("{}".to_string()), 2),
+            (None, None, 0),
+            (None, None, -1),
+        ] {
+            let error =
+                ProjectionReplayRow::try_from(("invalid".to_string(), sequence, payload, maximum))
+                    .unwrap_err();
+            assert!(matches!(error, sqlx::Error::Decode(_)));
+        }
+    }
 }
