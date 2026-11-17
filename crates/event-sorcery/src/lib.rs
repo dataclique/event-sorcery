@@ -160,7 +160,7 @@ pub use projection_recovery::{
 };
 pub use reactor::{
     IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,
-    RetryOnBusy, is_retryable_sqlite_busy, retry_with_backoff,
+    ReactorContext, RetryOnBusy, is_retryable_sqlite_busy, retry_with_backoff,
 };
 pub use schema_registry::{
     ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry, SchemaTarget,

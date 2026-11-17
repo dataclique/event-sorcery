@@ -13,11 +13,20 @@ use async_trait::async_trait;
 use cqrs_es::persist::PersistenceError;
 use sqlx::error::DatabaseError;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use tracing::warn;
 
 use crate::dependency::{Dependent, EntityList};
+
+/// Persistence provenance attached to framework-driven reactor delivery.
+#[derive(Clone, Copy, Debug)]
+pub struct ReactorContext {
+    /// Positive aggregate-local event sequence from the persisted envelope.
+    /// Absent only for the existing direct, unsequenced `react` entry point.
+    pub sequence: Option<NonZeroUsize>,
+}
 
 /// Event reactor with exhaustive compile-time checked handling.
 ///
@@ -65,6 +74,18 @@ pub trait Reactor: Dependent {
         &self,
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error>;
+
+    /// Handles a persisted envelope while preserving existing reactor implementations.
+    ///
+    /// The default delegates to `react`; materialized views use the sequence to
+    /// avoid reapplying events already incorporated by startup recovery.
+    async fn react_with_context(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+        _context: ReactorContext,
+    ) -> Result<(), Self::Error> {
+        self.react(event).await
+    }
 }
 
 /// Enables sharing a reactor via `Arc`.
@@ -77,6 +98,14 @@ impl<R: Reactor> Reactor for Arc<R> {
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
         R::react(self, event).await
+    }
+
+    async fn react_with_context(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+        context: ReactorContext,
+    ) -> Result<(), Self::Error> {
+        R::react_with_context(self, event, context).await
     }
 }
 
@@ -129,6 +158,7 @@ pub trait IdempotentReactor: Reactor {}
 /// `SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`. See [`IdempotentReactor`] for the
 /// safety contract that gates this, including the caller-latency tradeoff.
 pub struct RetryOnBusy<R> {
+    /// Reactor whose complete, idempotent delivery is retried on SQLite busy errors.
     pub inner: R,
 }
 
@@ -149,13 +179,22 @@ where
         &self,
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
+        self.react_with_context(event, ReactorContext { sequence: None })
+            .await
+    }
+
+    async fn react_with_context(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+        context: ReactorContext,
+    ) -> Result<(), Self::Error> {
         retry_with_backoff(
             RETRY_MAX_ATTEMPTS,
             RETRY_BASE_DELAY_MS,
             RETRY_MAX_DELAY_MS,
             move || {
                 let event = event.clone();
-                async move { self.inner.react(event).await }
+                async move { self.inner.react_with_context(event, context).await }
             },
             |error: &Self::Error| is_retryable_sqlite_busy(error),
         )

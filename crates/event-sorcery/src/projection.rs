@@ -23,8 +23,8 @@ use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::reactor::{
-    RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, backoff_delay_ms,
-    is_retryable_sqlite_busy,
+    RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, ReactorContext,
+    backoff_delay_ms, is_retryable_sqlite_busy,
 };
 use crate::view_backend::{SqliteViewBackend, ViewBackend};
 
@@ -294,6 +294,15 @@ where
         &self,
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
+        self.react_with_context(event, ReactorContext { sequence: None })
+            .await
+    }
+
+    async fn react_with_context(
+        &self,
+        event: <Self::Dependencies as EntityList>::Event,
+        delivery: ReactorContext,
+    ) -> Result<(), Self::Error> {
         let (id, event) = event.into_inner();
         let view_id = id.to_string();
 
@@ -333,6 +342,26 @@ where
                 }
             };
 
+            if let Some(sequence) = delivery.sequence {
+                let Ok(covered) = usize::try_from(context.version) else {
+                    error!(target: "cqrs", %view_id, version = context.version,
+                        "Invalid projection checkpoint; refusing event delivery");
+                    return Ok(());
+                };
+                if sequence.get() <= covered {
+                    return Ok(());
+                }
+                if covered.checked_add(1) != Some(sequence.get()) {
+                    if attempt < max_retries {
+                        let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
+                        sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    error!(target: "cqrs", %view_id, covered, sequence = sequence.get(),
+                        "Projection delivery is out of order; leaving checkpoint for recovery");
+                    return Ok(());
+                }
+            }
             lifecycle.apply(event.clone());
 
             match self.repo.update_view(lifecycle, context).await {

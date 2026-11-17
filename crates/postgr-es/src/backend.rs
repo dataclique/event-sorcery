@@ -178,12 +178,15 @@ pub(crate) mod tests {
     use sqlx::migrate::MigrateError;
     use sqlx::postgres::PgPoolOptions;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use tokio::sync::Notify;
     use tokio::time::timeout;
 
     use event_sorcery::{
-        Column, CompactionPolicy, DomainEvent, Effect, EventSourced, Never, Nil,
-        PersistenceBackend, ReconcileError, StoreBuilder, Table,
+        Column, CompactionPolicy, Cons, Dependent, DomainEvent, Effect, EntityList, EventSourced,
+        Never, Nil, PersistenceBackend, Reactor, ReconcileError, StoreBuilder, Table,
     };
 
     use crate::view_repository::tests::{RegisteredSchemaEvent, RegisteredSchemaView};
@@ -414,6 +417,84 @@ pub(crate) mod tests {
             store.load(&id).await.unwrap().unwrap().history,
             vec!["first", "second"]
         );
+    }
+
+    struct PausedDelivery {
+        armed: AtomicBool,
+        persisted: Notify,
+        resume: Notify,
+    }
+
+    impl Dependent for PausedDelivery {
+        type Dependencies = Cons<ProjectedNote<1>, Nil>;
+    }
+
+    #[async_trait]
+    impl Reactor for PausedDelivery {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            _event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Never> {
+            if self.armed.load(Ordering::SeqCst) {
+                self.persisted.notify_one();
+                self.resume.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn recovered_event_is_not_applied_again_by_its_pending_reactor_delivery(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let backend = PostgresBackend { pool: pool.clone() };
+        let gate = Arc::new(PausedDelivery {
+            armed: AtomicBool::new(false),
+            persisted: Notify::new(),
+            resume: Notify::new(),
+        });
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(backend.clone())
+                .with(gate.clone())
+                .build()
+                .await
+                .unwrap();
+        let id = "projected".to_string();
+        store.send(&id, "first".to_string()).await.unwrap();
+        gate.armed.store(true, Ordering::SeqCst);
+        let writing_id = id.clone();
+        let writing = tokio::spawn(async move {
+            store.send(&writing_id, "second".to_string()).await.unwrap();
+        });
+        timeout(Duration::from_secs(10), gate.persisted.notified())
+            .await
+            .unwrap();
+        let (_, recovered) = timeout(
+            Duration::from_secs(10),
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(backend).build(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            recovered.load(&id).await.unwrap().unwrap().history,
+            vec!["first", "second"]
+        );
+        gate.resume.notify_one();
+        timeout(Duration::from_secs(10), writing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection.load(&id).await.unwrap().unwrap().history,
+            vec!["first", "second"]
+        );
+        let version: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
     }
 
     async fn seed_projected(pool: &PgPool) {
