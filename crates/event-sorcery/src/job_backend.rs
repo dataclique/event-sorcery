@@ -50,6 +50,7 @@ use crate::job::{
 use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
 use crate::projection::Projection;
+use crate::view_backend::SqliteViewBackend;
 use crate::{LifecycleError, ReconcileError, SendError, Store, StoreBuilder};
 
 /// The durable-jobs runtime over one [`EventBackend`].
@@ -57,10 +58,10 @@ use crate::{LifecycleError, ReconcileError, SendError, Store, StoreBuilder};
 /// Holds the job [`Store`] (cqrs/es) and the `job_queue_projection` [`Projection`], built
 /// once per process. Cheap to clone (the store and projection are `Arc`); one
 /// runtime is shared by every job type's worker.
-pub struct JobRuntime<Backend: EventBackend = SqliteBackend> {
+pub struct JobRuntime<Backend: EventBackend> {
     backend: Backend,
     jobs: Arc<Store<JobState, Backend>>,
-    queue: Arc<Projection<JobState>>,
+    queue: Arc<Projection<JobState, SqliteViewBackend>>,
 }
 
 /// A won claim capability used by a worker adapter to renew or settle execution.
@@ -475,7 +476,7 @@ impl JobRuntime<SqliteBackend> {
     /// [`SqliteBackend`].
     pub async fn build(pool: SqlitePool) -> Result<Self, ReconcileError> {
         let backend = SqliteBackend::new(pool);
-        let (jobs, queue) = StoreBuilder::<JobState>::with_backend(backend.clone())
+        let (jobs, queue) = StoreBuilder::<JobState, _>::with_backend(backend.clone())
             .build()
             .await?;
         Ok(Self {
@@ -488,7 +489,7 @@ impl JobRuntime<SqliteBackend> {
 
 /// The event-sourced job backend for a single job type `J` over an
 /// [`EventBackend`].
-pub struct EventStoreBackend<J: StandaloneJob, Backend: EventBackend = SqliteBackend> {
+pub struct EventStoreBackend<J: StandaloneJob, Backend: EventBackend> {
     runtime: JobRuntime<Backend>,
     config: JobWorkerConfig,
     clock: Clock,
@@ -1232,7 +1233,7 @@ macro_rules! build_supervised_worker {
                         <$job as $crate::StandaloneJob>::WORKER_NAME,
                         index
                     );
-                    let backend = $crate::EventStoreBackend::<$job>::new(
+                    let backend = $crate::EventStoreBackend::<$job, _>::new(
                         ::std::clone::Clone::clone(&runtime),
                         &name,
                         ::std::clone::Clone::clone(&config),
@@ -1855,7 +1856,7 @@ mod tests {
         );
 
         // run_at is an hour out, so a poll at "now" finds nothing runnable.
-        let projection = Projection::<JobState>::sqlite(pool.clone());
+        let projection = Projection::<JobState, _>::sqlite(pool.clone());
         let now_ms = Utc::now().timestamp_millis();
         let found = projection
             .find(
@@ -1950,7 +1951,7 @@ mod tests {
         assert_eq!(state["Live"]["Pending"]["claims"], 0);
 
         // run_at is an hour out, so the deferred job is not runnable yet.
-        let projection = Projection::<JobState>::sqlite(pool.clone());
+        let projection = Projection::<JobState, _>::sqlite(pool.clone());
         let found = projection
             .find(
                 &poll_predicate(TestJob::KIND, Utc::now().timestamp_millis()),
@@ -1991,7 +1992,7 @@ mod tests {
         let job_id = enqueue(&pool, 1000).await;
         claim(&backend, &job_id, "w1", 1000, 50).await;
 
-        let projection = Projection::<JobState>::sqlite(pool.clone());
+        let projection = Projection::<JobState, _>::sqlite(pool.clone());
         let found = projection
             .find(
                 &poll_predicate(TestJob::KIND, 1000 + 5_000),
@@ -2159,7 +2160,7 @@ mod tests {
         let pool = create_test_pool().await.unwrap();
         let runtime = JobRuntime::build(pool.clone()).await.unwrap();
         let job_id = enqueue(&pool, 1_000).await;
-        let mut worker = EventStoreBackend::<TestJob>::new(
+        let mut worker = EventStoreBackend::<TestJob, _>::new(
             runtime,
             "native-worker",
             JobWorkerConfig::default(),
@@ -2325,7 +2326,7 @@ mod tests {
         let pool = create_test_pool().await.unwrap();
         let runtime = JobRuntime::build(pool.clone()).await.unwrap();
         let job_id = enqueue(&pool, 1_000).await;
-        let mut worker = EventStoreBackend::<TestJob>::new(
+        let mut worker = EventStoreBackend::<TestJob, _>::new(
             runtime,
             "native-worker",
             JobWorkerConfig::default(),

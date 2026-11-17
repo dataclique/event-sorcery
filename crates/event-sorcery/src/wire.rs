@@ -46,7 +46,7 @@ use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
 use crate::{
-    CompactionPolicy, EventSourced, PersistenceBackend, SqliteBackend, Store,
+    CompactionPolicy, EventSourced, PersistenceBackend, SqliteBackend, SqliteViewBackend, Store,
     UnmaterializedStoreBackend,
 };
 
@@ -62,7 +62,7 @@ use crate::{
 /// [`.build()`](Self::build) to construct the framework.
 pub struct StoreBuilder<
     Entity: EventSourced,
-    Backend: PersistenceBackend = SqliteBackend,
+    Backend: PersistenceBackend,
     Materialized = <Entity as EventSourced>::Materialized,
 > {
     backend: Backend,
@@ -127,7 +127,13 @@ where
 {
     pub async fn build(
         mut self,
-    ) -> Result<(Arc<Store<Entity>>, Arc<Projection<Entity>>), ReconcileError> {
+    ) -> Result<
+        (
+            Arc<Store<Entity, SqliteBackend>>,
+            Arc<Projection<Entity, SqliteViewBackend>>,
+        ),
+        ReconcileError,
+    > {
         // Projected entities must retain all events so that
         // `catch_up`/`rebuild_all` can replay the full history.
         // Compacted aggregates lose events after snapshot, making
@@ -363,7 +369,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlite_es::MIGRATOR.run(&pool).await.unwrap();
 
-        let _store = StoreBuilder::<AggregateA>::new(pool.clone())
+        let _store = StoreBuilder::<AggregateA, _>::new(pool.clone())
             .with(Arc::new(SingleEntityReactor))
             .build()
             .await
@@ -378,14 +384,14 @@ mod tests {
         let multi = Arc::new(MultiEntityReactor);
         let single = Arc::new(SingleEntityReactor);
 
-        let _store_a = StoreBuilder::<AggregateA>::new(pool.clone())
+        let _store_a = StoreBuilder::<AggregateA, _>::new(pool.clone())
             .with(multi.clone())
             .with(single)
             .build()
             .await
             .unwrap();
 
-        let _store_b = StoreBuilder::<AggregateB>::new(pool.clone())
+        let _store_b = StoreBuilder::<AggregateB, _>::new(pool.clone())
             .with(multi)
             .build()
             .await
@@ -492,7 +498,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (_store, _projection) = StoreBuilder::<Tally>::new(pool.clone())
+        let (_store, _projection) = StoreBuilder::<Tally, _>::new(pool.clone())
             .build()
             .await
             .unwrap();
@@ -566,7 +572,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (_store, _projection) = StoreBuilder::<Tally>::new(pool.clone())
+        let (_store, _projection) = StoreBuilder::<Tally, _>::new(pool.clone())
             .build()
             .await
             .unwrap();

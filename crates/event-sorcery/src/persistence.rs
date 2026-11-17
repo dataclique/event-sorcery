@@ -254,7 +254,7 @@ mod tests {
         let _: <SqliteBackend as EventBackend>::EventRepo =
             backend.persistence_repo(CompactionPolicy::Retain);
 
-        let _store = StoreBuilder::<SchemaRegistry>::new(pool.clone())
+        let _store = StoreBuilder::<SchemaRegistry, _>::new(pool.clone())
             .build()
             .await
             .unwrap();

@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let audit = Arc::new(AuditLog::new());
 
     // Order is Materialized = Nil -- no projection tuple in the return type.
-    let orders = StoreBuilder::<Order>::new(pool.clone())
+    let orders = StoreBuilder::<Order, _>::new(pool.clone())
         .with(stock_alert.clone())
         .with(audit.clone())
         .build()
@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Inventory is Materialized = Table -- the auto-wired projection is
     // returned alongside the store, and our custom reactor runs next to it.
-    let (inventory, inventory_projection) = StoreBuilder::<Inventory>::new(pool.clone())
+    let (inventory, inventory_projection) = StoreBuilder::<Inventory, _>::new(pool.clone())
         .with(stock_alert.clone())
         .build()
         .await?;

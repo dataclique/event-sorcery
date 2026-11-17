@@ -17,7 +17,7 @@ use tokio::runtime::Runtime;
 use event_sorcery::{
     CompactionPolicy, DispatchEvent, DispatchOutcome, DispatchRefused, DispatchedJob, Effect,
     EventSourced, Job, JobContext, JobFailure, JobOutcome, JobRuntime, Label, Never, Nil,
-    Reconciliation, StandaloneJob, Store, StoreBuilder, fx, jobs,
+    Reconciliation, SqliteBackend, StandaloneJob, Store, StoreBuilder, fx, jobs,
 };
 
 fn ok<Value, Error: Debug>(result: Result<Value, Error>) -> Value {
@@ -221,15 +221,17 @@ impl StandaloneJob for BenchSweep {
 }
 
 struct Fixture {
-    store: Arc<Store<BenchEntity>>,
-    jobs: JobRuntime,
+    store: Arc<Store<BenchEntity, SqliteBackend>>,
+    jobs: JobRuntime<SqliteBackend>,
     next_id: AtomicU64,
 }
 
 async fn fixture() -> Fixture {
     let pool = ok(SqlitePool::connect(":memory:").await);
     ok(sqlite_es::MIGRATOR.run(&pool).await);
-    let store = ok(StoreBuilder::<BenchEntity>::new(pool.clone()).build().await);
+    let store = ok(StoreBuilder::<BenchEntity, _>::new(pool.clone())
+        .build()
+        .await);
     let jobs = ok(JobRuntime::build(pool).await);
     Fixture {
         store,

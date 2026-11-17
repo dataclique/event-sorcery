@@ -1,9 +1,8 @@
 //! Backend-agnostic projection for loading entity state from
 //! materialized views.
 //!
-//! Generic over a [`ViewBackend`](crate::ViewBackend) — see the
-//! [`view_backend`](crate::view_backend) module for the trait and
-//! default [`SqliteViewBackend`](crate::SqliteViewBackend).
+//! Generic over an explicitly selected [`ViewBackend`](crate::ViewBackend).
+//! SQLite uses [`SqliteViewBackend`](crate::SqliteViewBackend).
 
 use async_trait::async_trait;
 use cqrs_es::Aggregate;
@@ -98,23 +97,22 @@ impl<Entity: EventSourced> From<LifecycleError<Entity>> for ProjectionError<Enti
 
 /// Materialized view of an event-sourced entity.
 ///
-/// Provides [`load`](Self::load) to retrieve a single entity by
-/// ID, [`load_all`](Self::load_all) to retrieve all live
-/// entities, and [`filter`](Self::filter) for typed
-/// column-filtered queries. Backed by SQLite in production; the
-/// `Backend` parameter defaults to [`SqliteViewBackend`] so
-/// consumers write `Projection<Position>`.
+/// Provides [`load`](Self::load) to retrieve a single entity by ID.
+/// SQLite-backed projections also provide [`load_all`](Self::load_all) and
+/// [`filter`](Self::filter) for typed column queries.
+/// The backend is explicit in named types: `Projection<Position, Backend>`.
+/// For SQLite, use [`SqliteViewBackend`].
 ///
 /// Constructed via [`sqlite`](Self::sqlite) during wiring or
 /// directly in CLI/test code.
-pub struct Projection<Entity: EventSourced, Backend: ViewBackend = SqliteViewBackend> {
+pub struct Projection<Entity: EventSourced, Backend: ViewBackend> {
     repo: Arc<Backend::Repo<Lifecycle<Entity>, Lifecycle<Entity>>>,
     pool: Option<SqlitePool>,
     table_name: Option<String>,
     _entity: PhantomData<Entity>,
 }
 
-impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
+impl<Entity: EventSourced<Materialized = Table>> Projection<Entity, SqliteViewBackend> {
     /// Creates a SQLite-backed projection for an entity that
     /// declares `type Materialized = Table`.
     ///
@@ -1524,7 +1522,7 @@ mod tests {
         // View is stale at version 1 (only saw Created)
         insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
 
-        let projection = Projection::<Counter>::sqlite(pool);
+        let projection = Projection::<Counter, _>::sqlite(pool);
 
         projection.catch_up().await.unwrap();
 
@@ -1541,7 +1539,7 @@ mod tests {
         // View is up to date at version 1
         insert_stale_view(&pool, "counter-1", 1, &Counter { value: 5 }).await;
 
-        let projection = Projection::<Counter>::sqlite(pool);
+        let projection = Projection::<Counter, _>::sqlite(pool);
 
         projection.catch_up().await.unwrap();
 
@@ -1553,7 +1551,7 @@ mod tests {
     async fn catch_up_with_no_events_is_noop() {
         let pool = setup_catch_up_db().await;
 
-        let projection = Projection::<Counter>::sqlite(pool);
+        let projection = Projection::<Counter, _>::sqlite(pool);
 
         projection.catch_up().await.unwrap();
     }
@@ -1568,7 +1566,7 @@ mod tests {
 
         insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
 
-        let projection = Projection::<Counter>::sqlite(pool.clone());
+        let projection = Projection::<Counter, _>::sqlite(pool.clone());
 
         projection.catch_up().await.unwrap();
         projection.catch_up().await.unwrap();
@@ -1600,7 +1598,7 @@ mod tests {
         .await;
         insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
 
-        let projection = Projection::<Counter>::sqlite(pool);
+        let projection = Projection::<Counter, _>::sqlite(pool);
 
         projection.catch_up().await.unwrap();
 
@@ -1621,7 +1619,7 @@ mod tests {
 
         insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
 
-        let projection = Projection::<Counter>::sqlite(pool.clone());
+        let projection = Projection::<Counter, _>::sqlite(pool.clone());
 
         projection.catch_up().await.unwrap();
 
@@ -1659,7 +1657,7 @@ mod tests {
         insert_event(&pool, "counter-1", 4560, &CounterEvent::Incremented).await;
         insert_event(&pool, "counter-1", 4561, &CounterEvent::Incremented).await;
 
-        let projection = Projection::<Counter>::sqlite(pool.clone());
+        let projection = Projection::<Counter, _>::sqlite(pool.clone());
 
         projection.catch_up().await.unwrap();
 
@@ -1693,7 +1691,7 @@ mod tests {
             .await
             .unwrap();
 
-        let projection = Projection::<Counter>::sqlite(pool.clone());
+        let projection = Projection::<Counter, _>::sqlite(pool.clone());
         projection.catch_up().await.unwrap();
 
         let payload: String =
@@ -1739,7 +1737,7 @@ mod tests {
 
         insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
 
-        let projection = Projection::<Counter>::sqlite(pool);
+        let projection = Projection::<Counter, _>::sqlite(pool);
 
         let error = projection.catch_up().await.unwrap_err();
         assert!(
@@ -1759,7 +1757,7 @@ mod tests {
 
         insert_stale_view(&pool, "counter-1", 3, &Counter { value: 99 }).await;
 
-        let projection = Projection::<Counter>::sqlite(pool);
+        let projection = Projection::<Counter, _>::sqlite(pool);
 
         // catch_up would not fix this because version matches max_seq
         projection.rebuild(&"counter-1".to_string()).await.unwrap();
@@ -1786,7 +1784,7 @@ mod tests {
         insert_stale_view(&pool, "counter-1", 2, &Counter { value: 99 }).await;
         insert_stale_view(&pool, "counter-2", 1, &Counter { value: 99 }).await;
 
-        let projection = Projection::<Counter>::sqlite(pool);
+        let projection = Projection::<Counter, _>::sqlite(pool);
 
         projection.rebuild_all().await.unwrap();
 

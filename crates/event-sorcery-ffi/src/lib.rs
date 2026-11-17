@@ -28,8 +28,8 @@ use event_sorcery::{
     CompactionPolicy, DeadReason, Engine, EngineError, JobClaimHandle, JobClaimResult, JobId,
     JobLeaseResult, JobRuntime, JobRuntimeError, JobSeed, JobSettlementResult, JobStoreError,
     OpaqueCommitRequest, OpaqueProposedEvent, OpaqueStoredEvent, ReconcileError,
-    SchemaReconciliation, SchemaTarget, SnapshotWrite, SqliteJobError, StreamIdentity,
-    decode_opaque_payload, encode_opaque_payload,
+    SchemaReconciliation, SchemaTarget, SnapshotWrite, SqliteBackend, SqliteJobError,
+    StreamIdentity, decode_opaque_payload, encode_opaque_payload,
 };
 
 const ABI_MAJOR: u32 = 0;
@@ -1107,7 +1107,7 @@ enum SqliteCacheMode {
 struct StoreInner {
     runtime: tokio::runtime::Runtime,
     engine: Engine,
-    jobs: JobRuntime,
+    jobs: JobRuntime<SqliteBackend>,
     claims: Mutex<ClaimRegistry>,
 }
 

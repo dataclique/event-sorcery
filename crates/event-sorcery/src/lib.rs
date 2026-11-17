@@ -370,7 +370,7 @@ pub trait EventSourced:
 /// # Usage
 ///
 /// ```ignore
-/// let positions: Store<Position> = /* built by StoreBuilder */;
+/// let positions: Store<Position, SqliteBackend> = /* built by StoreBuilder */;
 ///
 /// // Typed ID -- can't accidentally pass an OffchainOrderId
 /// let symbol = Symbol::new("AAPL").unwrap();
@@ -381,7 +381,7 @@ pub trait EventSourced:
 /// startup. The builder handles CQRS framework construction,
 /// query wiring, and schema reconciliation, returning a
 /// ready-to-use `Store`.
-pub struct Store<Entity: EventSourced, Backend: PersistenceBackend = SqliteBackend> {
+pub struct Store<Entity: EventSourced, Backend: PersistenceBackend> {
     cqrs: EsCqrs<Entity, Backend>,
     event_store: PersistedEventStore<Backend::PersistenceRepo, Lifecycle<Entity>>,
 }

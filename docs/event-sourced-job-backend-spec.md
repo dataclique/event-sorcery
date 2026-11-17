@@ -188,7 +188,7 @@ idempotency contracts.
 
 ```rust
 let runtime = JobRuntime::build(pool).await?;            // one per process
-let worker = EventStoreBackend::<MyJob>::new(runtime.clone(), "my-worker", cfg, Clock::system());
+let worker = EventStoreBackend::<MyJob, _>::new(runtime.clone(), "my-worker", cfg, Clock::system());
 WorkerBuilder::new(name).backend(worker).data(Arc::new(input)).build(run::<MyJob>);
 ```
 

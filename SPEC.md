@@ -83,6 +83,10 @@ job-event construction, and durable lifecycle decisions MUST remain shared
 library code. Adding a backend MUST preserve existing public constructors,
 backend implementations, migrations, stored data, and behavior.
 
+Backend type parameters MUST NOT have implicit database defaults. Named type
+annotations specify the backend; constructors MAY infer it from their inputs or
+backend-specific implementation.
+
 Each persistence implementation MUST:
 
 - Bootstrap library-owned event, snapshot, and job-queue storage through

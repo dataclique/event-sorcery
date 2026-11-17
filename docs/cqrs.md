@@ -162,41 +162,41 @@ sections below.
 
 ## Key Types
 
-| Type                   | Purpose                                      |
-| ---------------------- | -------------------------------------------- |
-| `EventSourced`         | Core trait -- implement on domain types      |
-| `Store<Entity>`        | Type-safe command dispatch                   |
-| `StoreBuilder<Entity>` | Wires reactors/projections, builds Store     |
-| `Projection<Entity>`   | Read-side materialized view                  |
-| `Reactor<Entity>`      | Event side-effect handler                    |
-| `SendError<Entity>`    | Error from `Store::send()`                   |
-| `LifecycleError<E>`    | Errors from event application                |
-| `Never`                | Error type for infallible entities           |
-| `DomainEvent`          | Trait for event serialization (from cqrs-es) |
-| `Table`                | Newtype for projection table name            |
-| `Nil`                  | Empty type-level list (no projection / jobs) |
-| `Effect<Entity>`       | Handler result: events, or one job dispatch  |
-| `fx(value)`            | Wraps events/job/dispatch/error into result  |
-| `uneventful()`         | No-op outcome: accept command, no events     |
-| `Job`                  | Entity-kicked job (submit/reconcile)         |
-| `StandaloneJob`        | Origin-less worker job (perform)             |
-| `DispatchedJob<J>`     | Entity-embedded state of a kicked-off job    |
-| `DispatchEvent<J>`     | Dispatch lifecycle facts on the entity       |
-| `DispatchOutcome<J>`   | Sealed verdict delivered by the framework    |
-| `JobDispatch<Entity>`  | Opaque kick-off returned in an `Effect`      |
-| `Settled<Output>`      | Sealed success payload (output + attempts)   |
-| `SettledFailure<E>`    | Sealed failure payload (reason + attempts)   |
-| `DispatchRefused`      | Guard refusal (in-flight, mismatch)          |
-| `Reconciliation<T>`    | reconcile verdict: settled / not / unknown   |
-| `OriginPort<J>`        | Delivery port for verdicts (impl by `Store`) |
-| `JobInput<J>`          | Worker input: deps + origin delivery port    |
-| `jobs!`                | Macro building the type-level `Job` list     |
-| `JobRuntime`           | Wires the worker-side durable-jobs runtime   |
+| Type                            | Purpose                                      |
+| ------------------------------- | -------------------------------------------- |
+| `EventSourced`                  | Core trait -- implement on domain types      |
+| `Store<Entity, Backend>`        | Type-safe command dispatch                   |
+| `StoreBuilder<Entity, Backend>` | Wires reactors/projections, builds Store     |
+| `Projection<Entity, Backend>`   | Read-side materialized view                  |
+| `Reactor<Entity>`               | Event side-effect handler                    |
+| `SendError<Entity>`             | Error from `Store::send()`                   |
+| `LifecycleError<E>`             | Errors from event application                |
+| `Never`                         | Error type for infallible entities           |
+| `DomainEvent`                   | Trait for event serialization (from cqrs-es) |
+| `Table`                         | Newtype for projection table name            |
+| `Nil`                           | Empty type-level list (no projection / jobs) |
+| `Effect<Entity>`                | Handler result: events, or one job dispatch  |
+| `fx(value)`                     | Wraps events/job/dispatch/error into result  |
+| `uneventful()`                  | No-op outcome: accept command, no events     |
+| `Job`                           | Entity-kicked job (submit/reconcile)         |
+| `StandaloneJob`                 | Origin-less worker job (perform)             |
+| `DispatchedJob<J>`              | Entity-embedded state of a kicked-off job    |
+| `DispatchEvent<J>`              | Dispatch lifecycle facts on the entity       |
+| `DispatchOutcome<J>`            | Sealed verdict delivered by the framework    |
+| `JobDispatch<Entity>`           | Opaque kick-off returned in an `Effect`      |
+| `Settled<Output>`               | Sealed success payload (output + attempts)   |
+| `SettledFailure<E>`             | Sealed failure payload (reason + attempts)   |
+| `DispatchRefused`               | Guard refusal (in-flight, mismatch)          |
+| `Reconciliation<T>`             | reconcile verdict: settled / not / unknown   |
+| `OriginPort<J>`                 | Delivery port for verdicts (impl by `Store`) |
+| `JobInput<J>`                   | Worker input: deps + origin delivery port    |
+| `jobs!`                         | Macro building the type-level `Job` list     |
+| `JobRuntime`                    | Wires the worker-side durable-jobs runtime   |
 
 ## Sending Commands
 
 ```rust
-let store: Store<Position> = /* built by StoreBuilder */;
+let store: Store<Position, SqliteBackend> = /* built by StoreBuilder */;
 
 let symbol = Symbol::new("AAPL").unwrap();
 store.send(&symbol, PositionCommand::AcknowledgeFill { /* ... */ }).await?;
@@ -215,7 +215,7 @@ aggregates directly:
 
 ```rust
 // Projection is returned by StoreBuilder::build() for Table entities
-let (store, projection) = StoreBuilder::<Position>::new(pool)
+let (store, projection) = StoreBuilder::<Position, _>::new(pool)
     .build()
     .await?;
 
@@ -247,7 +247,7 @@ For **projected entities** (`type Materialized = Table`), `build()` returns
 `(Arc<Store>, Arc<Projection>)`:
 
 ```rust
-let (store, projection) = StoreBuilder::<Position>::new(pool)
+let (store, projection) = StoreBuilder::<Position, _>::new(pool)
     .with(rebalancing_trigger)  // wire a reactor
     .build()
     .await?;
@@ -257,7 +257,7 @@ For **non-projected entities** (`type Materialized = Nil`), `build()` returns
 `Arc<Store>`:
 
 ```rust
-let store = StoreBuilder::<OnChainTrade>::new(pool)
+let store = StoreBuilder::<OnChainTrade, _>::new(pool)
     .build()
     .await?;
 ```
@@ -335,7 +335,7 @@ aggregate, message-queue publish) that would double-fire on retry:
 ```rust
 impl IdempotentReactor for MyReactor {}
 
-let store = StoreBuilder::<MyEntity>::new(pool)
+let store = StoreBuilder::<MyEntity, _>::new(pool)
     .with(Arc::new(RetryOnBusy { inner: my_reactor }))
     // ...
 ```
@@ -645,9 +645,9 @@ events.
 - **NEVER call `sqlite_cqrs()` or `CqrsFramework::new()` in production code** --
   use `StoreBuilder`. Direct construction is allowed in test helpers, CLI code,
   and migration code
-- **NEVER create multiple `Store<Entity>` for the same entity type** -- each
-  entity type must have exactly ONE `Store<Entity>` instance, constructed once
-  in `Conductor::start` via `StoreBuilder`, then shared
+- **NEVER create multiple `Store<Entity, Backend>` for the same entity type** --
+  each entity type must have exactly ONE `Store<Entity, Backend>` instance,
+  constructed once in `Conductor::start` via `StoreBuilder`, then shared
   - **WHY**: multiple instances cause silent production bugs -- events persist
     but query processors registered on other instances never see them, so views
     and projections go stale without warnings

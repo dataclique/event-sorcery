@@ -185,7 +185,7 @@ where
 ///
 /// Create a SQLite-backed Store with no reactors, for tests that
 /// need persistence but no event processing side-effects.
-pub fn test_store<Entity: EventSourced>(pool: sqlx::SqlitePool) -> Store<Entity> {
+pub fn test_store<Entity: EventSourced>(pool: sqlx::SqlitePool) -> Store<Entity, SqliteBackend> {
     let backend = SqliteBackend::new(pool);
     let event_store = PersistedEventStore::new_snapshot_store(
         backend.event_repo(Entity::COMPACTION_POLICY),
