@@ -773,8 +773,24 @@ CREATE TABLE IF NOT EXISTS my_view (
 - **version**: Event sequence number (used for optimistic locking)
 - **payload**: The view serialized via `serde_json::to_value(&view)`
 
-`SqliteViewRepository` stores views with `serde_json::to_value()` and loads them
-with `serde_json::from_value()`.
+`SqliteViewRepository` stores serialized JSON text; `PostgresViewRepository`
+stores JSONB. Applications own their projection-table migrations. See the
+[PostgreSQL setup guide](../crates/postgr-es/README.md#native-stores) for native
+projected and unprojected builders.
+
+Native framework delivery carries the persisted envelope's aggregate-local
+sequence through `Reactor::react_with_context`. Projection updates skip events
+already covered by recovery or another successful delivery. An ahead-of-next
+sequence retries without applying out of order; exhaustion leaves the checkpoint
+unchanged so `catch_up` can replay the missing history. `Arc` and `RetryOnBusy`
+preserve this context. Existing custom reactors default to their `react` method;
+plain custom `ViewBackend` repositories retain opaque optimistic revisions.
+
+Native projection repositories write payload and sequence checkpoints
+atomically, advance ordinary updates by one, and report competing identity
+writes as optimistic conflicts. Direct unsequenced `react` writes must not be
+mixed with native framework delivery because they cannot establish event
+coverage.
 
 ### Lifecycle Serialization in View Payloads
 
