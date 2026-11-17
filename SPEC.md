@@ -87,6 +87,11 @@ Backend type parameters MUST NOT have implicit database defaults. Named type
 annotations specify the backend; constructors MAY infer it from their inputs or
 backend-specific implementation.
 
+Shared indexed-query contracts and SQL lowering MUST live in a focused neutral
+workspace crate, not in a storage backend or the temporary CQRS fix fork.
+Existing SQLite query imports MUST remain available through reexports of those
+shared definitions. Repositories retain database execution and pool ownership.
+
 Each persistence implementation MUST:
 
 - Bootstrap library-owned event, snapshot, and job-queue storage through

@@ -40,7 +40,7 @@ IDs.
 
 ## CQRS dependency for external backends
 
-This revision uses a maintained `cqrs-es` fork for explicit snapshot
+This revision uses a temporary `cqrs-es` fix fork for explicit snapshot
 checkpoints, pinned to `cb0020add5dcff06f1ece3816fce9e4319004b87`. Cargo treats
 registry and Git packages as different identities even when both have version
 `0.5.0`. Mixing them gives different `PersistedEventRepository` traits and

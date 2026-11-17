@@ -99,14 +99,14 @@ Development-shell state lives under `.tmp/devenv/`.
 
 ### PostgreSQL persistence boundary
 
-`postgr-es` extends the maintained CQRS fork's official `postgres-es` adapter
-with atomic job writes, recovery policy, and indexed queries. Ordinary event,
-snapshot, replay, and view persistence delegate to that adapter. It exports
-`PostgresBackend`, `PostgresEventRepository`, `PostgresViewRepository`, and
-`MIGRATOR`. After bootstrapping persistence, unprojected entities use
+`postgr-es` extends the official `postgres-es` adapter from the temporary CQRS
+fix fork with atomic job writes, recovery policy, and indexed queries. Ordinary
+event, snapshot, replay, and view persistence delegate to that adapter. It
+exports `PostgresBackend`, `PostgresEventRepository`, `PostgresViewRepository`,
+and `MIGRATOR`. After bootstrapping persistence, unprojected entities use
 `StoreBuilder::with_backend`; startup reconciles their schema in one transaction
-before exposing the store. Database-dependent tests use the `integration-tests`
-feature.
+before exposing the store. PostgreSQL tests run in the ordinary workspace suite
+and require a test database.
 
 ### Local PostgreSQL
 
@@ -123,11 +123,11 @@ databases. PostgreSQL data lives under `.tmp/devenv/state/postgres/`. The shell
 sets `DATABASE_URL` to this role and database over the private Unix socket, so
 SQLx fixture tests can run after the service starts.
 
-Linux Nix package and test checks run all features with an isolated PostgreSQL
-service. The pinned PostgreSQL test hook does not support Darwin, so Darwin
-package and test checks run the default features; Clippy still compiles all
-features. To run PostgreSQL tests locally on Darwin, start the service above and
-run `cargo nextest run --workspace --all-features` in the development shell.
+Linux Nix package and test checks run the database suite with an isolated
+PostgreSQL service. The pinned PostgreSQL test hook does not support Darwin, so
+pure Nix PostgreSQL test provisioning there remains blocked. For local tests on
+Darwin, start the service above and run `cargo nextest run --workspace` in the
+development shell.
 
 See [AGENTS.md](AGENTS.md) for contribution conventions.
 

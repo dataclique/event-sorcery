@@ -6,21 +6,21 @@ The nix dev shell sets `SQLX_OFFLINE=true` (in `flake.nix`), which tells sqlx
 compile-time macros (`query!`, `query_scalar!`, etc.) to use cached metadata
 from the `.sqlx/` directory instead of connecting to the database. This means:
 
-- Regular `cargo check`/`cargo nextest run` typically don't need a running
-  database -- they read from `.sqlx/` cache files checked into version control.
-  Exception: test code using `query!` macros (see below).
+- Regular `cargo check` uses `.sqlx/` cache files without a running database.
+  Runtime tests still need their storage: SQLite tests use in-memory databases,
+  while PostgreSQL tests need PostgreSQL. Test code using `query!` macros has
+  additional compile-time requirements (see below).
 - If you add or change a `query!` macro invocation, you must regenerate the
   cache before the change will compile under `SQLX_OFFLINE=true`.
-- PostgreSQL-enabled tests still need a running PostgreSQL database.
-  `SQLX_OFFLINE` controls macro analysis, not runtime connections. The
-  `postgr-es` crate selects real-database tests with `integration-tests`; Linux
-  flake checks enable all features and provision PostgreSQL through the test
-  hook. Darwin flake tests retain the existing database-test exclusion. Enabled
-  database tests fail normally when storage is unavailable.
-- Keep `#[cfg(test)]` and the integration-test feature gate as separate module
-  attributes. With the pinned compiler, combining them in `cfg(all(...))`
-  prevents Clippy from recognizing test-only helpers for the configured
-  `allow-unwrap-in-tests` exception.
+- PostgreSQL tests run in the normal workspace suite, without a test-specific
+  feature flag. `SQLX_OFFLINE` controls macro analysis, not runtime connections;
+  database tests fail when required storage is unavailable. Linux flake checks
+  provision PostgreSQL through the test hook. The pinned nixpkgs hook marks
+  Darwin unsupported because of upstream sandbox IPC leaks, so pure Nix
+  PostgreSQL test provisioning there remains blocked rather than bypassed with
+  test exclusions.
+- Colocated Rust tests use `#[cfg(test)]` modules, which the pinned Clippy
+  recognizes for its configured `allow-unwrap-in-tests` exception.
 
 `migrate!` can otherwise leave a stale embedded migration after SQL-only edits
 on the pinned stable toolchain. Both backend crates have build scripts watching
