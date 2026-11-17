@@ -3,7 +3,7 @@ members = [
   "crates/sqlite-es",
   "crates/postgr-es",
   "crates/event-sorcery",
-  "crates/event-sorcery-ffi",
+  "crates/event-sorcery-ffi", "crates/query-es",
 ]
 exclude = ["examples/simple", "examples/complex"]
 resolver = "2"
@@ -46,6 +46,7 @@ cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f
 event-sorcery = { path = "crates/event-sorcery" }
 futures-util = "0.3.34"
 getrandom = "0.3.4"
+query-es = { path = "crates/query-es" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sqlite-es = { path = "crates/sqlite-es" }

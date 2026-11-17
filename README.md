@@ -6,6 +6,9 @@ persistence.
 
 ## Crates
 
+- **[`crates/query-es`](crates/query-es)** — backend-neutral indexed-view query
+  contracts and typed validation errors. Existing SQLite query imports reexport
+  these definitions.
 - **[`crates/sqlite-es`](crates/sqlite-es)** — SQLite implementation of
   `cqrs-es`'s event repository, view repository, and `CqrsFramework` glue.
   Standalone — usable wherever you'd plug in a `cqrs-es` backend.

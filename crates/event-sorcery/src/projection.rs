@@ -7,7 +7,8 @@
 use async_trait::async_trait;
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
-use sqlite_es::{IndexedView, Order, Predicate, SqliteViewRepository};
+use query_es::{IndexedView, Order, Predicate};
+use sqlite_es::SqliteViewRepository;
 use sqlx::AssertSqlSafe;
 use sqlx::SqlitePool;
 use sqlx::sqlite::Sqlite;

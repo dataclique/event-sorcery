@@ -1,7 +1,11 @@
+//! SQLite materialized-view storage and indexed predicate execution.
+
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use cqrs_es::{Aggregate, View};
 use sqlx::{AssertSqlSafe, Pool, Row, Sqlite};
 use std::marker::PhantomData;
+
+pub use query_es::{Cmp, IndexedView, Order, Predicate, Term, Value};
 
 use crate::sql_query::SqlQueryFactory;
 
@@ -193,92 +197,6 @@ where
 
         Ok(())
     }
-}
-
-/// A predicate scan the load-by-id [`ViewRepository`] cannot express.
-///
-/// Returns the `view_id`s whose columns satisfy a predicate, ordered and
-/// limited -- so a projection can be polled for "all rows matching X" (e.g. the
-/// durable-job runnable poll) without the caller writing SQL.
-pub trait IndexedView<V, A>: ViewRepository<V, A>
-where
-    V: View<A>,
-    A: Aggregate,
-{
-    /// Returns the `view_id`s whose columns satisfy `predicate` (disjunctive
-    /// normal form: an OR of AND-groups), ordered and capped at `limit`.
-    fn find(
-        &self,
-        predicate: &Predicate,
-        order: Option<&Order>,
-        limit: i64,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, PersistenceError>> + Send;
-}
-
-/// A predicate in disjunctive normal form: any of these AND-groups matching is a
-/// match. An empty `any_of` matches nothing.
-pub struct Predicate {
-    /// OR of conjunctions; each inner `Vec` is an AND of [`Term`]s.
-    pub any_of: Vec<Vec<Term>>,
-}
-
-/// One column comparison.
-pub struct Term {
-    /// The column name. MUST be a trusted, code-controlled identifier (a view
-    /// column), never user input -- it is interpolated, not bound.
-    pub column: String,
-    /// The comparison operator.
-    pub cmp: Cmp,
-    /// The bound value; `None` for [`Cmp::IsNull`]/[`Cmp::IsNotNull`].
-    pub value: Option<Value>,
-}
-
-/// Comparison operators for a [`Term`].
-pub enum Cmp {
-    /// `=`
-    Eq,
-    /// `<`
-    Lt,
-    /// `<=`
-    Le,
-    /// `>`
-    Gt,
-    /// `>=`
-    Ge,
-    /// `IS NULL` (no bound value)
-    IsNull,
-    /// `IS NOT NULL` (no bound value)
-    IsNotNull,
-}
-
-impl Cmp {
-    fn sql(&self) -> &'static str {
-        match self {
-            Self::Eq => "=",
-            Self::Lt => "<",
-            Self::Le => "<=",
-            Self::Gt => ">",
-            Self::Ge => ">=",
-            Self::IsNull => "IS NULL",
-            Self::IsNotNull => "IS NOT NULL",
-        }
-    }
-}
-
-/// A bound scalar value.
-pub enum Value {
-    /// An integer column value.
-    Int(i64),
-    /// A text column value.
-    Text(String),
-}
-
-/// Result ordering for [`IndexedView::find`].
-pub struct Order {
-    /// The column to order by (trusted identifier; interpolated).
-    pub column: String,
-    /// Ascending when true, descending otherwise.
-    pub ascending: bool,
 }
 
 impl<V, A> IndexedView<V, A> for SqliteViewRepository<V, A>

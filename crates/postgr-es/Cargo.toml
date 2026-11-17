@@ -17,8 +17,8 @@ sqlx = { workspace = true, features = [
 ] }
 tokio = { version = "1.52.3", features = ["sync"] }
 event-sorcery.workspace = true
-sqlite-es.workspace = true
 postgres-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87", version = "0.5.0" }
+query-es.workspace = true
 
 [lints]
 workspace = true

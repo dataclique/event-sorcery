@@ -6,9 +6,8 @@ use sqlx::postgres::PgArguments;
 use sqlx::{Arguments, AssertSqlSafe, PgPool, Postgres, QueryBuilder};
 use std::fmt::{self, Display};
 
-use sqlite_es::{Cmp, IndexedView, Order, Predicate, Value};
-
 use event_sorcery::{EngineError, ViewBackend};
+use query_es::{Cmp, IndexedView, Order, Predicate, ProjectionQueryError, Value};
 
 use crate::event_repository::adapter_error;
 
@@ -64,32 +63,6 @@ pub enum ProjectionVersionError {
     /// A persisted row has an invalid optimistic checkpoint.
     #[error("stored optimistic projection version must be positive: {0}")]
     StoredNonPositive(i64),
-}
-
-/// Invalid indexed-query inputs rejected before executing SQL.
-#[derive(Debug, thiserror::Error)]
-pub enum ProjectionQueryError {
-    /// The PostgreSQL driver could not encode a query argument.
-    #[error("indexed projection argument encoding failed")]
-    Encoding(#[source] sqlx::error::BoxDynError),
-    /// The driver could not format its own placeholder.
-    #[error("indexed projection placeholder formatting failed")]
-    Placeholder(#[from] fmt::Error),
-    /// A row limit must not be negative.
-    #[error("indexed projection query limit cannot be negative: {0}")]
-    NegativeLimit(i64),
-    /// Every disjunction arm must contain at least one comparison.
-    #[error("indexed projection query contains an empty conjunction")]
-    EmptyConjunction,
-    /// Binary comparisons require a bound value.
-    #[error("indexed projection comparison requires a bound value")]
-    MissingValue,
-    /// Null comparisons do not accept a bound value.
-    #[error("indexed projection null comparison cannot contain a bound value")]
-    UnexpectedValue,
-    /// No further placeholder fits the PostgreSQL wire representation.
-    #[error("indexed projection query exceeds the PostgreSQL parameter limit")]
-    ParameterLimit,
 }
 
 struct QuotedIdentifier<'name>(&'name str);
@@ -276,7 +249,7 @@ pub(crate) mod tests {
     use serde_json::json;
     use std::convert::Infallible;
 
-    use sqlite_es::{Cmp, Term, Value};
+    use query_es::{Cmp, Term, Value};
 
     use super::*;
 

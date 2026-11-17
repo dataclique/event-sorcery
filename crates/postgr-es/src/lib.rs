@@ -7,6 +7,5 @@ mod view_repository;
 
 pub use backend::{PostgresBackend, PostgresStoreRepository};
 pub use event_repository::{MIGRATOR, PostgresEventRepository};
-pub use view_repository::{
-    PostgresViewBackend, PostgresViewRepository, ProjectionQueryError, ProjectionVersionError,
-};
+pub use query_es::ProjectionQueryError;
+pub use view_repository::{PostgresViewBackend, PostgresViewRepository, ProjectionVersionError};

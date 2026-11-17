@@ -39,7 +39,7 @@ use tower_layer::{Layer, Stack};
 use tower_service::Service;
 use tracing::{error, warn};
 
-use sqlite_es::{Cmp, Order, Predicate, Term, Value};
+use query_es::{Cmp, Order, Predicate, Term, Value};
 
 use crate::dispatch::DeliveryPolicy;
 use crate::job::{
