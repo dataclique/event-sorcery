@@ -841,6 +841,69 @@ mod tests {
         assert_eq!(wrapped.inner.calls.load(Ordering::SeqCst), 3);
     }
 
+    struct SequencedReactor {
+        sequence: AtomicU32,
+        inner: FlakyReactor,
+    }
+
+    impl Dependent for SequencedReactor {
+        type Dependencies = Cons<TestEntity, Nil>;
+    }
+
+    #[async_trait]
+    impl Reactor for SequencedReactor {
+        type Error = FlakyReactorError;
+
+        async fn react(
+            &self,
+            _event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            Err(FlakyReactorError::Permanent)
+        }
+
+        async fn react_with_context(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+            context: ReactorContext,
+        ) -> Result<(), Self::Error> {
+            self.sequence.store(
+                u32::try_from(context.sequence.unwrap().get()).unwrap(),
+                Ordering::SeqCst,
+            );
+            self.inner.react(event).await
+        }
+    }
+
+    impl IdempotentReactor for SequencedReactor {}
+
+    #[tokio::test(start_paused = true)]
+    async fn arc_and_busy_retries_preserve_persisted_delivery_context() {
+        let wrapped = Arc::new(RetryOnBusy {
+            inner: SequencedReactor {
+                sequence: AtomicU32::new(0),
+                inner: FlakyReactor {
+                    remaining_busy_failures: AtomicU32::new(2),
+                    permanent_failure: false,
+                    calls: AtomicU32::new(0),
+                    applied: AtomicBool::new(false),
+                },
+            },
+        });
+        let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
+        wrapped
+            .react_with_context(
+                event,
+                ReactorContext {
+                    sequence: Some(7_usize.try_into().unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrapped.inner.sequence.load(Ordering::SeqCst), 7);
+        assert_eq!(wrapped.inner.inner.calls.load(Ordering::SeqCst), 3);
+        assert!(wrapped.inner.inner.applied.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn retry_on_busy_does_not_retry_non_busy_error() {
         let wrapped = RetryOnBusy {

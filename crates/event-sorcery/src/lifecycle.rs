@@ -829,6 +829,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_refuses_zero_sequence_without_discarding_valid_delivery() {
+        let reactor = Arc::new(AlwaysFailReactor {
+            calls: AtomicU32::new(0),
+        });
+        let bridge = ReactorBridge {
+            reactor: Arc::clone(&reactor),
+        };
+        let invalid: EventEnvelope<Lifecycle<Counter>> = EventEnvelope {
+            aggregate_id: "counter-1".to_string(),
+            sequence: 0,
+            payload: CounterEvent::Created { initial: 1 },
+            metadata: HashMap::new(),
+        };
+        let valid = EventEnvelope {
+            sequence: 1,
+            ..invalid.clone()
+        };
+        bridge.dispatch("counter-1", &[invalid, valid]).await;
+        assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn dispatch_retries_busy_error_via_retry_on_busy_and_succeeds() {
         let reactor = Arc::new(RetryOnBusy {
             inner: FlakyIdempotentReactor {
