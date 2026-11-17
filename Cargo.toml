@@ -3,7 +3,8 @@ members = [
   "crates/sqlite-es",
   "crates/postgr-es",
   "crates/event-sorcery",
-  "crates/event-sorcery-ffi", "crates/indexed-query",
+  "crates/event-sorcery-ffi",
+  "crates/indexed-query",
 ]
 exclude = ["examples/simple", "examples/complex"]
 resolver = "2"
