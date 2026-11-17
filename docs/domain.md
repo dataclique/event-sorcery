@@ -97,9 +97,9 @@ A persisted projection used for queries. An aggregate-state materialized view
 mirrors one aggregate instance per row. The current `Projection` API,
 parameterized by entity and backend, implements this specialization. `load`
 works through the selected view backend; `load_all` and `filter` currently exist
-only for the default SQLite backend. Its breaking rename to `MaterializedView`
-is specified in ADR 0014. The general multi-aggregate projection runtime is not
-yet implemented.
+only for the SQLite backend. Its breaking rename to `MaterializedView` is
+specified in ADR 0014. The general multi-aggregate projection runtime is not yet
+implemented.
 
 The event store remains authoritative, but additional derived tables are normal
 in CQRS/event sourcing. Their contents must be reconstructible from durable
@@ -118,8 +118,8 @@ with `Projection` directly.
 
 Pluggable storage for projections. `trait ViewBackend` is a higher-kinded type
 emulation: it supplies, per `(View, Aggregate)` pair, a concrete
-`ViewRepository` implementation. The default `SqliteViewBackend` maps every pair
-to `SqliteViewRepository`. Tests use bespoke in-memory backends. See
+`ViewRepository` implementation. `SqliteViewBackend` maps every pair to
+`SqliteViewRepository`. Tests use bespoke in-memory backends. See
 `crates/event-sorcery/src/view_backend.rs`.
 
 ### Snapshot
@@ -232,10 +232,11 @@ not part of the library's public API and must not appear in any public bound.
 
 ### Store / StoreBuilder
 
-`Store<Entity>` is the typed front door for sending commands.
-`StoreBuilder<Entity>` wires a `Store` together with its projection and reactors
-at startup, using a typed-list encoding (`Cons`/`Nil`) so forgetting a wiring
-step is a compile error.
+`Store<Entity, Backend>` is the typed front door for sending commands.
+`StoreBuilder<Entity, Backend>` wires a `Store` together with its projection and
+reactors at startup, using a typed-list encoding (`Cons`/`Nil`) so forgetting a
+wiring step is a compile error. Backend type parameters have no database
+default; SQLite convenience constructors can still infer their backend.
 
 ## Naming Conventions
 
