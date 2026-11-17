@@ -186,11 +186,12 @@ pub(crate) mod tests {
 
     use event_sorcery::{
         Column, CompactionPolicy, Cons, Dependent, DomainEvent, Effect, EntityList, EventSourced,
-        Never, Nil, PersistenceBackend, Reactor, ReconcileError, StoreBuilder, Table,
+        Never, Nil, OneOf, PersistenceBackend, Projection, Reactor, ReactorContext, ReconcileError,
+        Store, StoreBuilder, Table,
     };
 
     use crate::view_repository::tests::{RegisteredSchemaEvent, RegisteredSchemaView};
-    use crate::{MIGRATOR, PostgresBackend};
+    use crate::{MIGRATOR, PostgresBackend, PostgresViewBackend};
 
     async fn command_events(aggregate_id: &str, versions: &[u64]) -> Vec<SerializedEvent> {
         let memory = MemStore::<RegisteredSchemaView>::default();
@@ -435,9 +436,10 @@ pub(crate) mod tests {
 
         async fn react(
             &self,
-            _event: <Self::Dependencies as EntityList>::Event,
+            event: <Self::Dependencies as EntityList>::Event,
         ) -> Result<(), Never> {
-            if self.armed.load(Ordering::SeqCst) {
+            let (_, NoteEvent::Written { text }) = event.into_inner();
+            if self.armed.load(Ordering::SeqCst) && text == "second" {
                 self.persisted.notify_one();
                 self.resume.notified().await;
             }
@@ -495,6 +497,253 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(version, 2);
+    }
+
+    struct PendingProjection {
+        store: Arc<Store<ProjectedNote<1>, PostgresBackend>>,
+        projection: Arc<Projection<ProjectedNote<1>, PostgresViewBackend>>,
+        gate: Arc<PausedDelivery>,
+        writing: tokio::task::JoinHandle<()>,
+        event: NoteEvent,
+        context: ReactorContext,
+    }
+
+    async fn pending_projection(pool: &PgPool) -> PendingProjection {
+        let gate = Arc::new(PausedDelivery {
+            armed: AtomicBool::new(false),
+            persisted: Notify::new(),
+            resume: Notify::new(),
+        });
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .with(gate.clone())
+            .build()
+            .await
+            .unwrap();
+        store
+            .send(&"projected".to_string(), "first".to_string())
+            .await
+            .unwrap();
+        gate.armed.store(true, Ordering::SeqCst);
+        let writing_store = store.clone();
+        let writing = tokio::spawn(async move {
+            writing_store
+                .send(&"projected".to_string(), "second".to_string())
+                .await
+                .unwrap();
+        });
+        timeout(Duration::from_secs(10), gate.persisted.notified())
+            .await
+            .unwrap();
+        let (sequence, payload): (i64, serde_json::Value) = sqlx::query_as(
+            "SELECT sequence, payload FROM events
+             WHERE aggregate_type = 'ProjectedNote' AND aggregate_id = 'projected'
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        PendingProjection {
+            store,
+            projection,
+            gate,
+            writing,
+            event: serde_json::from_value(payload).unwrap(),
+            context: ReactorContext {
+                sequence: Some(usize::try_from(sequence).unwrap().try_into().unwrap()),
+            },
+        }
+    }
+
+    async fn wait_for_projection_locks(pool: &PgPool, mode: &str, expected: i64) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM pg_locks
+                     WHERE relation = 'note_projection'::regclass AND NOT granted AND mode = $1
+                       AND database = (
+                           SELECT oid FROM pg_database WHERE datname = current_database()
+                       )",
+                )
+                .bind(mode)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+
+                if waiting == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn overlapping_duplicate_deliveries_apply_the_persisted_event_once(pool: PgPool) {
+        let control = projected_pool(pool).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(3)
+            .connect_with(control.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let pending = pending_projection(&pool).await;
+        let mut blocker = control.begin().await.unwrap();
+        sqlx::query("LOCK TABLE note_projection IN SHARE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let deliveries: Vec<_> = (0..2)
+            .map(|_| {
+                let projection = pending.projection.clone();
+                let event = pending.event.clone();
+                let context = pending.context;
+                tokio::spawn(async move {
+                    projection
+                        .react_with_context(OneOf::Here(("projected".to_string(), event)), context)
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+        wait_for_projection_locks(&pool, "RowExclusiveLock", 2).await;
+        blocker.commit().await.unwrap();
+        for delivery in deliveries {
+            timeout(Duration::from_secs(10), delivery)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        pending.gate.resume.notify_one();
+        timeout(Duration::from_secs(10), pending.writing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending
+                .projection
+                .load(&"projected".to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .history,
+            vec!["first", "second"]
+        );
+        let version: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn recovery_advancing_a_loaded_checkpoint_fences_the_retrying_delivery(pool: PgPool) {
+        let control = projected_pool(pool).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(3)
+            .connect_with(control.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let pending = pending_projection(&pool).await;
+        let mut blocker = control.begin().await.unwrap();
+        sqlx::query("LOCK TABLE note_projection IN SHARE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let projection = pending.projection.clone();
+        let recovery = tokio::spawn(async move {
+            projection.catch_up().await.unwrap();
+        });
+        wait_for_projection_locks(&pool, "ShareRowExclusiveLock", 1).await;
+        let projection = pending.projection.clone();
+        let event = pending.event.clone();
+        let context = pending.context;
+        let delivery = tokio::spawn(async move {
+            projection
+                .react_with_context(OneOf::Here(("projected".to_string(), event)), context)
+                .await
+                .unwrap();
+        });
+        wait_for_projection_locks(&pool, "RowExclusiveLock", 1).await;
+        blocker.commit().await.unwrap();
+        timeout(Duration::from_secs(10), recovery)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(10), delivery)
+            .await
+            .unwrap()
+            .unwrap();
+        pending.gate.resume.notify_one();
+        timeout(Duration::from_secs(10), pending.writing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending
+                .projection
+                .load(&"projected".to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .history,
+            vec!["first", "second"]
+        );
+        let version: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn exhausted_gap_delivery_preserves_coverage_until_catch_up(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let pending = pending_projection(&pool).await;
+        pending
+            .store
+            .send(&"projected".to_string(), "third".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            pending
+                .projection
+                .load(&"projected".to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .history,
+            vec!["first"]
+        );
+        let version: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 1);
+        pending.gate.resume.notify_one();
+        timeout(Duration::from_secs(10), pending.writing)
+            .await
+            .unwrap()
+            .unwrap();
+        pending.projection.catch_up().await.unwrap();
+        assert_eq!(
+            pending
+                .projection
+                .load(&"projected".to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .history,
+            vec!["first", "second", "third"]
+        );
+        let version: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 3);
     }
 
     async fn seed_projected(pool: &PgPool) {
