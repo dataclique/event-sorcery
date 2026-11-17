@@ -305,6 +305,12 @@ where
     ) -> Result<(), Self::Error> {
         let (id, event) = event.into_inner();
         let view_id = id.to_string();
+        // Only native construction establishes sequence-based checkpoints.
+        // Plain custom repositories retain their opaque optimistic versions.
+        let delivery = match self.table {
+            Some(_) => delivery,
+            None => ReactorContext { sequence: None },
+        };
 
         // Retry with exponential backoff: 10ms, 20ms, 40ms, ... capped at 1s.
         // 10 retries gives ~4.3s of total retry budget, enough for any
@@ -1166,6 +1172,28 @@ mod tests {
             Some(TestEntity {
                 name: "original".to_string(),
             })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn custom_repository_keeps_opaque_versions_during_sequenced_delivery() {
+        let repo: Arc<CounterBusyRepo> =
+            Arc::new(BusyRepo::new(0).with_view("id-1", Lifecycle::Live(Counter { value: 0 })));
+        let projection: CounterBusyProjection = Projection::new(repo);
+        let event: OneOf<(String, CounterEvent), Never> =
+            OneOf::Here(("id-1".to_string(), CounterEvent::Incremented));
+        projection
+            .react_with_context(
+                event,
+                ReactorContext {
+                    sequence: Some(3_usize.try_into().unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            projection.load(&"id-1".to_string()).await.unwrap(),
+            Some(Counter { value: 1 })
         );
     }
 

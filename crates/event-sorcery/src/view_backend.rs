@@ -53,6 +53,15 @@ pub struct SqliteViewBackend;
 ///
 /// Ordinary custom [`ViewBackend`] implementations remain unchanged; only
 /// backends supporting native startup opt into this capability.
+///
+/// Native repositories use `ViewContext::version` as the last included aggregate-local
+/// event sequence. Payload and checkpoint must be written atomically. `update_view`
+/// advances the expected version by exactly one and reports competing writes as
+/// `PersistenceError::OptimisticLockError`, including competing initial inserts.
+/// Recovery may instead install the captured event maximum atomically with its payload.
+/// These rules do not apply to plain `ViewBackend` implementations with opaque revisions.
+/// Mixing direct unsequenced `Reactor::react` writes with native framework delivery is
+/// unsupported: direct writes cannot establish event coverage.
 pub trait NativeProjectionBackend: ViewBackend {
     /// Caller-owned connection source used to construct the view repository.
     type Source: Send + Sync + 'static;
