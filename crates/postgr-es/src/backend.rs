@@ -339,8 +339,7 @@ pub(crate) mod tests {
         }
     }
 
-    #[sqlx::test(migrations = false)]
-    async fn projected_builder_queries_and_recovers_with_one_connection(pool: PgPool) {
+    async fn projected_pool(pool: PgPool) -> PgPool {
         MIGRATOR.run(&pool).await.unwrap();
         let pool = PgPoolOptions::new()
             .max_connections(1)
@@ -358,6 +357,12 @@ pub(crate) mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        pool
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn projected_builder_queries_and_recovers_with_one_connection(pool: PgPool) {
+        let pool = projected_pool(pool).await;
         let backend = PostgresBackend { pool: pool.clone() };
         let (store, projection) = timeout(
             Duration::from_secs(10),
@@ -407,6 +412,194 @@ pub(crate) mod tests {
         );
         assert_eq!(
             store.load(&id).await.unwrap().unwrap().history,
+            vec!["first", "second"]
+        );
+    }
+
+    async fn seed_projected(pool: &PgPool) {
+        let (store, _) =
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let id = "projected".to_string();
+        store.send(&id, "first".to_string()).await.unwrap();
+        store.send(&id, "second".to_string()).await.unwrap();
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ProjectedRecoveryState {
+        view: (i64, serde_json::Value),
+        snapshot: (i64, i64, serde_json::Value),
+        registry: Vec<serde_json::Value>,
+    }
+
+    async fn projected_state(pool: &PgPool) -> ProjectedRecoveryState {
+        let view = sqlx::query_as(
+            "SELECT version, payload FROM note_projection WHERE view_id = 'projected'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let snapshot = sqlx::query_as(
+            "SELECT last_sequence, snapshot_version, payload FROM snapshots
+             WHERE aggregate_type = 'ProjectedNote' AND aggregate_id = 'projected'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let registry = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_type = 'SchemaRegistry' ORDER BY sequence",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        ProjectedRecoveryState {
+            view,
+            snapshot,
+            registry,
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn projected_schema_change_rebuilds_current_incompatible_state(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        seed_projected(&pool).await;
+        sqlx::query("UPDATE note_projection SET payload = '{\"old_format\":true}'::jsonb")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = projected_state(&pool).await;
+        assert_eq!(before.view.0, 2);
+        let (_, projection) =
+            StoreBuilder::<ProjectedNote<2>, PostgresBackend>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let id = "projected".to_string();
+        assert_eq!(
+            projection.load(&id).await.unwrap().unwrap().history,
+            vec!["first", "second"]
+        );
+        let checkpoint: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(checkpoint, 2);
+        let snapshots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM snapshots")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(snapshots, 0);
+        let registry: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_type = 'SchemaRegistry' ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            registry,
+            vec![
+                json!({"VersionUpdated": {"name": "ProjectedNote", "version": 1}}),
+                json!({"VersionUpdated": {"name": "ProjectedNote", "version": 2}}),
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn projected_write_failure_rolls_back_snapshot_view_and_registry(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        seed_projected(&pool).await;
+        let before = projected_state(&pool).await;
+        sqlx::query(
+            "ALTER TABLE note_projection ADD CONSTRAINT reject_rebuild CHECK (FALSE) NOT VALID",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let result =
+            StoreBuilder::<ProjectedNote<2>, PostgresBackend>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await;
+        let Err(ReconcileError::Sqlx(sqlx::Error::Database(source))) = result else {
+            panic!("recovery write rejection must preserve its SQL failure");
+        };
+        assert_eq!(source.code().as_deref(), Some("23514"));
+        assert_eq!(projected_state(&pool).await, before);
+        sqlx::query("ALTER TABLE note_projection DROP CONSTRAINT reject_rebuild")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, projection) =
+            StoreBuilder::<ProjectedNote<2>, PostgresBackend>::with_backend(PostgresBackend {
+                pool,
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&"projected".to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .history,
+            vec!["first", "second"]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn registry_failure_after_projected_replay_rolls_back_every_derived_write(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        seed_projected(&pool).await;
+        sqlx::query("UPDATE note_projection SET payload = '{\"old_format\":true}'::jsonb")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = projected_state(&pool).await;
+        sqlx::query(
+            "ALTER TABLE events ADD CONSTRAINT reject_projected_registration CHECK (
+                aggregate_type <> 'SchemaRegistry' OR sequence = 1
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let result =
+            StoreBuilder::<ProjectedNote<2>, PostgresBackend>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await;
+        let Err(error) = result else {
+            panic!("registry rejection must prevent projected startup");
+        };
+        assert!(matches!(error, ReconcileError::Aggregate(_)));
+        assert_eq!(projected_state(&pool).await, before);
+        sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_projected_registration")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, projection) =
+            StoreBuilder::<ProjectedNote<2>, PostgresBackend>::with_backend(PostgresBackend {
+                pool,
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&"projected".to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .history,
             vec!["first", "second"]
         );
     }
