@@ -1,6 +1,6 @@
 # ADR-0015: Backend-neutral indexed-query contracts
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-16
 - Issue:
   [Native PostgreSQL stores](https://github.com/dataclique/event-sorcery/issues/122)
