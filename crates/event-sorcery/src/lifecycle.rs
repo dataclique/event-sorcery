@@ -13,13 +13,14 @@ use cqrs_es::{Aggregate, EventEnvelope, Query, View};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::dependency::HasEntity;
 use crate::dispatch::JobDispatch;
-use crate::reactor::Reactor;
+use crate::reactor::{Reactor, ReactorContext};
 use crate::{Effect, EventSourced};
 
 /// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
@@ -350,7 +351,15 @@ where
             // No retry here by design -- wrap the reactor in `RetryOnBusy`
             // (gated by `IdempotentReactor`) to retry on transient SQLite
             // busy errors. See `docs/cqrs.md`'s "Reactors" section.
-            if let Err(error) = self.reactor.react(injected).await {
+            let Some(sequence) = NonZeroUsize::new(envelope.sequence) else {
+                error!(target: "cqrs", aggregate_id, sequence = envelope.sequence,
+                    "Persisted event has an invalid zero sequence; refusing reactor delivery");
+                continue;
+            };
+            let context = ReactorContext {
+                sequence: Some(sequence),
+            };
+            if let Err(error) = self.reactor.react_with_context(injected, context).await {
                 error!(
                     target: "cqrs",
                     ?error,
@@ -816,6 +825,28 @@ mod tests {
 
         bridge.dispatch("counter-1", &[envelope]).await;
 
+        assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_zero_sequence_without_discarding_valid_delivery() {
+        let reactor = Arc::new(AlwaysFailReactor {
+            calls: AtomicU32::new(0),
+        });
+        let bridge = ReactorBridge {
+            reactor: Arc::clone(&reactor),
+        };
+        let invalid: EventEnvelope<Lifecycle<Counter>> = EventEnvelope {
+            aggregate_id: "counter-1".to_string(),
+            sequence: 0,
+            payload: CounterEvent::Created { initial: 1 },
+            metadata: HashMap::new(),
+        };
+        let valid = EventEnvelope {
+            sequence: 1,
+            ..invalid.clone()
+        };
+        bridge.dispatch("counter-1", &[invalid, valid]).await;
         assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
     }
 

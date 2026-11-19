@@ -1,0 +1,13 @@
+[package]
+name = "indexed-query"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+cqrs-es.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
