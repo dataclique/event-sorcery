@@ -8,8 +8,9 @@
 use cqrs_es::Aggregate;
 use cqrs_es::persist::ViewRepository;
 
-use crate::{Column, EventSourced, ProjectionError, ProjectionRecoveryMode, Table};
 use indexed_query::IndexedView;
+
+use crate::{Column, EventSourced, ProjectionError, ProjectionRecoveryMode, Table};
 
 /// Pluggable storage backend for materialized views, supplying a
 /// concrete [`ViewRepository`] for each `(View, Aggregate)` pair.

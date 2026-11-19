@@ -7,13 +7,14 @@
 use async_trait::async_trait;
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
-use indexed_query::{IndexedView, Order, Predicate};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use tracing::{error, trace, warn};
+
+use indexed_query::{IndexedView, Order, Predicate};
 
 use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
