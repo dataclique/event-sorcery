@@ -2,7 +2,7 @@
 //!
 //! [`JobRuntime`] turns one [`EventBackend`] into the whole durable-jobs
 //! capability -- the job [`Store`] (cqrs/es) and the `job_queue_projection` [`Projection`],
-//! auto-wired by [`StoreBuilder`]. [`EventStoreBackend`] polls that projection
+//! auto-wired by [`StoreBuilder`](crate::StoreBuilder). [`EventStoreBackend`] polls that projection
 //! for runnable jobs, claims each via [`EventBackend::claim`], runs it through an
 //! apalis worker, and durably records the outcome as a [`JobCommand`] fenced on
 //! the claim's [`ClaimId`]. See [ADR-0006](../../adrs/0006-cqrs-native-durable-jobs.md).
@@ -31,7 +31,6 @@ use cqrs_es::AggregateError;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use futures_util::{FutureExt, StreamExt};
-use sqlx::SqlitePool;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tower::limit::ConcurrencyLimitLayer;
@@ -47,11 +46,14 @@ use crate::job::{
     JobOutcome, JobState, JobStoreError, StandaloneJob, WorkerId, enqueue_request, enqueued_event,
     pending_seed_payload, plan_claim,
 };
-use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
 use crate::projection::Projection;
 use crate::view_backend::ViewBackend;
-use crate::{LifecycleError, ProjectionError, ReconcileError, SendError, Store, StoreBuilder};
+use crate::{LifecycleError, ProjectionError, SendError, Store};
+
+#[cfg(any(test, feature = "sqlite"))]
+#[path = "sqlite_job_runtime.rs"]
+mod sqlite;
 
 /// The durable-jobs runtime over one [`EventBackend`].
 ///
@@ -484,27 +486,6 @@ pub enum JobEnqueueError<BackendError> {
     /// The backend rejected the append + seed transaction (e.g. a reused job id).
     #[error("the job backend rejected the enqueue")]
     Backend(#[source] BackendError),
-}
-
-impl JobRuntime<SqliteBackend> {
-    /// Wires the SQLite job runtime over `pool`: the job `Store` + `job_queue_projection`
-    /// projection. The canonical schema (events + snapshots + `job_queue_projection`) must
-    /// already be applied -- like [`StoreBuilder`], the consumer owns migrations,
-    /// so this composes with the consumer's own view migrations instead of
-    /// re-running event-sorcery's and conflicting. `pool` MUST satisfy the pool
-    /// contract (WAL, `busy_timeout>=5000ms`, `synchronous=FULL`); see
-    /// [`SqliteBackend`].
-    pub async fn build(pool: SqlitePool) -> Result<Self, ReconcileError> {
-        let backend = SqliteBackend::new(pool);
-        let (jobs, queue) = StoreBuilder::<JobState, _>::with_backend(backend.clone())
-            .build()
-            .await?;
-        Ok(Self {
-            backend,
-            jobs,
-            queue,
-        })
-    }
 }
 
 /// The event-sourced job backend for a single job type `J` over an
@@ -1222,7 +1203,7 @@ fn lease_millis(duration: Duration) -> i64 {
 /// per job type over a shared [`JobRuntime`].
 ///
 /// Each entry is `JobType => input_expr`, where `input_expr` builds that job's
-/// [`Job::Input`] dependency bundle. The macro builds an [`EventStoreBackend`]
+/// [`StandaloneJob::Input`] dependency bundle. The macro builds an [`EventStoreBackend`]
 /// per job (named `"{WORKER_NAME}-{index}"`, supervised/restartable) and returns
 /// the `Monitor`; call `.run().await` to start processing.
 ///
@@ -1292,6 +1273,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::SqliteBackend;
 
     #[derive(Serialize, Deserialize)]
     struct TestJob {
