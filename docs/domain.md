@@ -85,13 +85,28 @@ Split into:
 
 ### Projection
 
-A read model derived from events. The library's `Projection<Entity,
-Backend>` is
-a SQLite-backed materialized view: a denormalized table that mirrors live
-aggregate state for fast queries (`load`, `load_all`, `filter`).
+State derived from events, potentially from several aggregate types. A
+projection may summarize, join or reorganize those facts rather than mirror an
+aggregate. The planned native `Projection` trait is a synchronous deterministic
+fold, separate from asynchronous effectful `Reactor` handling; see
+[ADR 0014](../adrs/0014-replayable-multi-aggregate-projections.md).
 
-A projection is fully derived — it can be dropped and rebuilt from the event log
-at any time without data loss.
+### Materialized View
+
+A persisted projection used for queries. An aggregate-state materialized view
+mirrors one aggregate instance per row. The current `Projection` API,
+parameterized by entity and backend, implements this specialization. `load`
+works through the selected view backend; native SQLite and PostgreSQL backends
+also provide `load_all`, `filter`, catch-up and rebuild. Its breaking rename to
+`MaterializedView` is specified in ADR 0014. The general multi-aggregate
+projection runtime is not yet implemented.
+
+The event store remains authoritative, but additional derived tables are normal
+in CQRS/event sourcing. Their contents must be reconstructible from durable
+inputs. Record required external observations, adjustments and configuration;
+replay cannot recover facts that were never persisted. Keep required history
+through compaction. Ordered-feed metadata is also authoritative: cross-stream
+order cannot be recovered from aggregate-local sequence numbers alone.
 
 ### View
 
@@ -103,8 +118,8 @@ with `Projection` directly.
 
 Pluggable storage for projections. `trait ViewBackend` is a higher-kinded type
 emulation: it supplies, per `(View, Aggregate)` pair, a concrete
-`ViewRepository` implementation. The default `SqliteViewBackend` maps every pair
-to `SqliteViewRepository`. Tests use bespoke in-memory backends. See
+`ViewRepository` implementation. `SqliteViewBackend` maps every pair to
+`SqliteViewRepository`. Tests use bespoke in-memory backends. See
 `crates/event-sorcery/src/view_backend.rs`.
 
 ### Snapshot
@@ -217,10 +232,11 @@ not part of the library's public API and must not appear in any public bound.
 
 ### Store / StoreBuilder
 
-`Store<Entity>` is the typed front door for sending commands.
-`StoreBuilder<Entity>` wires a `Store` together with its projection and reactors
-at startup, using a typed-list encoding (`Cons`/`Nil`) so forgetting a wiring
-step is a compile error.
+`Store<Entity, Backend>` is the typed front door for sending commands.
+`StoreBuilder<Entity, Backend>` wires a `Store` together with its projection and
+reactors at startup, using a typed-list encoding (`Cons`/`Nil`) so forgetting a
+wiring step is a compile error. Backend type parameters have no database
+default; SQLite convenience constructors can still infer their backend.
 
 ## Naming Conventions
 
