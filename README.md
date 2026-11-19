@@ -29,6 +29,12 @@ persistence.
 `event-sorcery` is the recommended entry point. Use `sqlite-es` directly only if
 you need lower-level control.
 
+Enable the `sqlite` feature on `event-sorcery` for SQLite constructors, the
+serialized `Engine`, schema reconciliation and maintenance helpers. SQLite is
+opt-in: default core and PostgreSQL-only builds do not depend on SQLite. The FFI
+crate and SQLite examples enable it explicitly. Custom view backends can
+classify retryable storage errors through `ViewBackend::is_retryable_error`.
+
 `EventSourced` implementations must declare `SNAPSHOT_SIZE` and
 `COMPACTION_POLICY`; `StandaloneJob` implementations must declare
 `TERMINAL_FAILURE_MSG`. These settings have no inherited defaults. See

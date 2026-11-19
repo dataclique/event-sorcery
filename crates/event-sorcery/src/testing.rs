@@ -10,7 +10,6 @@
 
 use async_trait::async_trait;
 use cqrs_es::event_sink::EventSink;
-use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
 use std::fmt::Debug;
 use std::future::Future;
@@ -18,10 +17,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::EventSourced;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
 use crate::reactor::Reactor;
-use crate::{EventBackend, EventSourced, SqliteBackend, Store};
 
 struct EncodedTestJob {
     kind: crate::job::JobKind,
@@ -181,21 +180,6 @@ where
     }
 }
 
-/// Test-only escape hatch for creating CQRS frameworks directly.
-///
-/// Create a SQLite-backed Store with no reactors, for tests that
-/// need persistence but no event processing side-effects.
-pub fn test_store<Entity: EventSourced>(pool: sqlx::SqlitePool) -> Store<Entity, SqliteBackend> {
-    let backend = SqliteBackend::new(pool);
-    let event_store = PersistedEventStore::new_snapshot_store(
-        backend.event_repo(Entity::COMPACTION_POLICY),
-        Entity::SNAPSHOT_SIZE,
-    );
-    #[allow(clippy::disallowed_methods)]
-    let cqrs = CqrsFramework::new(event_store, vec![], ());
-    Store::new(cqrs, &backend)
-}
-
 /// Test wrapper for [`Reactor`] implementations that hides
 /// `OneOf::Here`/`OneOf::There` nesting.
 ///
@@ -238,7 +222,7 @@ impl<R: Reactor> ReactorHarness<R> {
     /// harness.receive::<EquityRedemption>(id, event).await?;
     /// ```
     ///
-    /// Requires [`register_entities!`] to be called for the
+    /// Requires [`register_entities!`](crate::register_entities) to be called for the
     /// reactor's entity list.
     pub async fn receive<Entity: EventSourced>(
         &self,
@@ -343,10 +327,10 @@ where
 
 /// In-memory event store for unit tests.
 ///
-/// Provides the same typed-ID interface as [`Store`] but backed
+/// Provides the same typed-ID interface as [`Store`](crate::Store) but backed
 /// by an in-memory store instead of SQLite. Also exposes
 /// [`load`](Self::load) for inspecting aggregate state after
-/// commands, which production [`Store`] intentionally omits
+/// commands, which production [`Store`](crate::Store) intentionally omits
 /// (use projections instead).
 pub struct TestStore<Entity: EventSourced> {
     mem_store: mem_store::MemStore<Lifecycle<Entity>>,

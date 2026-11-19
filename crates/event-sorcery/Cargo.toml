@@ -9,7 +9,7 @@ homepage.workspace = true
 apalis-core.workspace = true
 async-trait.workspace = true
 cqrs-es.workspace = true
-sqlite-es.workspace = true
+sqlite-es = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sqlx.workspace = true
@@ -28,6 +28,7 @@ indexed-query.workspace = true
 
 [features]
 test-support = []
+sqlite = ["dep:sqlite-es", "sqlx/sqlite"]
 
 [lints]
 workspace = true
@@ -35,14 +36,15 @@ workspace = true
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 proptest = "1.11.0"
+sqlite-es.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "dispatch"
 harness = false
-required-features = ["test-support"]
+required-features = ["test-support", "sqlite"]
 
 [[bench]]
 name = "store"
 harness = false
-required-features = ["test-support"]
+required-features = ["test-support", "sqlite"]

@@ -35,19 +35,18 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use cqrs_es::persist::{PersistedEventRepository, PersistedEventStore, PersistenceError};
+use cqrs_es::persist::{PersistedEventRepository, PersistedEventStore};
 use cqrs_es::{CqrsFramework, Query};
-use sqlx::SqlitePool;
 
 use crate::Nil;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
-use crate::projection::{Projection, ProjectionError, Table};
+use crate::projection::{Projection, Table};
 use crate::reactor::Reactor;
-use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
+use crate::schema_registry::ReconcileError;
 use crate::{
-    CompactionPolicy, EventSourced, PersistenceBackend, ProjectedStoreBackend, SqliteBackend,
-    SqliteViewBackend, Store, UnmaterializedStoreBackend,
+    CompactionPolicy, EventSourced, PersistenceBackend, ProjectedStoreBackend, Store,
+    UnmaterializedStoreBackend,
 };
 
 /// Builder for a single CQRS framework.
@@ -68,13 +67,6 @@ pub struct StoreBuilder<
     backend: Backend,
     queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
     _materialized: std::marker::PhantomData<Materialized>,
-}
-
-impl<Entity: EventSourced> StoreBuilder<Entity, SqliteBackend> {
-    /// Creates a new builder backed by SQLite over `pool`.
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::with_backend(SqliteBackend::new(pool))
-    }
 }
 
 impl<Entity: EventSourced, Backend: PersistenceBackend> StoreBuilder<Entity, Backend> {
@@ -114,55 +106,6 @@ pub(crate) fn es_cqrs<Entity: EventSourced, Repository: PersistedEventRepository
     // instead of calling out through injected services.
     #[allow(clippy::disallowed_methods)]
     CqrsFramework::new(store, queries, ())
-}
-
-impl crate::ProjectedStoreBackend for SqliteBackend {
-    type ViewBackend = SqliteViewBackend;
-
-    async fn reconcile_projected<Entity>(
-        &self,
-    ) -> Result<Projection<Entity, SqliteViewBackend>, ReconcileError>
-    where
-        Entity: EventSourced<Materialized = Table> + 'static,
-    {
-        let pool = self.pool().clone();
-        let reconciler = Reconciler::new(pool.clone());
-        let reconciliation = reconciler.reconcile::<Entity>().await?;
-
-        let projection = Projection::sqlite(pool.clone());
-
-        // A schema version change can leave stored view payloads in an
-        // incompatible format. `catch_up` only revisits views that are behind
-        // on event sequence, so a view that is current but incompatible (the
-        // normal state after a view-schema change with no new events) would
-        // never be healed. On a detected schema change, rebuild every view
-        // from the event log; otherwise just replay any events the view missed
-        // due to a crash between event persistence and view update. Projected
-        // entities are guaranteed `CompactionPolicy::Retain` (asserted above),
-        // so the full history is always available to rebuild from. Either path
-        // runs before registering the projection as a reactor so no concurrent
-        // writes can interfere.
-        let recovery = match reconciliation {
-            SchemaReconciliation::Changed => projection.rebuild_all().await,
-            SchemaReconciliation::Unchanged => projection.catch_up().await,
-        };
-        recovery.map_err(|error| match error {
-            ProjectionError::Sqlx(sqlx_error) => ReconcileError::from(sqlx_error),
-            ProjectionError::Persistence(persistence_error) => {
-                ReconcileError::from(persistence_error)
-            }
-            other => ReconcileError::Persistence(PersistenceError::UnknownError(Box::new(other))),
-        })?;
-
-        // Mark the schema version reconciled only after the snapshot clear and
-        // view recovery above have durably completed. A crash before this point
-        // leaves the version unadvanced, so the next startup re-runs the whole
-        // reconcile -- including rebuild_all -- instead of recording a version
-        // whose view rebuild never finished.
-        reconciler.record_version::<Entity>().await?;
-
-        Ok(projection)
-    }
 }
 
 /// Projected entities: auto-creates and wires a [`Projection`],
@@ -239,6 +182,7 @@ mod tests {
     use async_trait::async_trait;
     use cqrs_es::DomainEvent;
     use serde::{Deserialize, Serialize};
+    use sqlx::SqlitePool;
 
     use super::*;
     use crate::dependency::EntityList;

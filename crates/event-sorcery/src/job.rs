@@ -117,7 +117,7 @@ impl std::str::FromStr for JobId {
     }
 }
 
-/// Durable execution context a worker hands to [`Job::perform`], captured at
+/// Durable execution context a worker hands to [`StandaloneJob::perform`], captured at
 /// claim time; the ack reads it from the task's `parts.ctx`.
 #[derive(Clone, Default)]
 pub struct JobContext {
@@ -173,7 +173,7 @@ impl JobContext {
     }
 }
 
-/// What a [`Job::perform`] reports back to the worker (ADR-0007).
+/// What a [`StandaloneJob::perform`] reports back to the worker (ADR-0007).
 #[derive(Debug)]
 pub enum JobOutcome<Output> {
     /// The job finished; the worker records success and acks it (terminal).
@@ -185,7 +185,7 @@ pub enum JobOutcome<Output> {
     Defer(Duration),
 }
 
-/// How a failed [`Job::perform`] must be treated -- chosen explicitly at every
+/// How a failed [`StandaloneJob::perform`] must be treated -- chosen explicitly at every
 /// failure return (ADR-0008).
 ///
 /// There is deliberately NO `From<Error>` impl: `?` cannot silently classify a

@@ -23,6 +23,10 @@ impl ViewBackend for SqliteViewBackend {
     where
         View: cqrs_es::View<Agg> + Clone + 'static,
         Agg: Aggregate + 'static;
+
+    fn is_retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
+        crate::is_retryable_sqlite_busy(error)
+    }
 }
 
 impl<Entity: EventSourced<Materialized = Table>> Projection<Entity, SqliteViewBackend> {

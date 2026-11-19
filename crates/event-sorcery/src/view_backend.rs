@@ -40,6 +40,12 @@ pub trait ViewBackend: Send + Sync + 'static {
     where
         View: cqrs_es::View<Agg> + Clone + 'static,
         Agg: Aggregate + 'static;
+
+    /// Classifies storage contention that can safely retry a complete projection update.
+    /// Unknown errors are returned without retrying unless the backend opts in.
+    fn is_retryable_error(_error: &(dyn std::error::Error + 'static)) -> bool {
+        false
+    }
 }
 
 /// Optional native construction, queries and retained-history recovery.

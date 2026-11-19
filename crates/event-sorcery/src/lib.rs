@@ -37,7 +37,7 @@
 //! # Design
 //!
 //! [`EventSourced`] replaces direct `Aggregate` usage. Domain
-//! types implement `EventSourced`, and [`Lifecycle`] provides a
+//! types implement `EventSourced`, and `Lifecycle` provides a
 //! blanket `Aggregate` impl that bridges to cqrs-es. Consumers
 //! interact through [`Store`], which enforces typed IDs and hides
 //! cqrs-es internals.
@@ -91,6 +91,7 @@ mod dispatch;
 mod engine;
 mod job;
 mod job_backend;
+#[cfg(any(test, feature = "sqlite"))]
 mod job_sqlite;
 mod job_store;
 mod lifecycle;
@@ -99,8 +100,14 @@ mod projection;
 mod projection_recovery;
 mod reactor;
 mod schema_registry;
+#[cfg(any(test, feature = "sqlite"))]
 mod sqlite_event_repository;
+#[cfg(any(test, feature = "sqlite"))]
 mod sqlite_projection;
+#[cfg(any(test, feature = "sqlite"))]
+mod sqlite_reactor;
+#[cfg(any(test, feature = "sqlite"))]
+mod sqlite_store;
 #[cfg(any(test, feature = "test-support"))]
 mod testing;
 mod view_backend;
@@ -114,8 +121,6 @@ use cqrs_es::EventStore;
 use cqrs_es::persist::PersistedEventStore;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sqlx::AssertSqlSafe;
-use sqlx::SqlitePool;
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
 
@@ -132,11 +137,12 @@ pub use dispatch::{
     uneventful,
 };
 pub use engine::{
-    CommitRequest, Engine, EngineError, JobSeed, OpaqueCommitRequest, OpaqueProposedEvent,
-    OpaqueStoredEvent, PreparedCommit, PreparedJob, PreparedSnapshot, SnapshotUpdate,
-    SnapshotWrite, StoredEventRow, StoredSnapshotRow, StreamIdentity, decode_opaque_payload,
-    encode_opaque_payload, validate_expected_version,
+    CommitRequest, EngineError, JobSeed, OpaqueProposedEvent, OpaqueStoredEvent, PreparedCommit,
+    PreparedJob, PreparedSnapshot, SnapshotUpdate, StoredEventRow, StoredSnapshotRow,
+    StreamIdentity, decode_opaque_payload, encode_opaque_payload, validate_expected_version,
 };
+#[cfg(any(test, feature = "sqlite"))]
+pub use engine::{Engine, OpaqueCommitRequest, SnapshotWrite};
 pub use job::{
     DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label,
     PreparedPendingJobs, StandaloneJob,
@@ -145,6 +151,7 @@ pub use job_backend::{
     Backoff, ClaimedJob, Clock, EventStoreBackend, JobClaimHandle, JobClaimResult, JobEnqueueError,
     JobLeaseResult, JobRuntime, JobRuntimeError, JobSettlementResult, JobWorkerConfig, run_job,
 };
+#[cfg(any(test, feature = "sqlite"))]
 pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
@@ -158,20 +165,32 @@ pub use projection_recovery::{
     ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow,
     recover_projection,
 };
+#[cfg(any(test, feature = "sqlite"))]
+pub use reactor::{IdempotentReactor, RetryOnBusy, is_retryable_sqlite_busy};
 pub use reactor::{
-    IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,
-    ReactorContext, RetryOnBusy, is_retryable_sqlite_busy, retry_with_backoff,
+    RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, ReactorContext,
+    retry_with_backoff,
 };
+#[cfg(any(test, feature = "sqlite"))]
+pub use schema_registry::Reconciler;
 pub use schema_registry::{
-    ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry, SchemaTarget,
-    validate_snapshot_history,
+    ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, validate_snapshot_history,
 };
+#[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_event_repository::SqliteEventRepository;
+#[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_projection::SqliteViewBackend;
+#[cfg(all(any(test, feature = "test-support"), any(test, feature = "sqlite")))]
+pub use sqlite_store::test_store;
+#[cfg(any(test, feature = "sqlite"))]
+pub use sqlite_store::{
+    compact_events, count_aggregates, incremental_vacuum, load_all_ids, load_entity,
+    load_ids_paginated, send_command, vacuum,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, buffer_pending_job, replay,
-    test_store, with_pending_jobs,
+    with_pending_jobs,
 };
 pub use view_backend::{NativeProjectionBackend, ViewBackend};
 pub use wire::StoreBuilder;
@@ -215,7 +234,7 @@ pub enum CompactionPolicy {
 ///
 /// Implement this trait on your domain type (e.g., `Position`,
 /// `OffchainOrder`) to get a complete event-sourcing setup:
-/// [`Lifecycle`] provides a blanket `Aggregate` impl, and
+/// `Lifecycle` provides a blanket `Aggregate` impl, and
 /// [`Store`] provides type-safe command dispatch.
 ///
 /// # Associated types
@@ -250,7 +269,7 @@ pub enum CompactionPolicy {
 ///
 /// These reconstruct state from the event log during replay.
 /// They are called by the blanket `Aggregate::apply` impl on
-/// [`Lifecycle`], never by application code directly.
+/// `Lifecycle`, never by application code directly.
 ///
 /// - `originate`: Attempt to create initial state from an
 ///   event. Returns `Some(state)` for genesis events, `None`
@@ -264,7 +283,7 @@ pub enum CompactionPolicy {
 /// # Command-side methods
 ///
 /// These process commands to produce events. They are called by
-/// the blanket `Aggregate::handle` impl on [`Lifecycle`], which
+/// the blanket `Aggregate::handle` impl on `Lifecycle`, which
 /// routes commands based on lifecycle state.
 ///
 /// - `initialize`: Handle a command when the entity doesn't
@@ -336,7 +355,7 @@ pub trait EventSourced:
     ///
     /// Returns `Some(state)` if this event creates the entity,
     /// `None` if it requires existing state. Returning `None`
-    /// causes [`Lifecycle`] to enter a `Failed` state with a
+    /// causes `Lifecycle` to enter a `Failed` state with a
     /// [`LifecycleError::EventCantOriginate`].
     fn originate(event: &Self::Event) -> Option<Self>;
 
@@ -440,30 +459,6 @@ impl<Entity: EventSourced, Backend: PersistenceBackend> Store<Entity, Backend> {
     }
 }
 
-/// SQLite-specific [`Store`] helpers.
-impl<Entity: EventSourced> Store<Entity, SqliteBackend> {
-    /// Reconstruct an entity's state from events without needing
-    /// a full `Store` (no services or CQRS framework required).
-    ///
-    /// Useful in test/CLI contexts where you only need to read
-    /// aggregate state and never send commands.
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn load_from_pool(
-        pool: SqlitePool,
-        id: &Entity::Id,
-    ) -> Result<Option<Entity>, SendError<Entity>> {
-        let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
-        let event_store =
-            PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-                repo,
-                Entity::SNAPSHOT_SIZE,
-            );
-        let context = event_store.load_aggregate(&id.to_string()).await?;
-
-        Ok(context.aggregate.into_result()?)
-    }
-}
-
 /// Error returned by [`Store::send`] and [`Store::load`].
 ///
 /// Wraps the cqrs-es `AggregateError` containing a
@@ -493,296 +488,6 @@ pub trait DomainError:
 impl<T> DomainError for T where
     T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
-}
-
-/// Load a single entity by replaying events from the store.
-///
-/// Creates a lightweight, temporary event store - no CQRS framework, no
-/// query processors. Suitable for read-only access from contexts that
-/// don't own a [`Store`] (e.g., dashboard transfer loading).
-///
-/// # Errors
-///
-/// Returns `SendError` if event store loading or lifecycle
-/// reconstruction fails.
-pub async fn load_entity<Entity: EventSourced>(
-    pool: &SqlitePool,
-    id: &Entity::Id,
-) -> Result<Option<Entity>, SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
-    let event_store =
-        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-            repo,
-            Entity::SNAPSHOT_SIZE,
-        );
-
-    let context = event_store.load_aggregate(&id.to_string()).await?;
-
-    Ok(context.aggregate.into_result()?)
-}
-
-/// Execute a single command against an aggregate without a pre-built
-/// [`Store`].
-///
-/// Creates a temporary CQRS framework with no query processors,
-/// executes the command (inside a pending-job scope, so any jobs the
-/// handler enqueues flush with the events), and discards the framework.
-/// Useful in CLI contexts where you need to send a command but don't have
-/// (or need) a full server-lifetime Store.
-pub async fn send_command<Entity: EventSourced>(
-    pool: &SqlitePool,
-    id: &Entity::Id,
-    command: Entity::Command,
-) -> Result<(), SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
-    let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-        repo,
-        Entity::SNAPSHOT_SIZE,
-    );
-
-    #[allow(clippy::disallowed_methods)]
-    let cqrs = CqrsFramework::new(store, vec![], ());
-
-    job::with_pending_scope(cqrs.execute(&id.to_string(), command)).await
-}
-
-/// Delete compactable events that are already represented by snapshots.
-///
-/// This is a no-op for entities with [`CompactionPolicy::Retain`].
-/// [`CompactionPolicy::CompactAfterSnapshot`] removes snapshot-covered events;
-/// [`CompactionPolicy::RetainLast`] additionally preserves the trailing sequence
-/// window for each aggregate type and id. Neither policy deletes unsnapshotted
-/// events or events from streams without snapshots.
-///
-/// # Errors
-///
-/// Returns database errors from the delete query or an encoding error when the
-/// retention window cannot be represented as a SQLite integer.
-pub async fn compact_events<Entity: EventSourced>(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
-    let result = match Entity::COMPACTION_POLICY {
-        CompactionPolicy::Retain => return Ok(0),
-        CompactionPolicy::CompactAfterSnapshot => {
-            sqlx::query(
-                "DELETE FROM events \
-                 WHERE aggregate_type = ?1 \
-                   AND sequence <= COALESCE( \
-                       (SELECT last_sequence FROM snapshots \
-                        WHERE snapshots.aggregate_type = events.aggregate_type \
-                          AND snapshots.aggregate_id = events.aggregate_id), \
-                       0 \
-                   )",
-            )
-            .bind(Entity::AGGREGATE_TYPE)
-            .execute(pool)
-            .await?
-        }
-        CompactionPolicy::RetainLast { events } => {
-            let window =
-                i64::try_from(events).map_err(|source| sqlx::Error::Encode(Box::new(source)))?;
-
-            sqlx::query(
-                "DELETE FROM events \
-                 WHERE aggregate_type = ?1 \
-                   AND sequence <= COALESCE( \
-                       (SELECT last_sequence FROM snapshots \
-                        WHERE snapshots.aggregate_type = events.aggregate_type \
-                          AND snapshots.aggregate_id = events.aggregate_id), \
-                       0 \
-                   ) \
-                   AND sequence <= ( \
-                       SELECT MAX(newest.sequence) FROM events newest \
-                       WHERE newest.aggregate_type = events.aggregate_type \
-                         AND newest.aggregate_id = events.aggregate_id \
-                   ) - ?2",
-            )
-            .bind(Entity::AGGREGATE_TYPE)
-            .bind(window)
-            .execute(pool)
-            .await?
-        }
-    };
-
-    Ok(result.rows_affected())
-}
-
-/// Reclaim SQLite file space after event compaction.
-///
-/// Full `VACUUM` can take an exclusive database lock and should be reserved for
-/// explicit maintenance windows, not hot runtime loops.
-///
-/// # Errors
-///
-/// Returns database errors from SQLite `VACUUM`.
-pub async fn vacuum(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("VACUUM").execute(pool).await?;
-    Ok(())
-}
-
-/// Reclaim a bounded number of SQLite freelist pages.
-///
-/// This is intended for periodic background cleanup on databases configured
-/// with `auto_vacuum = INCREMENTAL`.
-///
-/// # Errors
-///
-/// Returns database errors from SQLite `PRAGMA incremental_vacuum`.
-pub async fn incremental_vacuum(pool: &SqlitePool, pages: u32) -> Result<(), sqlx::Error> {
-    sqlx::query(AssertSqlSafe(format!("PRAGMA incremental_vacuum({pages})")))
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// Load all aggregate IDs for a given entity type.
-///
-/// Queries events and snapshots for distinct aggregate IDs. Used by dashboard
-/// transfer loading to enumerate all transfer aggregates without requiring
-/// access to a [`Store`].
-///
-/// Returns an error if any stored aggregate ID fails to parse,
-/// since that indicates data corruption or a schema mismatch.
-///
-/// # Errors
-///
-/// Returns `LoadAllIdsError` on database errors or if stored aggregate
-/// IDs fail to parse.
-pub async fn load_all_ids<Entity: EventSourced>(
-    pool: &SqlitePool,
-) -> Result<Vec<Entity::Id>, LoadAllIdsError>
-where
-    <Entity::Id as FromStr>::Err: Debug,
-{
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT aggregate_id FROM ( \
-             SELECT aggregate_id FROM events WHERE aggregate_type = ?1 \
-             UNION \
-             SELECT aggregate_id FROM snapshots WHERE aggregate_type = ?1 \
-         ) \
-         ORDER BY aggregate_id ASC",
-    )
-    .bind(Entity::AGGREGATE_TYPE)
-    .fetch_all(pool)
-    .await?;
-
-    let (ids, invalid) = rows.into_iter().fold(
-        (Vec::new(), Vec::new()),
-        |(mut ids, mut invalid), (id_str,)| {
-            match id_str.parse::<Entity::Id>() {
-                Ok(id) => ids.push(id),
-                Err(parse_error) => {
-                    tracing::warn!(
-                        target: "cqrs",
-                        aggregate_id = id_str,
-                        aggregate_type = Entity::AGGREGATE_TYPE,
-                        ?parse_error,
-                        "Failed to parse aggregate ID"
-                    );
-                    invalid.push(id_str);
-                }
-            }
-            (ids, invalid)
-        },
-    );
-
-    if invalid.is_empty() {
-        Ok(ids)
-    } else {
-        Err(LoadAllIdsError::InvalidIds {
-            aggregate_type: Entity::AGGREGATE_TYPE,
-            ids: invalid,
-        })
-    }
-}
-
-/// Load aggregate IDs with pagination, newest first (by highest rowid).
-///
-/// Returns up to `limit` IDs starting from `offset`, ordered by most
-/// recently created aggregate first (based on the maximum rowid of each
-/// aggregate's events or snapshot).
-///
-/// # Errors
-///
-/// Returns `LoadAllIdsError` on database errors or unparseable IDs.
-pub async fn load_ids_paginated<Entity: EventSourced>(
-    pool: &SqlitePool,
-    limit: usize,
-    offset: usize,
-) -> Result<Vec<Entity::Id>, LoadAllIdsError>
-where
-    <Entity::Id as FromStr>::Err: Debug,
-{
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT aggregate_id FROM ( \
-             SELECT aggregate_id, MAX(rowid) AS latest_rowid \
-             FROM events \
-             WHERE aggregate_type = ?1 \
-             GROUP BY aggregate_id \
-             UNION ALL \
-             SELECT aggregate_id, MAX(rowid) AS latest_rowid \
-             FROM snapshots \
-             WHERE aggregate_type = ?1 \
-             GROUP BY aggregate_id \
-         ) \
-         GROUP BY aggregate_id \
-         ORDER BY MAX(latest_rowid) DESC \
-         LIMIT ?2 OFFSET ?3",
-    )
-    .bind(Entity::AGGREGATE_TYPE)
-    .bind(i64::try_from(limit)?)
-    .bind(i64::try_from(offset)?)
-    .fetch_all(pool)
-    .await?;
-
-    let (ids, invalid) = rows.into_iter().fold(
-        (Vec::new(), Vec::new()),
-        |(mut ids, mut invalid), (id_str,)| {
-            match id_str.parse::<Entity::Id>() {
-                Ok(id) => ids.push(id),
-                Err(parse_error) => {
-                    tracing::warn!(
-                        target: "cqrs",
-                        aggregate_id = id_str,
-                        aggregate_type = Entity::AGGREGATE_TYPE,
-                        ?parse_error,
-                        "Failed to parse aggregate ID (paginated)"
-                    );
-                    invalid.push(id_str);
-                }
-            }
-            (ids, invalid)
-        },
-    );
-
-    if invalid.is_empty() {
-        Ok(ids)
-    } else {
-        Err(LoadAllIdsError::InvalidIds {
-            aggregate_type: Entity::AGGREGATE_TYPE,
-            ids: invalid,
-        })
-    }
-}
-
-/// Count the total number of distinct aggregates of this type.
-///
-/// # Errors
-///
-/// Returns `LoadAllIdsError` on database failure or numeric conversion error.
-pub async fn count_aggregates<Entity: EventSourced>(
-    pool: &SqlitePool,
-) -> Result<usize, LoadAllIdsError> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM ( \
-             SELECT aggregate_id FROM events WHERE aggregate_type = ?1 \
-             UNION \
-             SELECT aggregate_id FROM snapshots WHERE aggregate_type = ?1 \
-         )",
-    )
-    .bind(Entity::AGGREGATE_TYPE)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(usize::try_from(row.0)?)
 }
 
 /// Errors that can occur when loading all aggregate IDs.
@@ -994,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn load_entity_replays_events_into_entity() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone());
+        let store = test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -1015,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn load_entity_uses_snapshot_after_events_are_compacted() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone());
+        let store = test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -1057,7 +762,7 @@ mod tests {
     #[tokio::test]
     async fn commands_still_commit_after_events_are_compacted() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone());
+        let store = test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -1105,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn windowed_compaction_preserves_the_unsnapshotted_tail() {
         let pool = test_pool().await;
-        let store = testing::test_store::<WindowedWidget<1, 3>>(pool.clone());
+        let store = test_store::<WindowedWidget<1, 3>>(pool.clone());
         store
             .send(
                 &NumericId(7),
@@ -1148,7 +853,7 @@ mod tests {
     #[tokio::test]
     async fn retain_last_keeps_the_newest_window_and_the_entity_loads() {
         let pool = test_pool().await;
-        let store = testing::test_store::<WindowedWidget>(pool.clone());
+        let store = test_store::<WindowedWidget>(pool.clone());
 
         store
             .send(
@@ -1194,8 +899,8 @@ mod tests {
     #[tokio::test]
     async fn windowed_compaction_isolates_streams_and_preserves_unsnapshotted_events() {
         let pool = test_pool().await;
-        let windowed = testing::test_store::<WindowedWidget<2, 5>>(pool.clone());
-        let unrelated = testing::test_store::<Widget>(pool.clone());
+        let windowed = test_store::<WindowedWidget<2, 5>>(pool.clone());
+        let unrelated = test_store::<Widget>(pool.clone());
 
         for (aggregate_id, event_count) in [(7, 6), (8, 11), (9, 4)] {
             windowed
@@ -1281,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_version_advances_across_loads() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone());
+        let store = test_store::<Widget>(pool.clone());
 
         store
             .send(
@@ -1388,7 +1093,7 @@ mod tests {
         }
 
         let pool = test_pool().await;
-        let store = testing::test_store::<Tally>(pool.clone());
+        let store = test_store::<Tally>(pool.clone());
 
         // SNAPSHOT_SIZE = 1 forces commit's snapshot rebuild
         // (`update_snapshot_with_events`) after every command, exercising the
@@ -1484,7 +1189,7 @@ mod tests {
         }
 
         let pool = test_pool().await;
-        let store = testing::test_store::<RetainedWidget>(pool.clone());
+        let store = test_store::<RetainedWidget>(pool.clone());
         store
             .send(
                 &NumericId(7),
@@ -1531,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn load_all_ids_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone());
+        let store = test_store::<Widget>(pool.clone());
         store
             .send(
                 &NumericId(30),
@@ -1598,7 +1303,7 @@ mod tests {
     #[tokio::test]
     async fn count_aggregates_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
-        let store = testing::test_store::<Widget>(pool.clone());
+        let store = test_store::<Widget>(pool.clone());
         store
             .send(
                 &NumericId(30),

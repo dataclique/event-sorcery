@@ -21,7 +21,7 @@ use crate::dependency::{Cons, Dependent, EntityList, Nil};
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::reactor::{
     RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, ReactorContext,
-    backoff_delay_ms, is_retryable_sqlite_busy,
+    backoff_delay_ms,
 };
 use crate::view_backend::ViewBackend;
 
@@ -29,7 +29,7 @@ use crate::view_backend::ViewBackend;
 ///
 /// Used with [`EventSourced::PROJECTION`] to declare that an
 /// entity has a materialized view, and with
-/// [`Projection::sqlite`] to create the projection.
+/// [`Projection::with_backend`] to create the projection.
 #[derive(Debug, Clone, Copy)]
 pub struct Table(pub &'static str);
 
@@ -311,7 +311,7 @@ where
             let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
                 Ok(Some(pair)) => pair,
                 Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
-                Err(error) if is_retryable_sqlite_busy(&error) => {
+                Err(error) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
                         let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
                         warn!(
@@ -377,7 +377,7 @@ where
                     );
                     return Ok(());
                 }
-                Err(error) if is_retryable_sqlite_busy(&error) => {
+                Err(error) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
                         let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
                         warn!(
@@ -950,6 +950,10 @@ mod tests {
         where
             View: cqrs_es::View<Agg> + Clone + 'static,
             Agg: cqrs_es::Aggregate + 'static;
+
+        fn is_retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
+            crate::is_retryable_sqlite_busy(error)
+        }
     }
 
     type TestBusyRepo = BusyRepo<Lifecycle<TestEntity>, Lifecycle<TestEntity>>;

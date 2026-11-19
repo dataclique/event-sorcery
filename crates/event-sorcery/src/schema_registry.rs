@@ -25,14 +25,18 @@ use async_trait::async_trait;
 use cqrs_es::AggregateError;
 use cqrs_es::persist::PersistenceError;
 use serde::{Deserialize, Serialize};
-use sqlite_es::SqliteCqrs;
-use sqlx::SqlitePool;
 use std::collections::BTreeMap;
-use tracing::{debug, info};
 
 use crate::CompactionPolicy;
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{LifecycleError, Never};
 use crate::{DomainEvent, Effect, EventSourced, Nil, StreamIdentity, uneventful};
+
+#[cfg(any(test, feature = "sqlite"))]
+#[path = "sqlite_schema_registry.rs"]
+mod sqlite;
+
+#[cfg(any(test, feature = "sqlite"))]
+pub use sqlite::Reconciler;
 
 /// Singleton aggregate ID for the schema registry.
 pub(crate) const REGISTRY_ID: &str = "schema";
@@ -178,7 +182,7 @@ impl EventSourced for SchemaRegistry {
     }
 }
 
-/// Outcome of [`Reconciler::reconcile`]: whether the stored schema version
+/// Outcome of schema reconciliation: whether the stored schema version
 /// diverged from the code's [`SCHEMA_VERSION`] for an entity.
 ///
 /// Callers branch on this to choose recovery: a `Changed` projected entity
@@ -186,9 +190,9 @@ impl EventSourced for SchemaRegistry {
 ///
 /// [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use = "reconciliation must be completed by calling `Reconciler::record_version` after \
-              recovery; dropping the outcome usually means that call was forgotten, leaving the \
-              schema version unadvanced and the recovery re-running on every startup"]
+#[must_use = "reconciliation must be completed by recording the schema version after recovery; \
+              dropping the outcome leaves the schema version unadvanced and recovery re-running \
+              on every startup"]
 pub enum SchemaReconciliation {
     /// The stored version did not match the current code version. Retained-history
     /// snapshots are cleared; compactable snapshots survive first registration.
@@ -209,160 +213,6 @@ impl SchemaReconciliation {
             (Changed, CompactAfterSnapshot | RetainLast { .. })
             | (Unchanged, Retain | CompactAfterSnapshot | RetainLast { .. }) => false,
         }
-    }
-}
-
-/// Handles schema version reconciliation at startup.
-///
-/// Reads state by replaying all SchemaRegistry events from the event
-/// store (no views, no snapshots). Writes go through the CQRS
-/// framework to maintain event sourcing invariants.
-pub struct Reconciler {
-    cqrs: SqliteCqrs<Lifecycle<SchemaRegistry>>,
-    pool: SqlitePool,
-}
-
-impl Reconciler {
-    pub fn new(pool: SqlitePool) -> Self {
-        #[allow(clippy::disallowed_methods)]
-        let cqrs = sqlite_es::sqlite_cqrs(pool.clone(), vec![], ());
-        Self { cqrs, pool }
-    }
-
-    /// Reconciles language-neutral schema metadata through the same registry
-    /// and snapshot recovery used by the native typed API.
-    pub async fn reconcile_target(
-        &self,
-        target: &SchemaTarget,
-    ) -> Result<SchemaReconciliation, ReconcileError> {
-        let registry = self.load_registry().await?;
-        let stored_version = registry
-            .as_ref()
-            .and_then(|state| state.version_of(&target.aggregate_type));
-
-        debug!(
-            target: "cqrs",
-            aggregate = target.aggregate_type,
-            ?stored_version,
-            "Loaded stored schema version"
-        );
-
-        let reconciliation = target.reconciliation(registry.as_ref())?;
-        if !reconciliation.clears_snapshots(target.compaction) {
-            debug!(
-                target: "cqrs",
-                aggregate = target.aggregate_type,
-                version = target.version,
-                ?stored_version,
-                "Schema reconciliation preserves snapshots"
-            );
-            return Ok(reconciliation);
-        }
-
-        let mut transaction = self.pool.begin().await?;
-        let histories: Vec<(String, i64, i64)> = sqlx::query_as(
-            "SELECT s.aggregate_id, s.last_sequence, \
-             (SELECT COUNT(*) FROM events e \
-              WHERE e.aggregate_type = s.aggregate_type \
-                AND e.aggregate_id = s.aggregate_id \
-                AND e.sequence BETWEEN 1 AND s.last_sequence) \
-             FROM snapshots s WHERE s.aggregate_type = ?1",
-        )
-        .bind(&target.aggregate_type)
-        .fetch_all(&mut *transaction)
-        .await?;
-        for (aggregate_id, covered_sequence, retained_events) in histories {
-            validate_snapshot_history(
-                StreamIdentity::new(&target.aggregate_type, aggregate_id),
-                covered_sequence,
-                retained_events,
-            )?;
-        }
-        sqlx::query("DELETE FROM snapshots WHERE aggregate_type = ?1")
-            .bind(&target.aggregate_type)
-            .execute(&mut *transaction)
-            .await?;
-        transaction.commit().await?;
-
-        info!(
-            target: "cqrs",
-            aggregate = target.aggregate_type,
-            old_version = ?stored_version,
-            new_version = target.version,
-            "Cleared stale snapshots for schema version change"
-        );
-
-        Ok(SchemaReconciliation::Changed)
-    }
-
-    /// Records a schema version only after its recovery has durably completed.
-    pub async fn record_target(&self, target: &SchemaTarget) -> Result<(), ReconcileError> {
-        self.cqrs
-            .execute(
-                REGISTRY_ID,
-                SchemaRegistryCommand::Register {
-                    name: target.aggregate_type.clone(),
-                    version: target.version,
-                },
-            )
-            .await?;
-
-        Ok(())
-    }
-
-    /// Rebuilds SchemaRegistry state from the full event log.
-    async fn load_registry(&self) -> Result<Option<SchemaRegistry>, ReconcileError> {
-        let payloads = sqlx::query_scalar!(
-            r#"
-            SELECT payload AS "payload: String"
-            FROM events
-            WHERE aggregate_type = 'SchemaRegistry'
-              AND aggregate_id = 'schema'
-            ORDER BY sequence
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        SchemaRegistry::from_payloads(payloads)
-    }
-
-    /// Reconciles `Entity`'s schema and clears mismatched retained-history snapshots.
-    /// First registration preserves compactable snapshots; recorded compactable
-    /// version changes are refused.
-    ///
-    /// Does NOT record the new version. The caller must call
-    /// [`Reconciler::record_version`] only after every version-change recovery
-    /// it owns (the snapshot clear here, plus any view rebuild the caller
-    /// performs) has durably completed -- recording the version is the "done"
-    /// marker, and a crash before it leaves the version unadvanced so the whole
-    /// recovery re-runs on the next startup. The snapshot clear is idempotent,
-    /// so re-running is safe.
-    #[allow(clippy::cognitive_complexity)]
-    pub async fn reconcile<Entity: EventSourced>(
-        &self,
-    ) -> Result<SchemaReconciliation, ReconcileError> {
-        self.reconcile_target(&SchemaTarget::new(
-            Entity::AGGREGATE_TYPE,
-            Entity::SCHEMA_VERSION,
-            Entity::COMPACTION_POLICY,
-        ))
-        .await
-    }
-
-    /// Records that `Entity`'s current [`SCHEMA_VERSION`] has been fully
-    /// reconciled. Call only after all version-change recovery (snapshot clear
-    /// and, for projected entities, view rebuild) has durably completed, so a
-    /// recorded version always implies its recovery finished.
-    ///
-    /// [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
-    pub async fn record_version<Entity: EventSourced>(&self) -> Result<(), ReconcileError> {
-        self.record_target(&SchemaTarget::new(
-            Entity::AGGREGATE_TYPE,
-            Entity::SCHEMA_VERSION,
-            Entity::COMPACTION_POLICY,
-        ))
-        .await
     }
 }
 
@@ -437,8 +287,10 @@ mod tests {
     use cqrs_es::event_sink::EventSink;
     use proptest::prelude::{any, prop_assert_eq, proptest};
     use serde_json::json;
+    use sqlx::SqlitePool;
 
     use super::*;
+    use crate::lifecycle::Lifecycle;
 
     #[test]
     fn registry_replay_rejects_incompatible_event_payloads() {
@@ -696,7 +548,7 @@ mod tests {
             CompactionPolicy::RetainLast { events: 2 },
         ] {
             let pool = sqlite_es::testing::create_test_pool().await.unwrap();
-            let store = crate::testing::test_store::<CompactableWidget>(pool.clone());
+            let store = crate::test_store::<CompactableWidget>(pool.clone());
             let id = "legacy-widget".to_string();
             store.send(&id, ()).await.unwrap();
             let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \

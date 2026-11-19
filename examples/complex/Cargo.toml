@@ -11,6 +11,7 @@ publish = false
 async-trait = "0.1.89"
 cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87", version = "0.5.0" }
 event-sorcery = { path = "../../crates/event-sorcery", features = [
+  "sqlite",
   "test-support",
 ] }
 serde = { version = "1.0.228", features = ["derive"] }

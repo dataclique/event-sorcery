@@ -9,7 +9,7 @@ use crate::engine::EngineError;
 use crate::schema_registry::{REGISTRY_ID, SchemaRegistryCommand};
 use crate::{
     CompactionPolicy, EventBackend, EventSourced, NativeProjectionBackend, Nil, Projection,
-    ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, SqliteBackend, Table,
+    ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, Table,
 };
 
 /// Storage required to execute and reload native aggregates.
@@ -63,16 +63,6 @@ pub trait UnmaterializedStoreBackend: PersistenceBackend {
     fn reconcile_unmaterialized<Entity: EventSourced<Materialized = Nil>>(
         &self,
     ) -> impl Future<Output = Result<(), ReconcileError>> + Send;
-}
-
-impl UnmaterializedStoreBackend for SqliteBackend {
-    async fn reconcile_unmaterialized<Entity: EventSourced<Materialized = Nil>>(
-        &self,
-    ) -> Result<(), ReconcileError> {
-        let reconciler = crate::Reconciler::new(self.pool().clone());
-        let _ = reconciler.reconcile::<Entity>().await?;
-        reconciler.record_version::<Entity>().await
-    }
 }
 
 /// Native startup for entities with a materialized view, independent of workers.
