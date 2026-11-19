@@ -12,7 +12,9 @@ persistence.
   SQLite query imports reexport the shared definitions.
 - **[`crates/sqlite-es`](crates/sqlite-es)** — SQLite implementation of
   `cqrs-es`'s event repository, view repository, and `CqrsFramework` glue.
-  Standalone — usable wherever you'd plug in a `cqrs-es` backend.
+  Standalone — usable wherever you'd plug in a `cqrs-es` backend. Its
+  `NativeRepository` integrates caller-owned commit and snapshot policy;
+  `commit_atomic` is the shared SQLite writer for native and erased callers.
 - **[`crates/event-sorcery`](crates/event-sorcery)** — higher-level ergonomics
   on top of `sqlite-es`: the `EventSourced` trait, `Lifecycle` adapter, typed
   `Store`, projections, schema registry, reactor, and durable job dispatch

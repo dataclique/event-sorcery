@@ -43,8 +43,10 @@
 //! let query = GenericQuery::new(view_repo);
 //! ```
 
+mod commit;
 mod cqrs;
 mod event_repository;
+mod native_repository;
 mod sql_query;
 pub mod testing;
 mod view_repository;
@@ -61,11 +63,13 @@ mod view_repository;
 /// edit them afterwards.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+pub use commit::{Commit, JobWrite, commit_atomic};
 pub use cqrs::{SqliteCqrs, sqlite_cqrs};
 pub use cqrs_es::persist::ViewContext;
 pub use event_repository::{
     SqliteAggregateError, SqliteEventRepository, insert_serialized_events_batch,
 };
+pub use native_repository::{NativeRepository, RepositoryPolicy, SnapshotInput};
 pub use view_repository::{
     Cmp, IndexedView, Order, Predicate, SqliteViewError, SqliteViewRepository, Term, Value,
 };

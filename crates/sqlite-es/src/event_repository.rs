@@ -31,6 +31,10 @@ pub enum SqliteAggregateError {
     /// so there is no event sequence to record for the snapshot
     #[error("snapshot update without accompanying events")]
     EmptySnapshotUpdate,
+
+    /// Snapshot coverage extends beyond the prepared event batch.
+    #[error("snapshot sequence {proposed} exceeds committed sequence {current}")]
+    SnapshotBeyondCurrentVersion { proposed: usize, current: usize },
 }
 
 impl From<SqliteAggregateError> for PersistenceError {
@@ -40,7 +44,10 @@ impl From<SqliteAggregateError> for PersistenceError {
             SqliteAggregateError::Connection(e) => Self::ConnectionError(Box::new(e)),
             SqliteAggregateError::Deserialization(e) => Self::DeserializationError(Box::new(e)),
             SqliteAggregateError::TryFromInt(e) => Self::UnknownError(Box::new(e)),
-            err @ SqliteAggregateError::EmptySnapshotUpdate => Self::UnknownError(Box::new(err)),
+            err @ (SqliteAggregateError::EmptySnapshotUpdate
+            | SqliteAggregateError::SnapshotBeyondCurrentVersion { .. }) => {
+                Self::UnknownError(Box::new(err))
+            }
         }
     }
 }
@@ -370,7 +377,9 @@ impl SqliteEventRepository {
     }
 }
 
-fn row_to_serialized_event(row: &SqliteRow) -> Result<SerializedEvent, SqliteAggregateError> {
+pub(crate) fn row_to_serialized_event(
+    row: &SqliteRow,
+) -> Result<SerializedEvent, SqliteAggregateError> {
     let sequence_i64: i64 = row.try_get("sequence")?;
     let sequence = usize::try_from(sequence_i64)?;
 

@@ -12,6 +12,84 @@ use crate::{
     ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, SqliteBackend, Table,
 };
 
+/// Domain policy injected into backend-owned native repository integration.
+#[derive(Clone)]
+pub struct NativeRepositoryPolicy {
+    compaction_policy: CompactionPolicy,
+}
+
+impl From<CompactionPolicy> for NativeRepositoryPolicy {
+    fn from(compaction_policy: CompactionPolicy) -> Self {
+        Self { compaction_policy }
+    }
+}
+
+impl sqlite_es::RepositoryPolicy for NativeRepositoryPolicy {
+    type Pending = crate::PreparedPendingJobs;
+
+    fn prepare<'events>(
+        &self,
+        aggregate_type: &str,
+        events: &'events [cqrs_es::persist::SerializedEvent],
+        snapshot: Option<sqlite_es::SnapshotInput>,
+    ) -> Result<(sqlite_es::Commit<'events>, Self::Pending), PersistenceError> {
+        let snapshot = snapshot.map(|snapshot| match snapshot {
+            sqlite_es::SnapshotInput::Counter {
+                aggregate_id,
+                aggregate,
+                snapshot_version,
+            } => (
+                aggregate_id,
+                crate::SnapshotUpdate::new(aggregate, snapshot_version),
+            ),
+            sqlite_es::SnapshotInput::Covered(snapshot) => {
+                crate::SnapshotUpdate::from_serialized(snapshot)
+            }
+        });
+        let (request, pending) =
+            crate::CommitRequest::prepare_repository(aggregate_type, events, snapshot)?;
+        Ok((request.prepare()?.into(), pending))
+    }
+
+    fn committed(pending: Self::Pending) {
+        pending.mark_committed();
+    }
+
+    fn snapshot<AggregateType: Aggregate>(
+        &self,
+        snapshot: SerializedSnapshot,
+    ) -> Result<SerializedSnapshot, PersistenceError> {
+        guard_snapshot::<AggregateType>(snapshot, self.compaction_policy)
+    }
+}
+
+impl<'events> From<crate::PreparedCommit<'events>> for sqlite_es::Commit<'events> {
+    fn from(commit: crate::PreparedCommit<'events>) -> Self {
+        let snapshot = commit.snapshot.map(|snapshot| SerializedSnapshot {
+            aggregate_id: commit.aggregate_id.clone(),
+            aggregate: snapshot.aggregate,
+            current_sequence: snapshot.last_sequence,
+            current_snapshot: snapshot.snapshot_version,
+        });
+        let jobs = commit
+            .jobs
+            .into_iter()
+            .map(|job| sqlite_es::JobWrite {
+                event: job.event,
+                queue_payload: job.queue_payload,
+            })
+            .collect();
+        Self {
+            aggregate_type: commit.aggregate_type,
+            aggregate_id: commit.aggregate_id,
+            expected_version: commit.expected_version,
+            events: commit.events,
+            snapshot,
+            jobs,
+        }
+    }
+}
+
 /// Storage required to execute and reload native aggregates.
 ///
 /// Repositories must atomically persist command events, snapshots and dispatched

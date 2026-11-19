@@ -1770,6 +1770,7 @@ version = "0.5.0"
 dependencies = [
  "chrono",
  "cqrs-es",
+ "futures-util",
  "indexed-query",
  "serde",
  "serde_json",

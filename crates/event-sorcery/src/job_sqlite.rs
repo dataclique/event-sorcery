@@ -15,7 +15,7 @@ use sqlite_es::SqliteAggregateError;
 use crate::CompactionPolicy;
 use crate::engine::Engine;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
-use crate::sqlite_event_repository::SqliteEventRepository;
+use crate::persistence::NativeRepositoryPolicy;
 
 /// The default [`EventBackend`]: durable jobs over SQLite.
 ///
@@ -67,11 +67,11 @@ pub enum SqliteJobError {
 }
 
 impl EventBackend for SqliteBackend {
-    type EventRepo = SqliteEventRepository;
+    type EventRepo = sqlite_es::NativeRepository<NativeRepositoryPolicy>;
     type Error = SqliteJobError;
 
-    fn event_repo(&self, compaction_policy: CompactionPolicy) -> SqliteEventRepository {
-        SqliteEventRepository::new(self.engine.pool().clone(), compaction_policy)
+    fn event_repo(&self, compaction_policy: CompactionPolicy) -> Self::EventRepo {
+        sqlite_es::NativeRepository::new(self.engine.pool().clone(), compaction_policy)
     }
 
     async fn migrate(&self) -> Result<(), SqliteJobError> {
