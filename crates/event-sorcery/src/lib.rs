@@ -167,12 +167,13 @@ pub use schema_registry::{
     validate_snapshot_history,
 };
 pub use sqlite_event_repository::SqliteEventRepository;
+pub use sqlite_projection::SqliteViewBackend;
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, buffer_pending_job, replay,
     test_store, with_pending_jobs,
 };
-pub use view_backend::{NativeProjectionBackend, SqliteViewBackend, ViewBackend};
+pub use view_backend::{NativeProjectionBackend, ViewBackend};
 pub use wire::StoreBuilder;
 
 pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<

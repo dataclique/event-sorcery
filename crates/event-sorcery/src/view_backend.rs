@@ -2,17 +2,14 @@
 //!
 //! [`ViewBackend`] is a higher-kinded-type emulation: it supplies,
 //! for each `(View, Aggregate)` pair, a concrete [`ViewRepository`]
-//! implementation. SQLite uses [`SqliteViewBackend`]; custom
-//! backends plug in alternative storage (in-memory for tests,
-//! Postgres, etc.).
+//! implementation. Database integrations supply their repository family;
+//! custom backends can also provide in-memory storage for tests.
 
 use cqrs_es::Aggregate;
 use cqrs_es::persist::ViewRepository;
 
-use indexed_query::IndexedView;
-use sqlite_es::SqliteViewRepository;
-
 use crate::{Column, EventSourced, ProjectionError, ProjectionRecoveryMode, Table};
+use indexed_query::IndexedView;
 
 /// Pluggable storage backend for materialized views, supplying a
 /// concrete [`ViewRepository`] for each `(View, Aggregate)` pair.
@@ -43,11 +40,6 @@ pub trait ViewBackend: Send + Sync + 'static {
         View: cqrs_es::View<Agg> + Clone + 'static,
         Agg: Aggregate + 'static;
 }
-
-/// SQLite [`ViewBackend`]: every `(View, Agg)` pair maps to a
-/// [`SqliteViewRepository`].
-#[derive(Debug, Clone, Copy)]
-pub struct SqliteViewBackend;
 
 /// Optional native construction, queries and retained-history recovery.
 ///
@@ -110,12 +102,4 @@ pub trait NativeProjectionBackend: ViewBackend {
     ) -> impl Future<Output = Result<(), ProjectionError<Entity>>> + Send
     where
         Entity: EventSourced<Materialized = Table>;
-}
-
-impl ViewBackend for SqliteViewBackend {
-    type Repo<View, Agg>
-        = SqliteViewRepository<View, Agg>
-    where
-        View: cqrs_es::View<Agg> + Clone + 'static,
-        Agg: Aggregate + 'static;
 }

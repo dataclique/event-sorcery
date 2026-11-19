@@ -2,16 +2,12 @@
 //! materialized views.
 //!
 //! Generic over an explicitly selected [`ViewBackend`](crate::ViewBackend).
-//! SQLite uses [`SqliteViewBackend`](crate::SqliteViewBackend).
+//! Database-specific construction and recovery live in the backend integrations.
 
 use async_trait::async_trait;
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use indexed_query::{IndexedView, Order, Predicate};
-use sqlite_es::SqliteViewRepository;
-use sqlx::AssertSqlSafe;
-use sqlx::SqlitePool;
-use sqlx::sqlite::Sqlite;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
@@ -26,7 +22,7 @@ use crate::reactor::{
     RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, ReactorContext,
     backoff_delay_ms, is_retryable_sqlite_busy,
 };
-use crate::view_backend::{SqliteViewBackend, ViewBackend};
+use crate::view_backend::ViewBackend;
 
 /// A materialized view table name.
 ///
@@ -102,21 +98,12 @@ impl<Entity: EventSourced> From<LifecycleError<Entity>> for ProjectionError<Enti
 /// SQLite-backed projections also provide [`load_all`](Self::load_all) and
 /// [`filter`](Self::filter) for typed column queries.
 /// The backend is explicit in named types: `Projection<Position, Backend>`.
-/// For SQLite, use [`SqliteViewBackend`].
-///
-/// Constructed via [`sqlite`](Self::sqlite) during wiring or
-/// directly in CLI/test code.
+/// Constructed through the selected native backend during wiring or directly
+/// in CLI/test code.
 pub struct Projection<Entity: EventSourced, Backend: ViewBackend> {
     repo: Arc<Backend::Repo<Lifecycle<Entity>, Lifecycle<Entity>>>,
     table: Option<Table>,
     _entity: PhantomData<Entity>,
-}
-
-impl<Entity: EventSourced<Materialized = Table>> Projection<Entity, SqliteViewBackend> {
-    /// Constructs the SQLite materialized view using the caller-owned pool.
-    pub fn sqlite(pool: SqlitePool) -> Self {
-        Self::with_backend(pool)
-    }
 }
 
 impl<Entity, Backend> Projection<Entity, Backend>
@@ -418,147 +405,13 @@ where
     }
 }
 
-impl crate::NativeProjectionBackend for SqliteViewBackend {
-    type Source = SqlitePool;
-    type Database = Sqlite;
-
-    fn repository<ViewState, AggregateType>(
-        source: SqlitePool,
-        Table(table): Table,
-    ) -> Self::Repo<ViewState, AggregateType>
-    where
-        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
-        AggregateType: Aggregate + 'static,
-    {
-        SqliteViewRepository::new(source, table.to_string())
-    }
-
-    fn source<ViewState, AggregateType>(
-        repository: &Self::Repo<ViewState, AggregateType>,
-    ) -> &SqlitePool
-    where
-        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
-        AggregateType: Aggregate + 'static,
-    {
-        repository.as_ref()
-    }
-
-    async fn rows(
-        source: &SqlitePool,
-        Table(table): Table,
-    ) -> Result<Vec<(String, String)>, sqlx::Error> {
-        sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT view_id, payload FROM {table}"
-        )))
-        .fetch_all(source)
-        .await
-    }
-
-    async fn filter<Entity, Value>(
-        source: &SqlitePool,
-        Table(table): Table,
-        column: Column,
-        value: &Value,
-    ) -> Result<Vec<(String, String)>, ProjectionError<Entity>>
-    where
-        Entity: EventSourced,
-        for<'query> &'query Value: sqlx::Encode<'query, Sqlite>,
-        Value: sqlx::Type<Sqlite> + Send + Sync,
-    {
-        validate_column::<Entity>(source, table, &column).await?;
-        let Column(column) = column;
-        Ok(sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT view_id, payload FROM {table} WHERE {column} = ?1 ORDER BY view_id"
-        )))
-        .bind(value)
-        .fetch_all(source)
-        .await?)
-    }
-
-    async fn recover<Entity>(
-        source: &SqlitePool,
-        mode: &crate::ProjectionRecoveryMode,
-    ) -> Result<(), ProjectionError<Entity>>
-    where
-        Entity: EventSourced<Materialized = Table>,
-    {
-        let mut transaction = source.begin().await?;
-        {
-            let mut storage = crate::sqlite_projection::SqliteProjectionRecovery {
-                connection: &mut transaction,
-            };
-            crate::recover_projection::<Entity>(&mut storage, mode).await?;
-        }
-        transaction.commit().await?;
-        Ok(())
-    }
-}
-
-/// Validates that a column exists in the table schema and returns
-/// an error if all values are NULL (indicates a stale generated
-/// column).
-async fn validate_column<Entity: EventSourced>(
-    pool: &SqlitePool,
-    table: &str,
-    column: &Column,
-) -> Result<(), ProjectionError<Entity>> {
-    let column_name = column.0;
-
-    let columns: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT name FROM pragma_table_xinfo('{table}')"
-    )))
-    .fetch_all(pool)
-    .await?;
-
-    if !columns.iter().any(|(name,)| name == column_name) {
-        warn!(
-            target: "cqrs",
-            %column_name, %table,
-            "Column does not exist in table schema"
-        );
-
-        return Err(ProjectionError::ColumnNotFound {
-            column: column.clone(),
-            table: table.to_string(),
-        });
-    }
-
-    let row_count: (i64,) = sqlx::query_as(AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
-        .fetch_one(pool)
-        .await?;
-
-    if row_count.0 > 0 {
-        let non_null_count: (i64,) = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM {table}
-             WHERE {column_name} IS NOT NULL"
-        )))
-        .fetch_one(pool)
-        .await?;
-
-        if non_null_count.0 == 0 {
-            warn!(
-                target: "cqrs",
-                %column_name, %table, row_count = %row_count.0,
-                "Generated column has all NULL values, likely stale JSON path"
-            );
-
-            return Err(ProjectionError::StaleColumn {
-                column: column.clone(),
-                table: table.to_string(),
-                row_count: row_count.0,
-            });
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
     use cqrs_es::DomainEvent;
     use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
     use serde::{Deserialize, Serialize};
+    use sqlx::SqlitePool;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -566,7 +419,9 @@ mod tests {
     use super::*;
     use crate::Nil;
     use crate::lifecycle::Never;
-    use crate::{CompactionPolicy, Effect, SqliteBackend, StoreBuilder, uneventful};
+    use crate::{
+        CompactionPolicy, Effect, SqliteBackend, SqliteViewBackend, StoreBuilder, uneventful,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct RecoveryEntity<const ACCEPT_HISTORY: bool>;
