@@ -51,7 +51,10 @@ use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
 use crate::projection::Projection;
 use crate::view_backend::ViewBackend;
-use crate::{LifecycleError, ProjectionError, ReconcileError, SendError, Store, StoreBuilder};
+use crate::{
+    LifecycleError, ProjectedStoreBackend, ProjectionError, ReconcileError, SendError, Store,
+    StoreBuilder,
+};
 
 /// The durable-jobs runtime over one [`EventBackend`].
 ///
@@ -484,6 +487,26 @@ pub enum JobEnqueueError<BackendError> {
     /// The backend rejected the append + seed transaction (e.g. a reused job id).
     #[error("the job backend rejected the enqueue")]
     Backend(#[source] BackendError),
+}
+
+impl<Backend> JobRuntime<Backend>
+where
+    Backend: EventBackend + ProjectedStoreBackend,
+{
+    /// Wires a native job store and queue through the selected backend.
+    ///
+    /// The caller applies library migrations before construction. Startup performs
+    /// the backend's existing schema reconciliation and retained queue recovery.
+    pub async fn with_backend(backend: Backend) -> Result<Self, ReconcileError> {
+        let (jobs, queue) = StoreBuilder::<JobState, Backend>::with_backend(backend.clone())
+            .build()
+            .await?;
+        Ok(Self {
+            backend,
+            jobs,
+            queue,
+        })
+    }
 }
 
 impl JobRuntime<SqliteBackend> {
@@ -1440,6 +1463,47 @@ mod tests {
         assert_eq!(
             queue_status(&pool, &job_id).await.as_deref(),
             Some("claimed")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_backend_runtime_wires_enqueue_poll_claim_and_settlement() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::with_backend(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
+        let job_id = JobId::new();
+        runtime
+            .enqueue_job_payload(
+                job_id,
+                TestJob::KIND.to_string(),
+                serde_json::json!({"n": 1}),
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.poll_jobs(TestJob::KIND, 1_000, 10).await.unwrap(),
+            vec![job_id.to_string()]
+        );
+        let JobClaimResult::Claimed(claimed) = runtime
+            .claim_job(job_id, "explicit-backend", 1_000, 30_000, 50)
+            .await
+            .unwrap()
+        else {
+            panic!("new runtime must claim its queued job");
+        };
+        assert_eq!(
+            runtime.acknowledge_job(claimed.handle).await.unwrap(),
+            JobSettlementResult::Applied
+        );
+        assert_eq!(
+            runtime.poll_jobs(TestJob::KIND, 1_000, 10).await.unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobSucceeded"]
         );
     }
 
