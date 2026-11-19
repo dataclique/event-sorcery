@@ -50,8 +50,8 @@ use crate::job::{
 use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
 use crate::projection::Projection;
-use crate::view_backend::SqliteViewBackend;
-use crate::{LifecycleError, ReconcileError, SendError, Store, StoreBuilder};
+use crate::view_backend::ViewBackend;
+use crate::{LifecycleError, ProjectionError, ReconcileError, SendError, Store, StoreBuilder};
 
 /// The durable-jobs runtime over one [`EventBackend`].
 ///
@@ -61,7 +61,7 @@ use crate::{LifecycleError, ReconcileError, SendError, Store, StoreBuilder};
 pub struct JobRuntime<Backend: EventBackend> {
     backend: Backend,
     jobs: Arc<Store<JobState, Backend>>,
-    queue: Arc<Projection<JobState, SqliteViewBackend>>,
+    queue: Arc<dyn JobQueueIndex>,
 }
 
 /// A won claim capability used by a worker adapter to renew or settle execution.
@@ -174,6 +174,26 @@ pub enum JobRuntimeError<BackendError> {
     /// The requested lease or claim budget cannot produce a valid claim.
     #[error("invalid job claim policy")]
     InvalidClaimPolicy,
+}
+
+trait JobQueueIndex: Send + Sync {
+    fn find<'query>(
+        &'query self,
+        predicate: &'query Predicate,
+        order: Option<&'query Order>,
+        limit: i64,
+    ) -> BoxFuture<'query, Result<Vec<String>, ProjectionError<JobState>>>;
+}
+
+impl<Backend: ViewBackend> JobQueueIndex for Projection<JobState, Backend> {
+    fn find<'query>(
+        &'query self,
+        predicate: &'query Predicate,
+        order: Option<&'query Order>,
+        limit: i64,
+    ) -> BoxFuture<'query, Result<Vec<String>, ProjectionError<JobState>>> {
+        Box::pin(Self::find(self, predicate, order, limit))
+    }
 }
 
 fn runtime_job_error<BackendError>(error: JobStoreError) -> JobRuntimeError<BackendError> {
