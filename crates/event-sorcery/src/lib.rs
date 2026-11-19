@@ -94,12 +94,13 @@ mod job_backend;
 mod job_sqlite;
 mod job_store;
 mod lifecycle;
-#[cfg(feature = "postgres")]
-mod postgres;
+mod persistence;
 mod projection;
+mod projection_recovery;
 mod reactor;
 mod schema_registry;
 mod sqlite_event_repository;
+mod sqlite_projection;
 #[cfg(any(test, feature = "test-support"))]
 mod testing;
 mod view_backend;
@@ -132,11 +133,13 @@ pub use dispatch::{
 };
 pub use engine::{
     CommitRequest, Engine, EngineError, JobSeed, OpaqueCommitRequest, OpaqueProposedEvent,
-    OpaqueStoredEvent, SnapshotUpdate, SnapshotWrite, StreamIdentity, decode_opaque_payload,
-    encode_opaque_payload,
+    OpaqueStoredEvent, PreparedCommit, PreparedJob, PreparedSnapshot, SnapshotUpdate,
+    SnapshotWrite, StoredEventRow, StoredSnapshotRow, StreamIdentity, decode_opaque_payload,
+    encode_opaque_payload, validate_expected_version,
 };
 pub use job::{
-    DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label, StandaloneJob,
+    DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label,
+    PreparedPendingJobs, StandaloneJob,
 };
 pub use job_backend::{
     Backoff, ClaimedJob, Clock, EventStoreBackend, JobClaimHandle, JobClaimResult, JobEnqueueError,
@@ -146,27 +149,36 @@ pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
-#[cfg(feature = "postgres")]
-pub use postgres::{POSTGRES_MIGRATOR, PostgresEventRepository};
+pub use persistence::{
+    PersistenceBackend, ProjectedStoreBackend, SCHEMA_REGISTRY_ID, UnmaterializedStoreBackend,
+    guard_snapshot, reconcile_schema, register_schema,
+};
 pub use projection::{Column, Projection, ProjectionError, Table};
+pub use projection_recovery::{
+    ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow,
+    recover_projection,
+};
 pub use reactor::{
     IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor,
-    RetryOnBusy, is_retryable_sqlite_busy, retry_with_backoff,
+    ReactorContext, RetryOnBusy, is_retryable_sqlite_busy, retry_with_backoff,
 };
 pub use schema_registry::{
     ReconcileError, Reconciler, SchemaReconciliation, SchemaRegistry, SchemaTarget,
+    validate_snapshot_history,
 };
 pub use sqlite_event_repository::SqliteEventRepository;
+pub use sqlite_projection::SqliteViewBackend;
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
-    ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, replay, test_store,
+    ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, buffer_pending_job, replay,
+    test_store, with_pending_jobs,
 };
-pub use view_backend::{SqliteViewBackend, ViewBackend};
+pub use view_backend::{NativeProjectionBackend, ViewBackend};
 pub use wire::StoreBuilder;
 
 pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
     Lifecycle<Entity>,
-    PersistedEventStore<<Backend as EventBackend>::EventRepo, Lifecycle<Entity>>,
+    PersistedEventStore<<Backend as PersistenceBackend>::PersistenceRepo, Lifecycle<Entity>>,
 >;
 
 /// apalis items that [`build_supervised_worker!`] expands to, so consumers need
@@ -174,7 +186,10 @@ pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
 #[doc(hidden)]
 pub mod __worker {
     pub use apalis_core::monitor::Monitor;
+    pub use apalis_core::task::data::Data;
     pub use apalis_core::worker::builder::WorkerBuilder;
+
+    pub use crate::job_backend::JobInput;
 }
 
 /// Whether old events may be deleted after they are captured in a snapshot.
@@ -362,7 +377,7 @@ pub trait EventSourced:
 /// # Usage
 ///
 /// ```ignore
-/// let positions: Store<Position> = /* built by StoreBuilder */;
+/// let positions: Store<Position, SqliteBackend> = /* built by StoreBuilder */;
 ///
 /// // Typed ID -- can't accidentally pass an OffchainOrderId
 /// let symbol = Symbol::new("AAPL").unwrap();
@@ -373,12 +388,12 @@ pub trait EventSourced:
 /// startup. The builder handles CQRS framework construction,
 /// query wiring, and schema reconciliation, returning a
 /// ready-to-use `Store`.
-pub struct Store<Entity: EventSourced, Backend: EventBackend = SqliteBackend> {
+pub struct Store<Entity: EventSourced, Backend: PersistenceBackend> {
     cqrs: EsCqrs<Entity, Backend>,
-    event_store: PersistedEventStore<Backend::EventRepo, Lifecycle<Entity>>,
+    event_store: PersistedEventStore<Backend::PersistenceRepo, Lifecycle<Entity>>,
 }
 
-impl<Entity: EventSourced, Backend: EventBackend> Store<Entity, Backend> {
+impl<Entity: EventSourced, Backend: PersistenceBackend> Store<Entity, Backend> {
     /// Wrap an existing CQRS framework built over `backend`.
     ///
     /// Prefer using `StoreBuilder::build()` which handles wiring
@@ -386,7 +401,7 @@ impl<Entity: EventSourced, Backend: EventBackend> Store<Entity, Backend> {
     /// where direct construction is needed (e.g., tests).
     pub(crate) fn new(cqrs: EsCqrs<Entity, Backend>, backend: &Backend) -> Self {
         let event_store = PersistedEventStore::new_snapshot_store(
-            backend.event_repo(Entity::COMPACTION_POLICY),
+            backend.persistence_repo(Entity::COMPACTION_POLICY),
             Entity::SNAPSHOT_SIZE,
         );
         Self { cqrs, event_store }

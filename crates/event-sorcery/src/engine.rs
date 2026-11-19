@@ -163,7 +163,8 @@ impl SnapshotUpdate {
         }
     }
 
-    pub(crate) fn from_serialized(snapshot: SerializedSnapshot) -> (String, Self) {
+    /// Preserves the snapshot's covered sequence at a repository boundary.
+    pub fn from_serialized(snapshot: SerializedSnapshot) -> (String, Self) {
         let SerializedSnapshot {
             aggregate_id,
             aggregate,
@@ -219,6 +220,32 @@ pub struct CommitRequest<'events> {
     pub(crate) events: &'events [SerializedEvent],
     pub(crate) snapshot: Option<SnapshotUpdate>,
     pub(crate) jobs: Vec<EnqueueRequest>,
+}
+
+/// Validated storage data consumed by a concrete database writer.
+#[non_exhaustive]
+pub struct PreparedCommit<'events> {
+    pub aggregate_type: String,
+    pub aggregate_id: String,
+    pub expected_version: Option<usize>,
+    pub events: &'events [SerializedEvent],
+    pub snapshot: Option<PreparedSnapshot>,
+    pub jobs: Vec<PreparedJob>,
+}
+
+/// Snapshot data with its independently validated coverage and counter.
+#[non_exhaustive]
+pub struct PreparedSnapshot {
+    pub aggregate: Value,
+    pub snapshot_version: usize,
+    pub last_sequence: usize,
+}
+
+/// Canonical job event and derived queue payload for one atomic write.
+#[non_exhaustive]
+pub struct PreparedJob {
+    pub event: SerializedEvent,
+    pub queue_payload: String,
 }
 
 /// Shared serialized SQLite persistence engine.
@@ -332,8 +359,8 @@ impl<'events> CommitRequest<'events> {
         self
     }
 
-    #[cfg(feature = "postgres")]
-    pub(crate) fn for_job(job: JobSeed) -> Self {
+    /// Prepares a standalone job for the same atomic storage path as commands.
+    pub fn for_job(job: JobSeed) -> Self {
         let JobSeed(request) = job;
         let stream = StreamIdentity::new(
             <crate::job::JobState as crate::EventSourced>::AGGREGATE_TYPE,
@@ -342,7 +369,8 @@ impl<'events> CommitRequest<'events> {
         Self::new(stream, &[]).with_jobs(vec![request])
     }
 
-    pub(crate) fn prepare_repository(
+    /// Captures command-scoped jobs without clearing them before database commit.
+    pub fn prepare_repository(
         aggregate_type: &str,
         events: &'events [SerializedEvent],
         snapshot_update: Option<(String, SnapshotUpdate)>,
@@ -369,6 +397,41 @@ impl<'events> CommitRequest<'events> {
         }
 
         Ok((request, pending_jobs))
+    }
+
+    /// Validates and serializes shared domain decisions before database-specific SQL.
+    pub fn prepare(self) -> Result<PreparedCommit<'events>, EngineError> {
+        self.validate_metadata()?;
+        self.validate_stream()?;
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                Ok::<_, EngineError>(PreparedSnapshot {
+                    aggregate: snapshot.aggregate.clone(),
+                    snapshot_version: snapshot.snapshot_version,
+                    last_sequence: snapshot.sequence_for(self.events)?,
+                })
+            })
+            .transpose()?;
+        let jobs = self
+            .jobs
+            .iter()
+            .map(|request| {
+                Ok::<_, EngineError>(PreparedJob {
+                    event: crate::job::enqueued_event(request)?,
+                    queue_payload: crate::job::pending_seed_payload(request)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PreparedCommit {
+            aggregate_type: self.stream.aggregate_type,
+            aggregate_id: self.stream.aggregate_id,
+            expected_version: self.expected_version,
+            events: self.events,
+            snapshot,
+            jobs,
+        })
     }
 
     pub(crate) fn validate_metadata(&self) -> Result<(), EngineError> {
@@ -1376,7 +1439,7 @@ impl From<sqlite_es::SqliteAggregateError> for EngineError {
     }
 }
 
-pub(crate) fn validate_expected_version(expected: usize, actual: usize) -> Result<(), EngineError> {
+pub fn validate_expected_version(expected: usize, actual: usize) -> Result<(), EngineError> {
     if actual != expected {
         return Err(EngineError::OptimisticLock);
     }
@@ -1521,7 +1584,7 @@ fn decode_opaque_event(event: SerializedEvent) -> Result<OpaqueStoredEvent, Engi
 }
 
 #[derive(sqlx::FromRow)]
-pub(crate) struct StoredEventRow {
+pub struct StoredEventRow {
     aggregate_type: String,
     aggregate_id: String,
     sequence: i64,
@@ -1548,7 +1611,7 @@ impl TryFrom<StoredEventRow> for SerializedEvent {
 }
 
 #[derive(sqlx::FromRow)]
-pub(crate) struct StoredSnapshotRow {
+pub struct StoredSnapshotRow {
     aggregate_id: String,
     last_sequence: i64,
     snapshot_version: i64,
@@ -1750,6 +1813,66 @@ mod tests {
 
         assert_eq!(outcome, SchemaReconciliation::Changed);
         assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn retained_schema_change_preserves_snapshots_with_incomplete_history() {
+        for (policy, removed_through) in [
+            (CompactionPolicy::RetainLast { events: 1 }, 1),
+            (CompactionPolicy::CompactAfterSnapshot, 2),
+        ] {
+            for registered in [false, true] {
+                let pool = create_test_pool().await.unwrap();
+                let engine = Engine::new(pool.clone());
+                let stream = StreamIdentity::new("engine-retention-transition", "one");
+                let original = SchemaTarget::new("engine-retention-transition", 1, policy);
+                if registered {
+                    engine.record_schema(&original).await.unwrap();
+                }
+                let events = [serialized_event(&stream, 1), serialized_event(&stream, 2)];
+                engine
+                    .commit(
+                        CommitRequest::new(stream.clone(), &events)
+                            .with_snapshot(SnapshotUpdate::new(serde_json::json!({"value": 42}), 1))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let preserved = engine.load_snapshot(&stream).await.unwrap().unwrap();
+                sqlx::query("DELETE FROM events WHERE aggregate_type = ?1 AND sequence <= ?2")
+                    .bind("engine-retention-transition")
+                    .bind(removed_through)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let remaining = engine.load_events(&stream, None).await.unwrap();
+                let changed =
+                    SchemaTarget::new("engine-retention-transition", 2, CompactionPolicy::Retain);
+
+                let error = engine.reconcile_schema(&changed).await.unwrap_err();
+                assert!(matches!(
+                    error,
+                    EngineError::Schema(ReconcileError::UnprovenSnapshotHistory {
+                        stream: rejected,
+                        covered_sequence: 2,
+                        retained_events,
+                    }) if rejected == stream && retained_events == 2 - removed_through
+                ));
+                assert_eq!(
+                    engine.load_snapshot(&stream).await.unwrap(),
+                    Some(preserved)
+                );
+                assert_eq!(engine.load_events(&stream, None).await.unwrap(), remaining);
+                assert_eq!(
+                    engine.reconcile_schema(&original).await.unwrap(),
+                    if registered {
+                        SchemaReconciliation::Unchanged
+                    } else {
+                        SchemaReconciliation::Changed
+                    }
+                );
+            }
+        }
     }
 
     #[tokio::test]

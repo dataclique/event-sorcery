@@ -52,11 +52,11 @@ fallthrough. Single-entity reactors get the dual `event.into_inner()` shorthand
 (see `AuditLog`).
 
 **Custom reactor + auto-projection.** `Materialized = Table` auto-wires a
-`Projection<Inventory>` reactor; you can still register arbitrary additional
-reactors via `.with()`. Here `StockAlert` runs alongside the `Inventory`
-projection. This is how production systems compose: side-effects (alerts, logs,
-downstream publishing) sit next to the read-side view without the wiring code
-knowing about either.
+`Projection<Inventory, SqliteViewBackend>` reactor; you can still register
+arbitrary additional reactors via `.with()`. Here `StockAlert` runs alongside
+the `Inventory` projection. This is how production systems compose: side-effects
+(alerts, logs, downstream publishing) sit next to the read-side view without the
+wiring code knowing about either.
 
 **Two named `Notifier` impls (`LogNotifier`, `RecordingNotifier`)** instead of
 one configurable mock with booleans -- distinct types make it obvious at the

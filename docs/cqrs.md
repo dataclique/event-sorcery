@@ -40,8 +40,8 @@ IDs.
 
 ## CQRS dependency for external backends
 
-This revision uses a maintained `cqrs-es` fork for explicit snapshot
-checkpoints, pinned to `d61e05290bc7b24af1f615bc828a74ae6fc22f25`. Cargo treats
+This revision uses a temporary `cqrs-es` fix fork for explicit snapshot
+checkpoints, pinned to `cb0020add5dcff06f1ece3816fce9e4319004b87`. Cargo treats
 registry and Git packages as different identities even when both have version
 `0.5.0`. Mixing them gives different `PersistedEventRepository` traits and
 `SerializedEvent` types at the `EventBackend` boundary.
@@ -54,7 +54,7 @@ graph in its **root** `Cargo.toml`:
 cqrs-es = "=0.5.0"
 
 [patch.crates-io]
-cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "d61e05290bc7b24af1f615bc828a74ae6fc22f25" }
+cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87" }
 ```
 
 A patch inside a dependency's manifest is ignored by the consuming application.
@@ -162,41 +162,41 @@ sections below.
 
 ## Key Types
 
-| Type                   | Purpose                                      |
-| ---------------------- | -------------------------------------------- |
-| `EventSourced`         | Core trait -- implement on domain types      |
-| `Store<Entity>`        | Type-safe command dispatch                   |
-| `StoreBuilder<Entity>` | Wires reactors/projections, builds Store     |
-| `Projection<Entity>`   | Read-side materialized view                  |
-| `Reactor<Entity>`      | Event side-effect handler                    |
-| `SendError<Entity>`    | Error from `Store::send()`                   |
-| `LifecycleError<E>`    | Errors from event application                |
-| `Never`                | Error type for infallible entities           |
-| `DomainEvent`          | Trait for event serialization (from cqrs-es) |
-| `Table`                | Newtype for projection table name            |
-| `Nil`                  | Empty type-level list (no projection / jobs) |
-| `Effect<Entity>`       | Handler result: events, or one job dispatch  |
-| `fx(value)`            | Wraps events/job/dispatch/error into result  |
-| `uneventful()`         | No-op outcome: accept command, no events     |
-| `Job`                  | Entity-kicked job (submit/reconcile)         |
-| `StandaloneJob`        | Origin-less worker job (perform)             |
-| `DispatchedJob<J>`     | Entity-embedded state of a kicked-off job    |
-| `DispatchEvent<J>`     | Dispatch lifecycle facts on the entity       |
-| `DispatchOutcome<J>`   | Sealed verdict delivered by the framework    |
-| `JobDispatch<Entity>`  | Opaque kick-off returned in an `Effect`      |
-| `Settled<Output>`      | Sealed success payload (output + attempts)   |
-| `SettledFailure<E>`    | Sealed failure payload (reason + attempts)   |
-| `DispatchRefused`      | Guard refusal (in-flight, mismatch)          |
-| `Reconciliation<T>`    | reconcile verdict: settled / not / unknown   |
-| `OriginPort<J>`        | Delivery port for verdicts (impl by `Store`) |
-| `JobInput<J>`          | Worker input: deps + origin delivery port    |
-| `jobs!`                | Macro building the type-level `Job` list     |
-| `JobRuntime`           | Wires the worker-side durable-jobs runtime   |
+| Type                            | Purpose                                      |
+| ------------------------------- | -------------------------------------------- |
+| `EventSourced`                  | Core trait -- implement on domain types      |
+| `Store<Entity, Backend>`        | Type-safe command dispatch                   |
+| `StoreBuilder<Entity, Backend>` | Wires reactors/projections, builds Store     |
+| `Projection<Entity, Backend>`   | Read-side materialized view                  |
+| `Reactor<Entity>`               | Event side-effect handler                    |
+| `SendError<Entity>`             | Error from `Store::send()`                   |
+| `LifecycleError<E>`             | Errors from event application                |
+| `Never`                         | Error type for infallible entities           |
+| `DomainEvent`                   | Trait for event serialization (from cqrs-es) |
+| `Table`                         | Newtype for projection table name            |
+| `Nil`                           | Empty type-level list (no projection / jobs) |
+| `Effect<Entity>`                | Handler result: events, or one job dispatch  |
+| `fx(value)`                     | Wraps events/job/dispatch/error into result  |
+| `uneventful()`                  | No-op outcome: accept command, no events     |
+| `Job`                           | Entity-kicked job (submit/reconcile)         |
+| `StandaloneJob`                 | Origin-less worker job (perform)             |
+| `DispatchedJob<J>`              | Entity-embedded state of a kicked-off job    |
+| `DispatchEvent<J>`              | Dispatch lifecycle facts on the entity       |
+| `DispatchOutcome<J>`            | Sealed verdict delivered by the framework    |
+| `JobDispatch<Entity>`           | Opaque kick-off returned in an `Effect`      |
+| `Settled<Output>`               | Sealed success payload (output + attempts)   |
+| `SettledFailure<E>`             | Sealed failure payload (reason + attempts)   |
+| `DispatchRefused`               | Guard refusal (in-flight, mismatch)          |
+| `Reconciliation<T>`             | reconcile verdict: settled / not / unknown   |
+| `OriginPort<J>`                 | Delivery port for verdicts (impl by `Store`) |
+| `JobInput<J>`                   | Worker input: deps + origin delivery port    |
+| `jobs!`                         | Macro building the type-level `Job` list     |
+| `JobRuntime`                    | Wires the worker-side durable-jobs runtime   |
 
 ## Sending Commands
 
 ```rust
-let store: Store<Position> = /* built by StoreBuilder */;
+let store: Store<Position, SqliteBackend> = /* built by StoreBuilder */;
 
 let symbol = Symbol::new("AAPL").unwrap();
 store.send(&symbol, PositionCommand::AcknowledgeFill { /* ... */ }).await?;
@@ -215,7 +215,7 @@ aggregates directly:
 
 ```rust
 // Projection is returned by StoreBuilder::build() for Table entities
-let (store, projection) = StoreBuilder::<Position>::new(pool)
+let (store, projection) = StoreBuilder::<Position, _>::new(pool)
     .build()
     .await?;
 
@@ -247,7 +247,7 @@ For **projected entities** (`type Materialized = Table`), `build()` returns
 `(Arc<Store>, Arc<Projection>)`:
 
 ```rust
-let (store, projection) = StoreBuilder::<Position>::new(pool)
+let (store, projection) = StoreBuilder::<Position, _>::new(pool)
     .with(rebalancing_trigger)  // wire a reactor
     .build()
     .await?;
@@ -257,7 +257,7 @@ For **non-projected entities** (`type Materialized = Nil`), `build()` returns
 `Arc<Store>`:
 
 ```rust
-let store = StoreBuilder::<OnChainTrade>::new(pool)
+let store = StoreBuilder::<OnChainTrade, _>::new(pool)
     .build()
     .await?;
 ```
@@ -335,7 +335,7 @@ aggregate, message-queue publish) that would double-fire on retry:
 ```rust
 impl IdempotentReactor for MyReactor {}
 
-let store = StoreBuilder::<MyEntity>::new(pool)
+let store = StoreBuilder::<MyEntity, _>::new(pool)
     .with(Arc::new(RetryOnBusy { inner: my_reactor }))
     // ...
 ```
@@ -493,9 +493,17 @@ explicitly.
 
 Bump `SCHEMA_VERSION` when the entity's state, event, or projection schema
 changes. On startup, the wiring infrastructure (via `StoreBuilder::build()`)
-detects version mismatches and clears stale snapshots for `Retain` entities. For
-current policies that may delete history, it refuses a recorded schema version
-change instead; those entities require snapshot-aware migration.
+detects version mismatches and clears stale snapshots for `Retain` entities only
+when every positive sequence through each snapshot's covered boundary is
+present. Missing or sparse covered history returns `UnprovenSnapshotHistory`
+without clearing snapshots or advancing the registry. Such streams require an
+explicit snapshot-preserving migration; switching to `Retain` does not restore
+previously compacted events. Current policies that may delete history also
+refuse recorded schema version changes.
+
+First registration of a `Retain` entity follows the same snapshot validation and
+clearing path when no version is registered. Incomplete covered history can
+therefore block first registration even without a recorded version mismatch.
 
 ### Adding Optional Fields to Events
 
@@ -641,9 +649,9 @@ events.
 - **NEVER call `sqlite_cqrs()` or `CqrsFramework::new()` in production code** --
   use `StoreBuilder`. Direct construction is allowed in test helpers, CLI code,
   and migration code
-- **NEVER create multiple `Store<Entity>` for the same entity type** -- each
-  entity type must have exactly ONE `Store<Entity>` instance, constructed once
-  in `Conductor::start` via `StoreBuilder`, then shared
+- **NEVER create multiple `Store<Entity, Backend>` for the same entity type** --
+  each entity type must have exactly ONE `Store<Entity, Backend>` instance,
+  constructed once in `Conductor::start` via `StoreBuilder`, then shared
   - **WHY**: multiple instances cause silent production bugs -- events persist
     but query processors registered on other instances never see them, so views
     and projections go stale without warnings
@@ -711,9 +719,11 @@ as a replay starting point so hot aggregates do not reload their full event
 history on every command.
 
 For `Retain` entities, bump `SCHEMA_VERSION` after changing aggregate struct
-layout so startup clears stale snapshots through the schema reconciler. Manual
-snapshot deletion is safe only for retained event streams where the full event
-history remains available for replay.
+layout so startup validates covered history before clearing stale snapshots
+through the schema reconciler. The validation and deletion share a database
+transaction. An unproven history leaves snapshots intact and requires explicit
+migration. Manual snapshot deletion is safe only where the full event history
+remains available for replay, regardless of the current retention policy.
 
 ```sql
 -- Retained streams only: reset snapshots when full event replay is available.
@@ -767,8 +777,24 @@ CREATE TABLE IF NOT EXISTS my_view (
 - **version**: Event sequence number (used for optimistic locking)
 - **payload**: The view serialized via `serde_json::to_value(&view)`
 
-`SqliteViewRepository` stores views with `serde_json::to_value()` and loads them
-with `serde_json::from_value()`.
+`SqliteViewRepository` stores serialized JSON text; `PostgresViewRepository`
+stores JSONB. Applications own their projection-table migrations. See the
+[PostgreSQL setup guide](../crates/postgr-es/README.md#native-stores) for native
+projected and unprojected builders.
+
+Native framework delivery carries the persisted envelope's aggregate-local
+sequence through `Reactor::react_with_context`. Projection updates skip events
+already covered by recovery or another successful delivery. An ahead-of-next
+sequence retries without applying out of order; exhaustion leaves the checkpoint
+unchanged so `catch_up` can replay the missing history. `Arc` and `RetryOnBusy`
+preserve this context. Existing custom reactors default to their `react` method;
+plain custom `ViewBackend` repositories retain opaque optimistic revisions.
+
+Native projection repositories write payload and sequence checkpoints
+atomically, advance ordinary updates by one, and report competing identity
+writes as optimistic conflicts. Direct unsequenced `react` writes must not be
+mixed with native framework delivery because they cannot establish event
+coverage.
 
 ### Lifecycle Serialization in View Payloads
 
@@ -878,17 +904,17 @@ changes.
 
 ## Running Jobs
 
-The worker API below requires a `SqlitePool`. PostgreSQL support currently
-provides the CQRS persistence repository, not a PostgreSQL `EventBackend` for
-`StoreBuilder` or worker execution. Do not use a PostgreSQL pool with
+The worker API below requires a `SqlitePool`. PostgreSQL persistence uses
+`PostgresBackend` and the CQRS repository contract, not an operational
+`EventBackend` for worker execution. Do not use a PostgreSQL pool with
 `JobRuntime::build` or assume its workers can drain PostgreSQL jobs.
 
-Dispatching a job (see **Jobs Pattern** above) only writes a pending row; a
-worker has to drain it. `JobRuntime::build(pool)` wires the durable-jobs runtime
-over the same database, and `build_supervised_worker!` registers one supervised
-worker per job type -- entity-kicked jobs get a `JobInput` (their dependencies
-plus the origin store verdicts are delivered through), standalone jobs get their
-plain input:
+The worker host uses stable Apalis 1.0. Dispatching a job (see **Jobs Pattern**
+above) only writes a pending row; a worker has to drain it.
+`JobRuntime::build(pool)` wires the durable-jobs runtime over the same database,
+and `build_supervised_worker!` registers one supervised worker per job type --
+entity-kicked jobs get a `JobInput` (their dependencies plus the origin store
+verdicts are delivered through), standalone jobs get their plain input:
 
 ```rust
 let runtime = JobRuntime::build(pool.clone()).await?;
@@ -912,9 +938,9 @@ for entity-kicked jobs, `perform` for standalone ones), delivers the verdict,
 and durably records the outcome (success, retry with backoff, or dead-letter) --
 all fenced so a job runs exactly once per successful claim. `JobWorkerConfig`
 tunes poll cadence, concurrency, lease duration, retry budget, backoff, and the
-verdict-delivery deferrals (`DeliveryPolicy`); `Clock::system()` is the real
-wall clock (use `Clock::from_fn(..)` to drive lease and retry timing
-deterministically in tests).
+verdict-delivery deferrals (`DeliveryPolicy`). `Clock::system()` reads real wall
+time; `Clock::from_fn(..)` supplies timestamp reads for eligibility and lease
+decisions.
 
 ## Testing Aggregates
 

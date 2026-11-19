@@ -6,13 +6,26 @@ The nix dev shell sets `SQLX_OFFLINE=true` (in `flake.nix`), which tells sqlx
 compile-time macros (`query!`, `query_scalar!`, etc.) to use cached metadata
 from the `.sqlx/` directory instead of connecting to the database. This means:
 
-- Regular `cargo check`/`cargo nextest run` typically don't need a running
-  database -- they read from `.sqlx/` cache files checked into version control.
-  Exception: test code using `query!` macros (see below).
+- Regular `cargo check` uses `.sqlx/` cache files without a running database.
+  Runtime tests still need their storage: SQLite tests use in-memory databases,
+  while PostgreSQL tests need PostgreSQL. Test code using `query!` macros has
+  additional compile-time requirements (see below).
 - If you add or change a `query!` macro invocation, you must regenerate the
   cache before the change will compile under `SQLX_OFFLINE=true`.
-- PostgreSQL-enabled tests still need a running PostgreSQL database.
-  `SQLX_OFFLINE` controls macro analysis, not runtime connections.
+- PostgreSQL tests run in the normal workspace suite, without a test-specific
+  feature flag. `SQLX_OFFLINE` controls macro analysis, not runtime connections;
+  database tests fail when required storage is unavailable. Linux flake checks
+  provision PostgreSQL through the test hook. The pinned nixpkgs hook marks
+  Darwin unsupported because of upstream sandbox IPC leaks, so pure Nix
+  PostgreSQL test provisioning there remains blocked rather than bypassed with
+  test exclusions.
+- Colocated Rust tests use `#[cfg(test)]` modules, which the pinned Clippy
+  recognizes for its configured `allow-unwrap-in-tests` exception.
+
+`migrate!` can otherwise leave a stale embedded migration after SQL-only edits
+on the pinned stable toolchain. Both backend crates have build scripts watching
+their `migrations/` directories so Cargo rebuilds the owning migrator when SQL
+inputs change.
 
 ## Local PostgreSQL and flake tests
 
@@ -82,6 +95,19 @@ let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM my_table")
 Note the type annotation on the `let` binding -- the runtime function doesn't
 infer return types like the macro does.
 
+## Dynamic PostgreSQL queries
+
+Indexed projection queries use SQLx `QueryBuilder` and `PgArguments`. The
+PostgreSQL driver encodes values and formats its own numbered placeholders;
+there is no separate placeholder allocator or binding list. Argument counts are
+checked against the protocol's `u16` range, including the row limit. Identifiers
+are quoted separately from bound values.
+
+In SQLx 0.9, `QueryBuilder::push_bind` can panic when argument encoding fails.
+The indexed-query extension instead uses fallible `Arguments::add`, then passes
+the encoded arguments to `QueryBuilder::with_arguments`. Encoding failures
+return typed errors without executing SQL.
+
 ## Cancellation and pooled transactions
 
 Never pair a raw `BEGIN` statement on a `PoolConnection` with a later raw
@@ -97,6 +123,18 @@ guard alive across the whole operation. Its drop path queues a rollback before
 the pooled connection is reused. The durable-job claim uses
 `begin_with("BEGIN IMMEDIATE")` because it needs the write lock at transaction
 start.
+
+## PostgreSQL migration connections
+
+SQLx 0.9 migrations hold a session advisory lock; an error can return before
+unlocking it. PostgreSQL bootstrap acquires a connection and marks it
+`close_on_drop` before migrating, so failure or cancellation cannot return a
+lock-holding session to the pool.
+
+`Migrator::run` delegates to `run_direct(None, connection, false)`. The
+bootstrap uses that same pipeline directly because the generic `Acquire` wrapper
+fails lifetime inference for the borrowed connection in its required `Send`
+future. Locking, migration validation, and execution remain enabled.
 
 ## `SQLITE_BUSY` vs `SQLITE_BUSY_SNAPSHOT`
 

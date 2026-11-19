@@ -8,7 +8,7 @@ let
       path: type:
       craneLib.filterCargoSources path type
       || pkgs.lib.hasPrefix (toString ./crates/sqlite-es/migrations) path
-      || pkgs.lib.hasPrefix (toString ./crates/event-sorcery/migrations/postgres) path
+      || pkgs.lib.hasPrefix (toString ./crates/postgr-es/migrations) path
       || pkgs.lib.hasPrefix (toString ./.sqlx) path
       || pkgs.lib.hasPrefix (toString ./bindings/haskell/conformance) path;
   };
@@ -43,8 +43,7 @@ let
       platforms = pkgs.lib.platforms.unix;
     };
   };
-  testCargoArgs =
-    "--locked --workspace" + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux " --all-features";
+  testCargoArgs = commonArgs.cargoExtraArgs;
 
   postgresTestArgs = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     nativeCheckInputs = [
@@ -83,7 +82,7 @@ in
     // {
       inherit cargoArtifacts;
       cargoExtraArgs = testCargoArgs;
-      cargoNextestExtraArgs = "--all-targets";
+      cargoNextestExtraArgs = "--all-targets --no-fail-fast";
       postCheck = ''
         cargo test ''${CARGO_PROFILE:+--profile $CARGO_PROFILE} \
           ${testCargoArgs} --doc

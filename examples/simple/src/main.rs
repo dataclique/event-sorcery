@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let pool = SqlitePool::connect(":memory:").await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let (store, projection) = StoreBuilder::<SupportTicket>::new(pool.clone())
+    let (store, projection) = StoreBuilder::<SupportTicket, _>::new(pool.clone())
         .build()
         .await?;
 

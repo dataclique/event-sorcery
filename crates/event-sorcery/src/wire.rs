@@ -35,8 +35,7 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::persist::PersistenceError;
+use cqrs_es::persist::{PersistedEventRepository, PersistedEventStore, PersistenceError};
 use cqrs_es::{CqrsFramework, Query};
 use sqlx::SqlitePool;
 
@@ -46,7 +45,10 @@ use crate::lifecycle::{Lifecycle, ReactorBridge};
 use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler, SchemaReconciliation};
-use crate::{CompactionPolicy, EsCqrs, EventBackend, EventSourced, SqliteBackend, Store};
+use crate::{
+    CompactionPolicy, EventSourced, PersistenceBackend, ProjectedStoreBackend, SqliteBackend,
+    SqliteViewBackend, Store, UnmaterializedStoreBackend,
+};
 
 /// Builder for a single CQRS framework.
 ///
@@ -60,7 +62,7 @@ use crate::{CompactionPolicy, EsCqrs, EventBackend, EventSourced, SqliteBackend,
 /// [`.build()`](Self::build) to construct the framework.
 pub struct StoreBuilder<
     Entity: EventSourced,
-    Backend: EventBackend = SqliteBackend,
+    Backend: PersistenceBackend,
     Materialized = <Entity as EventSourced>::Materialized,
 > {
     backend: Backend,
@@ -75,8 +77,8 @@ impl<Entity: EventSourced> StoreBuilder<Entity, SqliteBackend> {
     }
 }
 
-impl<Entity: EventSourced, Backend: EventBackend> StoreBuilder<Entity, Backend> {
-    /// Creates a new builder over an arbitrary [`EventBackend`].
+impl<Entity: EventSourced, Backend: PersistenceBackend> StoreBuilder<Entity, Backend> {
+    /// Creates a new builder over an arbitrary [`PersistenceBackend`].
     pub fn with_backend(backend: Backend) -> Self {
         Self {
             backend,
@@ -104,50 +106,30 @@ impl<Entity: EventSourced, Backend: EventBackend> StoreBuilder<Entity, Backend> 
     }
 }
 
-fn es_cqrs<Entity: EventSourced, Backend: EventBackend>(
-    backend: &Backend,
+pub(crate) fn es_cqrs<Entity: EventSourced, Repository: PersistedEventRepository>(
+    store: PersistedEventStore<Repository, Lifecycle<Entity>>,
     queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
-) -> EsCqrs<Entity, Backend> {
-    let store = PersistedEventStore::new_snapshot_store(
-        backend.event_repo(Entity::COMPACTION_POLICY),
-        Entity::SNAPSHOT_SIZE,
-    );
+) -> CqrsFramework<Lifecycle<Entity>, PersistedEventStore<Repository, Lifecycle<Entity>>> {
     // `Lifecycle`'s cqrs-es services are unit -- handlers return an `Effect`
     // instead of calling out through injected services.
     #[allow(clippy::disallowed_methods)]
     CqrsFramework::new(store, queries, ())
 }
 
-/// Projected entities: auto-creates and wires a [`Projection`],
-/// returning `(Arc<Store>, Arc<Projection>)`.
-impl<Entity: EventSourced<Materialized = Table> + 'static>
-    StoreBuilder<Entity, SqliteBackend, Table>
-where
-    Entity::Id: Clone,
-    Entity::Event: Clone,
-    <Entity::Id as FromStr>::Err: Debug,
-{
-    pub async fn build(
-        mut self,
-    ) -> Result<(Arc<Store<Entity>>, Arc<Projection<Entity>>), ReconcileError> {
-        // Projected entities must retain all events so that
-        // `catch_up`/`rebuild_all` can replay the full history.
-        // Compacted aggregates lose events after snapshot, making
-        // projection rebuilds silently incomplete.
-        const {
-            assert!(
-                matches!(Entity::COMPACTION_POLICY, CompactionPolicy::Retain),
-                "CompactAfterSnapshot entities must not have table projections -- \
-                 rebuild_all only reads the events table and would miss \
-                 compacted snapshot-only aggregates"
-            );
-        }
+impl crate::ProjectedStoreBackend for SqliteBackend {
+    type ViewBackend = SqliteViewBackend;
 
-        let pool = self.backend.pool().clone();
+    async fn reconcile_projected<Entity>(
+        &self,
+    ) -> Result<Projection<Entity, SqliteViewBackend>, ReconcileError>
+    where
+        Entity: EventSourced<Materialized = Table> + 'static,
+    {
+        let pool = self.pool().clone();
         let reconciler = Reconciler::new(pool.clone());
         let reconciliation = reconciler.reconcile::<Entity>().await?;
 
-        let projection = Arc::new(Projection::sqlite(pool.clone()));
+        let projection = Projection::sqlite(pool.clone());
 
         // A schema version change can leave stored view payloads in an
         // incompatible format. `catch_up` only revisits views that are behind
@@ -179,6 +161,44 @@ where
         // whose view rebuild never finished.
         reconciler.record_version::<Entity>().await?;
 
+        Ok(projection)
+    }
+}
+
+/// Projected entities: auto-creates and wires a [`Projection`],
+/// returning `(Arc<Store>, Arc<Projection>)`.
+impl<Entity, Backend> StoreBuilder<Entity, Backend, Table>
+where
+    Entity: EventSourced<Materialized = Table> + 'static,
+    Backend: ProjectedStoreBackend,
+    Entity::Id: Clone,
+    Entity::Event: Clone,
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    pub async fn build(
+        mut self,
+    ) -> Result<
+        (
+            Arc<Store<Entity, Backend>>,
+            Arc<Projection<Entity, Backend::ViewBackend>>,
+        ),
+        ReconcileError,
+    > {
+        // Projected entities must retain all events so that
+        // `catch_up`/`rebuild_all` can replay the full history.
+        // Compacted aggregates lose events after snapshot, making
+        // projection rebuilds silently incomplete.
+        const {
+            assert!(
+                matches!(Entity::COMPACTION_POLICY, CompactionPolicy::Retain),
+                "CompactAfterSnapshot entities must not have table projections -- \
+                 rebuild_all only reads the events table and would miss \
+                 compacted snapshot-only aggregates"
+            );
+        }
+
+        let projection = Arc::new(self.backend.reconcile_projected::<Entity>().await?);
+
         self.queries.push(Box::new(ReactorBridge {
             reactor: projection.clone(),
         }));
@@ -186,25 +206,30 @@ where
         let Self {
             backend, queries, ..
         } = self;
-        let cqrs = es_cqrs(&backend, queries);
+        let event_store = PersistedEventStore::new_snapshot_store(
+            backend.persistence_repo(Entity::COMPACTION_POLICY),
+            Entity::SNAPSHOT_SIZE,
+        );
+        let cqrs = es_cqrs(event_store, queries);
         Ok((Arc::new(Store::new(cqrs, &backend)), projection))
     }
 }
 
 /// Non-projected entities: returns just `Store`.
-impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, SqliteBackend, Nil> {
-    pub async fn build(self) -> Result<Arc<Store<Entity>>, ReconcileError> {
-        // A non-projected entity has no views to rebuild, so the reconciliation
-        // outcome does not change recovery; reconcile still clears stale
-        // snapshots and record_version marks the version handled.
-        let reconciler = Reconciler::new(self.backend.pool().clone());
-        let _ = reconciler.reconcile::<Entity>().await?;
-        reconciler.record_version::<Entity>().await?;
+impl<Entity: EventSourced<Materialized = Nil>, Backend: UnmaterializedStoreBackend>
+    StoreBuilder<Entity, Backend, Nil>
+{
+    pub async fn build(self) -> Result<Arc<Store<Entity, Backend>>, ReconcileError> {
+        self.backend.reconcile_unmaterialized::<Entity>().await?;
 
         let Self {
             backend, queries, ..
         } = self;
-        let cqrs = es_cqrs(&backend, queries);
+        let event_store = PersistedEventStore::new_snapshot_store(
+            backend.persistence_repo(Entity::COMPACTION_POLICY),
+            Entity::SNAPSHOT_SIZE,
+        );
+        let cqrs = es_cqrs(event_store, queries);
         Ok(Arc::new(Store::new(cqrs, &backend)))
     }
 }
@@ -360,7 +385,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlite_es::MIGRATOR.run(&pool).await.unwrap();
 
-        let _store = StoreBuilder::<AggregateA>::new(pool.clone())
+        let _store = StoreBuilder::<AggregateA, _>::new(pool.clone())
             .with(Arc::new(SingleEntityReactor))
             .build()
             .await
@@ -375,14 +400,14 @@ mod tests {
         let multi = Arc::new(MultiEntityReactor);
         let single = Arc::new(SingleEntityReactor);
 
-        let _store_a = StoreBuilder::<AggregateA>::new(pool.clone())
+        let _store_a = StoreBuilder::<AggregateA, _>::new(pool.clone())
             .with(multi.clone())
             .with(single)
             .build()
             .await
             .unwrap();
 
-        let _store_b = StoreBuilder::<AggregateB>::new(pool.clone())
+        let _store_b = StoreBuilder::<AggregateB, _>::new(pool.clone())
             .with(multi)
             .build()
             .await
@@ -489,7 +514,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (_store, _projection) = StoreBuilder::<Tally>::new(pool.clone())
+        let (_store, _projection) = StoreBuilder::<Tally, _>::new(pool.clone())
             .build()
             .await
             .unwrap();
@@ -563,7 +588,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (_store, _projection) = StoreBuilder::<Tally>::new(pool.clone())
+        let (_store, _projection) = StoreBuilder::<Tally, _>::new(pool.clone())
             .build()
             .await
             .unwrap();

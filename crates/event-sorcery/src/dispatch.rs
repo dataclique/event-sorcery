@@ -1499,7 +1499,7 @@ mod tests {
 
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlite_es::MIGRATOR.run(&pool).await.unwrap();
-        let desk_store = StoreBuilder::<Desk>::new(pool.clone())
+        let desk_store = StoreBuilder::<Desk, _>::new(pool.clone())
             .build()
             .await
             .unwrap();

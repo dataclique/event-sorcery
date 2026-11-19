@@ -2,13 +2,15 @@
 //!
 //! [`ViewBackend`] is a higher-kinded-type emulation: it supplies,
 //! for each `(View, Aggregate)` pair, a concrete [`ViewRepository`]
-//! implementation. The default is [`SqliteViewBackend`]; custom
-//! backends plug in alternative storage (in-memory for tests,
-//! Postgres, etc.).
+//! implementation. Database integrations supply their repository family;
+//! custom backends can also provide in-memory storage for tests.
 
 use cqrs_es::Aggregate;
 use cqrs_es::persist::ViewRepository;
-use sqlite_es::{IndexedView, SqliteViewRepository};
+
+use indexed_query::IndexedView;
+
+use crate::{Column, EventSourced, ProjectionError, ProjectionRecoveryMode, Table};
 
 /// Pluggable storage backend for materialized views, supplying a
 /// concrete [`ViewRepository`] for each `(View, Aggregate)` pair.
@@ -40,15 +42,65 @@ pub trait ViewBackend: Send + Sync + 'static {
         Agg: Aggregate + 'static;
 }
 
-/// Default [`ViewBackend`]: every `(View, Agg)` pair maps to a
-/// [`SqliteViewRepository`].
-#[derive(Debug, Clone, Copy)]
-pub struct SqliteViewBackend;
+/// Optional native construction, queries and retained-history recovery.
+///
+/// Ordinary custom [`ViewBackend`] implementations remain unchanged; only
+/// backends supporting native startup opt into this capability.
+///
+/// Native repositories use `ViewContext::version` as the last included aggregate-local
+/// event sequence. Payload and checkpoint must be written atomically. `update_view`
+/// advances the expected version by exactly one and reports competing writes as
+/// `PersistenceError::OptimisticLockError`, including competing initial inserts.
+/// Recovery may instead install the captured event maximum atomically with its payload.
+/// These rules do not apply to plain `ViewBackend` implementations with opaque revisions.
+/// Mixing direct unsequenced `Reactor::react` writes with native framework delivery is
+/// unsupported: direct writes cannot establish event coverage.
+pub trait NativeProjectionBackend: ViewBackend {
+    /// Caller-owned connection source used to construct the view repository.
+    type Source: Send + Sync + 'static;
+    /// Native SQLx encoding contract accepted by typed column filters.
+    type Database: sqlx::Database;
 
-impl ViewBackend for SqliteViewBackend {
-    type Repo<View, Agg>
-        = SqliteViewRepository<View, Agg>
+    /// Constructs the existing repository family without exposing lifecycle types.
+    fn repository<ViewState, AggregateType>(
+        source: Self::Source,
+        table: Table,
+    ) -> Self::Repo<ViewState, AggregateType>
     where
-        View: cqrs_es::View<Agg> + Clone + 'static,
-        Agg: Aggregate + 'static;
+        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static;
+
+    /// Borrows the repository's original source without opening another pool.
+    fn source<ViewState, AggregateType>(
+        repository: &Self::Repo<ViewState, AggregateType>,
+    ) -> &Self::Source
+    where
+        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static;
+
+    /// Reads serialized view rows for the existing typed projection decoder.
+    fn rows(
+        source: &Self::Source,
+        table: Table,
+    ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send;
+
+    /// Validates a column and executes its native typed equality filter.
+    fn filter<Entity, Value>(
+        source: &Self::Source,
+        table: Table,
+        column: Column,
+        value: &Value,
+    ) -> impl Future<Output = Result<Vec<(String, String)>, ProjectionError<Entity>>> + Send
+    where
+        Entity: EventSourced,
+        for<'query> &'query Value: sqlx::Encode<'query, Self::Database>,
+        Value: sqlx::Type<Self::Database> + Send + Sync;
+
+    /// Owns a standalone recovery transaction and reuses borrowed-I/O replay.
+    fn recover<Entity>(
+        source: &Self::Source,
+        mode: &ProjectionRecoveryMode,
+    ) -> impl Future<Output = Result<(), ProjectionError<Entity>>> + Send
+    where
+        Entity: EventSourced<Materialized = Table>;
 }

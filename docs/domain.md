@@ -31,6 +31,14 @@ aggregate_id, sequence)`. The library's event store is the
 `events` table in SQLite, accessed through `cqrs-es`'s
 `PersistedEventRepository` trait (implemented by `sqlite-es`).
 
+### Persistence Backend
+
+`PersistenceBackend` supplies a command-aware cqrs-es repository and explicit
+library-storage bootstrap. `Store` and `StoreBuilder` use this capability.
+`EventBackend` adds the durable-worker operations; existing implementations
+receive the persistence capability through a blanket implementation. Entity
+schema reconciliation remains part of store startup.
+
 ### Aggregate
 
 A consistency boundary: a cluster of state that's loaded, mutated, and persisted
