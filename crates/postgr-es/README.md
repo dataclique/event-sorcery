@@ -107,6 +107,39 @@ applied again. Out-of-order delivery retries without advancing past missing
 history; `catch_up` repairs a remaining lag. Use framework delivery rather than
 mixing direct, unsequenced `Reactor::react` calls into a native projection.
 
+## Standalone durable enqueue
+
+Use `PostgresEventRepository::enqueue` when a job has no application command
+transaction to join. Apply the library migrations first. The repository commits
+its canonical enqueue event and initial queue row in one transaction:
+
+```rust
+use cqrs_es::persist::PersistenceError;
+use serde_json::Value;
+use sqlx::PgPool;
+
+use event_sorcery::{JobId, JobSeed};
+use postgr_es::PostgresEventRepository;
+
+async fn enqueue_job(
+    pool: PgPool,
+    job_id: JobId,
+    kind: String,
+    payload: Value,
+    run_at_ms: i64,
+) -> Result<(), PersistenceError> {
+    let repository = PostgresEventRepository { pool };
+    repository
+        .enqueue(JobSeed::new(job_id, kind, payload, run_at_ms))
+        .await
+}
+```
+
+`run_at_ms` is the scheduled Unix timestamp in milliseconds. Supply a fresh job
+identity for a new enqueue; reusing an existing identity returns a persistence
+error rather than creating another job. Enqueue records durable intent; it does
+not execute the job's external effects.
+
 ## Migrations
 
 `PostgresBackend::bootstrap_persistence` applies `MIGRATOR`. Applications may
