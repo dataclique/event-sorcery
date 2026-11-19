@@ -1,7 +1,9 @@
 //! CQRS repository integration with caller-owned commit preparation and snapshot policy.
 
+use std::future::{Future, poll_fn};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::task::Poll;
 
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{
@@ -194,17 +196,17 @@ impl<Policy: RepositoryPolicy> PersistedEventRepository for NativeRepository<Pol
             .await
     }
 
-    async fn stream_events<AggregateType: Aggregate>(
+    fn stream_events<AggregateType: Aggregate>(
         &self,
         id: &str,
-    ) -> Result<ReplayStream, PersistenceError> {
-        Ok(self.stream::<AggregateType>(Some(id.to_string())))
+    ) -> impl Future<Output = Result<ReplayStream, PersistenceError>> + Send {
+        poll_fn(move |_| Poll::Ready(Ok(self.stream::<AggregateType>(Some(id.to_string())))))
     }
 
-    async fn stream_all_events<AggregateType: Aggregate>(
+    fn stream_all_events<AggregateType: Aggregate>(
         &self,
-    ) -> Result<ReplayStream, PersistenceError> {
-        Ok(self.stream::<AggregateType>(None))
+    ) -> impl Future<Output = Result<ReplayStream, PersistenceError>> + Send {
+        poll_fn(move |_| Poll::Ready(Ok(self.stream::<AggregateType>(None))))
     }
 }
 

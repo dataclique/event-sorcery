@@ -50,7 +50,7 @@
         };
 
         # Preserve the compiler version while replacing the build integration.
-        rustToolchain = pkgs.rust-bin.stable."1.94.0".default;
+        rustToolchain = pkgs.rust-bin.stable.latest.default;
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
         rustPkgs = pkgs.callPackage ./rust.nix { inherit craneLib; };

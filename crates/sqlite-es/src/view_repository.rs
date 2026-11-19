@@ -263,6 +263,7 @@ mod tests {
     use cqrs_es::{DomainEvent, EventEnvelope};
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
+    use std::future::{Future, ready};
 
     use indexed_query::ProjectionQueryError;
 
@@ -309,13 +310,13 @@ mod tests {
         type Error = TestError;
         type Services = ();
 
-        async fn handle(
+        fn handle(
             &mut self,
             _command: Self::Command,
             _services: &Self::Services,
             _sink: &EventSink<Self>,
-        ) -> Result<(), Self::Error> {
-            Ok(())
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            ready(Ok(()))
         }
 
         fn apply(&mut self, _event: Self::Event) {}

@@ -560,6 +560,7 @@ mod tests {
     use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
+    use std::future::{Future, ready};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -771,13 +772,13 @@ mod tests {
     {
         // The in-memory double has no indexed columns; `find` behavior is
         // covered against `SqliteViewRepository`. Tests here poll via `load`.
-        async fn find(
+        fn find(
             &self,
             _predicate: &Predicate,
             _order: Option<&Order>,
             _limit: i64,
-        ) -> Result<Vec<String>, PersistenceError> {
-            Ok(vec![])
+        ) -> impl Future<Output = Result<Vec<String>, PersistenceError>> + Send {
+            ready(Ok(vec![]))
         }
     }
 
@@ -888,13 +889,13 @@ mod tests {
         View: cqrs_es::View<Agg> + Clone,
         Agg: cqrs_es::Aggregate,
     {
-        async fn find(
+        fn find(
             &self,
             _predicate: &Predicate,
             _order: Option<&Order>,
             _limit: i64,
-        ) -> Result<Vec<String>, PersistenceError> {
-            Ok(vec![])
+        ) -> impl Future<Output = Result<Vec<String>, PersistenceError>> + Send {
+            ready(Ok(vec![]))
         }
     }
 
@@ -1075,13 +1076,13 @@ mod tests {
         View: cqrs_es::View<Agg> + Clone,
         Agg: cqrs_es::Aggregate,
     {
-        async fn find(
+        fn find(
             &self,
             _predicate: &Predicate,
             _order: Option<&Order>,
             _limit: i64,
-        ) -> Result<Vec<String>, PersistenceError> {
-            Ok(vec![])
+        ) -> impl Future<Output = Result<Vec<String>, PersistenceError>> + Send {
+            ready(Ok(vec![]))
         }
     }
 

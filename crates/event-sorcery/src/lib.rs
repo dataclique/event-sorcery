@@ -1554,7 +1554,7 @@ mod tests {
 
         let ids = load_all_ids::<Widget>(&pool).await.unwrap();
 
-        assert!(ids.is_empty());
+        assert_eq!(ids, Vec::<NumericId>::new());
     }
 
     #[tokio::test]

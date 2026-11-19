@@ -15,6 +15,7 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
     use std::fmt::{self, Display};
+    use std::future::{Future, ready};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -30,6 +31,19 @@ mod tests {
     use crate::job_store::EventBackend;
     use crate::*;
     use crate::{Effect, EventSourced, Never, Nil, SqliteBackend, compact_events};
+
+    #[test]
+    fn creating_native_replay_futures_does_not_start_background_io() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let pool = runtime.block_on(create_test_pool()).unwrap();
+        let backend = SqliteBackend::new(pool.clone());
+        let repository = backend.event_repo(CompactionPolicy::Retain);
+
+        drop(repository.stream_events::<TestAggregate>("unpolled"));
+        drop(repository.stream_all_events::<TestAggregate>());
+
+        runtime.block_on(pool.close());
+    }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     struct TestAggregate {
@@ -81,13 +95,13 @@ mod tests {
         type Error = TestError;
         type Services = ();
 
-        async fn handle(
+        fn handle(
             &mut self,
             _command: Self::Command,
             _services: &Self::Services,
             _sink: &EventSink<Self>,
-        ) -> Result<(), Self::Error> {
-            Ok(())
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            ready(Ok(()))
         }
 
         fn apply(&mut self, event: Self::Event) {
@@ -111,12 +125,12 @@ mod tests {
                 matches!(result, Err(PersistenceError::OptimisticLockError)),
                 "{result:?}"
             );
-            assert!(
+            assert_eq!(
                 repository
                     .get_events::<TestAggregate>("version-guard")
                     .await
-                    .unwrap()
-                    .is_empty()
+                    .unwrap(),
+                Vec::<SerializedEvent>::new()
             );
         }
 
