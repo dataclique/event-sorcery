@@ -100,15 +100,14 @@ pub async fn register_schema<Entity: EventSourced, Repository: PersistedEventRep
 ) -> Result<(), ReconcileError> {
     let store = cqrs_es::persist::PersistedEventStore::new_event_store(repository);
     let framework = crate::wire::es_cqrs::<SchemaRegistry, _>(store, vec![]);
-    framework
-        .execute(
-            REGISTRY_ID,
-            SchemaRegistryCommand::Register {
-                name: Entity::AGGREGATE_TYPE.to_string(),
-                version: Entity::SCHEMA_VERSION,
-            },
-        )
-        .await?;
+    crate::job::with_pending_scope(framework.execute(
+        REGISTRY_ID,
+        SchemaRegistryCommand::Register {
+            name: Entity::AGGREGATE_TYPE.to_string(),
+            version: Entity::SCHEMA_VERSION,
+        },
+    ))
+    .await?;
     Ok(())
 }
 
@@ -168,6 +167,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{guard_snapshot, reconcile_schema, register_schema};
+    use crate::job::{
+        ErasedJob, JobId, JobKind, PendingPush, buffer, take_pending, with_pending_scope,
+    };
     use crate::lifecycle::Lifecycle;
     use crate::{
         ClaimDecision, ClaimOutcome, ClaimRead, CompactionPolicy, DomainEvent, Effect,
@@ -521,6 +523,56 @@ mod tests {
                 ),
             ],
         );
+    }
+
+    struct RegistryPendingJob;
+
+    impl ErasedJob for RegistryPendingJob {
+        fn kind(&self) -> JobKind {
+            JobKind::new("registry-isolation-probe")
+        }
+
+        fn encode(&self) -> Result<serde_json::Value, serde_json::Error> {
+            Ok(json!({"probe": "caller-dispatch"}))
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_registration_does_not_commit_the_callers_pending_jobs() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        let backend = SqliteBackend::new(pool.clone());
+        backend.bootstrap_persistence().await.unwrap();
+        let job_id = JobId::new();
+
+        with_pending_scope(async {
+            buffer(PendingPush {
+                job_id,
+                job: Box::new(RegistryPendingJob),
+                delay: None,
+            })
+            .unwrap();
+
+            register_schema::<SchemaProbe<1, false>, _>(
+                backend.persistence_repo(CompactionPolicy::Retain),
+            )
+            .await
+            .unwrap();
+
+            let committed_jobs: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE aggregate_type = 'job'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(committed_jobs, 0);
+            let remaining = take_pending().unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].job_id, job_id);
+        })
+        .await;
     }
 
     #[tokio::test]
