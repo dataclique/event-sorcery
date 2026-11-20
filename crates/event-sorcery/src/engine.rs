@@ -408,6 +408,14 @@ impl<'events> CommitRequest<'events> {
     pub(crate) fn validate_stream(&self) -> Result<(), EngineError> {
         validate_event_stream(&self.stream, self.events)?;
         if self
+            .events
+            .windows(2)
+            .any(|events| events[0].sequence.checked_add(1) != Some(events[1].sequence))
+        {
+            return Err(EngineError::OptimisticLock);
+        }
+
+        if self
             .expected_version
             .is_some_and(|expected| !events_follow_version(self.events, expected))
         {
@@ -572,5 +580,59 @@ impl TryFrom<StoredSnapshotRow> for SerializedSnapshot {
             current_sequence: usize::try_from(row.last_sequence)?,
             current_snapshot: usize::try_from(row.snapshot_version)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Commit preparation validates batches independently of database version guards.
+
+    use cqrs_es::persist::SerializedEvent;
+    use serde_json::json;
+
+    use super::{CommitRequest, EngineError, StreamIdentity};
+
+    #[test]
+    fn unguarded_commit_rejects_noncontiguous_event_batches() {
+        for sequences in [[1, 3], [2, 1], [1, 1], [usize::MAX, 0]] {
+            let events: Vec<_> = sequences
+                .into_iter()
+                .map(|sequence| SerializedEvent {
+                    aggregate_type: "CommitProbe".to_string(),
+                    aggregate_id: "probe".to_string(),
+                    sequence,
+                    event_type: "Updated".to_string(),
+                    event_version: "1".to_string(),
+                    payload: json!({"value": sequence}),
+                    metadata: json!({}),
+                })
+                .collect();
+            let result =
+                CommitRequest::new(StreamIdentity::new("CommitProbe", "probe"), &events).prepare();
+            assert!(matches!(result, Err(EngineError::OptimisticLock)));
+        }
+    }
+
+    #[test]
+    fn unguarded_commit_preserves_contiguous_and_empty_batches() {
+        for sequences in [vec![], vec![7], vec![7, 8, 9]] {
+            let events: Vec<_> = sequences
+                .into_iter()
+                .map(|sequence| SerializedEvent {
+                    aggregate_type: "CommitProbe".to_string(),
+                    aggregate_id: "probe".to_string(),
+                    sequence,
+                    event_type: "Updated".to_string(),
+                    event_version: "1".to_string(),
+                    payload: json!({"value": sequence}),
+                    metadata: json!({}),
+                })
+                .collect();
+            let prepared = CommitRequest::new(StreamIdentity::new("CommitProbe", "probe"), &events)
+                .prepare()
+                .unwrap();
+            assert_eq!(prepared.events.len(), events.len());
+            assert_eq!(prepared.expected_version, None);
+        }
     }
 }
