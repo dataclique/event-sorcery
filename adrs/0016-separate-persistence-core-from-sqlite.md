@@ -1,6 +1,6 @@
 # 0016. Separate the persistence core from SQLite
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-20
 - Issue: [#122](https://github.com/dataclique/event-sorcery/issues/122)
 
@@ -19,24 +19,24 @@ change stored data, migrations, or public constructor signatures.
 ## Decision
 
 Extract backend-neutral persistence contracts and the shared behavior they
-require into a new workspace crate, `event-sorcery-core`. Move SQLite storage
-implementation into the existing `sqlite-es` crate. Do not add a second SQLite
-adapter crate.
+require into `event-sorcery-core` (`crates/core/`). Move SQLite storage into the
+existing `sqlite-es` crate.
 
-```text
-event-sorcery -> event-sorcery-core
-event-sorcery -> sqlite-es (opt-in)
-sqlite-es -> event-sorcery-core
-postgr-es -> event-sorcery
-event-sorcery-ffi -> event-sorcery[sqlite]
+```mermaid
+flowchart LR
+    framework["event-sorcery"] -->|"depends on"| core["event-sorcery-core (crates/core/)"]
+    sqlite["sqlite-es"] -->|"depends on"| core
+    framework -.->|"only with the sqlite feature"| sqlite
 ```
 
-Neither dependency may depend back on `event-sorcery`. PostgreSQL continues to
-use the shared contracts without enabling SQLite. The new crate contains the
-existing contract definitions and decisions, not copies of them. Extract only
-what a storage implementation consumes. Keep `Lifecycle`, CQRS execution, and
-worker hosting on the framework side; pass prepared values or use the existing
-replay and decision boundaries instead of exposing private types.
+The diagram shows the split, not the unchanged callers. `postgr-es` uses
+`event-sorcery` without SQLite; `event-sorcery-ffi` enables its `sqlite`
+feature. Neither `sqlite-es` nor `event-sorcery-core` depends on
+`event-sorcery`. The new crate contains the existing contract definitions and
+decisions, not copies of them. Extract only what a storage implementation
+consumes. Keep `Lifecycle`, CQRS execution, and worker hosting on the framework
+side; pass prepared values or use the existing replay and decision boundaries
+instead of exposing private types.
 
 Move SQL and transaction ownership together into `sqlite-es`. Command events,
 snapshot changes, and durable job intent (job event and queue row) must still
