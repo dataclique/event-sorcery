@@ -68,6 +68,20 @@ in
       inherit cargoArtifacts;
       cargoExtraArgs = testCargoArgs;
       cargoBuildExtraArgs = "--all-targets";
+      preBuild = ''
+        for package in event-sorcery postgr-es; do
+          echo "Checking backend isolation for $package"
+          cargo check ''${CARGO_PROFILE:+--profile $CARGO_PROFILE} \
+            --locked --offline --package "$package" --lib --no-default-features
+          graph="$TMPDIR/$package-normal-dependencies"
+          cargo tree --locked --offline --package "$package" \
+            --no-default-features --edges normal > "$graph"
+          if grep -E 'sqlite-es|sqlx-sqlite|libsqlite3-sys' "$graph"; then
+            echo "SQLite leaked into $package normal dependencies" >&2
+            exit 1
+          fi
+        done
+      '';
     }
   );
 
