@@ -11,7 +11,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep};
+use tokio::time::sleep;
 use tracing::{error, trace, warn};
 
 use indexed_query::{IndexedView, Order, Predicate};
@@ -21,7 +21,7 @@ use crate::dependency::{Cons, Dependent, EntityList, Nil};
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::reactor::{
     RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, ReactorContext,
-    backoff_delay_ms,
+    retry_delays,
 };
 use crate::view_backend::ViewBackend;
 
@@ -307,26 +307,26 @@ where
         let base_delay_ms = RETRY_BASE_DELAY_MS;
         let max_delay_ms = RETRY_MAX_DELAY_MS;
 
-        for attempt in 0..=max_retries {
+        let delays = retry_delays(base_delay_ms, max_delay_ms);
+        for (attempt, delay) in (0..=max_retries).zip(delays) {
             let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
                 Ok(Some(pair)) => pair,
                 Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
                 Err(error) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
-                        let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
                         warn!(
                             target: "cqrs",
-                            %view_id, attempt = attempt + 1, max_retries, delay_ms,
-                            "SQLite busy loading view, retrying"
+                            %view_id, attempt = attempt + 1, max_retries, ?delay,
+                            "Storage contention loading view, retrying"
                         );
-                        sleep(Duration::from_millis(delay_ms)).await;
+                        sleep(delay).await;
                         continue;
                     }
 
                     error!(
                         target: "cqrs",
                         %view_id, max_retries,
-                        "View load lost: SQLite busy conflict persisted after all retries"
+                        "View load lost: Storage contention conflict persisted after all retries"
                     );
                     return Ok(());
                 }
@@ -347,8 +347,7 @@ where
                 }
                 if covered.checked_add(1) != Some(sequence.get()) {
                     if attempt < max_retries {
-                        let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
-                        sleep(Duration::from_millis(delay_ms)).await;
+                        sleep(delay).await;
                         continue;
                     }
                     error!(target: "cqrs", %view_id, covered, sequence = sequence.get(),
@@ -361,13 +360,12 @@ where
             match self.repo.update_view(lifecycle, context).await {
                 Ok(()) => return Ok(()),
                 Err(PersistenceError::OptimisticLockError) if attempt < max_retries => {
-                    let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
                     warn!(
                         target: "cqrs",
-                        %view_id, attempt = attempt + 1, max_retries, delay_ms,
+                        %view_id, attempt = attempt + 1, max_retries, ?delay,
                         "Optimistic lock conflict, retrying view update"
                     );
-                    sleep(Duration::from_millis(delay_ms)).await;
+                    sleep(delay).await;
                 }
                 Err(PersistenceError::OptimisticLockError) => {
                     error!(
@@ -379,18 +377,17 @@ where
                 }
                 Err(error) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
-                        let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
                         warn!(
                             target: "cqrs",
-                            %view_id, attempt = attempt + 1, max_retries, delay_ms,
-                            "SQLite busy, retrying view update"
+                            %view_id, attempt = attempt + 1, max_retries, ?delay,
+                            "Storage contention, retrying view update"
                         );
-                        sleep(Duration::from_millis(delay_ms)).await;
+                        sleep(delay).await;
                     } else {
                         error!(
                             target: "cqrs",
                             %view_id, max_retries,
-                            "View update lost: SQLite busy conflict persisted after all retries"
+                            "View update lost: Storage contention conflict persisted after all retries"
                         );
                         return Ok(());
                     }

@@ -383,10 +383,7 @@ mod tests {
 
     use super::*;
     use crate::dependency::{Cons, Dependent, EntityList};
-    use crate::reactor::{
-        IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS,
-        RetryOnBusy, backoff_delay_ms,
-    };
+    use crate::reactor::{IdempotentReactor, RETRY_MAX_ATTEMPTS, RetryOnBusy};
     use crate::{CompactionPolicy, EventSourced, Nil, uneventful};
 
     /// Test entity: a simple counter with controllable error behavior.
@@ -896,9 +893,7 @@ mod tests {
             payload: CounterEvent::Created { initial: 1 },
             metadata: HashMap::new(),
         };
-        let full_schedule: u64 = (0..RETRY_MAX_ATTEMPTS)
-            .map(|attempt| backoff_delay_ms(attempt, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS))
-            .sum();
+        let full_schedule = std::time::Duration::from_millis(4_270);
         let started = tokio::time::Instant::now();
 
         bridge.dispatch("counter-1", &[envelope]).await;
@@ -906,10 +901,7 @@ mod tests {
         // Paused Tokio time advances only through the retry sleeps, so the
         // elapsed virtual time IS the backoff schedule -- immediate retries
         // or removed delays fail this exactly.
-        assert_eq!(
-            started.elapsed(),
-            std::time::Duration::from_millis(full_schedule)
-        );
+        assert_eq!(started.elapsed(), full_schedule);
         assert!(!reactor.inner.applied.load(Ordering::SeqCst));
         assert_eq!(
             reactor.inner.calls.load(Ordering::SeqCst),

@@ -10,6 +10,7 @@
 //! [`dependency`](crate::dependency) module.
 
 use async_trait::async_trait;
+use backon::{BackoffBuilder, ExponentialBuilder};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -119,17 +120,18 @@ pub const RETRY_MAX_ATTEMPTS: u32 = 10;
 pub const RETRY_BASE_DELAY_MS: u64 = 10;
 pub const RETRY_MAX_DELAY_MS: u64 = 1000;
 
-/// Computes the exponential backoff delay for a given retry attempt.
+/// Builds the shared capped, non-jittered exponential delivery schedule.
 ///
-/// Saturates toward `max_delay_ms` instead of overflowing: a caller-supplied
-/// `attempt`/`base_delay_ms` large enough to overflow the exponential term
-/// just hits the cap sooner rather than panicking (debug) or wrapping
-/// (release). Shared by [`retry_with_backoff`] and `Projection::react`'s own
-/// retry loop so the two schedules can't silently diverge on this property.
-pub(crate) fn backoff_delay_ms(attempt: u32, base_delay_ms: u64, max_delay_ms: u64) -> u64 {
-    2u64.checked_pow(attempt)
-        .and_then(|multiplier| base_delay_ms.checked_mul(multiplier))
-        .map_or(max_delay_ms, |computed| computed.min(max_delay_ms))
+/// Callers own their retry budget. A zero initial delay remains zero.
+pub(crate) fn retry_delays(base_delay_ms: u64, max_delay_ms: u64) -> backon::ExponentialBackoff {
+    let minimum = Duration::from_millis(base_delay_ms.min(max_delay_ms));
+    let maximum = Duration::from_millis(max_delay_ms);
+    ExponentialBuilder::default()
+        .with_min_delay(minimum)
+        .with_max_delay(maximum)
+        .with_factor(2.0)
+        .without_max_times()
+        .build()
 }
 
 /// Retries `make_attempt` with exponential backoff while `should_retry`
@@ -153,18 +155,22 @@ where
     Attempt: Future<Output = Result<Output, Error>>,
 {
     let mut attempt = 0u32;
+    let mut delays = retry_delays(base_delay_ms, max_delay_ms);
 
     loop {
         match make_attempt().await {
             Ok(output) => return Ok(output),
             Err(error) if attempt < max_attempts && should_retry(&error) => {
-                let delay_ms = backoff_delay_ms(attempt, base_delay_ms, max_delay_ms);
+                let Some(delay) = delays.next() else {
+                    warn!(target: "cqrs", attempt, "Retry delay schedule exhausted");
+                    return Err(error);
+                };
                 warn!(
                     target: "cqrs",
-                    attempt = attempt + 1, max_attempts, delay_ms,
+                    attempt = attempt + 1, max_attempts, ?delay,
                     "Retrying after transient error"
                 );
-                sleep(Duration::from_millis(delay_ms)).await;
+                sleep(delay).await;
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -522,11 +528,28 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), TEST_MAX_ATTEMPTS + 1);
     }
 
-    /// `2u64.pow(attempt)` overflows once `attempt >= 64`. A caller-supplied
-    /// schedule with enough attempts to reach that must saturate toward
-    /// `max_delay_ms` instead of panicking (debug builds) or silently
-    /// wrapping (release builds) -- this exercises exactly that range with a
-    /// tiny delay so the test stays fast.
+    #[tokio::test(start_paused = true)]
+    async fn zero_base_retry_delay_stays_zero_across_large_budgets() {
+        let started = tokio::time::Instant::now();
+        let call_count = AtomicU32::new(0);
+        let result: Result<u32, SyntheticError> = retry_with_backoff(
+            70,
+            0,
+            1,
+            || {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                async { Err(SyntheticError::Retryable) }
+            },
+            is_synthetic_retryable,
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), SyntheticError::Retryable);
+        assert_eq!(call_count.load(Ordering::SeqCst), 71);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// Large retry budgets retain the configured cap without arithmetic overflow.
     #[tokio::test]
     async fn retry_with_backoff_caps_delay_without_overflow_at_high_attempt_counts() {
         const HIGH_MAX_ATTEMPTS: u32 = 70;
