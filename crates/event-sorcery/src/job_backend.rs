@@ -968,7 +968,10 @@ impl<S, J: StandaloneJob, Backend: EventBackend> Layer<S> for AckLayer<J, Backen
 fn settled_worker_outcome<Output>(outcome: JobOutcome<Output>) -> JobOutcome<()> {
     use JobOutcome::{Defer, Done};
     match outcome {
-        Done(_) => Done(()),
+        Done(output) => {
+            drop(output);
+            Done(())
+        }
         Defer(delay) => Defer(delay),
     }
 }

@@ -911,13 +911,15 @@ pub(crate) fn prepare_pending() -> Result<PreparedPendingJobs, JobStoreError> {
             acknowledgements,
         })
     });
-    match prepared {
-        Ok(prepared) => prepared,
-        Err(_) => Ok(PreparedPendingJobs {
-            requests: Vec::new(),
-            acknowledgements: Vec::new(),
-        }),
-    }
+    prepared.map_or_else(
+        |_| {
+            Ok(PreparedPendingJobs {
+                requests: Vec::new(),
+                acknowledgements: Vec::new(),
+            })
+        },
+        std::convert::identity,
+    )
 }
 
 /// Drains the per-command pending-job buffer into [`EnqueueRequest`]s for tests
