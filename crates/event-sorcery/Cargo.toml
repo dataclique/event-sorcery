@@ -22,7 +22,7 @@ tokio-util = "0.7.18"
 tokio-stream = "0.1.18"
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
-tower = { version = "0.5.3", features = ["limit"] }
+tower = { version = "0.5.3", features = ["limit", "util"] }
 futures-util = "0.3.32"
 indexed-query.workspace = true
 backon = { version = "1.6.0", default-features = false, features = ["std"] }

@@ -34,6 +34,7 @@ use futures_util::{FutureExt, StreamExt};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tower::limit::ConcurrencyLimitLayer;
+use tower::util::MapResponse;
 use tower_layer::{Layer, Stack};
 use tower_service::Service;
 use tracing::{error, warn};
@@ -933,6 +934,10 @@ fn poll_order() -> Order {
 
 /// Layer that wraps the worker's execution service to durably record each job's
 /// outcome and hold its lease for the duration of the run.
+///
+/// [`AckService`] retains the job's output through settlement. Only its completed
+/// response is mapped to a unit output for Apalis, whose monitor requires `Sync`
+/// responses even though [`StandaloneJob::Output`] requires only `Send`.
 pub struct AckLayer<J: StandaloneJob, Backend: EventBackend> {
     jobs: Arc<Store<JobState, Backend>>,
     backend: Backend,
@@ -942,17 +947,29 @@ pub struct AckLayer<J: StandaloneJob, Backend: EventBackend> {
 }
 
 impl<S, J: StandaloneJob, Backend: EventBackend> Layer<S> for AckLayer<J, Backend> {
-    type Service = AckService<S, J, Backend>;
+    type Service =
+        MapResponse<AckService<S, J, Backend>, fn(JobOutcome<J::Output>) -> JobOutcome<()>>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        AckService {
-            inner,
-            jobs: self.jobs.clone(),
-            backend: self.backend.clone(),
-            config: self.config.clone(),
-            clock: self.clock.clone(),
-            _job: PhantomData,
-        }
+        MapResponse::new(
+            AckService {
+                inner,
+                jobs: self.jobs.clone(),
+                backend: self.backend.clone(),
+                config: self.config.clone(),
+                clock: self.clock.clone(),
+                _job: PhantomData,
+            },
+            settled_worker_outcome::<J::Output> as fn(JobOutcome<J::Output>) -> JobOutcome<()>,
+        )
+    }
+}
+
+fn settled_worker_outcome<Output>(outcome: JobOutcome<Output>) -> JobOutcome<()> {
+    use JobOutcome::{Defer, Done};
+    match outcome {
+        Done(_) => Done(()),
+        Defer(delay) => Defer(delay),
     }
 }
 
@@ -1637,7 +1654,7 @@ mod tests {
 
     impl StandaloneJob for WorkerProbe {
         type Input = tokio::sync::mpsc::UnboundedSender<(JobId, u32)>;
-        type Output = ();
+        type Output = Cell<u32>;
         type Error = Infallible;
 
         const WORKER_NAME: &'static str = "worker-probe";
@@ -1652,11 +1669,12 @@ mod tests {
             &self,
             context: &JobContext,
             input: &Self::Input,
-        ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<Infallible>>> + Send {
+        ) -> impl Future<Output = Result<JobOutcome<Cell<u32>>, JobFailure<Infallible>>> + Send
+        {
             let value = self.value.get();
             poll_fn(move |_| {
                 input.send((context.job_id(), value)).unwrap();
-                Poll::Ready(Ok(JobOutcome::Done(())))
+                Poll::Ready(Ok(JobOutcome::Done(Cell::new(value))))
             })
         }
     }
