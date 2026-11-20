@@ -26,6 +26,7 @@ tower = { version = "0.5.3", features = ["limit", "util"] }
 futures-util = "0.3.32"
 indexed-query.workspace = true
 backon = { version = "1.6.0", default-features = false, features = ["std"] }
+event-sorcery-core.workspace = true
 
 [features]
 test-support = []

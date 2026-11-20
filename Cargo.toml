@@ -5,6 +5,7 @@ members = [
   "crates/event-sorcery",
   "crates/event-sorcery-ffi",
   "crates/indexed-query",
+  "crates/core",
 ]
 exclude = ["examples/simple", "examples/complex"]
 resolver = "2"
@@ -45,6 +46,7 @@ cbindgen = "=0.29.2"
 ciborium = "0.2.2"
 cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87", version = "0.5.0" }
 event-sorcery = { path = "crates/event-sorcery" }
+event-sorcery-core = { version = "0.5.0", path = "crates/core" }
 futures-util = "0.3.34"
 getrandom = "0.3.4"
 indexed-query = { path = "crates/indexed-query" }

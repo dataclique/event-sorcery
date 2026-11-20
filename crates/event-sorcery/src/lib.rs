@@ -124,6 +124,8 @@ use serde::de::DeserializeOwned;
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
 
+pub use event_sorcery_core::CompactionPolicy;
+
 #[doc(hidden)]
 pub use dependency::Cons;
 pub use dependency::Nil;
@@ -210,25 +212,6 @@ pub mod __worker {
     pub use apalis_core::worker::builder::WorkerBuilder;
 
     pub use crate::job_backend::JobInput;
-}
-
-/// Whether old events may be deleted after they are captured in a snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompactionPolicy {
-    /// Keep all events indefinitely.
-    Retain,
-    /// Delete events at or before the current snapshot sequence.
-    CompactAfterSnapshot,
-    /// Preserve a trailing sequence window independently for each aggregate type and id.
-    ///
-    /// Delete only events both covered by the snapshot and at or below the
-    /// stream's newest sequence minus `events`. Unsnapshotted events survive
-    /// even when they exceed the window. Sparse histories may retain fewer
-    /// rows than the numeric window. Without a snapshot, nothing is deleted.
-    RetainLast {
-        /// Width of the retained sequence interval; zero keeps only unsnapshotted events.
-        events: usize,
-    },
 }
 
 /// The core abstraction for event-sourced domain entities.

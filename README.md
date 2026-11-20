@@ -6,6 +6,8 @@ persistence.
 
 ## Crates
 
+- **[`crates/core`](crates/core)** (`event-sorcery-core`) — shared persistence
+  contracts, including snapshot compaction policy. No database driver.
 - **[`crates/indexed-query`](crates/indexed-query)** — backend-neutral
   indexed-view query contracts, typed validation errors, and shared SQL
   lowering. Repositories own native argument encoding and execution. Existing
@@ -13,11 +15,11 @@ persistence.
 - **[`crates/sqlite-es`](crates/sqlite-es)** — SQLite implementation of
   `cqrs-es`'s event repository, view repository, and `CqrsFramework` glue.
   Standalone — usable wherever you'd plug in a `cqrs-es` backend.
-- **[`crates/event-sorcery`](crates/event-sorcery)** — higher-level ergonomics
-  on top of `sqlite-es`: the `EventSourced` trait, `Lifecycle` adapter, typed
-  `Store`, projections, schema registry, reactor, and durable job dispatch
-  enforced by the handler signature (dispatch/confirm/fail lifecycles with
-  submit/reconcile retry safety and outcome feedback; see
+- **[`crates/event-sorcery`](crates/event-sorcery)** — the public framework: the
+  `EventSourced` trait, `Lifecycle` adapter, typed `Store`, projections, schema
+  registry, reactor, and durable job dispatch enforced by the handler signature
+  (dispatch/confirm/fail lifecycles with submit/reconcile retry safety and
+  outcome feedback; see
   [ADR-0008](adrs/0008-entity-scoped-durable-operations.md) and
   [ADR-0009](adrs/0009-handlers-return-events-or-one-job-dispatch.md)).
 - **[`crates/event-sorcery-ffi`](crates/event-sorcery-ffi)** — C ABI over the

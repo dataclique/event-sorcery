@@ -11,10 +11,9 @@ use crate::EventBackend;
 use crate::job;
 use crate::lifecycle::Lifecycle;
 use crate::{
-    CompactionPolicy, EventSourced, LoadAllIdsError, Nil, Projection, ProjectionError,
-    ReconcileError, Reconciler, SchemaReconciliation, SendError, SqliteBackend,
-    SqliteEventRepository, SqliteViewBackend, Store, StoreBuilder, Table,
-    UnmaterializedStoreBackend,
+    EventSourced, LoadAllIdsError, Nil, Projection, ProjectionError, ReconcileError, Reconciler,
+    SchemaReconciliation, SendError, SqliteBackend, SqliteEventRepository, SqliteViewBackend,
+    Store, StoreBuilder, Table, UnmaterializedStoreBackend,
 };
 
 /// SQLite-specific [`Store`] helpers.
@@ -160,9 +159,9 @@ pub async fn send_command<Entity: EventSourced>(
 
 /// Delete compactable events that are already represented by snapshots.
 ///
-/// This is a no-op for entities with [`CompactionPolicy::Retain`].
-/// [`CompactionPolicy::CompactAfterSnapshot`] removes snapshot-covered events;
-/// [`CompactionPolicy::RetainLast`] additionally preserves the trailing sequence
+/// This is a no-op for entities with [`crate::CompactionPolicy::Retain`].
+/// [`crate::CompactionPolicy::CompactAfterSnapshot`] removes snapshot-covered events;
+/// [`crate::CompactionPolicy::RetainLast`] additionally preserves the trailing sequence
 /// window for each aggregate type and id. Neither policy deletes unsnapshotted
 /// events or events from streams without snapshots.
 ///
@@ -171,50 +170,7 @@ pub async fn send_command<Entity: EventSourced>(
 /// Returns database errors from the delete query or an encoding error when the
 /// retention window cannot be represented as a SQLite integer.
 pub async fn compact_events<Entity: EventSourced>(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
-    let result = match Entity::COMPACTION_POLICY {
-        CompactionPolicy::Retain => return Ok(0),
-        CompactionPolicy::CompactAfterSnapshot => {
-            sqlx::query(
-                "DELETE FROM events \
-                 WHERE aggregate_type = ?1 \
-                   AND sequence <= COALESCE( \
-                       (SELECT last_sequence FROM snapshots \
-                        WHERE snapshots.aggregate_type = events.aggregate_type \
-                          AND snapshots.aggregate_id = events.aggregate_id), \
-                       0 \
-                   )",
-            )
-            .bind(Entity::AGGREGATE_TYPE)
-            .execute(pool)
-            .await?
-        }
-        CompactionPolicy::RetainLast { events } => {
-            let window =
-                i64::try_from(events).map_err(|source| sqlx::Error::Encode(Box::new(source)))?;
-
-            sqlx::query(
-                "DELETE FROM events \
-                 WHERE aggregate_type = ?1 \
-                   AND sequence <= COALESCE( \
-                       (SELECT last_sequence FROM snapshots \
-                        WHERE snapshots.aggregate_type = events.aggregate_type \
-                          AND snapshots.aggregate_id = events.aggregate_id), \
-                       0 \
-                   ) \
-                   AND sequence <= ( \
-                       SELECT MAX(newest.sequence) FROM events newest \
-                       WHERE newest.aggregate_type = events.aggregate_type \
-                         AND newest.aggregate_id = events.aggregate_id \
-                   ) - ?2",
-            )
-            .bind(Entity::AGGREGATE_TYPE)
-            .bind(window)
-            .execute(pool)
-            .await?
-        }
-    };
-
-    Ok(result.rows_affected())
+    sqlite_es::compact_events(pool, Entity::AGGREGATE_TYPE, Entity::COMPACTION_POLICY).await
 }
 
 /// Reclaim SQLite file space after event compaction.
