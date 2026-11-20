@@ -22,6 +22,12 @@ from the `.sqlx/` directory instead of connecting to the database. This means:
 - Colocated Rust tests use `#[cfg(test)]` modules, which the pinned Clippy
   recognizes for its configured `allow-unwrap-in-tests` exception.
 
+When a database test also exercises paused Tokio time, finish SQLx pool setup
+and database operations before pausing, and resume time before further database
+I/O. SQLite work runs on background threads; an idle paused runtime can advance
+the pool acquisition deadline before that work completes, producing
+`PoolTimedOut` during setup. Pause only the timer-only phase under test.
+
 `migrate!` can otherwise leave a stale embedded migration after SQL-only edits
 on the pinned stable toolchain. Both backend crates have build scripts watching
 their `migrations/` directories so Cargo rebuilds the owning migrator when SQL

@@ -149,7 +149,8 @@ pub use job::{
 };
 pub use job_backend::{
     Backoff, ClaimedJob, Clock, EventStoreBackend, JobClaimHandle, JobClaimResult, JobEnqueueError,
-    JobLeaseResult, JobRuntime, JobRuntimeError, JobSettlementResult, JobWorkerConfig, run_job,
+    JobLeaseResult, JobRuntime, JobRuntimeError, JobScheduleError, JobSettlementResult,
+    JobWorkerConfig, run_job,
 };
 #[cfg(any(test, feature = "sqlite"))]
 pub use job_sqlite::{SqliteBackend, SqliteJobError};

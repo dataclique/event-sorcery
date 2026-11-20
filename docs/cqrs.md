@@ -936,11 +936,30 @@ Each worker polls the `job_queue_projection` projection for runnable jobs of its
 `KIND`, claims one under a lease, runs the routed execution (submit/reconcile
 for entity-kicked jobs, `perform` for standalone ones), delivers the verdict,
 and durably records the outcome (success, retry with backoff, or dead-letter) --
-all fenced so a job runs exactly once per successful claim. `JobWorkerConfig`
-tunes poll cadence, concurrency, lease duration, retry budget, backoff, and the
-verdict-delivery deferrals (`DeliveryPolicy`). `Clock::system()` reads real wall
-time; `Clock::from_fn(..)` supplies timestamp reads for eligibility and lease
-decisions.
+with outcome commands fenced by the claim, not an exactly-once guarantee for
+external effects. `JobWorkerConfig` tunes poll cadence, concurrency, lease
+duration, retry budget, backoff, and the verdict-delivery deferrals
+(`DeliveryPolicy`). `Clock::system()` reads real wall time; `Clock::from_fn(..)`
+supplies timestamp reads for eligibility and lease decisions.
+
+Transient delivery retries and durable retry schedules use `backon` without
+jitter. Durable retries persist their next run time; they do not call `perform`
+again inside the current execution. The failed-attempt index remains capped at
+32, independently of the configured failure budget.
+
+`Backoff::factor` is an `f32`, matching `backon` rather than narrowing an `f64`
+implicitly. It must be finite and at least one. The initial delay is capped at
+`cap`; delay scaling and timestamp conversion must fit their supported ranges.
+`Backoff::validate()` checks the configuration, and worker polling rejects an
+invalid configuration with `JobScheduleError` before claiming a job. Worker
+constructors and `build_supervised_worker!` keep their existing signatures.
+Custom fractional schedules follow `backon` duration rounding rather than the
+former indexed `f64` calculation.
+
+A failed retry/defer timestamp calculation returns a typed schedule error,
+without recording a replacement outcome or incrementing the persisted failure
+count. The acknowledgement middleware stops lease renewal before returning that
+error. Handler failures remain separate from schedule failures.
 
 ## Testing Aggregates
 
