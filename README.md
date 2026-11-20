@@ -1,10 +1,15 @@
 # Event Sorcery
 
 Event-sourcing primitives in Rust. A thin, opinionated layer on top of
-[`cqrs-es`](https://crates.io/crates/cqrs-es) plus a SQLite-backed event store.
+[`cqrs-es`](https://crates.io/crates/cqrs-es), with SQLite and PostgreSQL
+persistence.
 
 ## Crates
 
+- **[`crates/indexed-query`](crates/indexed-query)** — backend-neutral
+  indexed-view query contracts, typed validation errors, and shared SQL
+  lowering. Repositories own native argument encoding and execution. Existing
+  SQLite query imports reexport the shared definitions.
 - **[`crates/sqlite-es`](crates/sqlite-es)** — SQLite implementation of
   `cqrs-es`'s event repository, view repository, and `CqrsFramework` glue.
   Standalone — usable wherever you'd plug in a `cqrs-es` backend.
@@ -18,9 +23,17 @@ Event-sourcing primitives in Rust. A thin, opinionated layer on top of
 - **[`crates/event-sorcery-ffi`](crates/event-sorcery-ffi)** — C ABI over the
   shared Rust engine, with a generated C header and static library for language
   bindings.
+- **[`crates/postgr-es`](crates/postgr-es)** — PostgreSQL repositories,
+  migrations, and native backend integration for `event-sorcery`.
 
 `event-sorcery` is the recommended entry point. Use `sqlite-es` directly only if
 you need lower-level control.
+
+Enable the `sqlite` feature on `event-sorcery` for SQLite constructors, the
+serialized `Engine`, schema reconciliation and maintenance helpers. SQLite is
+opt-in: default core and PostgreSQL-only builds do not depend on SQLite. The FFI
+crate and SQLite examples enable it explicitly. Custom view backends can
+classify retryable storage errors through `ViewBackend::is_retryable_error`.
 
 `EventSourced` implementations must declare `SNAPSHOT_SIZE` and
 `COMPACTION_POLICY`; `StandaloneJob` implementations must declare
@@ -96,10 +109,14 @@ Development-shell state lives under `.tmp/devenv/`.
 
 ### PostgreSQL persistence boundary
 
-The `postgres` feature exposes `PostgresEventRepository` and `POSTGRES_MIGRATOR`
-through the CQRS repository contract. It does not provide a PostgreSQL
-`EventBackend` for `StoreBuilder`; the built-in native store and worker
-integration remain SQLite-only.
+`postgr-es` extends the official `postgres-es` adapter from the temporary CQRS
+fix fork with atomic job writes, recovery policy, and indexed queries. Ordinary
+event, snapshot, replay, and view persistence delegate to that adapter. It
+exports `PostgresBackend`, `PostgresEventRepository`, `PostgresViewRepository`,
+and `MIGRATOR`. After bootstrapping persistence, unprojected entities use
+`StoreBuilder::with_backend`; startup reconciles their schema in one transaction
+before exposing the store. PostgreSQL tests run in the ordinary workspace suite
+and require a test database.
 
 ### Local PostgreSQL
 
@@ -116,11 +133,11 @@ databases. PostgreSQL data lives under `.tmp/devenv/state/postgres/`. The shell
 sets `DATABASE_URL` to this role and database over the private Unix socket, so
 SQLx fixture tests can run after the service starts.
 
-Linux Nix package and test checks run all features with an isolated PostgreSQL
-service. The pinned PostgreSQL test hook does not support Darwin, so Darwin
-package and test checks run the default features; Clippy still compiles all
-features. To run PostgreSQL tests locally on Darwin, start the service above and
-run `cargo nextest run --workspace --all-features` in the development shell.
+Linux Nix package and test checks run the database suite with an isolated
+PostgreSQL service. The pinned PostgreSQL test hook does not support Darwin, so
+pure Nix PostgreSQL test provisioning there remains blocked. For local tests on
+Darwin, start the service above and run `cargo nextest run --workspace` in the
+development shell.
 
 See [AGENTS.md](AGENTS.md) for contribution conventions.
 

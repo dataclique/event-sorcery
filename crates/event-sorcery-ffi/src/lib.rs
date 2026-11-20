@@ -28,8 +28,8 @@ use event_sorcery::{
     CompactionPolicy, DeadReason, Engine, EngineError, JobClaimHandle, JobClaimResult, JobId,
     JobLeaseResult, JobRuntime, JobRuntimeError, JobSeed, JobSettlementResult, JobStoreError,
     OpaqueCommitRequest, OpaqueProposedEvent, OpaqueStoredEvent, ReconcileError,
-    SchemaReconciliation, SchemaTarget, SnapshotWrite, SqliteJobError, StreamIdentity,
-    decode_opaque_payload, encode_opaque_payload,
+    SchemaReconciliation, SchemaTarget, SnapshotWrite, SqliteBackend, SqliteJobError,
+    StreamIdentity, decode_opaque_payload, encode_opaque_payload,
 };
 
 const ABI_MAJOR: u32 = 0;
@@ -1107,7 +1107,7 @@ enum SqliteCacheMode {
 struct StoreInner {
     runtime: tokio::runtime::Runtime,
     engine: Engine,
-    jobs: JobRuntime,
+    jobs: JobRuntime<SqliteBackend>,
     claims: Mutex<ClaimRegistry>,
 }
 
@@ -1768,6 +1768,9 @@ impl From<EngineError> for AbiError {
             // permanently refused, so it must not surface as retryable storage.
             EngineError::Schema(ReconcileError::CompactedSnapshotClear { .. }) => {
                 Self::State("compacted snapshot retention cannot be cleared")
+            }
+            EngineError::Schema(ReconcileError::UnprovenSnapshotHistory { .. }) => {
+                Self::State("snapshot history cannot be proven complete")
             }
             other => Self::Engine(other),
         }
@@ -4955,6 +4958,18 @@ mod tests {
         );
         assert_eq!(reconciliation, 1);
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn unproven_snapshot_history_is_a_nonretryable_state_error() {
+        let error = AbiError::from(EngineError::Schema(
+            ReconcileError::UnprovenSnapshotHistory {
+                stream: StreamIdentity::new("ffi-schema", "one"),
+                covered_sequence: 2,
+                retained_events: 1,
+            },
+        ));
+        assert_eq!(error.code(), ES_ERR_STATE);
     }
 
     #[test]

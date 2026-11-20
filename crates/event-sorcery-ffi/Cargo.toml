@@ -12,11 +12,11 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 ciborium.workspace = true
 cqrs-es.workspace = true
-event-sorcery.workspace = true
+event-sorcery = { workspace = true, features = ["sqlite"] }
 getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true

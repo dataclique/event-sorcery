@@ -119,7 +119,8 @@ impl SqlQueryFactory {
                 view_id,
                 version,
                 payload
-            ) VALUES (?, ?, ?)"
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(view_id) DO NOTHING"
         )
     }
 

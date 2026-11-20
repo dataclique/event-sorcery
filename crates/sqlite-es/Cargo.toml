@@ -7,6 +7,7 @@ homepage.workspace = true
 
 [dependencies]
 cqrs-es.workspace = true
+indexed-query.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

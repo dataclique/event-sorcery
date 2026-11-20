@@ -1,8 +1,10 @@
 [workspace]
 members = [
   "crates/sqlite-es",
+  "crates/postgr-es",
   "crates/event-sorcery",
   "crates/event-sorcery-ffi",
+  "crates/indexed-query",
 ]
 exclude = ["examples/simple", "examples/complex"]
 resolver = "2"
@@ -37,18 +39,19 @@ must_use_candidate = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.dependencies]
-apalis-core = "=1.0.0-rc.9"
+apalis-core = "=1.0.0"
 async-trait = "0.1.89"
 cbindgen = "=0.29.2"
 ciborium = "0.2.2"
-cqrs-es = { git = "https://github.com/0xgleb/cqrs", rev = "d61e05290bc7b24af1f615bc828a74ae6fc22f25", version = "0.5.0" }
+cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87", version = "0.5.0" }
 event-sorcery = { path = "crates/event-sorcery" }
+futures-util = "0.3.34"
 getrandom = "0.3.4"
+indexed-query = { path = "crates/indexed-query" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sqlite-es = { path = "crates/sqlite-es" }
 sqlx = { version = "0.9.0", features = [
-  "sqlite",
   "chrono",
   "runtime-tokio",
   "tls-rustls",

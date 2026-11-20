@@ -13,13 +13,14 @@ use cqrs_es::{Aggregate, EventEnvelope, Query, View};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::dependency::HasEntity;
 use crate::dispatch::JobDispatch;
-use crate::reactor::Reactor;
+use crate::reactor::{Reactor, ReactorContext};
 use crate::{Effect, EventSourced};
 
 /// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
@@ -76,7 +77,7 @@ impl<Entity: EventSourced> Lifecycle<Entity> {
 /// Errors from lifecycle state management.
 ///
 /// These are infrastructure-level errors produced by
-/// [`Lifecycle`]'s blanket `Aggregate` impl, not by domain
+/// `Lifecycle`'s blanket `Aggregate` impl, not by domain
 /// code directly. Domain errors are wrapped in the [`Apply`]
 /// variant.
 ///
@@ -350,7 +351,15 @@ where
             // No retry here by design -- wrap the reactor in `RetryOnBusy`
             // (gated by `IdempotentReactor`) to retry on transient SQLite
             // busy errors. See `docs/cqrs.md`'s "Reactors" section.
-            if let Err(error) = self.reactor.react(injected).await {
+            let Some(sequence) = NonZeroUsize::new(envelope.sequence) else {
+                error!(target: "cqrs", aggregate_id, sequence = envelope.sequence,
+                    "Persisted event has an invalid zero sequence; refusing reactor delivery");
+                continue;
+            };
+            let context = ReactorContext {
+                sequence: Some(sequence),
+            };
+            if let Err(error) = self.reactor.react_with_context(injected, context).await {
                 error!(
                     target: "cqrs",
                     ?error,
@@ -374,10 +383,7 @@ mod tests {
 
     use super::*;
     use crate::dependency::{Cons, Dependent, EntityList};
-    use crate::reactor::{
-        IdempotentReactor, RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS,
-        RetryOnBusy, backoff_delay_ms,
-    };
+    use crate::reactor::{IdempotentReactor, RETRY_MAX_ATTEMPTS, RetryOnBusy};
     use crate::{CompactionPolicy, EventSourced, Nil, uneventful};
 
     /// Test entity: a simple counter with controllable error behavior.
@@ -820,6 +826,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_refuses_zero_sequence_without_discarding_valid_delivery() {
+        let reactor = Arc::new(AlwaysFailReactor {
+            calls: AtomicU32::new(0),
+        });
+        let bridge = ReactorBridge {
+            reactor: Arc::clone(&reactor),
+        };
+        let invalid: EventEnvelope<Lifecycle<Counter>> = EventEnvelope {
+            aggregate_id: "counter-1".to_string(),
+            sequence: 0,
+            payload: CounterEvent::Created { initial: 1 },
+            metadata: HashMap::new(),
+        };
+        let valid = EventEnvelope {
+            sequence: 1,
+            ..invalid.clone()
+        };
+        bridge.dispatch("counter-1", &[invalid, valid]).await;
+        assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn dispatch_retries_busy_error_via_retry_on_busy_and_succeeds() {
         let reactor = Arc::new(RetryOnBusy {
             inner: FlakyIdempotentReactor {
@@ -865,9 +893,7 @@ mod tests {
             payload: CounterEvent::Created { initial: 1 },
             metadata: HashMap::new(),
         };
-        let full_schedule: u64 = (0..RETRY_MAX_ATTEMPTS)
-            .map(|attempt| backoff_delay_ms(attempt, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS))
-            .sum();
+        let full_schedule = std::time::Duration::from_millis(4_270);
         let started = tokio::time::Instant::now();
 
         bridge.dispatch("counter-1", &[envelope]).await;
@@ -875,10 +901,7 @@ mod tests {
         // Paused Tokio time advances only through the retry sleeps, so the
         // elapsed virtual time IS the backoff schedule -- immediate retries
         // or removed delays fail this exactly.
-        assert_eq!(
-            started.elapsed(),
-            std::time::Duration::from_millis(full_schedule)
-        );
+        assert_eq!(started.elapsed(), full_schedule);
         assert!(!reactor.inner.applied.load(Ordering::SeqCst));
         assert_eq!(
             reactor.inner.calls.load(Ordering::SeqCst),

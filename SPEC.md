@@ -80,8 +80,24 @@ shared persistence contracts.
 
 Database-specific SQL and transaction mechanisms MAY differ. Command validation,
 job-event construction, and durable lifecycle decisions MUST remain shared
-library code. Adding a backend MUST preserve existing public constructors,
-backend implementations, migrations, stored data, and behavior.
+library code. Adding a backend MUST preserve existing public constructor
+signatures, backend implementations, migrations, stored data, and behavior.
+Database-specific integrations MUST be opt-in: the default core build and a
+PostgreSQL-only build MUST NOT pull in SQLite repositories, SQLite driver
+dependencies, or SQLite implementation modules. SQLite constructors and
+reexports remain available when the SQLite integration is explicitly enabled.
+Generic modules MUST keep backend implementations in their owning integration
+modules rather than embed SQLite implementations alongside backend-neutral
+interfaces.
+
+Backend type parameters MUST NOT have implicit database defaults. Named type
+annotations specify the backend; constructors MAY infer it from their inputs or
+backend-specific implementation.
+
+Shared indexed-query contracts and SQL lowering MUST live in a focused neutral
+workspace crate, not in a storage backend or the temporary CQRS fix fork.
+Existing SQLite query imports MUST remain available through reexports of those
+shared definitions. Repositories retain database execution and pool ownership.
 
 Each persistence implementation MUST:
 

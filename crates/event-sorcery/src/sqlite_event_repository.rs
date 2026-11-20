@@ -9,10 +9,10 @@ use cqrs_es::persist::{
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
-use tracing::warn;
 
 use crate::CompactionPolicy;
-use crate::engine::{CommitRequest, Engine, EngineError, SnapshotUpdate, StreamIdentity};
+use crate::engine::{CommitRequest, Engine, SnapshotUpdate, StreamIdentity};
+use crate::persistence::guard_snapshot;
 
 /// SQLite implementation of the cqrs-es [`PersistedEventRepository`].
 ///
@@ -121,36 +121,7 @@ impl PersistedEventRepository for SqliteEventRepository {
             return Ok(None);
         };
 
-        // Whether an incompatible snapshot must be guarded depends on the
-        // entity's compaction policy (ADR-0003).
-        match self.compaction_policy {
-            // A `Retain` aggregate keeps its full event history, so cqrs-es
-            // safely rebuilds from events on a deserialize failure. The snapshot
-            // is returned as stored -- no shape check is needed here, and doing
-            // one would only duplicate the deserialize cqrs-es already performs.
-            CompactionPolicy::Retain => Ok(Some(snapshot)),
-            // A compacting aggregate (full or windowed) may have lost the
-            // events behind the snapshot, making the snapshot the only
-            // durable record of state. An incompatible payload must surface
-            // an error rather than letting cqrs-es silently rebuild from an
-            // incomplete history.
-            CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => {
-                match A::deserialize(&snapshot.aggregate) {
-                    Ok(_) => Ok(Some(snapshot)),
-                    Err(source) => {
-                        warn!(
-                            target: "cqrs",
-                            aggregate_type = A::TYPE,
-                            aggregate_id,
-                            %source,
-                            "Incompatible snapshot for a compactable aggregate cannot be \
-                             safely rebuilt from events; surfacing error"
-                        );
-                        Err(EngineError::Json(source).into())
-                    }
-                }
-            }
-        }
+        guard_snapshot::<A>(snapshot, self.compaction_policy).map(Some)
     }
 
     async fn persist<A: Aggregate>(
@@ -227,6 +198,7 @@ mod tests {
     use sqlite_es::testing::create_test_pool;
 
     use super::*;
+    use crate::engine::EngineError;
     use crate::job::{
         EnqueueRequest, ErasedJob, JobId, JobKind, PendingPush, enqueued_event,
         pending_seed_payload,
