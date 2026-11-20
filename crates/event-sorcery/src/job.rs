@@ -22,6 +22,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::error;
 use ulid::Ulid;
@@ -800,7 +802,12 @@ pub(crate) struct PendingPush {
 /// Encoded pending jobs whose source buffer remains intact until commit.
 pub struct PreparedPendingJobs {
     requests: Vec<EnqueueRequest>,
-    prepared_count: Option<usize>,
+    acknowledgements: Vec<Arc<AtomicBool>>,
+}
+
+struct PendingBufferEntry {
+    push: PendingPush,
+    committed: Arc<AtomicBool>,
 }
 
 /// Type erasure over a dispatched [`crate::Job`] so the pending buffer can
@@ -829,10 +836,8 @@ impl PreparedPendingJobs {
 
     /// Removes the retained source pushes included in a successful database commit.
     pub fn mark_committed(self) {
-        if let Some(prepared_count) = self.prepared_count {
-            PENDING_JOBS.with(|pending| {
-                drop(pending.borrow_mut().drain(..prepared_count));
-            });
+        for acknowledgement in self.acknowledgements {
+            acknowledgement.store(true, Ordering::Release);
         }
     }
 }
@@ -840,7 +845,7 @@ impl PreparedPendingJobs {
 tokio::task_local! {
     /// Per-command buffer of jobs awaiting flush, cleared by the event
     /// repository only after its commit transaction succeeds.
-    static PENDING_JOBS: RefCell<Vec<PendingPush>>;
+    static PENDING_JOBS: RefCell<Vec<PendingBufferEntry>>;
 }
 
 /// Runs `command_execution` with a fresh pending-job scope active, so the
@@ -862,7 +867,12 @@ pub(crate) async fn with_pending_scope<Output>(
 /// `Dispatched` event is never committed without its enqueue.
 pub(crate) fn buffer(push: PendingPush) -> Result<(), DispatchNotBuffered> {
     PENDING_JOBS
-        .try_with(|pending| pending.borrow_mut().push(push))
+        .try_with(|pending| {
+            pending.borrow_mut().push(PendingBufferEntry {
+                push,
+                committed: Arc::new(AtomicBool::new(false)),
+            });
+        })
         .map_err(|_| DispatchNotBuffered)
 }
 
@@ -878,10 +888,12 @@ pub struct DispatchNotBuffered;
 /// succeeds, leaving the original pushes available after any failure.
 pub(crate) fn prepare_pending() -> Result<PreparedPendingJobs, JobStoreError> {
     let prepared = PENDING_JOBS.try_with(|pending| {
-        let pending = pending.borrow();
+        let mut pending = pending.borrow_mut();
+        pending.retain(|entry| !entry.committed.load(Ordering::Acquire));
         let requests = pending
             .iter()
-            .map(|push| {
+            .map(|entry| {
+                let push = &entry.push;
                 Ok(EnqueueRequest {
                     job_id: push.job_id,
                     kind: push.job.kind(),
@@ -890,19 +902,22 @@ pub(crate) fn prepare_pending() -> Result<PreparedPendingJobs, JobStoreError> {
                 })
             })
             .collect::<Result<Vec<_>, JobStoreError>>()?;
-        Ok::<_, JobStoreError>((requests, pending.len()))
+        let acknowledgements = pending
+            .iter()
+            .map(|entry| Arc::clone(&entry.committed))
+            .collect();
+        Ok::<_, JobStoreError>(PreparedPendingJobs {
+            requests,
+            acknowledgements,
+        })
     });
-    let (requests, prepared_count) = match prepared {
-        Ok(prepared) => {
-            let (requests, prepared_count) = prepared?;
-            (requests, Some(prepared_count))
-        }
-        Err(_) => (Vec::new(), None),
-    };
-    Ok(PreparedPendingJobs {
-        requests,
-        prepared_count,
-    })
+    match prepared {
+        Ok(prepared) => prepared,
+        Err(_) => Ok(PreparedPendingJobs {
+            requests: Vec::new(),
+            acknowledgements: Vec::new(),
+        }),
+    }
 }
 
 /// Drains the per-command pending-job buffer into [`EnqueueRequest`]s for tests
@@ -1043,6 +1058,54 @@ mod tests {
             assert_eq!(remaining[0].job_id, later_job_id);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn commit_receipt_acknowledges_its_original_scope_inside_another_scope() {
+        with_pending_scope(async {
+            buffer(PendingPush {
+                job_id: JobId::new(),
+                job: Box::new(TestPendingJob),
+                delay: None,
+            })
+            .unwrap();
+            let prepared = prepare_pending().unwrap();
+            let inner_id = JobId::new();
+
+            with_pending_scope(async {
+                buffer(PendingPush {
+                    job_id: inner_id,
+                    job: Box::new(TestPendingJob),
+                    delay: None,
+                })
+                .unwrap();
+                prepared.mark_committed();
+                let remaining = take_pending().unwrap();
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].job_id, inner_id);
+            })
+            .await;
+
+            assert_eq!(take_pending().unwrap().len(), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn commit_receipt_can_complete_after_its_command_scope_ends() {
+        let prepared = with_pending_scope(async {
+            buffer(PendingPush {
+                job_id: JobId::new(),
+                job: Box::new(TestPendingJob),
+                delay: None,
+            })
+            .unwrap();
+            prepare_pending().unwrap()
+        })
+        .await;
+
+        prepared.mark_committed();
+        assert_eq!(take_pending().unwrap().len(), 0);
     }
 
     #[test]
