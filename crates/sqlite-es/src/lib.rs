@@ -43,6 +43,7 @@
 //! let query = GenericQuery::new(view_repo);
 //! ```
 
+mod aggregate_ids;
 mod compaction;
 mod cqrs;
 mod event_repository;
@@ -63,6 +64,7 @@ mod view_repository;
 /// edit them afterwards.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+pub use aggregate_ids::{count_aggregates, load_all_ids, load_ids_paginated};
 pub use compaction::compact_events;
 pub use cqrs::{SqliteCqrs, sqlite_cqrs};
 pub use cqrs_es::persist::ViewContext;

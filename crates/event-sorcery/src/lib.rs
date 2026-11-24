@@ -1219,6 +1219,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_ids_paginated_orders_by_maximum_rowid_after_an_append() {
+        let pool = test_pool().await;
+        let store = test_store::<Widget>(pool.clone());
+        for id in [1, 2] {
+            store
+                .send(
+                    &NumericId(id),
+                    WidgetCommand::Create {
+                        name: id.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .send(
+                &NumericId(1),
+                WidgetCommand::Rename {
+                    name: "renamed".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_ids_paginated::<Widget>(&pool, 1, 0).await.unwrap(),
+            [NumericId(1)]
+        );
+        assert_eq!(
+            load_ids_paginated::<Widget>(&pool, 1, 1).await.unwrap(),
+            [NumericId(2)]
+        );
+        assert_eq!(load_ids_paginated::<Widget>(&pool, 1, 2).await.unwrap(), []);
+    }
+
+    #[tokio::test]
     async fn load_all_ids_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
         let store = test_store::<Widget>(pool.clone());

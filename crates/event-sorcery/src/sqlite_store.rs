@@ -192,21 +192,11 @@ pub async fn load_all_ids<Entity: EventSourced>(
 where
     <Entity::Id as FromStr>::Err: Debug,
 {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT aggregate_id FROM ( \
-             SELECT aggregate_id FROM events WHERE aggregate_type = ?1 \
-             UNION \
-             SELECT aggregate_id FROM snapshots WHERE aggregate_type = ?1 \
-         ) \
-         ORDER BY aggregate_id ASC",
-    )
-    .bind(Entity::AGGREGATE_TYPE)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlite_es::load_all_ids(pool, Entity::AGGREGATE_TYPE).await?;
 
     let (ids, invalid) = rows.into_iter().fold(
         (Vec::new(), Vec::new()),
-        |(mut ids, mut invalid), (id_str,)| {
+        |(mut ids, mut invalid), id_str| {
             match id_str.parse::<Entity::Id>() {
                 Ok(id) => ids.push(id),
                 Err(parse_error) => {
@@ -234,11 +224,11 @@ where
     }
 }
 
-/// Load aggregate IDs with pagination, newest first (by highest rowid).
+/// Load up to `limit` aggregate IDs starting from `offset`.
 ///
-/// Returns up to `limit` IDs starting from `offset`, ordered by most
-/// recently created aggregate first (based on the maximum rowid of each
-/// aggregate's events or snapshot).
+/// Orders IDs by descending maximum rowid across each aggregate's events and
+/// snapshot, not by creation time. An append can change the order; ties have
+/// no guaranteed order.
 ///
 /// # Errors
 ///
@@ -251,31 +241,17 @@ pub async fn load_ids_paginated<Entity: EventSourced>(
 where
     <Entity::Id as FromStr>::Err: Debug,
 {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT aggregate_id FROM ( \
-             SELECT aggregate_id, MAX(rowid) AS latest_rowid \
-             FROM events \
-             WHERE aggregate_type = ?1 \
-             GROUP BY aggregate_id \
-             UNION ALL \
-             SELECT aggregate_id, MAX(rowid) AS latest_rowid \
-             FROM snapshots \
-             WHERE aggregate_type = ?1 \
-             GROUP BY aggregate_id \
-         ) \
-         GROUP BY aggregate_id \
-         ORDER BY MAX(latest_rowid) DESC \
-         LIMIT ?2 OFFSET ?3",
+    let rows = sqlite_es::load_ids_paginated(
+        pool,
+        Entity::AGGREGATE_TYPE,
+        i64::try_from(limit)?,
+        i64::try_from(offset)?,
     )
-    .bind(Entity::AGGREGATE_TYPE)
-    .bind(i64::try_from(limit)?)
-    .bind(i64::try_from(offset)?)
-    .fetch_all(pool)
     .await?;
 
     let (ids, invalid) = rows.into_iter().fold(
         (Vec::new(), Vec::new()),
-        |(mut ids, mut invalid), (id_str,)| {
+        |(mut ids, mut invalid), id_str| {
             match id_str.parse::<Entity::Id>() {
                 Ok(id) => ids.push(id),
                 Err(parse_error) => {
@@ -311,18 +287,8 @@ where
 pub async fn count_aggregates<Entity: EventSourced>(
     pool: &SqlitePool,
 ) -> Result<usize, LoadAllIdsError> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM ( \
-             SELECT aggregate_id FROM events WHERE aggregate_type = ?1 \
-             UNION \
-             SELECT aggregate_id FROM snapshots WHERE aggregate_type = ?1 \
-         )",
-    )
-    .bind(Entity::AGGREGATE_TYPE)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(usize::try_from(row.0)?)
+    let count = sqlite_es::count_aggregates(pool, Entity::AGGREGATE_TYPE).await?;
+    Ok(usize::try_from(count)?)
 }
 
 #[cfg(any(test, feature = "test-support"))]
