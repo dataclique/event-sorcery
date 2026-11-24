@@ -381,7 +381,7 @@ pub async fn load_event_rows<EventRow>(
 where
     EventRow: for<'row> FromRow<'row, SqliteRow> + Send + Unpin,
 {
-    let factory = SqlQueryFactory::new("events".to_owned(), "snapshots".to_owned());
+    let factory = SqlQueryFactory::native_event_rows();
     let checkpoint = after_sequence.map(i64::try_from).transpose()?;
     let sql = match checkpoint {
         None => factory.select_events(),
@@ -413,7 +413,7 @@ where
         for<'row> FromRow<'row, SqliteRow> + Send + Unpin + TryInto<SerializedEvent> + 'static,
     EventRow::Error: Into<PersistenceError>,
 {
-    let factory = SqlQueryFactory::new("events".to_owned(), "snapshots".to_owned());
+    let factory = SqlQueryFactory::native_event_rows();
     let (mut feed, stream) = ReplayStream::new(channel_size);
     let pool = pool.clone();
     tokio::spawn(async move {

@@ -1083,6 +1083,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn numeric_json_remains_readable_before_upcasting_and_after_checkpoints() {
+        let repository =
+            SqliteEventRepository::new(create_test_pool().await.unwrap(), CompactionPolicy::Retain);
+        let mut events = covering_events("numeric", 2);
+        events[1].payload = serde_json::json!(42);
+        events[1].metadata = serde_json::json!(3.5);
+        repository
+            .persist::<TestAggregate>(&events, None)
+            .await
+            .unwrap();
+        let stream = StreamIdentity::new(TestAggregate::TYPE, "numeric");
+
+        assert_eq!(
+            repository.engine.load_events(&stream, None).await.unwrap(),
+            events
+        );
+        assert_eq!(
+            repository
+                .engine
+                .load_events(&stream, Some(1))
+                .await
+                .unwrap(),
+            events[1..]
+        );
+        for aggregate_id in [Some("numeric".to_string()), None] {
+            let mut replay = repository.engine.stream_events(
+                TestAggregate::TYPE,
+                aggregate_id,
+                1,
+                |mut event| {
+                    if event.sequence == 2 {
+                        assert_eq!(event.payload, serde_json::json!(42));
+                        assert_eq!(event.metadata, serde_json::json!(3.5));
+                        event.payload = serde_json::json!("Created");
+                        event.metadata = serde_json::json!({"upcast": "numeric"});
+                    }
+                    event
+                },
+            );
+            assert_eq!(
+                replay
+                    .next::<TestAggregate>(&[])
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sequence,
+                1
+            );
+            let event = replay.next::<TestAggregate>(&[]).await.unwrap().unwrap();
+            assert_eq!(event.sequence, 2);
+            assert_eq!(event.payload, TestEvent::Created);
+            assert_eq!(
+                event.metadata.get("upcast").map(String::as_str),
+                Some("numeric")
+            );
+            assert!(replay.next::<TestAggregate>(&[]).await.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn upcasters_apply_to_suffix_and_both_replay_paths_without_rewriting_history() {
         let pool = create_test_pool().await.unwrap();
         let writer = SqliteEventRepository::new(pool.clone(), CompactionPolicy::Retain);
