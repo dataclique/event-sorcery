@@ -1065,19 +1065,11 @@ mod tests {
     }
 
     async fn queue_row_count(engine: &Engine, job_id: &JobId) -> i64 {
-        let job_id = job_id.to_string();
-
-        sqlx::query_scalar!(
-            r"
-            SELECT COUNT(*)
-            FROM job_queue_projection
-            WHERE view_id = ?1
-            ",
-            job_id,
-        )
-        .fetch_one(engine.pool())
-        .await
-        .unwrap()
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_queue_projection WHERE view_id = ?1")
+            .bind(job_id.to_string())
+            .fetch_one(engine.pool())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

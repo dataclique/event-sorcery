@@ -825,11 +825,44 @@ mod tests {
         assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
     }
 
+    #[derive(Default)]
+    struct DeliveryProbe {
+        deliveries: tokio::sync::Mutex<Vec<(Option<NonZeroUsize>, CounterEvent)>>,
+    }
+
+    impl Dependent for DeliveryProbe {
+        type Dependencies = Cons<Counter, Nil>;
+    }
+
+    #[async_trait]
+    impl Reactor for DeliveryProbe {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Never> {
+            self.react_with_context(event, ReactorContext { sequence: None })
+                .await
+        }
+
+        async fn react_with_context(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+            context: ReactorContext,
+        ) -> Result<(), Never> {
+            let (_, payload) = event.into_inner();
+            self.deliveries
+                .lock()
+                .await
+                .push((context.sequence, payload));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_refuses_zero_sequence_without_discarding_valid_delivery() {
-        let reactor = Arc::new(AlwaysFailReactor {
-            calls: AtomicU32::new(0),
-        });
+        let reactor = Arc::new(DeliveryProbe::default());
         let bridge = ReactorBridge {
             reactor: Arc::clone(&reactor),
         };
@@ -841,10 +874,14 @@ mod tests {
         };
         let valid = EventEnvelope {
             sequence: 1,
+            payload: CounterEvent::Created { initial: 2 },
             ..invalid.clone()
         };
         bridge.dispatch("counter-1", &[invalid, valid]).await;
-        assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *reactor.deliveries.lock().await,
+            [(NonZeroUsize::new(1), CounterEvent::Created { initial: 2 })],
+        );
     }
 
     #[tokio::test]

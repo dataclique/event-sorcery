@@ -558,6 +558,12 @@ mod tests {
             let store = crate::test_store::<CompactableWidget>(pool.clone());
             let id = "legacy-widget".to_string();
             store.send(&id, ()).await.unwrap();
+            assert_eq!(
+                crate::compact_events::<CompactableWidget>(&pool)
+                    .await
+                    .unwrap(),
+                1
+            );
             let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
                                 WHERE aggregate_type = 'CompactableWidget'";
             let before: (i64, i64, String) =

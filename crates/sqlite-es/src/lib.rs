@@ -120,6 +120,7 @@ mod tests {
                     "kind": "migration-probe"
                 }}}),
                 "done",
+                "resolved by operator",
             ),
             (
                 "01ARZ3NDEKTSV4RRFFQ69G5FAX",
@@ -127,30 +128,33 @@ mod tests {
                     "kind": "migration-probe", "reason": "Abandoned"
                 }}}),
                 "dead",
+                "review abandonment",
             ),
         ];
-        for (view_id, payload, _) in &jobs {
+        for (view_id, payload, _, note) in &jobs {
             sqlx::query(
-                "INSERT INTO job_queue_projection (view_id, version, payload, lease_until) \
-                 VALUES (?1, 7, ?2, ?3)",
+                "INSERT INTO job_queue_projection \
+                 (view_id, version, payload, lease_until, operator_note) VALUES (?1, 7, ?2, ?3, ?4)",
             )
             .bind(view_id)
             .bind(payload.to_string())
             .bind(1_700_000_030_000_i64)
+            .bind(note)
             .execute(&pool)
             .await
             .unwrap();
         }
 
         MIGRATOR.run(&pool).await.unwrap();
-        let notes: Vec<String> =
-            sqlx::query_scalar("SELECT operator_note FROM job_queue_projection ORDER BY view_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(notes, ["retained", "retained"]);
-
-        for (view_id, payload, expected_status) in &jobs {
+        for (view_id, payload, expected_status, expected_note) in &jobs {
+            let note: String = sqlx::query_scalar(
+                "SELECT operator_note FROM job_queue_projection WHERE view_id = ?1",
+            )
+            .bind(view_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(note, *expected_note);
             let (version, stored, lease, kind, status, run_at): (
                 i64,
                 String,
