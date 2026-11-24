@@ -168,59 +168,17 @@ impl Engine {
         after_sequence: Option<usize>,
         limit: NonZeroUsize,
     ) -> Result<Vec<SerializedEvent>, EngineError> {
-        let limit = i64::try_from(limit.get())?;
-        let rows = match after_sequence {
-            None => {
-                sqlx::query_as::<_, StoredEventRow>(
-                    r"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload,
-                           metadata
-                    FROM events
-                    WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                    ORDER BY sequence
-                    LIMIT ?3
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            Some(after_sequence) => {
-                let after_sequence = i64::try_from(after_sequence)?;
-                sqlx::query_as::<_, StoredEventRow>(
-                    r"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload,
-                           metadata
-                    FROM events
-                    WHERE aggregate_type = ?1
-                      AND aggregate_id = ?2
-                      AND sequence > ?3
-                    ORDER BY sequence
-                    LIMIT ?4
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(after_sequence)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
-
-        rows.into_iter().map(SerializedEvent::try_from).collect()
+        sqlite_es::load_events_page::<StoredEventRow>(
+            &self.pool,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+            after_sequence,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(SerializedEvent::try_from)
+        .collect()
     }
 
     /// Loads an item- and storage-byte-bounded event page.
@@ -231,141 +189,18 @@ impl Engine {
         item_limit: NonZeroUsize,
         byte_limit: NonZeroUsize,
     ) -> Result<Vec<SerializedEvent>, EngineError> {
-        let item_limit = i64::try_from(item_limit.get())?;
-        let mut transaction = self.pool.begin().await?;
-        let storage_bytes = match after_sequence {
-            None => {
-                sqlx::query_scalar::<_, i64>(
-                    r"
-                    SELECT COALESCE(SUM(
-                        length(CAST(aggregate_type AS BLOB))
-                        + length(CAST(aggregate_id AS BLOB))
-                        + 8
-                        + length(CAST(event_type AS BLOB))
-                        + length(CAST(event_version AS BLOB))
-                        + length(CAST(payload AS BLOB))
-                        + length(CAST(metadata AS BLOB))
-                    ), 0)
-                    FROM (
-                        SELECT aggregate_type,
-                               aggregate_id,
-                               sequence,
-                               event_type,
-                               event_version,
-                               payload,
-                               metadata
-                        FROM events
-                        WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                        ORDER BY sequence
-                        LIMIT ?3
-                    )
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(item_limit)
-                .fetch_one(&mut *transaction)
-                .await?
-            }
-            Some(after_sequence) => {
-                let after_sequence = i64::try_from(after_sequence)?;
-                sqlx::query_scalar::<_, i64>(
-                    r"
-                    SELECT COALESCE(SUM(
-                        length(CAST(aggregate_type AS BLOB))
-                        + length(CAST(aggregate_id AS BLOB))
-                        + 8
-                        + length(CAST(event_type AS BLOB))
-                        + length(CAST(event_version AS BLOB))
-                        + length(CAST(payload AS BLOB))
-                        + length(CAST(metadata AS BLOB))
-                    ), 0)
-                    FROM (
-                        SELECT aggregate_type,
-                               aggregate_id,
-                               sequence,
-                               event_type,
-                               event_version,
-                               payload,
-                               metadata
-                        FROM events
-                        WHERE aggregate_type = ?1
-                          AND aggregate_id = ?2
-                          AND sequence > ?3
-                        ORDER BY sequence
-                        LIMIT ?4
-                    )
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(after_sequence)
-                .bind(item_limit)
-                .fetch_one(&mut *transaction)
-                .await?
-            }
-        };
-        let observed = usize::try_from(storage_bytes)?;
-        if observed > byte_limit.get() {
-            return Err(EngineError::EventPageTooLarge {
-                observed,
-                limit: byte_limit.get(),
-            });
-        }
-
-        let rows = match after_sequence {
-            None => {
-                sqlx::query_as::<_, StoredEventRow>(
-                    r"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload,
-                           metadata
-                    FROM events
-                    WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                    ORDER BY sequence
-                    LIMIT ?3
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(item_limit)
-                .fetch_all(&mut *transaction)
-                .await?
-            }
-            Some(after_sequence) => {
-                let after_sequence = i64::try_from(after_sequence)?;
-                sqlx::query_as::<_, StoredEventRow>(
-                    r"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload,
-                           metadata
-                    FROM events
-                    WHERE aggregate_type = ?1
-                      AND aggregate_id = ?2
-                      AND sequence > ?3
-                    ORDER BY sequence
-                    LIMIT ?4
-                    ",
-                )
-                .bind(&stream.aggregate_type)
-                .bind(&stream.aggregate_id)
-                .bind(after_sequence)
-                .bind(item_limit)
-                .fetch_all(&mut *transaction)
-                .await?
-            }
-        };
-        transaction.commit().await?;
-
-        rows.into_iter().map(SerializedEvent::try_from).collect()
+        sqlite_es::load_events_page_bounded::<StoredEventRow>(
+            &self.pool,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+            after_sequence,
+            item_limit,
+            byte_limit,
+        )
+        .await?
+        .into_iter()
+        .map(SerializedEvent::try_from)
+        .collect()
     }
 
     /// Loads an opaque event page while preserving legacy JSON event semantics.
@@ -744,6 +579,18 @@ async fn store_snapshot_in_transaction(
     .await?;
 
     Ok(snapshot_version)
+}
+
+impl From<sqlite_es::EventPageReadError> for EngineError {
+    fn from(error: sqlite_es::EventPageReadError) -> Self {
+        use sqlite_es::EventPageReadError::{Integer, Sql, TooLarge};
+
+        match error {
+            Sql(source) => Self::Sql(source),
+            Integer(source) => Self::Integer(source),
+            TooLarge { observed, limit } => Self::EventPageTooLarge { observed, limit },
+        }
+    }
 }
 
 impl From<sqlite_es::SqliteAggregateError> for EngineError {

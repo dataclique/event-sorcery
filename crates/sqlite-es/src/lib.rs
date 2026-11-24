@@ -46,6 +46,7 @@
 mod aggregate_ids;
 mod compaction;
 mod cqrs;
+mod event_page;
 mod event_repository;
 mod job_queue;
 mod projection_queries;
@@ -74,6 +75,7 @@ pub use aggregate_ids::{count_aggregates, load_all_ids, load_ids_paginated};
 pub use compaction::compact_events;
 pub use cqrs::{SqliteCqrs, sqlite_cqrs};
 pub use cqrs_es::persist::ViewContext;
+pub use event_page::{EventPageReadError, load_events_page, load_events_page_bounded};
 pub use event_repository::{
     SqliteAggregateError, SqliteEventRepository, insert_serialized_events_batch,
 };
