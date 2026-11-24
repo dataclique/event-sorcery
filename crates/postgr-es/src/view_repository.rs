@@ -23,6 +23,25 @@ impl ViewBackend for PostgresViewBackend {
     where
         ViewState: View<AggregateType> + Clone + 'static,
         AggregateType: Aggregate + 'static;
+
+    fn is_retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
+        use PersistenceError::{ConnectionError, UnknownError};
+
+        // CQRS does not expose these boxed errors through Error::source.
+        let sql_error = match error.downcast_ref::<PersistenceError>() {
+            Some(ConnectionError(source) | UnknownError(source)) => {
+                source.downcast_ref::<sqlx::Error>()
+            }
+            Some(_) => None,
+            None => error.downcast_ref::<sqlx::Error>(),
+        };
+        sql_error
+            .and_then(sqlx::Error::as_database_error)
+            .is_some_and(|source| match source.code().as_deref() {
+                Some("55P03" | "40001" | "40P01") => true,
+                Some(_) | None => false,
+            })
+    }
 }
 
 /// PostgreSQL storage for a materialized view and its optimistic version.
@@ -888,6 +907,76 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn projection_lock_timeout_is_retryable_without_advancing_the_checkpoint(pool: PgPool) {
+        sqlx::query(
+            "CREATE TABLE schema_projection (view_id TEXT PRIMARY KEY, \
+             version BIGINT NOT NULL, payload JSONB NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let writer = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        sqlx::query("SET lock_timeout = '100ms'")
+            .execute(&writer)
+            .await
+            .unwrap();
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            writer,
+            "schema_projection",
+        );
+        let view = RegisteredSchemaView {
+            name: "Account".to_string(),
+            schema_version: 10,
+        };
+        repository
+            .update_view(view.clone(), ViewContext::new("schema".to_string(), 0))
+            .await
+            .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE schema_projection IN SHARE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let (_, context) = repository
+            .load_with_context("schema")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.version, 1);
+        let error = repository
+            .update_view(view.clone(), context)
+            .await
+            .unwrap_err();
+
+        let PersistenceError::ConnectionError(source) = &error else {
+            panic!("expected a SQLx lock timeout: {error:?}");
+        };
+        let source = source.downcast_ref::<sqlx::Error>().unwrap();
+        let database = source.as_database_error().unwrap();
+        assert_eq!(database.code().as_deref(), Some("55P03"));
+        assert!(PostgresViewBackend::is_retryable_error(&error));
+        blocker.rollback().await.unwrap();
+        let (_, context) = repository
+            .load_with_context("schema")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.version, 1);
+        repository.update_view(view, context).await.unwrap();
+        let (_, context) = repository
+            .load_with_context("schema")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.version, 2);
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn unrelated_unique_failures_remain_storage_errors(pool: PgPool) {
         sqlx::query(
             "CREATE TABLE schema_projection (view_id TEXT PRIMARY KEY, \
@@ -918,6 +1007,7 @@ pub(crate) mod tests {
             .update_view(view, ViewContext::new("second".to_string(), 0))
             .await
             .unwrap_err();
+        assert!(!PostgresViewBackend::is_retryable_error(&error));
         let PersistenceError::ConnectionError(source) = error else {
             panic!("expected an unrelated uniqueness failure to remain a storage error");
         };
