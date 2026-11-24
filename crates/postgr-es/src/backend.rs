@@ -195,8 +195,8 @@ pub(crate) mod tests {
 
     use event_sorcery::{
         Column, CompactionPolicy, Cons, Dependent, DomainEvent, Effect, EntityList, EventSourced,
-        Never, Nil, OneOf, PersistenceBackend, ProjectedStoreBackend, Projection, Reactor,
-        ReactorContext, ReconcileError, Store, StoreBuilder, Table,
+        Never, Nil, OneOf, PersistenceBackend, ProjectedStoreBackend, Projection, ProjectionError,
+        Reactor, ReactorContext, ReconcileError, Store, StoreBuilder, Table,
     };
 
     use crate::view_repository::tests::{RegisteredSchemaEvent, RegisteredSchemaView};
@@ -397,6 +397,32 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(registry, 0);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn standalone_rebuild_refuses_compaction_without_replacing_the_view(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let backend = PostgresBackend { pool: pool.clone() };
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(backend)
+                .build()
+                .await
+                .unwrap();
+        let id = "projected".to_string();
+        store.send(&id, "before".to_string()).await.unwrap();
+        let before = projection.load(&id).await.unwrap().unwrap();
+        let compactable =
+            Projection::<ProjectedNote<1, true>, PostgresViewBackend>::with_backend(pool);
+
+        let result = compactable.rebuild_all().await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectionError::RequiresRetainedHistory {
+                aggregate_type: "ProjectedNote"
+            })
+        ));
+        assert_eq!(projection.load(&id).await.unwrap(), Some(before));
     }
 
     #[sqlx::test(migrations = false)]

@@ -43,6 +43,12 @@ impl std::fmt::Display for Column {
 /// Errors from [`Projection`] query operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectionError<Entity: EventSourced> {
+    /// Replay requires an entity configured to retain its event history.
+    #[error("projection recovery requires retained history for aggregate '{aggregate_type}'")]
+    RequiresRetainedHistory {
+        /// Entity type whose projection cannot be recovered from compactable history.
+        aggregate_type: &'static str,
+    },
     #[error(
         "operation requires a SQLite-backed projection \
          created via Projection::sqlite()"

@@ -7,20 +7,30 @@ use event_sorcery_core::{
 use tracing::warn;
 
 use crate::lifecycle::Lifecycle;
-use crate::{EventSourced, ProjectionError, Table};
+use crate::{CompactionPolicy, EventSourced, ProjectionError, Table};
 
 /// Replays materialized state without acquiring or committing a connection.
 ///
 /// # Errors
 ///
-/// Preserves database, payload-decoding and lifecycle failures. The caller must
-/// roll back on failure and register the schema before committing on success.
+/// Rejects compactable entities before modifying the projection. Preserves
+/// database, payload-decoding and lifecycle failures. The caller must roll back
+/// on failure and register the schema before committing on successful startup.
 pub async fn recover_projection<Entity: EventSourced<Materialized = Table>>(
     storage: &mut impl ProjectionRecoveryStorage,
     mode: &ProjectionRecoveryMode,
 ) -> Result<(), ProjectionError<Entity>> {
-    let table = Entity::PROJECTION;
+    use CompactionPolicy::{CompactAfterSnapshot, Retain, RetainLast};
+
     let aggregate_type = <Lifecycle<Entity> as Aggregate>::TYPE;
+    match Entity::COMPACTION_POLICY {
+        Retain => {}
+        CompactAfterSnapshot | RetainLast { .. } => {
+            return Err(ProjectionError::RequiresRetainedHistory { aggregate_type });
+        }
+    }
+
+    let table = Entity::PROJECTION;
     storage.reset(table, mode).await?;
     let streams = storage.streams(table, aggregate_type, mode).await?;
     for stream in streams {
