@@ -556,9 +556,9 @@ mod tests {
             })
             .unwrap();
 
-            register_schema::<SchemaProbe<1, false>, _>(
+            Box::pin(register_schema::<SchemaProbe<1, false>, _>(
                 backend.persistence_repo(CompactionPolicy::Retain),
-            )
+            ))
             .await
             .unwrap();
 
