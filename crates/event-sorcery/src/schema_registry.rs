@@ -564,6 +564,16 @@ mod tests {
                     .unwrap(),
                 1
             );
+            let retained_events: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM events WHERE aggregate_type = ?1 AND aggregate_id = ?2",
+            )
+            .bind("CompactableWidget")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(retained_events, 0);
+
             let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
                                 WHERE aggregate_type = 'CompactableWidget'";
             let before: (i64, i64, String) =
