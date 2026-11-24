@@ -41,11 +41,11 @@ use cqrs_es::{CqrsFramework, Query};
 use crate::Nil;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
-use crate::projection::{Projection, Table};
+use crate::projection::Projection;
 use crate::reactor::Reactor;
 use crate::schema_registry::ReconcileError;
 use crate::{
-    CompactionPolicy, EventSourced, PersistenceBackend, ProjectedStoreBackend, Store,
+    CompactionPolicy, EventSourced, PersistenceBackend, ProjectedStoreBackend, Store, Table,
     UnmaterializedStoreBackend,
 };
 

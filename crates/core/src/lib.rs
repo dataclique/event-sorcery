@@ -1,5 +1,25 @@
 //! Shared persistence contracts for event-sorcery and its storage adapters.
 
+mod projection_recovery;
+
+pub use projection_recovery::{
+    ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow,
+};
+
+/// A materialized view table name.
+#[derive(Debug, Clone, Copy)]
+pub struct Table(
+    /// The table declared by the entity for its materialized view.
+    pub &'static str,
+);
+
+impl std::fmt::Display for Table {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(name) = self;
+        formatter.write_str(name)
+    }
+}
+
 /// Whether old events may be deleted after they are captured in a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionPolicy {

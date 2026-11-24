@@ -16,7 +16,6 @@ use tracing::{error, trace, warn};
 
 use indexed_query::{IndexedView, Order, Predicate};
 
-use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::reactor::{
@@ -24,20 +23,7 @@ use crate::reactor::{
     retry_delays,
 };
 use crate::view_backend::ViewBackend;
-
-/// A materialized view table name.
-///
-/// Used with [`EventSourced::PROJECTION`] to declare that an
-/// entity has a materialized view, and with
-/// [`Projection::with_backend`] to create the projection.
-#[derive(Debug, Clone, Copy)]
-pub struct Table(pub &'static str);
-
-impl std::fmt::Display for Table {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
-    }
-}
+use crate::{EventSourced, Table};
 
 /// A column name for view table queries.
 ///

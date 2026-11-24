@@ -124,7 +124,10 @@ use serde::de::DeserializeOwned;
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
 
-pub use event_sorcery_core::CompactionPolicy;
+pub use event_sorcery_core::{
+    CompactionPolicy, ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage,
+    ProjectionReplayRow, Table,
+};
 
 #[doc(hidden)]
 pub use dependency::Cons;
@@ -163,11 +166,8 @@ pub use persistence::{
     PersistenceBackend, ProjectedStoreBackend, SCHEMA_REGISTRY_ID, UnmaterializedStoreBackend,
     guard_snapshot, reconcile_schema, register_schema,
 };
-pub use projection::{Column, Projection, ProjectionError, Table};
-pub use projection_recovery::{
-    ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow,
-    recover_projection,
-};
+pub use projection::{Column, Projection, ProjectionError};
+pub use projection_recovery::recover_projection;
 #[cfg(any(test, feature = "sqlite"))]
 pub use reactor::{IdempotentReactor, RetryOnBusy, is_retryable_sqlite_busy};
 pub use reactor::{
