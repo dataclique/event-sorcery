@@ -4,7 +4,81 @@ use cqrs_es::persist::SerializedSnapshot;
 use serde_json::Value;
 use sqlx::{SqliteConnection, SqlitePool};
 
-use crate::SqliteAggregateError;
+use crate::{SqliteAggregateError, committed_stream_version};
+
+/// Stores a snapshot independently of an event append, under the SQLite write lock.
+///
+/// The covered event sequence must not exceed the durable stream version, or
+/// precede the current snapshot's coverage. Returns the next snapshot counter.
+pub async fn store_snapshot(
+    pool: &SqlitePool,
+    aggregate_type: &str,
+    aggregate_id: &str,
+    last_sequence: usize,
+    aggregate: &Value,
+) -> Result<usize, StoreSnapshotError> {
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let current = committed_stream_version(&mut transaction, aggregate_type, aggregate_id).await?;
+    if current == 0 {
+        return Err(StoreSnapshotError::EmptyStream);
+    }
+    if last_sequence > current {
+        return Err(StoreSnapshotError::BeyondCurrentVersion {
+            proposed: last_sequence,
+            current,
+        });
+    }
+
+    let stored = load_snapshot(&mut transaction, aggregate_type, aggregate_id).await?;
+    if stored
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.current_sequence > last_sequence)
+    {
+        return Err(SqliteAggregateError::OptimisticLock.into());
+    }
+    let snapshot_version = stored.map_or(Ok(1), |snapshot| {
+        snapshot
+            .current_snapshot
+            .checked_add(1)
+            .ok_or(StoreSnapshotError::VersionExhausted)
+    })?;
+    write_snapshot(
+        &mut transaction,
+        aggregate_type,
+        aggregate_id,
+        last_sequence,
+        snapshot_version,
+        aggregate,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(snapshot_version)
+}
+
+/// Failure to write a snapshot independently of an event append.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreSnapshotError {
+    /// The stream has never committed any events.
+    #[error("snapshot update was requested without persisted events")]
+    EmptyStream,
+    /// The proposed coverage exceeds the durable stream version.
+    #[error("snapshot sequence {proposed} is beyond the current stream version {current}")]
+    BeyondCurrentVersion {
+        /// Proposed covered event sequence.
+        proposed: usize,
+        /// Current durable version of the stream.
+        current: usize,
+    },
+    /// The snapshot counter cannot be incremented.
+    #[error("snapshot version is exhausted")]
+    VersionExhausted,
+    /// SQLite could not start or commit the write transaction.
+    #[error(transparent)]
+    Sql(#[from] sqlx::Error),
+    /// Loading or writing the snapshot failed.
+    #[error(transparent)]
+    Repository(#[from] SqliteAggregateError),
+}
 
 /// Writes a snapshot after the caller checks its coverage in the same transaction.
 ///

@@ -83,7 +83,10 @@ pub use job_queue::{SqliteJobError, claim_job, enqueue_job, renew_job};
 pub use projection_queries::{SqliteProjectionFilterError, filter_projection, projection_rows};
 pub use projection_recovery::SqliteProjectionRecovery;
 pub use schema_registry::load_schema_registry_payloads;
-pub use snapshot::{clear_snapshots, discard_snapshot, load_snapshot, write_snapshot};
+pub use snapshot::{
+    StoreSnapshotError, clear_snapshots, discard_snapshot, load_snapshot, store_snapshot,
+    write_snapshot,
+};
 pub use stream_version::committed_stream_version;
 pub use vacuum::{incremental_vacuum, vacuum};
 pub use view_repository::{

@@ -258,12 +258,14 @@ impl Engine {
         stream: &StreamIdentity,
         snapshot: SnapshotWrite,
     ) -> Result<usize, EngineError> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let snapshot_version =
-            store_snapshot_in_transaction(&mut transaction, stream, snapshot).await?;
-        transaction.commit().await?;
-
-        Ok(snapshot_version)
+        Ok(sqlite_es::store_snapshot(
+            &self.pool,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+            snapshot.last_sequence,
+            &snapshot.aggregate,
+        )
+        .await?)
     }
 
     pub async fn discard_snapshot(&self, stream: &StreamIdentity) -> Result<(), EngineError> {
@@ -525,60 +527,22 @@ async fn load_events_on(
     rows.into_iter().map(SerializedEvent::try_from).collect()
 }
 
-/// Writes one snapshot against the version the stream durably committed.
-///
-/// Compaction erases the events a snapshot already covers, so the surviving
-/// maximum sequence is not the stream's version. Validating against
-/// [`sqlite_es::committed_stream_version`] keeps a snapshot of a compacted stream
-/// acceptable while still rejecting one that runs ahead of the committed
-/// version.
-async fn store_snapshot_in_transaction(
-    connection: &mut SqliteConnection,
-    stream: &StreamIdentity,
-    snapshot: SnapshotWrite,
-) -> Result<usize, EngineError> {
-    let current_sequence = sqlite_es::committed_stream_version(
-        connection,
-        &stream.aggregate_type,
-        &stream.aggregate_id,
-    )
-    .await?;
-    if current_sequence == 0 {
-        return Err(EngineError::EmptySnapshotUpdate);
-    }
+impl From<sqlite_es::StoreSnapshotError> for EngineError {
+    fn from(error: sqlite_es::StoreSnapshotError) -> Self {
+        use sqlite_es::StoreSnapshotError::{
+            BeyondCurrentVersion, EmptyStream, Repository, Sql, VersionExhausted,
+        };
 
-    if snapshot.last_sequence > current_sequence {
-        return Err(EngineError::SnapshotBeyondCurrentVersion {
-            proposed: snapshot.last_sequence,
-            current: current_sequence,
-        });
+        match error {
+            EmptyStream => Self::EmptySnapshotUpdate,
+            BeyondCurrentVersion { proposed, current } => {
+                Self::SnapshotBeyondCurrentVersion { proposed, current }
+            }
+            VersionExhausted => Self::SnapshotVersionExhausted,
+            Sql(source) => Self::Sql(source),
+            Repository(source) => source.into(),
+        }
     }
-
-    let stored =
-        sqlite_es::load_snapshot(connection, &stream.aggregate_type, &stream.aggregate_id).await?;
-    if stored
-        .as_ref()
-        .is_some_and(|current| current.current_sequence > snapshot.last_sequence)
-    {
-        return Err(EngineError::OptimisticLock);
-    }
-    let snapshot_version = stored.map_or(Ok(1), |current| {
-        current
-            .current_snapshot
-            .checked_add(1)
-            .ok_or(EngineError::SnapshotVersionExhausted)
-    })?;
-    sqlite_es::write_snapshot(
-        connection,
-        &stream.aggregate_type,
-        &stream.aggregate_id,
-        snapshot.last_sequence,
-        snapshot_version,
-        &snapshot.aggregate,
-    )
-    .await?;
-
-    Ok(snapshot_version)
 }
 
 impl From<sqlite_es::EventPageReadError> for EngineError {
