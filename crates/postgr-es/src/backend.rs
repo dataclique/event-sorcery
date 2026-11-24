@@ -73,6 +73,15 @@ impl ProjectedStoreBackend for PostgresBackend {
     {
         use SchemaReconciliation::{Changed, Unchanged};
 
+        match Entity::COMPACTION_POLICY {
+            CompactionPolicy::Retain => {}
+            CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => {
+                return Err(ReconcileError::ProjectionRequiresRetainedHistory {
+                    aggregate_type: Entity::AGGREGATE_TYPE,
+                });
+            }
+        }
+
         let (mut recovery, decision) = PostgresRecovery::<Entity>::begin(&self.pool).await?;
         let mode = match decision {
             Changed => ProjectionRecoveryMode::RebuildAll,
@@ -186,8 +195,8 @@ pub(crate) mod tests {
 
     use event_sorcery::{
         Column, CompactionPolicy, Cons, Dependent, DomainEvent, Effect, EntityList, EventSourced,
-        Never, Nil, OneOf, PersistenceBackend, Projection, Reactor, ReactorContext, ReconcileError,
-        Store, StoreBuilder, Table,
+        Never, Nil, OneOf, PersistenceBackend, ProjectedStoreBackend, Projection, Reactor,
+        ReactorContext, ReconcileError, Store, StoreBuilder, Table,
     };
 
     use crate::view_repository::tests::{RegisteredSchemaEvent, RegisteredSchemaView};
@@ -293,13 +302,13 @@ pub(crate) mod tests {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    struct ProjectedNote<const VERSION: u64> {
+    struct ProjectedNote<const VERSION: u64, const COMPACT: bool = false> {
         text: String,
         history: Vec<String>,
     }
 
     #[async_trait]
-    impl<const VERSION: u64> EventSourced for ProjectedNote<VERSION> {
+    impl<const VERSION: u64, const COMPACT: bool> EventSourced for ProjectedNote<VERSION, COMPACT> {
         type Id = String;
         type Command = String;
         type Event = NoteEvent;
@@ -310,7 +319,11 @@ pub(crate) mod tests {
         const AGGREGATE_TYPE: &'static str = "ProjectedNote";
         const SCHEMA_VERSION: u64 = VERSION;
         const SNAPSHOT_SIZE: usize = 2;
-        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
+        const COMPACTION_POLICY: CompactionPolicy = if COMPACT {
+            CompactionPolicy::CompactAfterSnapshot
+        } else {
+            CompactionPolicy::Retain
+        };
         const PROJECTION: Table = Table("note_projection");
 
         fn originate(event: &Self::Event) -> Option<Self> {
@@ -362,6 +375,28 @@ pub(crate) mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn direct_projected_startup_refuses_a_compactable_entity(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let backend = PostgresBackend { pool: pool.clone() };
+
+        let result = backend
+            .reconcile_projected::<ProjectedNote<1, true>>()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ReconcileError::ProjectionRequiresRetainedHistory { .. })
+        ));
+        let registry: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'SchemaRegistry'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(registry, 0);
     }
 
     #[sqlx::test(migrations = false)]

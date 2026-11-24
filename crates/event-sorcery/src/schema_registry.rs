@@ -239,6 +239,12 @@ pub fn validate_snapshot_history(
 /// Errors from schema reconciliation during startup.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
+    /// A materialized view cannot recover from a compactable event stream.
+    #[error("projection startup requires retained history for aggregate '{aggregate_type}'")]
+    ProjectionRequiresRetainedHistory {
+        /// Entity type whose projection needs complete history.
+        aggregate_type: &'static str,
+    },
     /// Snapshot clearing requires proof that its entire covered history is retained.
     #[error(
         "Cannot clear snapshot for {stream:?}: covered sequence {covered_sequence}, \
