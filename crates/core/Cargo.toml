@@ -9,5 +9,6 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+cqrs-es.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true

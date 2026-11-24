@@ -393,6 +393,7 @@ dependencies = [
 name = "event-sorcery-core"
 version = "0.5.0"
 dependencies = [
+ "cqrs-es",
  "sqlx",
  "thiserror",
 ]

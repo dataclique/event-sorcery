@@ -10,7 +10,7 @@
 use cqrs_es::persist::SerializedEvent;
 use sqlx::SqlitePool;
 
-use sqlite_es::SqliteAggregateError;
+pub use sqlite_es::SqliteJobError;
 
 use crate::CompactionPolicy;
 use crate::engine::Engine;
@@ -41,29 +41,6 @@ impl SqliteBackend {
     pub(crate) fn pool(&self) -> &SqlitePool {
         self.engine.pool()
     }
-}
-
-/// Backend-native error for the SQLite job store.
-#[derive(Debug, thiserror::Error)]
-pub enum SqliteJobError {
-    /// A direct SQL statement failed.
-    #[error("job store SQL error")]
-    Sql(#[from] sqlx::Error),
-    /// A compare-and-swap event append failed (other than a conflict, which is
-    /// reported as [`ClaimOutcome::Contended`]).
-    #[error("job event append failed")]
-    Append(#[from] SqliteAggregateError),
-    /// A sequence value exceeded the storable range.
-    #[error("job sequence out of range")]
-    Sequence(#[from] std::num::TryFromIntError),
-    /// A standalone [`enqueue`](EventBackend::enqueue) hit an existing stream for
-    /// its `view_id` -- the caller reused a job id (a freshly minted id never
-    /// collides).
-    #[error("duplicate enqueue: job id {job_id} already has an event stream")]
-    DuplicateEnqueue {
-        /// The reused job id.
-        job_id: String,
-    },
 }
 
 impl EventBackend for SqliteBackend {
