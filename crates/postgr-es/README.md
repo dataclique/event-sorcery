@@ -109,9 +109,21 @@ mixing direct, unsequenced `Reactor::react` calls into a native projection.
 
 ## Migrations
 
-`PostgresBackend::bootstrap_persistence` applies `MIGRATOR`. Applications may
-also run `MIGRATOR.run(&pool).await?` directly. Apply the complete migration set
-from this crate's `migrations/` directory; application view tables are separate.
+Use `PostgresBackend::bootstrap_persistence` to apply the library migrations
+from a pool. It closes its migration connection on drop, so failure or
+cancellation cannot return a connection holding the migration advisory lock to
+the pool.
+
+Apply the complete migration set from this crate's `migrations/` directory, as
+well as your application's migrations. If one application migrator includes both
+sets, run it instead of library bootstrap. If the library and application run
+separate migrators on the same database, give them distinct migration history
+tables from the first run. For example, leave the library on `_sqlx_migrations`
+and configure the application migrator with
+`dangerous_set_table_name("_app_sqlx_migrations")`. Sharing the default table
+makes either migrator reject versions present only in the other set
+(`VersionMissing`), regardless of execution order. Do not rename an existing
+history table without preserving its migration records.
 
 The backend crates watch their migration directories so SQL-only changes rebuild
 the embedded migrator.
