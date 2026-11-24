@@ -1302,6 +1302,7 @@ dependencies = [
  "chrono",
  "cqrs-es",
  "event-sorcery-core",
+ "futures-util",
  "indexed-query",
  "serde",
  "serde_json",

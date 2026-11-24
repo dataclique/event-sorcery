@@ -1,9 +1,8 @@
 //! SQLite serialized storage facade and transaction-bound operations.
 
-use cqrs_es::persist::{PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot};
-use futures_util::TryStreamExt;
+use cqrs_es::persist::{ReplayStream, SerializedEvent, SerializedSnapshot};
 use serde_json::Value;
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::SqlitePool;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -157,7 +156,16 @@ impl Engine {
         after_sequence: Option<usize>,
     ) -> Result<Vec<SerializedEvent>, EngineError> {
         let mut connection = self.pool.acquire().await?;
-        load_events_on(&mut connection, stream, after_sequence).await
+        sqlite_es::load_event_rows::<StoredEventRow>(
+            &mut connection,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+            after_sequence,
+        )
+        .await?
+        .into_iter()
+        .map(SerializedEvent::try_from)
+        .collect()
     }
 
     /// Loads at most `limit` events from one stream after an optional exclusive
@@ -286,77 +294,13 @@ impl Engine {
     where
         Transform: Fn(SerializedEvent) -> SerializedEvent + Send + 'static,
     {
-        let (mut feed, stream) = ReplayStream::new(channel_size);
-        let pool = self.pool.clone();
-
-        tokio::spawn(async move {
-            let mut rows = aggregate_id.as_ref().map_or_else(
-                || {
-                    sqlx::query_as!(
-                        StoredEventRow,
-                        r#"
-                        SELECT aggregate_type,
-                               aggregate_id,
-                               sequence,
-                               event_type,
-                               event_version,
-                               payload AS "payload: String",
-                               metadata AS "metadata: String"
-                        FROM events
-                        WHERE aggregate_type = ?1
-                        ORDER BY sequence
-                        "#,
-                        aggregate_type,
-                    )
-                    .fetch(&pool)
-                },
-                |aggregate_id| {
-                    sqlx::query_as!(
-                        StoredEventRow,
-                        r#"
-                        SELECT aggregate_type,
-                               aggregate_id,
-                               sequence,
-                               event_type,
-                               event_version,
-                               payload AS "payload: String",
-                               metadata AS "metadata: String"
-                        FROM events
-                        WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                        ORDER BY sequence
-                        "#,
-                        aggregate_type,
-                        aggregate_id,
-                    )
-                    .fetch(&pool)
-                },
-            );
-
-            loop {
-                let row = match rows.try_next().await {
-                    Ok(Some(row)) => row,
-                    Ok(None) => return,
-                    Err(error) => {
-                        let error = EngineError::Sql(error);
-                        let _ = feed.push(Err(PersistenceError::from(error))).await;
-                        return;
-                    }
-                };
-                let event = match SerializedEvent::try_from(row) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        let _ = feed.push(Err(PersistenceError::from(error))).await;
-                        return;
-                    }
-                };
-
-                if feed.push(Ok(transform(event))).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        stream
+        sqlite_es::replay_events::<StoredEventRow>(
+            &self.pool,
+            aggregate_type,
+            aggregate_id,
+            channel_size,
+            transform,
+        )
     }
 
     /// Atomically persists a validated event, snapshot, and durable-job batch.
@@ -468,63 +412,6 @@ impl Engine {
         tx.commit().await?;
         Ok(())
     }
-}
-
-async fn load_events_on(
-    connection: &mut SqliteConnection,
-    stream: &StreamIdentity,
-    after_sequence: Option<usize>,
-) -> Result<Vec<SerializedEvent>, EngineError> {
-    let rows = match after_sequence {
-        None => {
-            sqlx::query_as!(
-                StoredEventRow,
-                r#"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload AS "payload: String",
-                           metadata AS "metadata: String"
-                    FROM events
-                    WHERE aggregate_type = ?1 AND aggregate_id = ?2
-                    ORDER BY sequence
-                    "#,
-                stream.aggregate_type,
-                stream.aggregate_id,
-            )
-            .fetch_all(connection)
-            .await?
-        }
-        Some(after_sequence) => {
-            let after_sequence = i64::try_from(after_sequence)?;
-            sqlx::query_as!(
-                StoredEventRow,
-                r#"
-                    SELECT aggregate_type,
-                           aggregate_id,
-                           sequence,
-                           event_type,
-                           event_version,
-                           payload AS "payload: String",
-                           metadata AS "metadata: String"
-                    FROM events
-                    WHERE aggregate_type = ?1
-                      AND aggregate_id = ?2
-                      AND sequence > ?3
-                    ORDER BY sequence
-                    "#,
-                stream.aggregate_type,
-                stream.aggregate_id,
-                after_sequence,
-            )
-            .fetch_all(connection)
-            .await?
-        }
-    };
-
-    rows.into_iter().map(SerializedEvent::try_from).collect()
 }
 
 impl From<sqlite_es::StoreSnapshotError> for EngineError {
