@@ -60,30 +60,18 @@ impl Reconciler {
             return Ok(reconciliation);
         }
 
-        let mut transaction = self.pool.begin().await?;
-        let histories: Vec<(String, i64, i64)> = sqlx::query_as(
-            "SELECT s.aggregate_id, s.last_sequence, \
-             (SELECT COUNT(*) FROM events e \
-              WHERE e.aggregate_type = s.aggregate_type \
-                AND e.aggregate_id = s.aggregate_id \
-                AND e.sequence BETWEEN 1 AND s.last_sequence) \
-             FROM snapshots s WHERE s.aggregate_type = ?1",
+        sqlite_es::clear_snapshots(
+            &self.pool,
+            &target.aggregate_type,
+            |aggregate_id, covered_sequence, retained_events| {
+                validate_snapshot_history(
+                    StreamIdentity::new(&target.aggregate_type, aggregate_id),
+                    covered_sequence,
+                    retained_events,
+                )
+            },
         )
-        .bind(&target.aggregate_type)
-        .fetch_all(&mut *transaction)
         .await?;
-        for (aggregate_id, covered_sequence, retained_events) in histories {
-            validate_snapshot_history(
-                StreamIdentity::new(&target.aggregate_type, aggregate_id),
-                covered_sequence,
-                retained_events,
-            )?;
-        }
-        sqlx::query("DELETE FROM snapshots WHERE aggregate_type = ?1")
-            .bind(&target.aggregate_type)
-            .execute(&mut *transaction)
-            .await?;
-        transaction.commit().await?;
 
         info!(
             target: "cqrs",

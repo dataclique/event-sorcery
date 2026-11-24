@@ -2,7 +2,7 @@
 
 use cqrs_es::persist::SerializedSnapshot;
 use serde_json::Value;
-use sqlx::SqliteConnection;
+use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::SqliteAggregateError;
 
@@ -48,6 +48,42 @@ pub async fn write_snapshot(
     )
     .execute(connection)
     .await?;
+    Ok(())
+}
+
+/// Clears snapshots for an aggregate type after validating each covered history.
+///
+/// Validation sees the snapshot's covered sequence and the count of retained
+/// events in its positive covered range. A refusal rolls back the whole clear.
+pub async fn clear_snapshots<Error>(
+    pool: &SqlitePool,
+    aggregate_type: &str,
+    mut validate: impl FnMut(String, i64, i64) -> Result<(), Error> + Send,
+) -> Result<(), Error>
+where
+    Error: From<sqlx::Error>,
+{
+    let mut transaction = pool.begin().await?;
+    let histories: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT s.aggregate_id, s.last_sequence, \
+         (SELECT COUNT(*) FROM events e \
+          WHERE e.aggregate_type = s.aggregate_type \
+            AND e.aggregate_id = s.aggregate_id \
+            AND e.sequence BETWEEN 1 AND s.last_sequence) \
+         FROM snapshots s WHERE s.aggregate_type = ?1",
+    )
+    .bind(aggregate_type)
+    .fetch_all(&mut *transaction)
+    .await?;
+    for (aggregate_id, covered_sequence, retained_events) in histories {
+        validate(aggregate_id, covered_sequence, retained_events)?;
+    }
+
+    sqlx::query("DELETE FROM snapshots WHERE aggregate_type = ?1")
+        .bind(aggregate_type)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
