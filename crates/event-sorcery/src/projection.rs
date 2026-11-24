@@ -924,6 +924,7 @@ mod tests {
         views: RwLock<HashMap<String, (View, i64)>>,
         remaining_busy_failures: AtomicU32,
         remaining_load_busy_failures: AtomicU32,
+        recoveries: AtomicU32,
         _phantom: PhantomData<Agg>,
     }
 
@@ -938,6 +939,7 @@ mod tests {
                 views: RwLock::new(HashMap::new()),
                 remaining_busy_failures: AtomicU32::new(busy_failures),
                 remaining_load_busy_failures: AtomicU32::new(0),
+                recoveries: AtomicU32::new(0),
                 _phantom: PhantomData,
             }
         }
@@ -950,6 +952,7 @@ mod tests {
                 views: RwLock::new(HashMap::new()),
                 remaining_busy_failures: AtomicU32::new(0),
                 remaining_load_busy_failures: AtomicU32::new(load_busy_failures),
+                recoveries: AtomicU32::new(0),
                 _phantom: PhantomData,
             }
         }
@@ -1126,6 +1129,110 @@ mod tests {
             Some(TestEntity {
                 name: "original".to_string(),
             })
+        );
+    }
+
+    impl crate::NativeProjectionBackend for BusyViewBackend {
+        type Source = AtomicU32;
+        type Database = sqlx::Sqlite;
+
+        fn repository<ViewState, AggregateType>(
+            recoveries: Self::Source,
+            _table: Table,
+        ) -> Self::Repo<ViewState, AggregateType>
+        where
+            ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+            AggregateType: Aggregate + 'static,
+        {
+            BusyRepo {
+                recoveries,
+                ..BusyRepo::new(0)
+            }
+        }
+
+        fn source<ViewState, AggregateType>(
+            repository: &Self::Repo<ViewState, AggregateType>,
+        ) -> &Self::Source
+        where
+            ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+            AggregateType: Aggregate + 'static,
+        {
+            &repository.recoveries
+        }
+
+        async fn rows(
+            _source: &Self::Source,
+            _table: Table,
+        ) -> Result<Vec<(String, String)>, sqlx::Error> {
+            unreachable!("gap recovery does not scan materialized views")
+        }
+
+        async fn filter<Entity, Value>(
+            _source: &Self::Source,
+            _table: Table,
+            _column: Column,
+            _value: &Value,
+        ) -> Result<Vec<(String, String)>, ProjectionError<Entity>>
+        where
+            Entity: EventSourced,
+            for<'query> &'query Value: sqlx::Encode<'query, Self::Database>,
+            Value: sqlx::Type<Self::Database> + Send + Sync,
+        {
+            unreachable!("gap recovery does not filter materialized views")
+        }
+
+        async fn recover<Entity>(
+            recoveries: &Self::Source,
+            mode: &crate::ProjectionRecoveryMode,
+        ) -> Result<(), ProjectionError<Entity>>
+        where
+            Entity: EventSourced<Materialized = Table>,
+        {
+            assert!(matches!(mode, crate::ProjectionRecoveryMode::CatchUp));
+            recoveries.fetch_add(1, Ordering::SeqCst);
+            // A storage failure leaves the gap unresolved, so processing another
+            // envelope would request catch-up again.
+            Err(sqlx::Error::PoolClosed.into())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_dispatch_waits_one_budget_and_attempts_recovery_once() {
+        let id = "id-1".to_string();
+        let projection = Arc::new(CounterBusyProjection::with_backend(AtomicU32::new(0)));
+        projection
+            .repo
+            .update_view(
+                Lifecycle::Live(Counter { value: 0 }),
+                ViewContext::new(id.clone(), 0),
+            )
+            .await
+            .unwrap();
+        let query = ProjectionQuery {
+            projection: projection.clone(),
+        };
+        let batch = [3, 4].map(|sequence| EventEnvelope {
+            aggregate_id: id.clone(),
+            sequence,
+            payload: CounterEvent::Incremented,
+            metadata: HashMap::new(),
+        });
+
+        let started_at = tokio::time::Instant::now();
+        query.dispatch(&id, &batch).await;
+
+        assert_eq!(started_at.elapsed(), Duration::from_millis(4_270));
+        assert_eq!(projection.repo.recoveries.load(Ordering::SeqCst), 1);
+        let (_, context) = projection
+            .repo
+            .load_with_context(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.version, 1);
+        assert_eq!(
+            projection.load(&id).await.unwrap(),
+            Some(Counter { value: 0 })
         );
     }
 
