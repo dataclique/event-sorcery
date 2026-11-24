@@ -196,7 +196,7 @@ pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, buffer_pending_job, replay,
     with_pending_jobs,
 };
-pub use view_backend::{NativeProjectionBackend, ViewBackend};
+pub use view_backend::{NativeProjectionBackend, ViewBackend, ViewUpdateError};
 pub use wire::StoreBuilder;
 
 pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<

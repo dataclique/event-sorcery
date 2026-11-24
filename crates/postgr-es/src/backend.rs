@@ -830,6 +830,64 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn rebuilding_at_the_same_checkpoint_fences_an_in_flight_delivery(pool: PgPool) {
+        let control = projected_pool(pool).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(3)
+            .connect_with(control.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let id = "projected".to_string();
+        store.send(&id, "first".to_string()).await.unwrap();
+        sqlx::query("UPDATE note_projection SET payload = $1 WHERE view_id = $2")
+            .bind(json!({"Live": {"text": "stale", "history": ["stale"]}}))
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut recovery = control.begin().await.unwrap();
+        event_sorcery::recover_projection::<ProjectedNote<1>>(
+            &mut crate::projection_recovery::PostgresProjectionRecovery {
+                connection: &mut recovery,
+            },
+            &event_sorcery::ProjectionRecoveryMode::RebuildAll,
+        )
+        .await
+        .unwrap();
+
+        let writing_id = id.clone();
+        let writing = tokio::spawn(async move {
+            store.send(&writing_id, "second".to_string()).await.unwrap();
+        });
+        wait_for_projection_locks(&pool, "RowExclusiveLock", 1).await;
+        recovery.commit().await.unwrap();
+        timeout(Duration::from_secs(10), writing)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM note_projection WHERE view_id = $1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(
+            projection.load(&id).await.unwrap().unwrap().history,
+            ["first", "second"]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn exhausted_gap_delivery_preserves_coverage_until_catch_up(pool: PgPool) {
         let pool = projected_pool(pool).await;
         let pending = pending_projection(&pool).await;

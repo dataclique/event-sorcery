@@ -6,9 +6,11 @@
 
 use async_trait::async_trait;
 use cqrs_es::Aggregate;
-use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
+use cqrs_es::persist::{PersistenceError, ViewRepository};
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::sleep;
@@ -22,7 +24,7 @@ use crate::reactor::{
     RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, ReactorContext,
     retry_delays,
 };
-use crate::view_backend::ViewBackend;
+use crate::view_backend::{ViewBackend, ViewUpdateError};
 use crate::{EventSourced, Table};
 
 /// A column name for view table queries.
@@ -259,6 +261,15 @@ where
     type Dependencies = Cons<Entity, Nil>;
 }
 
+enum SkippedDelivery {
+    Covered,
+    InvalidCheckpoint(i64),
+    Gap {
+        covered: usize,
+        sequence: NonZeroUsize,
+    },
+}
+
 #[async_trait]
 impl<Entity, Backend> Reactor for Projection<Entity, Backend>
 where
@@ -298,10 +309,44 @@ where
 
         let delays = retry_delays(base_delay_ms, max_delay_ms);
         for (attempt, delay) in (0..=max_retries).zip(delays) {
-            let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
-                Ok(Some(pair)) => pair,
-                Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
-                Err(error) if Backend::is_retryable_error(&error) => {
+            let outcome = Backend::try_update(&self.repo, &view_id, |stored, context| {
+                if let Some(sequence) = delivery.sequence {
+                    let Ok(covered) = usize::try_from(context.version) else {
+                        return ControlFlow::Break(SkippedDelivery::InvalidCheckpoint(
+                            context.version,
+                        ));
+                    };
+                    if sequence.get() <= covered {
+                        return ControlFlow::Break(SkippedDelivery::Covered);
+                    }
+                    if covered.checked_add(1) != Some(sequence.get()) {
+                        return ControlFlow::Break(SkippedDelivery::Gap { covered, sequence });
+                    }
+                }
+                let mut lifecycle = stored.unwrap_or_default();
+                lifecycle.apply(event.clone());
+                ControlFlow::Continue(lifecycle)
+            })
+            .await;
+
+            use ViewUpdateError::{Load, Write};
+            match outcome {
+                Ok(None | Some(SkippedDelivery::Covered)) => return Ok(()),
+                Ok(Some(SkippedDelivery::InvalidCheckpoint(version))) => {
+                    error!(target: "cqrs", %view_id, version,
+                        "Invalid projection checkpoint; refusing event delivery");
+                    return Ok(());
+                }
+                Ok(Some(SkippedDelivery::Gap { covered, sequence })) => {
+                    if attempt < max_retries {
+                        sleep(delay).await;
+                        continue;
+                    }
+                    error!(target: "cqrs", %view_id, covered, sequence = sequence.get(),
+                        "Projection delivery is out of order; leaving checkpoint for recovery");
+                    return Ok(());
+                }
+                Err(Load(error)) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
                         warn!(
                             target: "cqrs",
@@ -319,36 +364,11 @@ where
                     );
                     return Ok(());
                 }
-                Err(error) => {
+                Err(Load(error)) => {
                     warn!(target: "cqrs", %view_id, ?error, "Failed to load view for update");
                     return Ok(());
                 }
-            };
-
-            if let Some(sequence) = delivery.sequence {
-                let Ok(covered) = usize::try_from(context.version) else {
-                    error!(target: "cqrs", %view_id, version = context.version,
-                        "Invalid projection checkpoint; refusing event delivery");
-                    return Ok(());
-                };
-                if sequence.get() <= covered {
-                    return Ok(());
-                }
-                if covered.checked_add(1) != Some(sequence.get()) {
-                    if attempt < max_retries {
-                        sleep(delay).await;
-                        continue;
-                    }
-                    error!(target: "cqrs", %view_id, covered, sequence = sequence.get(),
-                        "Projection delivery is out of order; leaving checkpoint for recovery");
-                    return Ok(());
-                }
-            }
-            lifecycle.apply(event.clone());
-
-            match self.repo.update_view(lifecycle, context).await {
-                Ok(()) => return Ok(()),
-                Err(PersistenceError::OptimisticLockError) if attempt < max_retries => {
+                Err(Write(PersistenceError::OptimisticLockError)) if attempt < max_retries => {
                     warn!(
                         target: "cqrs",
                         %view_id, attempt = attempt + 1, max_retries, ?delay,
@@ -356,7 +376,7 @@ where
                     );
                     sleep(delay).await;
                 }
-                Err(PersistenceError::OptimisticLockError) => {
+                Err(Write(PersistenceError::OptimisticLockError)) => {
                     error!(
                         target: "cqrs",
                         %view_id, max_retries,
@@ -364,7 +384,7 @@ where
                     );
                     return Ok(());
                 }
-                Err(error) if Backend::is_retryable_error(&error) => {
+                Err(Write(error)) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
                         warn!(
                             target: "cqrs",
@@ -381,7 +401,7 @@ where
                         return Ok(());
                     }
                 }
-                Err(error) => {
+                Err(Write(error)) => {
                     warn!(target: "cqrs", %view_id, ?error, "Failed to save view update");
                     return Ok(());
                 }

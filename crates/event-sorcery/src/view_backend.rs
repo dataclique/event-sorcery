@@ -5,8 +5,10 @@
 //! implementation. Database integrations supply their repository family;
 //! custom backends can also provide in-memory storage for tests.
 
+use std::ops::ControlFlow;
+
 use cqrs_es::Aggregate;
-use cqrs_es::persist::ViewRepository;
+use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 
 use indexed_query::IndexedView;
 
@@ -41,11 +43,60 @@ pub trait ViewBackend: Send + Sync + 'static {
         View: cqrs_es::View<Agg> + Clone + 'static,
         Agg: Aggregate + 'static;
 
+    /// Runs one live delivery against the observed state and its optimistic context.
+    ///
+    /// Backends can override this to compare more than the optimistic version when
+    /// saving, for example when recovery can replace a payload at the same checkpoint.
+    /// A failed comparison must report `PersistenceError::OptimisticLockError` as
+    /// a write error. Returning `Break` from `apply` skips the write entirely.
+    fn try_update<ViewState, AggregateType, Skip>(
+        repository: &Self::Repo<ViewState, AggregateType>,
+        view_id: &str,
+        apply: impl FnOnce(Option<ViewState>, &ViewContext) -> ControlFlow<Skip, ViewState> + Send,
+    ) -> impl Future<Output = Result<Option<Skip>, ViewUpdateError>> + Send
+    where
+        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static,
+        Skip: Send,
+    {
+        async move {
+            let (stored, context) = match repository
+                .load_with_context(view_id)
+                .await
+                .map_err(ViewUpdateError::Load)?
+            {
+                Some((stored, context)) => (Some(stored), context),
+                None => (None, ViewContext::new(view_id.to_owned(), 0)),
+            };
+            match apply(stored, &context) {
+                ControlFlow::Break(skipped) => Ok(Some(skipped)),
+                ControlFlow::Continue(view) => {
+                    repository
+                        .update_view(view, context)
+                        .await
+                        .map_err(ViewUpdateError::Write)?;
+                    Ok(None)
+                }
+            }
+        }
+    }
+
     /// Classifies storage contention that can safely retry a complete projection update.
     /// Unknown errors are returned without retrying unless the backend opts in.
     fn is_retryable_error(_error: &(dyn std::error::Error + 'static)) -> bool {
         false
     }
+}
+
+/// Storage phase that failed during one live projection delivery.
+#[derive(Debug, thiserror::Error)]
+pub enum ViewUpdateError {
+    /// The previous view state could not be loaded.
+    #[error("failed to load the view for update")]
+    Load(#[source] PersistenceError),
+    /// The new view state could not be saved.
+    #[error("failed to save the view update")]
+    Write(#[source] PersistenceError),
 }
 
 /// Optional native construction, queries and retained-history recovery.
