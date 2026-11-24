@@ -11,13 +11,13 @@ use crate::reactor::{
     retry_with_backoff,
 };
 
-/// Marks a [`Reactor`] whose `react()` implementation is safe to retry in
+/// Marks a [`Reactor`] whose `react_with_context()` is safe to retry in
 /// full after a transient SQLite busy error.
 ///
 /// # Safety contract
 ///
-/// Implement this only for reactors whose `react()` performs exclusively
-/// SQLite writes, with no side effect preceding the write that would double-
+/// Implement this only if the whole delivery, including any `react_with_context()`
+/// override, performs exclusively SQLite writes, with no side effect preceding the write that would double-
 /// fire on retry: no HTTP/RPC calls, no `Store::send()` to another aggregate,
 /// no message-queue publish. `Projection` does not need this -- it has its
 /// own internal retry already, covering both optimistic-lock conflicts and
@@ -26,13 +26,11 @@ use crate::reactor::{
 /// `docs/cqrs.md`) must NOT implement this unless the downstream command
 /// handler is independently confirmed idempotent under re-invocation.
 ///
-/// A `react()` that issues two or more separate, non-transactional SQLite
-/// statements is also unsafe to mark: if the first statement commits and a
-/// later one hits `SQLITE_BUSY`, the retry replays the *whole* `react()`,
-/// re-running the already-committed statement. A conforming `react()` must
-/// therefore be atomic as a whole -- a single statement, a single
-/// transaction, or written so replaying it is safe (upserts, not bare
-/// inserts).
+/// If the first of several non-transactional statements commits and a later
+/// one hits `SQLITE_BUSY`, retrying repeats the already-committed statement.
+/// The whole delivery must therefore be atomic (one statement or transaction)
+/// or safe to replay. This applies to `react()` when using the default
+/// `react_with_context()` implementation.
 ///
 /// This is a marker trait: implementing it is a declaration, not a
 /// capability check the compiler can verify -- the burden of proof is on the
@@ -56,7 +54,7 @@ pub trait IdempotentReactor: Reactor {}
 
 /// Wraps an [`IdempotentReactor`] to retry on transient SQLite busy errors.
 ///
-/// Retries `react()` with exponential backoff when it fails with
+/// Retries `react_with_context()` with exponential backoff when it fails with
 /// `SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`. See [`IdempotentReactor`] for the
 /// safety contract that gates this, including the caller-latency tradeoff.
 pub struct RetryOnBusy<R> {

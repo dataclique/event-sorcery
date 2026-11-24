@@ -49,10 +49,7 @@ pub enum ProjectionError<Entity: EventSourced> {
         /// Entity type whose projection cannot be recovered from compactable history.
         aggregate_type: &'static str,
     },
-    #[error(
-        "operation requires a SQLite-backed projection \
-         created via Projection::sqlite()"
-    )]
+    #[error("operation requires a projection backed by a native persistence adapter")]
     NotSqliteBacked,
     #[error("column '{column}' does not exist in table '{table}'")]
     ColumnNotFound { column: Column, table: String },
@@ -71,7 +68,7 @@ pub enum ProjectionError<Entity: EventSourced> {
         aggregate_id: String,
         source: serde_json::Error,
     },
-    #[error("sqlite query failed: {0}")]
+    #[error("projection query failed: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("view repository operation failed: {0}")]
     Persistence(#[from] PersistenceError),

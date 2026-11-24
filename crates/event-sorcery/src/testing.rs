@@ -327,11 +327,9 @@ where
 
 /// In-memory event store for unit tests.
 ///
-/// Provides the same typed-ID interface as [`Store`](crate::Store) but backed
-/// by an in-memory store instead of SQLite. Also exposes
-/// [`load`](Self::load) for inspecting aggregate state after
-/// commands, which production [`Store`](crate::Store) intentionally omits
-/// (use projections instead).
+/// Provides the same typed-ID interface as [`Store`](crate::Store). Its
+/// [`load`](Self::load) reads aggregate state from memory rather than the
+/// configured persistence backend.
 pub struct TestStore<Entity: EventSourced> {
     mem_store: mem_store::MemStore<Lifecycle<Entity>>,
     cqrs: CqrsFramework<Lifecycle<Entity>, mem_store::MemStore<Lifecycle<Entity>>>,
