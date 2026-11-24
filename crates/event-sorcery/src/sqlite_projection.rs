@@ -1,11 +1,10 @@
 //! SQLite materialized-view construction, queries and transaction-bound recovery.
 
 use cqrs_es::Aggregate;
+use sqlx::SqlitePool;
 use sqlx::sqlite::Sqlite;
-use sqlx::{AssertSqlSafe, SqlitePool};
-use tracing::warn;
 
-use sqlite_es::{SqliteProjectionRecovery, SqliteViewRepository};
+use sqlite_es::{SqliteProjectionFilterError, SqliteProjectionRecovery, SqliteViewRepository};
 
 use crate::{Column, EventSourced, Projection, ProjectionError, Table, ViewBackend};
 
@@ -61,11 +60,7 @@ impl crate::NativeProjectionBackend for SqliteViewBackend {
         source: &SqlitePool,
         Table(table): Table,
     ) -> Result<Vec<(String, String)>, sqlx::Error> {
-        sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT view_id, payload FROM {table}"
-        )))
-        .fetch_all(source)
-        .await
+        sqlite_es::projection_rows(source, table).await
     }
 
     async fn filter<Entity, Value>(
@@ -79,14 +74,25 @@ impl crate::NativeProjectionBackend for SqliteViewBackend {
         for<'query> &'query Value: sqlx::Encode<'query, Sqlite>,
         Value: sqlx::Type<Sqlite> + Send + Sync,
     {
-        validate_column::<Entity>(source, table, &column).await?;
-        let Column(column) = column;
-        Ok(sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT view_id, payload FROM {table} WHERE {column} = ?1 ORDER BY view_id"
-        )))
-        .bind(value)
-        .fetch_all(source)
-        .await?)
+        let Column(column_name) = column;
+        sqlite_es::filter_projection(source, table, column_name, value)
+            .await
+            .map_err(|error| {
+                use SqliteProjectionFilterError::{ColumnNotFound, Sql, StaleColumn};
+
+                match error {
+                    ColumnNotFound => ProjectionError::ColumnNotFound {
+                        column,
+                        table: table.to_string(),
+                    },
+                    StaleColumn { row_count } => ProjectionError::StaleColumn {
+                        column,
+                        table: table.to_string(),
+                        row_count,
+                    },
+                    Sql(source) => ProjectionError::Sqlx(source),
+                }
+            })
     }
 
     async fn recover<Entity>(
@@ -106,63 +112,4 @@ impl crate::NativeProjectionBackend for SqliteViewBackend {
         transaction.commit().await?;
         Ok(())
     }
-}
-
-/// Validates that a column exists in the table schema and returns
-/// an error if all values are NULL (indicates a stale generated
-/// column).
-async fn validate_column<Entity: EventSourced>(
-    pool: &SqlitePool,
-    table: &str,
-    column: &Column,
-) -> Result<(), ProjectionError<Entity>> {
-    let column_name = column.0;
-
-    let columns: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT name FROM pragma_table_xinfo('{table}')"
-    )))
-    .fetch_all(pool)
-    .await?;
-
-    if !columns.iter().any(|(name,)| name == column_name) {
-        warn!(
-            target: "cqrs",
-            %column_name, %table,
-            "Column does not exist in table schema"
-        );
-
-        return Err(ProjectionError::ColumnNotFound {
-            column: column.clone(),
-            table: table.to_string(),
-        });
-    }
-
-    let row_count: (i64,) = sqlx::query_as(AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
-        .fetch_one(pool)
-        .await?;
-
-    if row_count.0 > 0 {
-        let non_null_count: (i64,) = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM {table}
-             WHERE {column_name} IS NOT NULL"
-        )))
-        .fetch_one(pool)
-        .await?;
-
-        if non_null_count.0 == 0 {
-            warn!(
-                target: "cqrs",
-                %column_name, %table, row_count = %row_count.0,
-                "Generated column has all NULL values, likely stale JSON path"
-            );
-
-            return Err(ProjectionError::StaleColumn {
-                column: column.clone(),
-                table: table.to_string(),
-                row_count: row_count.0,
-            });
-        }
-    }
-
-    Ok(())
 }

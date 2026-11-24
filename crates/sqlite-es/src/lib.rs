@@ -47,6 +47,7 @@ mod aggregate_ids;
 mod compaction;
 mod cqrs;
 mod event_repository;
+mod projection_queries;
 mod projection_recovery;
 mod schema_registry;
 mod snapshot;
@@ -75,6 +76,7 @@ pub use cqrs_es::persist::ViewContext;
 pub use event_repository::{
     SqliteAggregateError, SqliteEventRepository, insert_serialized_events_batch,
 };
+pub use projection_queries::{SqliteProjectionFilterError, filter_projection, projection_rows};
 pub use projection_recovery::SqliteProjectionRecovery;
 pub use schema_registry::load_schema_registry_payloads;
 pub use snapshot::{clear_snapshots, discard_snapshot, load_snapshot, write_snapshot};
