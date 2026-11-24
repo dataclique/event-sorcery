@@ -2,7 +2,7 @@
 
 use cqrs_es::persist::{PersistedEventStore, PersistenceError};
 use cqrs_es::{CqrsFramework, EventStore};
-use sqlx::{AssertSqlSafe, SqlitePool};
+use sqlx::SqlitePool;
 use std::fmt::Debug;
 use std::str::FromStr;
 
@@ -171,34 +171,6 @@ pub async fn send_command<Entity: EventSourced>(
 /// retention window cannot be represented as a SQLite integer.
 pub async fn compact_events<Entity: EventSourced>(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     sqlite_es::compact_events(pool, Entity::AGGREGATE_TYPE, Entity::COMPACTION_POLICY).await
-}
-
-/// Reclaim SQLite file space after event compaction.
-///
-/// Full `VACUUM` can take an exclusive database lock and should be reserved for
-/// explicit maintenance windows, not hot runtime loops.
-///
-/// # Errors
-///
-/// Returns database errors from SQLite `VACUUM`.
-pub async fn vacuum(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("VACUUM").execute(pool).await?;
-    Ok(())
-}
-
-/// Reclaim a bounded number of SQLite freelist pages.
-///
-/// This is intended for periodic background cleanup on databases configured
-/// with `auto_vacuum = INCREMENTAL`.
-///
-/// # Errors
-///
-/// Returns database errors from SQLite `PRAGMA incremental_vacuum`.
-pub async fn incremental_vacuum(pool: &SqlitePool, pages: u32) -> Result<(), sqlx::Error> {
-    sqlx::query(AssertSqlSafe(format!("PRAGMA incremental_vacuum({pages})")))
-        .execute(pool)
-        .await?;
-    Ok(())
 }
 
 /// Load all aggregate IDs for a given entity type.

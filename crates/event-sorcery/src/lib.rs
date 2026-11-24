@@ -180,6 +180,8 @@ pub use schema_registry::{
     ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, validate_snapshot_history,
 };
 #[cfg(any(test, feature = "sqlite"))]
+pub use sqlite_es::{incremental_vacuum, vacuum};
+#[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_event_repository::SqliteEventRepository;
 #[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_projection::SqliteViewBackend;
@@ -187,8 +189,7 @@ pub use sqlite_projection::SqliteViewBackend;
 pub use sqlite_store::test_store;
 #[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_store::{
-    compact_events, count_aggregates, incremental_vacuum, load_all_ids, load_entity,
-    load_ids_paginated, send_command, vacuum,
+    compact_events, count_aggregates, load_all_ids, load_entity, load_ids_paginated, send_command,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{

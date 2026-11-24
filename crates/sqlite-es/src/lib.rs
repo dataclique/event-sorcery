@@ -48,6 +48,7 @@ mod cqrs;
 mod event_repository;
 mod sql_query;
 pub mod testing;
+mod vacuum;
 mod view_repository;
 
 /// The canonical event-store schema (events, snapshots, job queue,
@@ -68,6 +69,7 @@ pub use cqrs_es::persist::ViewContext;
 pub use event_repository::{
     SqliteAggregateError, SqliteEventRepository, insert_serialized_events_batch,
 };
+pub use vacuum::{incremental_vacuum, vacuum};
 pub use view_repository::{
     Cmp, IndexedView, Order, Predicate, SqliteViewError, SqliteViewRepository, Term, Value,
 };
