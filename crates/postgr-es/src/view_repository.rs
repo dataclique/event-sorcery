@@ -129,13 +129,17 @@ impl NativeProjectionBackend for PostgresViewBackend {
     {
         let quoted_table = indexed_query::quote_identifier(table);
         let Column(column_name) = &column;
+        let mut transaction = source
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
+
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM pg_attribute
              WHERE attrelid = to_regclass($1) AND attname = $2 AND NOT attisdropped)",
         )
         .bind(&quoted_table)
         .bind(column_name)
-        .fetch_one(source)
+        .fetch_one(&mut *transaction)
         .await?;
         if !exists {
             return Err(ProjectionError::ColumnNotFound {
@@ -147,7 +151,7 @@ impl NativeProjectionBackend for PostgresViewBackend {
         let (rows, non_null): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT COUNT(*), COUNT({quoted_column}) FROM {quoted_table}"
         )))
-        .fetch_one(source)
+        .fetch_one(&mut *transaction)
         .await?;
         if rows > 0 && non_null == 0 {
             return Err(ProjectionError::StaleColumn {
@@ -156,13 +160,15 @@ impl NativeProjectionBackend for PostgresViewBackend {
                 row_count: rows,
             });
         }
-        Ok(sqlx::query_as(AssertSqlSafe(format!(
+        let matches = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT view_id, payload::text FROM {quoted_table}
              WHERE {quoted_column} = $1 ORDER BY view_id"
         )))
         .bind(value)
-        .fetch_all(source)
-        .await?)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(matches)
     }
 
     async fn recover<Entity>(

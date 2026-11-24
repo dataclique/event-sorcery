@@ -183,9 +183,11 @@ pub(crate) mod tests {
     use futures_util::{TryStreamExt, stream};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
-    use sqlx::PgPool;
+    use sqlx::encode::IsNull;
+    use sqlx::error::BoxDynError;
     use sqlx::migrate::MigrateError;
-    use sqlx::postgres::PgPoolOptions;
+    use sqlx::postgres::{PgArgumentBuffer, PgConnectOptions, PgPoolOptions, PgTypeInfo};
+    use sqlx::{ConnectOptions, Encode, PgPool, Postgres, Type};
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -423,6 +425,73 @@ pub(crate) mod tests {
             })
         ));
         assert_eq!(projection.load(&id).await.unwrap(), Some(before));
+    }
+
+    struct FilterValueAfterConcurrentUpdate(PgConnectOptions);
+
+    impl Type<Postgres> for FilterValueAfterConcurrentUpdate {
+        fn type_info() -> PgTypeInfo {
+            <str as Type<Postgres>>::type_info()
+        }
+    }
+
+    impl Encode<'_, Postgres> for FilterValueAfterConcurrentUpdate {
+        fn encode_by_ref(&self, buffer: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+            let Self(options) = self;
+            // SQLx binds the filter value immediately before fetching matches.
+            // Use a separate runtime because the test runs on one Tokio thread.
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(async {
+                            timeout(Duration::from_secs(5), async {
+                                let mut connection = options.connect().await?;
+                                sqlx::query("UPDATE note_projection SET payload = '{\"Live\": {\"history\": []}}'")
+                                    .execute(&mut connection)
+                                    .await?;
+                                Ok::<_, sqlx::Error>(())
+                            })
+                            .await??;
+                            Ok::<_, BoxDynError>(())
+                        })
+                }).join().unwrap()
+            })?;
+            <&str as Encode<Postgres>>::encode_by_ref(&"matching", buffer)
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn filter_uses_the_same_snapshot_for_validation_and_matches(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let id = "note".to_string();
+        store.send(&id, "matching".to_string()).await.unwrap();
+        let expected = projection.load(&id).await.unwrap().unwrap();
+
+        let result = projection
+            .filter(
+                Column("text_value"),
+                &FilterValueAfterConcurrentUpdate(pool.connect_options().as_ref().clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, [(id, expected)]);
+        let error = projection
+            .filter(Column("text_value"), &"matching".to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectionError::StaleColumn { row_count: 1, .. }
+        ));
     }
 
     #[sqlx::test(migrations = false)]
