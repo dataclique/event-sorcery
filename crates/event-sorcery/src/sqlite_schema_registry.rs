@@ -101,17 +101,7 @@ impl Reconciler {
 
     /// Rebuilds SchemaRegistry state from the full event log.
     pub(super) async fn load_registry(&self) -> Result<Option<SchemaRegistry>, ReconcileError> {
-        let payloads = sqlx::query_scalar!(
-            r#"
-            SELECT payload AS "payload: String"
-            FROM events
-            WHERE aggregate_type = 'SchemaRegistry'
-              AND aggregate_id = 'schema'
-            ORDER BY sequence
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let payloads = sqlite_es::load_schema_registry_payloads(&self.pool).await?;
 
         SchemaRegistry::from_payloads(payloads)
     }
