@@ -1057,6 +1057,26 @@ pub(crate) mod tests {
         let database = source.as_database_error().unwrap();
         assert_eq!(database.code().as_deref(), Some("55P03"));
         assert!(PostgresViewBackend::is_retryable_error(&error));
+
+        let error = PostgresViewBackend::try_update(&repository, "schema", |stored, context| {
+            assert_eq!(context.version, 1);
+            ControlFlow::<(), _>::Continue(stored.unwrap())
+        })
+        .await
+        .unwrap_err();
+        let ViewUpdateError::Write(error) = error else {
+            panic!("expected the live compare-and-write to fail during the write: {error:?}");
+        };
+        let PersistenceError::ConnectionError(source) = &error else {
+            panic!("expected a typed SQLx lock timeout from the live write: {error:?}");
+        };
+        let source = source.downcast_ref::<sqlx::Error>().unwrap();
+        assert_eq!(
+            source.as_database_error().unwrap().code().as_deref(),
+            Some("55P03")
+        );
+        assert!(PostgresViewBackend::is_retryable_error(&error));
+
         blocker.rollback().await.unwrap();
         let (_, context) = repository
             .load_with_context("schema")
