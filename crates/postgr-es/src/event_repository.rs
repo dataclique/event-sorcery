@@ -1325,6 +1325,41 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn append_preserves_application_unique_constraint_identity(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX one_event_per_type ON events (aggregate_type, event_type)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let store = PersistedEventStore::<_, RecordedValues>::new_event_store(repository);
+        let framework = CqrsFramework::new(store, vec![], None);
+        framework
+            .execute("first", "saved".to_string())
+            .await
+            .unwrap();
+        let error = framework
+            .execute("second", "rejected".to_string())
+            .await
+            .unwrap_err();
+        let AggregateError::DatabaseConnectionError(source) = error else {
+            panic!("expected the application constraint to remain a storage error: {error:?}");
+        };
+        let source = source.downcast_ref::<sqlx::Error>().unwrap();
+        let source = source.as_database_error().unwrap();
+        assert_eq!(source.code().as_deref(), Some("23505"));
+        assert_eq!(source.table(), Some("events"));
+        assert_eq!(source.constraint(), Some("one_event_per_type"));
+        let persisted: Vec<String> = sqlx::query_scalar("SELECT aggregate_id FROM events")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(persisted, ["first"]);
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn unrelated_unique_constraint_is_not_an_optimistic_conflict(pool: PgPool) {
         MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
