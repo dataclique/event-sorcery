@@ -77,7 +77,7 @@ pub use event_repository::{
 };
 pub use projection_recovery::SqliteProjectionRecovery;
 pub use schema_registry::load_schema_registry_payloads;
-pub use snapshot::{clear_snapshots, load_snapshot, write_snapshot};
+pub use snapshot::{clear_snapshots, discard_snapshot, load_snapshot, write_snapshot};
 pub use stream_version::committed_stream_version;
 pub use vacuum::{incremental_vacuum, vacuum};
 pub use view_repository::{

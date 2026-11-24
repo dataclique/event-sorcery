@@ -87,6 +87,25 @@ where
     Ok(())
 }
 
+/// Deletes the snapshot for one stream, without changing its events.
+pub async fn discard_snapshot(
+    pool: &SqlitePool,
+    aggregate_type: &str,
+    aggregate_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+            DELETE FROM snapshots
+            WHERE aggregate_type = ?1 AND aggregate_id = ?2
+            "#,
+        aggregate_type,
+        aggregate_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Loads the current snapshot on the caller's connection, when present.
 pub async fn load_snapshot(
     connection: &mut SqliteConnection,

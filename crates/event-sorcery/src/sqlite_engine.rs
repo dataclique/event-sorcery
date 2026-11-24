@@ -479,16 +479,8 @@ impl Engine {
     }
 
     pub async fn discard_snapshot(&self, stream: &StreamIdentity) -> Result<(), EngineError> {
-        sqlx::query!(
-            r#"
-            DELETE FROM snapshots
-            WHERE aggregate_type = ?1 AND aggregate_id = ?2
-            "#,
-            stream.aggregate_type,
-            stream.aggregate_id,
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlite_es::discard_snapshot(&self.pool, &stream.aggregate_type, &stream.aggregate_id)
+            .await?;
 
         Ok(())
     }
