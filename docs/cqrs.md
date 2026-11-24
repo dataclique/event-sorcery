@@ -782,13 +782,20 @@ stores JSONB. Applications own their projection-table migrations. See the
 [PostgreSQL setup guide](../crates/postgr-es/README.md#native-stores) for native
 projected and unprojected builders.
 
-Native framework delivery carries the persisted envelope's aggregate-local
-sequence through `Reactor::react_with_context`. Projection updates skip events
-already covered by recovery or another successful delivery. An ahead-of-next
-sequence retries without applying out of order; exhaustion leaves the checkpoint
-unchanged so `catch_up` can replay the missing history. `Arc` and `RetryOnBusy`
-preserve this context. Existing custom reactors default to their `react` method;
-plain custom `ViewBackend` repositories retain opaque optimistic revisions.
+Native framework delivery uses the persisted envelope's aggregate-local
+sequence. Projection updates skip events already covered by recovery or another
+successful delivery. A gap never applies a live event out of order. The native
+builder's projection shares one gap-wait budget across the committed batch. If
+that wait runs out, it calls `catch_up` once to replay durable history instead
+of retrying each remaining event. Catch-up can touch other streams in the same
+projection table; if it fails, delivery logs the failure without undoing the
+committed command.
+
+Other reactors receive the sequence through `Reactor::react_with_context`. `Arc`
+and `RetryOnBusy` preserve it, and custom reactors default to their `react`
+method. A native projection called directly with a sequence still leaves an
+exhausted gap for explicit recovery. Plain custom `ViewBackend` repositories
+retain opaque optimistic revisions.
 
 Native projection repositories write payload and sequence checkpoints
 atomically, advance ordinary updates by one, and report competing identity

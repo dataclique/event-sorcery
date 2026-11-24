@@ -354,7 +354,13 @@ pub(crate) mod tests {
         }
 
         async fn transition(&self, text: String) -> Result<Effect<Self>, Never> {
-            Self::initialize(text).await
+            Ok(Effect::Events(
+                text.lines()
+                    .map(|text| NoteEvent::Written {
+                        text: text.to_string(),
+                    })
+                    .collect(),
+            ))
         }
     }
 
@@ -888,50 +894,40 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn exhausted_gap_delivery_preserves_coverage_until_catch_up(pool: PgPool) {
+    async fn a_batch_catches_up_once_when_the_predecessor_delivery_is_late(pool: PgPool) {
         let pool = projected_pool(pool).await;
         let pending = pending_projection(&pool).await;
-        pending
-            .store
-            .send(&"projected".to_string(), "third".to_string())
-            .await
-            .unwrap();
-        assert_eq!(
-            pending
-                .projection
-                .load(&"projected".to_string())
-                .await
-                .unwrap()
-                .unwrap()
-                .history,
-            vec!["first"]
-        );
-        let version: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
+        let id = "projected".to_string();
+        timeout(
+            Duration::from_secs(15),
+            pending.store.send(&id, "third\nfourth".to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let checkpoint = || {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM note_projection WHERE view_id = 'projected'",
+            )
             .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(version, 1);
+        };
+        assert_eq!(checkpoint().await.unwrap(), 4);
+        assert_eq!(
+            pending.projection.load(&id).await.unwrap().unwrap().history,
+            ["first", "second", "third", "fourth"]
+        );
+
         pending.gate.resume.notify_one();
         timeout(Duration::from_secs(10), pending.writing)
             .await
             .unwrap()
             .unwrap();
-        pending.projection.catch_up().await.unwrap();
+        assert_eq!(checkpoint().await.unwrap(), 4);
         assert_eq!(
-            pending
-                .projection
-                .load(&"projected".to_string())
-                .await
-                .unwrap()
-                .unwrap()
-                .history,
-            vec!["first", "second", "third"]
+            pending.projection.load(&id).await.unwrap().unwrap().history,
+            ["first", "second", "third", "fourth"]
         );
-        let version: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(version, 3);
     }
 
     async fn seed_projected(pool: &PgPool) {

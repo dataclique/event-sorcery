@@ -41,7 +41,7 @@ use cqrs_es::{CqrsFramework, Query};
 use crate::Nil;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
-use crate::projection::Projection;
+use crate::projection::{Projection, ProjectionQuery};
 use crate::reactor::Reactor;
 use crate::schema_registry::ReconcileError;
 use crate::{
@@ -142,8 +142,8 @@ where
 
         let projection = Arc::new(self.backend.reconcile_projected::<Entity>().await?);
 
-        self.queries.push(Box::new(ReactorBridge {
-            reactor: projection.clone(),
+        self.queries.push(Box::new(ProjectionQuery {
+            projection: projection.clone(),
         }));
 
         let Self {

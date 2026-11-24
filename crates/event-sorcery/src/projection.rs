@@ -5,15 +5,15 @@
 //! Database-specific construction and recovery live in the backend integrations.
 
 use async_trait::async_trait;
-use cqrs_es::Aggregate;
 use cqrs_es::persist::{PersistenceError, ViewRepository};
+use cqrs_es::{Aggregate, EventEnvelope, Query};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::sleep;
+use tokio::time::{Duration, sleep};
 use tracing::{error, trace, warn};
 
 use indexed_query::{IndexedView, Order, Predicate};
@@ -264,10 +264,82 @@ where
 enum SkippedDelivery {
     Covered,
     InvalidCheckpoint(i64),
-    Gap {
-        covered: usize,
-        sequence: NonZeroUsize,
-    },
+    Gap(DeliveryGap),
+}
+
+struct DeliveryGap {
+    covered: usize,
+    sequence: NonZeroUsize,
+}
+
+struct GapWait(Duration);
+
+impl GapWait {
+    fn for_batch() -> Self {
+        let schedule = retry_delays(RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
+        Self(
+            schedule
+                .zip(0..RETRY_MAX_ATTEMPTS)
+                .map(|(delay, _)| delay)
+                .sum(),
+        )
+    }
+
+    fn spend(&mut self, delay: Duration) -> bool {
+        let Self(remaining) = self;
+        let Some(after_sleep) = remaining.checked_sub(delay) else {
+            return false;
+        };
+        *remaining = after_sleep;
+        true
+    }
+}
+
+pub(crate) struct ProjectionQuery<Entity: EventSourced, Backend: ViewBackend> {
+    /// The builder's recovered native projection, shared with the caller.
+    pub(crate) projection: Arc<Projection<Entity, Backend>>,
+}
+
+#[async_trait]
+impl<Entity, Backend> Query<Lifecycle<Entity>> for ProjectionQuery<Entity, Backend>
+where
+    Entity: EventSourced<Materialized = Table> + 'static,
+    Backend: crate::NativeProjectionBackend,
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Entity>>]) {
+        let Ok(id) = aggregate_id.parse::<Entity::Id>() else {
+            warn!(target: "cqrs", aggregate_id, aggregate_type = Entity::AGGREGATE_TYPE,
+                "Failed to parse aggregate ID in projection query");
+            return;
+        };
+        let view_id = id.to_string();
+        let mut gap_wait = GapWait::for_batch();
+        for envelope in events {
+            let Some(sequence) = NonZeroUsize::new(envelope.sequence) else {
+                error!(target: "cqrs", %view_id, sequence = envelope.sequence,
+                    "Persisted event has an invalid zero sequence; refusing projection delivery");
+                continue;
+            };
+            let gap = self
+                .projection
+                .deliver(
+                    &view_id,
+                    &envelope.payload,
+                    self.projection.table.and(Some(sequence)),
+                    &mut gap_wait,
+                )
+                .await;
+            if let Some(DeliveryGap { covered, sequence }) = gap {
+                if let Err(error) = self.projection.catch_up().await {
+                    error!(target: "cqrs", %view_id, covered, sequence = sequence.get(), ?error,
+                        "Projection catch-up failed after a delivery gap");
+                }
+                // Catch-up captures the durable events, including the rest of this batch.
+                return;
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -295,11 +367,26 @@ where
         let view_id = id.to_string();
         // Only native construction establishes sequence-based checkpoints.
         // Plain custom repositories retain their opaque optimistic versions.
-        let delivery = match self.table {
-            Some(_) => delivery,
-            None => ReactorContext { sequence: None },
-        };
+        let sequence = self.table.and(delivery.sequence);
+        if let Some(DeliveryGap { covered, sequence }) = self
+            .deliver(&view_id, &event, sequence, &mut GapWait::for_batch())
+            .await
+        {
+            error!(target: "cqrs", %view_id, covered, sequence = sequence.get(),
+                "Projection delivery is out of order; leaving checkpoint for recovery");
+        }
+        Ok(())
+    }
+}
 
+impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
+    async fn deliver(
+        &self,
+        view_id: &str,
+        event: &Entity::Event,
+        sequence: Option<NonZeroUsize>,
+        gap_wait: &mut GapWait,
+    ) -> Option<DeliveryGap> {
         // Retry with exponential backoff: 10ms, 20ms, 40ms, ... capped at 1s.
         // 10 retries gives ~4.3s of total retry budget, enough for any
         // realistic burst of concurrent writers on the same aggregate.
@@ -309,8 +396,8 @@ where
 
         let delays = retry_delays(base_delay_ms, max_delay_ms);
         for (attempt, delay) in (0..=max_retries).zip(delays) {
-            let outcome = Backend::try_update(&self.repo, &view_id, |stored, context| {
-                if let Some(sequence) = delivery.sequence {
+            let outcome = Backend::try_update(&self.repo, view_id, |stored, context| {
+                if let Some(sequence) = sequence {
                     let Ok(covered) = usize::try_from(context.version) else {
                         return ControlFlow::Break(SkippedDelivery::InvalidCheckpoint(
                             context.version,
@@ -320,7 +407,10 @@ where
                         return ControlFlow::Break(SkippedDelivery::Covered);
                     }
                     if covered.checked_add(1) != Some(sequence.get()) {
-                        return ControlFlow::Break(SkippedDelivery::Gap { covered, sequence });
+                        return ControlFlow::Break(SkippedDelivery::Gap(DeliveryGap {
+                            covered,
+                            sequence,
+                        }));
                     }
                 }
                 let mut lifecycle = stored.unwrap_or_default();
@@ -331,20 +421,18 @@ where
 
             use ViewUpdateError::{Load, Write};
             match outcome {
-                Ok(None | Some(SkippedDelivery::Covered)) => return Ok(()),
+                Ok(None | Some(SkippedDelivery::Covered)) => return None,
                 Ok(Some(SkippedDelivery::InvalidCheckpoint(version))) => {
                     error!(target: "cqrs", %view_id, version,
                         "Invalid projection checkpoint; refusing event delivery");
-                    return Ok(());
+                    return None;
                 }
-                Ok(Some(SkippedDelivery::Gap { covered, sequence })) => {
-                    if attempt < max_retries {
+                Ok(Some(SkippedDelivery::Gap(gap))) => {
+                    if attempt < max_retries && gap_wait.spend(delay) {
                         sleep(delay).await;
                         continue;
                     }
-                    error!(target: "cqrs", %view_id, covered, sequence = sequence.get(),
-                        "Projection delivery is out of order; leaving checkpoint for recovery");
-                    return Ok(());
+                    return Some(gap);
                 }
                 Err(Load(error)) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
@@ -362,11 +450,11 @@ where
                         %view_id, max_retries,
                         "View load lost: Storage contention conflict persisted after all retries"
                     );
-                    return Ok(());
+                    return None;
                 }
                 Err(Load(error)) => {
                     warn!(target: "cqrs", %view_id, ?error, "Failed to load view for update");
-                    return Ok(());
+                    return None;
                 }
                 Err(Write(PersistenceError::OptimisticLockError)) if attempt < max_retries => {
                     warn!(
@@ -382,7 +470,7 @@ where
                         %view_id, max_retries,
                         "View update lost: optimistic lock conflict persisted after all retries"
                     );
-                    return Ok(());
+                    return None;
                 }
                 Err(Write(error)) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
@@ -398,17 +486,17 @@ where
                             %view_id, max_retries,
                             "View update lost: Storage contention conflict persisted after all retries"
                         );
-                        return Ok(());
+                        return None;
                     }
                 }
                 Err(Write(error)) => {
                     warn!(target: "cqrs", %view_id, ?error, "Failed to save view update");
-                    return Ok(());
+                    return None;
                 }
             }
         }
 
-        Ok(())
+        None
     }
 }
 
@@ -1038,6 +1126,34 @@ mod tests {
             Some(TestEntity {
                 name: "original".to_string(),
             })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_gap_cannot_restart_the_batch_wait() {
+        let repo: Arc<CounterBusyRepo> =
+            Arc::new(BusyRepo::new(0).with_view("id-1", Lifecycle::Live(Counter { value: 0 })));
+        let projection: CounterBusyProjection = Projection::new(repo);
+        let event = CounterEvent::Incremented;
+        let mut wait = GapWait::for_batch();
+        let initial_time = tokio::time::Instant::now();
+        for sequence in [3, 4] {
+            let gap = projection
+                .deliver(
+                    "id-1",
+                    &event,
+                    Some(sequence.try_into().unwrap()),
+                    &mut wait,
+                )
+                .await
+                .unwrap();
+            assert_eq!(gap.covered, 1);
+            assert_eq!(gap.sequence.get(), sequence);
+            assert_eq!(initial_time.elapsed(), Duration::from_millis(4_270));
+        }
+        assert_eq!(
+            projection.load(&"id-1".to_string()).await.unwrap(),
+            Some(Counter { value: 0 })
         );
     }
 
