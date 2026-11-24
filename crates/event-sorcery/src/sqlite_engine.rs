@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::{
     CommitRequest, ENGINE_PAYLOAD_PROVENANCE_KEY, EngineError, JobSeed, OpaqueProposedEvent,
     OpaqueStoredEvent, StoredEventRow, StreamIdentity, decode_opaque_payload,
-    encode_opaque_payload, validate_expected_version,
+    encode_opaque_payload,
 };
 use crate::job::EnqueueRequest;
 use crate::job_sqlite::SqliteJobError;
@@ -354,63 +354,29 @@ impl Engine {
             snapshot,
             jobs,
         } = request;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(expected) = expected_version {
-            let actual = sqlite_es::committed_stream_version(
-                &mut tx,
-                &stream.aggregate_type,
-                &stream.aggregate_id,
-            )
-            .await?;
-            validate_expected_version(expected, actual)?;
-        }
-
-        sqlite_es::insert_serialized_events_batch(&mut tx, "events", events).await?;
-
-        if let Some(snapshot) = snapshot {
-            let last_sequence = snapshot.sequence_for(events)?;
-            if sqlite_es::load_snapshot(&mut tx, &stream.aggregate_type, &stream.aggregate_id)
-                .await?
-                .is_some_and(|stored| stored.current_sequence >= last_sequence)
-            {
-                return Err(EngineError::OptimisticLock);
-            }
-            sqlite_es::write_snapshot(
-                &mut tx,
-                &stream.aggregate_type,
-                &stream.aggregate_id,
-                last_sequence,
-                snapshot.snapshot_version,
-                &snapshot.aggregate,
-            )
-            .await?;
-        }
-
-        for request in jobs {
-            let event = crate::job::enqueued_event(&request)?;
-            sqlite_es::insert_serialized_events_batch(
-                &mut tx,
-                "events",
-                std::slice::from_ref(&event),
-            )
-            .await?;
-
-            let payload = crate::job::pending_seed_payload(&request)?;
-            let job_id = request.job_id.to_string();
-            sqlx::query!(
-                r#"
-                INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
-                VALUES (?1, 1, ?2, NULL)
-                "#,
-                job_id,
-                payload,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(())
+        sqlite_es::commit_atomic(
+            &self.pool,
+            sqlite_es::Commit {
+                aggregate_type: &stream.aggregate_type,
+                aggregate_id: &stream.aggregate_id,
+                expected_version,
+                events,
+                snapshot,
+                jobs,
+            },
+            |snapshot| {
+                let current_sequence = snapshot.sequence_for(events)?;
+                Ok(SerializedSnapshot {
+                    aggregate_id: stream.aggregate_id.clone(),
+                    aggregate: snapshot.aggregate,
+                    current_sequence,
+                    current_snapshot: snapshot.snapshot_version,
+                })
+            },
+            |request| Ok(crate::job::enqueued_event(request)?),
+            |request| Ok(crate::job::pending_seed_payload(&request)?),
+        )
+        .await
     }
 }
 

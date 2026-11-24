@@ -44,6 +44,7 @@
 //! ```
 
 mod aggregate_ids;
+mod commit;
 mod compaction;
 mod contention;
 mod cqrs;
@@ -73,6 +74,7 @@ mod view_repository;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub use aggregate_ids::{count_aggregates, load_all_ids, load_ids_paginated};
+pub use commit::{Commit, commit_atomic};
 pub use compaction::compact_events;
 pub use contention::is_retryable_sqlite_busy;
 pub use cqrs::{SqliteCqrs, sqlite_cqrs};
