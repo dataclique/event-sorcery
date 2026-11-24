@@ -1192,6 +1192,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_registration_clears_zero_coverage_snapshot_without_deleting_events() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-zero-coverage", "one");
+        let target = SchemaTarget::new("engine-zero-coverage", 1, CompactionPolicy::Retain);
+        let events = [serialized_event(&stream, 1)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await
+            .unwrap();
+        engine
+            .store_snapshot(&stream, SnapshotWrite::new(serde_json::json!({}), 0))
+            .await
+            .unwrap();
+        let snapshot = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        assert_eq!(snapshot.current_sequence, 0);
+
+        let outcome = engine.reconcile_schema(&target).await.unwrap();
+
+        assert_eq!(outcome, SchemaReconciliation::Changed);
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), events);
+    }
+
+    #[tokio::test]
     async fn retained_schema_change_preserves_snapshots_with_incomplete_history() {
         for (policy, removed_through) in [
             (CompactionPolicy::RetainLast { events: 1 }, 1),

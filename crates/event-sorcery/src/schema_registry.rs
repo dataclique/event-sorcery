@@ -219,13 +219,14 @@ impl SchemaReconciliation {
 /// Proves that every positive sequence covered by a snapshot remains available.
 ///
 /// Counts must include only this stream and sequences in `1..=covered_sequence`.
+/// Zero coverage requires zero retained events in that range.
 /// Sparse or compacted histories without this proof require an explicit migration.
 pub fn validate_snapshot_history(
     stream: StreamIdentity,
     covered_sequence: i64,
     retained_events: i64,
 ) -> Result<(), ReconcileError> {
-    if covered_sequence <= 0 || retained_events != covered_sequence {
+    if covered_sequence < 0 || retained_events != covered_sequence {
         return Err(ReconcileError::UnprovenSnapshotHistory {
             stream,
             covered_sequence,
