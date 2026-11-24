@@ -644,36 +644,14 @@ impl Engine {
             {
                 return Err(EngineError::OptimisticLock);
             }
-            let last_sequence = i64::try_from(last_sequence)?;
-            let snapshot_version = i64::try_from(snapshot.snapshot_version)?;
-            let aggregate = serde_json::to_string(&snapshot.aggregate)?;
-
-            sqlx::query!(
-                r#"
-                INSERT OR REPLACE INTO snapshots (
-                    aggregate_type,
-                    aggregate_id,
-                    last_sequence,
-                    snapshot_version,
-                    payload,
-                    timestamp
-                )
-                VALUES (
-                    ?1,
-                    ?2,
-                    ?3,
-                    ?4,
-                    ?5,
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                )
-                "#,
-                stream.aggregate_type,
-                stream.aggregate_id,
+            sqlite_es::write_snapshot(
+                &mut tx,
+                &stream.aggregate_type,
+                &stream.aggregate_id,
                 last_sequence,
-                snapshot_version,
-                aggregate,
+                snapshot.snapshot_version,
+                &snapshot.aggregate,
             )
-            .execute(&mut *tx)
             .await?;
         }
 
@@ -862,36 +840,14 @@ async fn store_snapshot_in_transaction(
             .checked_add(1)
             .ok_or(EngineError::SnapshotVersionExhausted)
     })?;
-    let last_sequence = i64::try_from(snapshot.last_sequence)?;
-    let stored_version = i64::try_from(snapshot_version)?;
-    let aggregate = serde_json::to_string(&snapshot.aggregate)?;
-
-    sqlx::query!(
-        r#"
-                INSERT OR REPLACE INTO snapshots (
-                    aggregate_type,
-                    aggregate_id,
-                    last_sequence,
-                    snapshot_version,
-                    payload,
-                    timestamp
-                )
-                VALUES (
-                    ?1,
-                    ?2,
-                    ?3,
-                    ?4,
-                    ?5,
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                )
-                "#,
-        stream.aggregate_type,
-        stream.aggregate_id,
-        last_sequence,
-        stored_version,
-        aggregate,
+    sqlite_es::write_snapshot(
+        connection,
+        &stream.aggregate_type,
+        &stream.aggregate_id,
+        snapshot.last_sequence,
+        snapshot_version,
+        &snapshot.aggregate,
     )
-    .execute(connection)
     .await?;
 
     Ok(snapshot_version)

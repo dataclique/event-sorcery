@@ -47,6 +47,7 @@ mod aggregate_ids;
 mod compaction;
 mod cqrs;
 mod event_repository;
+mod snapshot;
 mod sql_query;
 mod stream_version;
 pub mod testing;
@@ -72,6 +73,7 @@ pub use cqrs_es::persist::ViewContext;
 pub use event_repository::{
     SqliteAggregateError, SqliteEventRepository, insert_serialized_events_batch,
 };
+pub use snapshot::write_snapshot;
 pub use stream_version::committed_stream_version;
 pub use vacuum::{incremental_vacuum, vacuum};
 pub use view_repository::{
