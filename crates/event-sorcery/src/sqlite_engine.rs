@@ -438,7 +438,12 @@ impl Engine {
     /// than the lower maximum sequence its surviving events show.
     pub async fn current_version(&self, stream: &StreamIdentity) -> Result<usize, EngineError> {
         let mut connection = self.pool.acquire().await?;
-        committed_stream_version(&mut connection, stream).await
+        Ok(sqlite_es::committed_stream_version(
+            &mut connection,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+        )
+        .await?)
     }
 
     /// Loads the current snapshot for one stream when present.
@@ -620,7 +625,12 @@ impl Engine {
         } = request;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(expected) = expected_version {
-            let actual = committed_stream_version(&mut tx, &stream).await?;
+            let actual = sqlite_es::committed_stream_version(
+                &mut tx,
+                &stream.aggregate_type,
+                &stream.aggregate_id,
+            )
+            .await?;
             validate_expected_version(expected, actual)?;
         }
 
@@ -693,44 +703,6 @@ impl Engine {
         tx.commit().await?;
         Ok(())
     }
-}
-
-/// Reads one stream's durable version, where zero means nothing was ever
-/// committed.
-///
-/// Compaction deletes every event a snapshot already covers, so
-/// `MAX(events.sequence)` alone can fall back below the aggregate's real version
-/// and stop reporting stale writers. `snapshots.last_sequence` is the durable
-/// record of how far the erased prefix reached, so the greater of the two is the
-/// only sound conflict oracle. Reads on the caller's connection, so a commit
-/// sees the two records under the write lock it already holds and appends
-/// against exactly what it observed.
-async fn committed_stream_version(
-    connection: &mut SqliteConnection,
-    stream: &StreamIdentity,
-) -> Result<usize, EngineError> {
-    let version = sqlx::query_scalar::<_, i64>(
-        r"
-        SELECT MAX(
-            COALESCE(
-                (SELECT MAX(sequence) FROM events
-                 WHERE aggregate_type = ?1 AND aggregate_id = ?2),
-                0
-            ),
-            COALESCE(
-                (SELECT last_sequence FROM snapshots
-                 WHERE aggregate_type = ?1 AND aggregate_id = ?2),
-                0
-            )
-        )
-        ",
-    )
-    .bind(&stream.aggregate_type)
-    .bind(&stream.aggregate_id)
-    .fetch_one(connection)
-    .await?;
-
-    usize::try_from(version).map_err(EngineError::from)
 }
 
 enum TransactionOutcome<Output> {
@@ -852,7 +824,7 @@ async fn load_snapshot_on(
 ///
 /// Compaction erases the events a snapshot already covers, so the surviving
 /// maximum sequence is not the stream's version. Validating against
-/// [`committed_stream_version`] keeps a snapshot of a compacted stream
+/// [`sqlite_es::committed_stream_version`] keeps a snapshot of a compacted stream
 /// acceptable while still rejecting one that runs ahead of the committed
 /// version.
 async fn store_snapshot_in_transaction(
@@ -860,7 +832,12 @@ async fn store_snapshot_in_transaction(
     stream: &StreamIdentity,
     snapshot: SnapshotWrite,
 ) -> Result<usize, EngineError> {
-    let current_sequence = committed_stream_version(connection, stream).await?;
+    let current_sequence = sqlite_es::committed_stream_version(
+        connection,
+        &stream.aggregate_type,
+        &stream.aggregate_id,
+    )
+    .await?;
     if current_sequence == 0 {
         return Err(EngineError::EmptySnapshotUpdate);
     }
