@@ -1,5 +1,6 @@
-//! Snapshot writes on the caller's SQLite connection.
+//! Snapshots on the caller's SQLite connection.
 
+use cqrs_es::persist::SerializedSnapshot;
 use serde_json::Value;
 use sqlx::SqliteConnection;
 
@@ -48,4 +49,36 @@ pub async fn write_snapshot(
     .execute(connection)
     .await?;
     Ok(())
+}
+
+/// Loads the current snapshot on the caller's connection, when present.
+pub async fn load_snapshot(
+    connection: &mut SqliteConnection,
+    aggregate_type: &str,
+    aggregate_id: &str,
+) -> Result<Option<SerializedSnapshot>, SqliteAggregateError> {
+    let row = sqlx::query!(
+        r#"
+            SELECT aggregate_id,
+                   last_sequence,
+                   snapshot_version,
+                   payload AS "payload: String"
+            FROM snapshots
+            WHERE aggregate_type = ?1 AND aggregate_id = ?2
+            "#,
+        aggregate_type,
+        aggregate_id,
+    )
+    .fetch_optional(connection)
+    .await?;
+
+    row.map(|row| {
+        Ok(SerializedSnapshot {
+            aggregate_id: row.aggregate_id,
+            current_sequence: usize::try_from(row.last_sequence)?,
+            current_snapshot: usize::try_from(row.snapshot_version)?,
+            aggregate: serde_json::from_str(&row.payload)?,
+        })
+    })
+    .transpose()
 }

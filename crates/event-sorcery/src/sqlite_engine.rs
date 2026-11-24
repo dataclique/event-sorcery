@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::{
     CommitRequest, ENGINE_PAYLOAD_PROVENANCE_KEY, EngineError, JobSeed, OpaqueProposedEvent,
-    OpaqueStoredEvent, StoredEventRow, StoredSnapshotRow, StreamIdentity, decode_opaque_payload,
+    OpaqueStoredEvent, StoredEventRow, StreamIdentity, decode_opaque_payload,
     encode_opaque_payload, validate_expected_version,
 };
 use crate::job::EnqueueRequest;
@@ -452,7 +452,12 @@ impl Engine {
         stream: &StreamIdentity,
     ) -> Result<Option<SerializedSnapshot>, EngineError> {
         let mut connection = self.pool.acquire().await?;
-        load_snapshot_on(&mut connection, stream).await
+        Ok(sqlite_es::load_snapshot(
+            &mut connection,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+        )
+        .await?)
     }
 
     /// Writes one snapshot under the same write lock the commit path takes.
@@ -638,7 +643,7 @@ impl Engine {
 
         if let Some(snapshot) = snapshot {
             let last_sequence = snapshot.sequence_for(events)?;
-            if load_snapshot_on(&mut tx, &stream)
+            if sqlite_es::load_snapshot(&mut tx, &stream.aggregate_type, &stream.aggregate_id)
                 .await?
                 .is_some_and(|stored| stored.current_sequence >= last_sequence)
             {
@@ -775,29 +780,6 @@ async fn load_events_on(
     rows.into_iter().map(SerializedEvent::try_from).collect()
 }
 
-async fn load_snapshot_on(
-    connection: &mut SqliteConnection,
-    stream: &StreamIdentity,
-) -> Result<Option<SerializedSnapshot>, EngineError> {
-    let row = sqlx::query_as!(
-        StoredSnapshotRow,
-        r#"
-            SELECT aggregate_id,
-                   last_sequence,
-                   snapshot_version,
-                   payload AS "payload: String"
-            FROM snapshots
-            WHERE aggregate_type = ?1 AND aggregate_id = ?2
-            "#,
-        stream.aggregate_type,
-        stream.aggregate_id,
-    )
-    .fetch_optional(connection)
-    .await?;
-
-    row.map(SerializedSnapshot::try_from).transpose()
-}
-
 /// Writes one snapshot against the version the stream durably committed.
 ///
 /// Compaction erases the events a snapshot already covers, so the surviving
@@ -827,7 +809,8 @@ async fn store_snapshot_in_transaction(
         });
     }
 
-    let stored = load_snapshot_on(connection, stream).await?;
+    let stored =
+        sqlite_es::load_snapshot(connection, &stream.aggregate_type, &stream.aggregate_id).await?;
     if stored
         .as_ref()
         .is_some_and(|current| current.current_sequence > snapshot.last_sequence)
