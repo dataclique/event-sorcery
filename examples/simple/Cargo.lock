@@ -211,7 +211,7 @@ dependencies = [
 [[package]]
 name = "cqrs-es"
 version = "0.5.0"
-source = "git+https://github.com/dataclique/cqrs?rev=cb0020add5dcff06f1ece3816fce9e4319004b87#cb0020add5dcff06f1ece3816fce9e4319004b87"
+source = "git+https://github.com/dataclique/cqrs?rev=78e0ae7ed9f03a63ebae7b53d76e609e9f2e83a5#78e0ae7ed9f03a63ebae7b53d76e609e9f2e83a5"
 dependencies = [
  "async-trait",
  "serde",
@@ -338,7 +338,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

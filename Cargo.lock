@@ -410,7 +410,7 @@ dependencies = [
 [[package]]
 name = "cqrs-es"
 version = "0.5.0"
-source = "git+https://github.com/dataclique/cqrs?rev=cb0020add5dcff06f1ece3816fce9e4319004b87#cb0020add5dcff06f1ece3816fce9e4319004b87"
+source = "git+https://github.com/dataclique/cqrs?rev=78e0ae7ed9f03a63ebae7b53d76e609e9f2e83a5#78e0ae7ed9f03a63ebae7b53d76e609e9f2e83a5"
 dependencies = [
  "async-trait",
  "serde",
@@ -1348,7 +1348,7 @@ dependencies = [
 [[package]]
 name = "postgres-es"
 version = "0.5.0"
-source = "git+https://github.com/dataclique/cqrs?rev=cb0020add5dcff06f1ece3816fce9e4319004b87#cb0020add5dcff06f1ece3816fce9e4319004b87"
+source = "git+https://github.com/dataclique/cqrs?rev=78e0ae7ed9f03a63ebae7b53d76e609e9f2e83a5#78e0ae7ed9f03a63ebae7b53d76e609e9f2e83a5"
 dependencies = [
  "cqrs-es",
  "futures",
@@ -2053,7 +2053,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
