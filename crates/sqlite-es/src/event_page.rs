@@ -238,3 +238,147 @@ pub enum EventPageReadError {
         limit: usize,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    //! Byte budgets track the exact rows returned from the selected stream.
+
+    use cqrs_es::event_sink::EventSink;
+    use cqrs_es::{Aggregate, DomainEvent};
+    use serde::{Deserialize, Serialize};
+    use sqlx::SqlitePool;
+    use std::convert::Infallible;
+    use std::num::NonZeroUsize;
+
+    use super::{EventPageReadError, load_events_page_bounded};
+    use crate::sqlite_cqrs;
+    use crate::testing::create_test_pool;
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    struct RecordedText(String);
+
+    impl DomainEvent for RecordedText {
+        fn event_type(&self) -> String {
+            "E".to_owned()
+        }
+
+        fn event_version(&self) -> String {
+            "1".to_owned()
+        }
+    }
+
+    #[derive(Default, Serialize, Deserialize)]
+    struct PageStream<const OTHER_TYPE: bool>;
+
+    impl<const OTHER_TYPE: bool> Aggregate for PageStream<OTHER_TYPE> {
+        const TYPE: &'static str = if OTHER_TYPE { "B" } else { "A" };
+        type Command = RecordedText;
+        type Event = RecordedText;
+        type Error = Infallible;
+        type Services = ();
+
+        async fn handle(
+            &mut self,
+            command: Self::Command,
+            _services: &Self::Services,
+            sink: &EventSink<Self>,
+        ) -> Result<(), Self::Error> {
+            sink.write(command, self).await;
+            Ok(())
+        }
+
+        fn apply(&mut self, _event: Self::Event) {}
+    }
+
+    #[derive(Debug, PartialEq, sqlx::FromRow)]
+    struct EventRow {
+        aggregate_type: String,
+        aggregate_id: String,
+        sequence: i64,
+        payload: String,
+    }
+
+    async fn seed_page() -> SqlitePool {
+        let pool = create_test_pool().await.unwrap();
+        let stream = sqlite_cqrs::<PageStream<false>>(pool.clone(), vec![], ());
+        let other_stream = sqlite_cqrs::<PageStream<true>>(pool.clone(), vec![], ());
+        let large = "payload ".repeat(20);
+
+        for text in ["ab".to_owned(), "\u{e9}".to_owned(), large.clone()] {
+            stream.execute("x", RecordedText(text)).await.unwrap();
+        }
+        for text in ["ab".to_owned(), large] {
+            stream
+                .execute("y", RecordedText(text.clone()))
+                .await
+                .unwrap();
+            other_stream.execute("x", RecordedText(text)).await.unwrap();
+        }
+
+        pool
+    }
+
+    #[tokio::test]
+    async fn bounded_page_respects_the_stream_checkpoint_item_limit_and_exact_byte_budget() {
+        let pool = seed_page().await;
+        let result = load_events_page_bounded::<EventRow>(
+            &pool,
+            "A",
+            "x",
+            Some(1),
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(18).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            [EventRow {
+                aggregate_type: "A".into(),
+                aggregate_id: "x".into(),
+                sequence: 2,
+                payload: "\"\u{e9}\"".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_page_rejects_when_the_budget_is_one_byte_short() {
+        let pool = seed_page().await;
+        let error = load_events_page_bounded::<EventRow>(
+            &pool,
+            "A",
+            "x",
+            Some(1),
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(17).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            EventPageReadError::TooLarge {
+                observed: 18,
+                limit: 17
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_page_is_empty_after_the_last_event() {
+        let pool = seed_page().await;
+        let result = load_events_page_bounded::<EventRow>(
+            &pool,
+            "A",
+            "x",
+            Some(3),
+            NonZeroUsize::MIN,
+            NonZeroUsize::MIN,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, []);
+    }
+}
