@@ -1,4 +1,4 @@
-# 0016. Separate the persistence core from SQLite
+# 0016. Separate the framework from its storage adapters
 
 - Status: Accepted
 - Date: 2026-11-20
@@ -6,71 +6,65 @@
 
 ## Context
 
-`event-sorcery` can build without SQLite, but still owns SQLite SQL and
-transaction code behind its `sqlite` feature. `sqlite-es` owns the SQLite schema
-and repositories, yet cannot import the shared persistence logic it needs:
-`event-sorcery` already depends on `sqlite-es`. Moving files to a module within
-`event-sorcery` does not change that dependency direction.
-
-Both backends must use the same commit validation and durable decisions. Native
-Rust and FFI must continue to use one SQLite writer. The crate split must not
-change stored data, migrations, or public constructor signatures.
+[ADR-0012](0012-postgresql-repository-persistence.md) introduced atomic command
+persistence on PostgreSQL. PostgreSQL also needs to build and recover native
+stores and projections without linking SQLite. An optional SQLite dependency in
+`event-sorcery` still makes the framework own SQLite constructors, concrete
+errors, and startup wiring. Moving SQL alone does not fix that boundary.
 
 ## Decision
 
-Extract backend-neutral persistence contracts and the shared behavior they
-require into `event-sorcery-core` (`crates/core/`). Move SQLite storage into the
-existing `sqlite-es` crate.
+`event-sorcery` owns typed stores, CQRS execution, projections, schema policy,
+and worker orchestration. `Lifecycle` stays private. `event-sorcery-core`, in
+`crates/core/`, owns the shared persistence contracts that must work without
+building the framework or linking a database driver. Shared indexed-query
+contracts remain in `indexed-query` per
+[ADR-0015](0015-backend-neutral-indexed-queries.md).
+
+`sqlite-es` and `postgr-es` implement the framework's backend contracts. Both
+own their concrete types and errors, migrations, repository operations,
+transactions, and startup wiring. The framework depends on neither adapter,
+including in test builds. Neither adapter depends on the other.
 
 ```mermaid
 flowchart LR
-    framework["event-sorcery"] -->|"depends on"| core["event-sorcery-core (crates/core/)"]
-    sqlite["sqlite-es"] -->|"depends on"| core
-    framework -.->|"only with the sqlite feature"| sqlite
+    sqlite[sqlite-es] --> framework[event-sorcery]
+    postgres[postgr-es] --> framework
+    framework --> core[event-sorcery-core]
+    ffi[event-sorcery-ffi] --> sqlite
 ```
 
-The diagram shows the split, not the unchanged callers. `postgr-es` uses
-`event-sorcery` without SQLite; `event-sorcery-ffi` enables its `sqlite`
-feature. Neither `sqlite-es` nor `event-sorcery-core` depends on
-`event-sorcery`. The new crate contains the existing contract definitions and
-decisions, not copies of them. Extract only what a storage implementation
-consumes. Keep `Lifecycle`, CQRS execution, and worker hosting on the framework
-side; pass prepared values or use the existing replay and decision boundaries
-instead of exposing private types.
+Rust applications select an adapter by passing its backend to the framework's
+generic store constructor. Adapter-specific operations come from the owning
+crate. The Rust 0.6 release removes the old SQLite feature, constructors, and
+reexports from `event-sorcery`; it does not provide compatibility shims.
 
-Move SQL and transaction ownership together into `sqlite-es`. Command events,
-snapshot changes, and durable job intent (job event and queue row) must still
-commit atomically. Native Rust and FFI delegate to the same writer; no
-transaction crosses the C ABI. The public `event-sorcery` crate retains
-reexports and inherent constructors such as `StoreBuilder::new(pool)`; those
-constructors compose the SQLite adapter with the framework rather than
-performing storage operations.
+## Storage guarantees
 
-Start with the shared `CompactionPolicy`. Keep `compact_events::<Entity>(pool)`
-and its result and error contract. The wrapper passes the aggregate type and
-policy to `sqlite-es`, which owns the retention-window conversion and bounded
-delete. Check per-stream windows, snapshot bounds, and rejection before deletion
-when the window does not fit. Move the remaining persistence paths in slices
-that preserve their tests and the native/FFI write boundary.
+Each adapter validates expected versions within its transaction and commits
+command events, snapshot updates, and job intent atomically. Shared command
+validation and job-event policy stay outside database code. SQLite's native
+repository and the C binding use the same writer. The split changes neither the
+C ABI nor existing migrations and data formats.
 
-Verify default and PostgreSQL-only normal dependencies in isolated package
-builds; workspace builds can enable SQLite through FFI and test dependencies.
-Exercise the explicitly enabled SQLite constructors, real database tests, and
-FFI conformance. No storage migration is needed; reverting a slice restores code
-ownership without rolling back data.
+PostgreSQL supports native projected and unprojected startup, with adapter-owned
+recovery and shared replay policy. Atomic job enqueue does not imply worker
+support or compaction parity. PostgreSQL queue reconstruction, ownership and
+leases, and worker integration are separate deliveries.
 
 ## Alternatives considered
 
-- **Group the SQLite code under one module in `event-sorcery`.** This cleans up
-  names, but leaves SQLite persistence split between two crates and does not let
-  `sqlite-es` consume shared decisions.
-- **Make `sqlite-es` depend on `event-sorcery`.** This creates a dependency
-  cycle unless `event-sorcery` drops its SQLite dependency, which would break
-  the existing opt-in constructors and reexports.
+- **Keep SQLite optional in the framework.** Default builds avoid the driver,
+  but the framework still owns SQLite APIs and fixtures. PostgreSQL and SQLite
+  would continue to integrate in opposite directions.
+- **Put all startup and execution contracts in the shared core.** That would
+  make the core depend on typed orchestration it does not need. Both adapters
+  can use the framework's existing contracts without exposing `Lifecycle`.
 
-## Consequences
+## Verification
 
-`sqlite-es` gains a dependency on the shared persistence crate, not on the
-framework or worker host. The public crate keeps its existing SQLite call sites
-while no longer owning SQLite SQL or transaction execution. Shared contracts
-must remain usable without either database driver.
+Check the framework's normal and test dependency graphs for database adapters
+and drivers. Run the real SQLite and PostgreSQL suites, preserving the existing
+SQLite-backed cases on the adapter side. Assert exact conflict and decode
+errors, snapshot coverage and counters, and rollback of partial event, snapshot,
+job, and recovery writes. Run FFI conformance against the same SQLite writer.

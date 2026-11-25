@@ -80,15 +80,15 @@ shared persistence contracts.
 
 Database-specific SQL and transaction mechanisms MAY differ. Command validation,
 job-event construction, and durable lifecycle decisions MUST remain shared
-library code. Adding a backend MUST preserve existing public constructor
-signatures, backend implementations, migrations, stored data, and behavior.
-Database-specific integrations MUST be opt-in: the default core build and a
-PostgreSQL-only build MUST NOT pull in SQLite repositories, SQLite driver
-dependencies, or SQLite implementation modules. SQLite constructors and
-reexports remain available when the SQLite integration is explicitly enabled.
-Generic modules MUST keep backend implementations in their owning integration
-modules rather than embed SQLite implementations alongside backend-neutral
-interfaces.
+library code. Adding a backend MUST preserve existing backend behavior,
+migrations, and stored data. The Rust 0.6 crate split moves backend-specific
+constructors and types to their owning adapters without compatibility shims. It
+does not change the C ABI.
+
+The framework and shared core MUST NOT depend on database adapters or drivers,
+including in their test builds. Each adapter MUST own its concrete repository
+and startup wiring. Rust applications opt in by selecting an adapter and passing
+its backend to the framework. Neither adapter may pull in the other's driver.
 
 Backend type parameters MUST NOT have implicit database defaults. Named type
 annotations specify the backend; constructors MAY infer it from their inputs or
