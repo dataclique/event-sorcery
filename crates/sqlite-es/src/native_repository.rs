@@ -14,9 +14,7 @@ use sqlx::{FromRow, SqlitePool};
 
 use event_sorcery_core::CompactionPolicy;
 
-use crate::{
-    CommandRepository, SqliteAggregateError, load_event_rows, load_snapshot, replay_events,
-};
+use crate::{CommandRepository, load_event_rows, load_snapshot, replay_events};
 
 /// Snapshot inputs supplied by the two CQRS persistence entry points.
 pub enum SnapshotInput {
@@ -98,25 +96,15 @@ impl<Policy: RepositoryPolicy> NativeRepository<Policy> {
         aggregate_id: &str,
         after: Option<usize>,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(SqliteAggregateError::from)?;
-        load_event_rows::<Policy::EventRow>(
-            &mut connection,
-            AggregateType::TYPE,
-            aggregate_id,
-            after,
-        )
-        .await?
-        .into_iter()
-        .map(|row| {
-            row.try_into()
-                .map(|event| upcast(event, &self.upcasters))
-                .map_err(Into::into)
-        })
-        .collect()
+        load_event_rows::<Policy::EventRow>(&self.pool, AggregateType::TYPE, aggregate_id, after)
+            .await?
+            .into_iter()
+            .map(|row| {
+                row.try_into()
+                    .map(|event| upcast(event, &self.upcasters))
+                    .map_err(Into::into)
+            })
+            .collect()
     }
 
     fn replay<AggregateType: Aggregate>(&self, aggregate_id: Option<String>) -> ReplayStream {
@@ -158,12 +146,7 @@ impl<Policy: RepositoryPolicy> PersistedEventRepository for NativeRepository<Pol
         &self,
         aggregate_id: &str,
     ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(SqliteAggregateError::from)?;
-        load_snapshot(&mut connection, AggregateType::TYPE, aggregate_id)
+        load_snapshot(&self.pool, AggregateType::TYPE, aggregate_id)
             .await?
             .map(|snapshot| Policy::guard_snapshot::<AggregateType>(snapshot, self.compaction))
             .transpose()

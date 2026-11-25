@@ -1,6 +1,6 @@
 //! SQLite's durable stream version, including compacted history.
 
-use sqlx::SqliteConnection;
+use sqlx::SqliteExecutor;
 
 use crate::SqliteAggregateError;
 
@@ -11,11 +11,10 @@ use crate::SqliteAggregateError;
 /// `MAX(events.sequence)` alone can fall back below the aggregate's real version
 /// and stop reporting stale writers. `snapshots.last_sequence` is the durable
 /// record of how far the erased prefix reached, so the greater of the two is the
-/// only sound conflict oracle. Reads on the caller's connection, so a commit
-/// sees the two records under the write lock it already holds and appends
-/// against exactly what it observed.
-pub async fn committed_stream_version(
-    connection: &mut SqliteConnection,
+/// only sound conflict oracle. Pass the transaction's connection when fencing
+/// a write so it observes the same state as the append.
+pub async fn committed_stream_version<'connection>(
+    executor: impl SqliteExecutor<'connection>,
     aggregate_type: &str,
     aggregate_id: &str,
 ) -> Result<usize, SqliteAggregateError> {
@@ -37,7 +36,7 @@ pub async fn committed_stream_version(
     )
     .bind(aggregate_type)
     .bind(aggregate_id)
-    .fetch_one(connection)
+    .fetch_one(executor)
     .await?;
 
     usize::try_from(version).map_err(SqliteAggregateError::from)
@@ -78,7 +77,7 @@ mod tests {
             ("invoice", "missing", 0),
         ] {
             assert_eq!(
-                committed_stream_version(&mut connection, aggregate_type, aggregate_id)
+                committed_stream_version(&mut *connection, aggregate_type, aggregate_id)
                     .await
                     .unwrap(),
                 expected,
@@ -112,7 +111,7 @@ mod tests {
         );
         let mut transaction = pool.begin().await.unwrap();
         assert_eq!(
-            committed_stream_version(&mut transaction, "invoice", "one")
+            committed_stream_version(&mut *transaction, "invoice", "one")
                 .await
                 .unwrap(),
             2,
@@ -126,7 +125,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            committed_stream_version(&mut transaction, "invoice", "one")
+            committed_stream_version(&mut *transaction, "invoice", "one")
                 .await
                 .unwrap(),
             3,
@@ -135,7 +134,7 @@ mod tests {
 
         let mut connection = pool.acquire().await.unwrap();
         assert_eq!(
-            committed_stream_version(&mut connection, "invoice", "one")
+            committed_stream_version(&mut *connection, "invoice", "one")
                 .await
                 .unwrap(),
             2,

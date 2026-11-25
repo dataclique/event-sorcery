@@ -2,7 +2,7 @@
 
 use cqrs_es::persist::SerializedSnapshot;
 use serde_json::Value;
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::{SqliteConnection, SqliteExecutor, SqlitePool};
 
 use crate::{SqliteAggregateError, committed_stream_version};
 
@@ -18,7 +18,7 @@ pub async fn store_snapshot(
     aggregate: &Value,
 ) -> Result<usize, StoreSnapshotError> {
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let current = committed_stream_version(&mut transaction, aggregate_type, aggregate_id).await?;
+    let current = committed_stream_version(&mut *transaction, aggregate_type, aggregate_id).await?;
     if current == 0 {
         return Err(StoreSnapshotError::EmptyStream);
     }
@@ -29,7 +29,7 @@ pub async fn store_snapshot(
         });
     }
 
-    let stored = load_snapshot(&mut transaction, aggregate_type, aggregate_id).await?;
+    let stored = load_snapshot(&mut *transaction, aggregate_type, aggregate_id).await?;
     if stored
         .as_ref()
         .is_some_and(|snapshot| snapshot.current_sequence > last_sequence)
@@ -180,9 +180,9 @@ pub async fn discard_snapshot(
     Ok(())
 }
 
-/// Loads the current snapshot on the caller's connection, when present.
-pub async fn load_snapshot(
-    connection: &mut SqliteConnection,
+/// Loads the current snapshot from the pool or the caller's transaction.
+pub async fn load_snapshot<'connection>(
+    executor: impl SqliteExecutor<'connection>,
     aggregate_type: &str,
     aggregate_id: &str,
 ) -> Result<Option<SerializedSnapshot>, SqliteAggregateError> {
@@ -198,7 +198,7 @@ pub async fn load_snapshot(
         aggregate_type,
         aggregate_id,
     )
-    .fetch_optional(connection)
+    .fetch_optional(executor)
     .await?;
 
     row.map(|row| {
@@ -239,7 +239,7 @@ mod tests {
         id: &str,
     ) -> Option<SerializedSnapshot> {
         let mut connection = pool.acquire().await.unwrap();
-        load_snapshot(&mut connection, aggregate_type, id)
+        load_snapshot(&mut *connection, aggregate_type, id)
             .await
             .unwrap()
     }
@@ -319,7 +319,7 @@ mod tests {
         .await
         .unwrap();
         let mut connection = pool.acquire().await.unwrap();
-        let error = load_snapshot(&mut connection, "invoice", "one")
+        let error = load_snapshot(&mut *connection, "invoice", "one")
             .await
             .unwrap_err();
         assert!(matches!(error, SqliteAggregateError::Deserialization(_)));

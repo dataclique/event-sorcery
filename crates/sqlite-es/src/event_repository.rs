@@ -371,9 +371,9 @@ impl SqliteEventRepository {
     }
 }
 
-/// Loads ordered event rows on an existing connection, optionally after an exclusive checkpoint.
+/// Loads ordered event rows, optionally after an exclusive checkpoint.
 pub async fn load_event_rows<EventRow>(
-    connection: &mut SqliteConnection,
+    pool: &SqlitePool,
     aggregate_type: &str,
     aggregate_id: &str,
     after_sequence: Option<usize>,
@@ -381,6 +381,7 @@ pub async fn load_event_rows<EventRow>(
 where
     EventRow: for<'row> FromRow<'row, SqliteRow> + Send + Unpin,
 {
+    let mut connection = pool.acquire().await?;
     let factory = SqlQueryFactory::native_event_rows();
     let checkpoint = after_sequence.map(i64::try_from).transpose()?;
     let sql = match checkpoint {
@@ -394,7 +395,7 @@ where
         None => query,
         Some(checkpoint) => query.bind(checkpoint),
     };
-    Ok(query.fetch_all(connection).await?)
+    Ok(query.fetch_all(&mut *connection).await?)
 }
 
 /// Feeds an ordered, incremental replay of one stream or all streams of an aggregate type.

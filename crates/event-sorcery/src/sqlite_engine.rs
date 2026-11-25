@@ -151,9 +151,8 @@ impl Engine {
         stream: &StreamIdentity,
         after_sequence: Option<usize>,
     ) -> Result<Vec<SerializedEvent>, EngineError> {
-        let mut connection = self.pool.acquire().await?;
         sqlite_es::load_event_rows::<StoredEventRow>(
-            &mut connection,
+            &self.pool,
             &stream.aggregate_type,
             &stream.aggregate_id,
             after_sequence,
@@ -229,9 +228,8 @@ impl Engine {
     /// compacted stream reports the version its snapshot still covers rather
     /// than the lower maximum sequence its surviving events show.
     pub async fn current_version(&self, stream: &StreamIdentity) -> Result<usize, EngineError> {
-        let mut connection = self.pool.acquire().await?;
         Ok(sqlite_es::committed_stream_version(
-            &mut connection,
+            &self.pool,
             &stream.aggregate_type,
             &stream.aggregate_id,
         )
@@ -243,13 +241,10 @@ impl Engine {
         &self,
         stream: &StreamIdentity,
     ) -> Result<Option<SerializedSnapshot>, EngineError> {
-        let mut connection = self.pool.acquire().await?;
-        Ok(sqlite_es::load_snapshot(
-            &mut connection,
-            &stream.aggregate_type,
-            &stream.aggregate_id,
+        Ok(
+            sqlite_es::load_snapshot(&self.pool, &stream.aggregate_type, &stream.aggregate_id)
+                .await?,
         )
-        .await?)
     }
 
     /// Writes one snapshot under the same write lock the commit path takes.

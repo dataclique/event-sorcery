@@ -52,7 +52,7 @@ where
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     if let Some(expected) = expected_version {
         let actual =
-            committed_stream_version(&mut transaction, aggregate_type, aggregate_id).await?;
+            committed_stream_version(&mut *transaction, aggregate_type, aggregate_id).await?;
         if actual != expected {
             return Err(SqliteAggregateError::OptimisticLock.into());
         }
@@ -62,7 +62,7 @@ where
 
     if let Some(snapshot) = snapshot {
         let snapshot = prepare_snapshot(snapshot)?;
-        if load_snapshot(&mut transaction, aggregate_type, aggregate_id)
+        if load_snapshot(&mut *transaction, aggregate_type, aggregate_id)
             .await?
             .is_some_and(|stored| stored.current_sequence >= snapshot.current_sequence)
         {
