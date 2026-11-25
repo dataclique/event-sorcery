@@ -189,13 +189,13 @@ impl<Entity: EventSourced<Materialized = Nil>, Backend: UnmaterializedStoreBacke
 }
 
 /// SQLite-specific [`Store`] helpers.
+#[cfg(all(any(test, feature = "test-support"), any(test, feature = "sqlite")))]
 impl<Entity: EventSourced> Store<Entity, SqliteBackend> {
     /// Reconstruct an entity's state from events without needing
     /// a full `Store` (no services or CQRS framework required).
     ///
     /// Useful in test/CLI contexts where you only need to read
     /// aggregate state and never send commands.
-    #[cfg(any(test, feature = "test-support"))]
     pub async fn load_from_pool(
         pool: SqlitePool,
         id: &Entity::Id,
@@ -212,6 +212,7 @@ impl<Entity: EventSourced> Store<Entity, SqliteBackend> {
     }
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 impl<Entity: EventSourced> StoreBuilder<Entity, SqliteBackend> {
     /// Creates a new builder backed by SQLite over `pool`.
     pub fn new(pool: SqlitePool) -> Self {
