@@ -633,6 +633,52 @@ mod tests {
         assert_eq!(registry.version_of("SchemaRegistry"), Some(1));
     }
 
+    #[tokio::test]
+    async fn registry_reads_only_the_singleton_stream_in_sequence_order() {
+        let pool = sqlite_es::testing::create_test_pool().await.unwrap();
+        let reconciler = Reconciler::new(pool.clone());
+
+        for version in [2, 5] {
+            reconciler
+                .record_target(&SchemaTarget::new(
+                    "Widget",
+                    version,
+                    CompactionPolicy::Retain,
+                ))
+                .await
+                .unwrap();
+        }
+        reconciler
+            .writer
+            .cqrs
+            .execute(
+                "not-the-registry",
+                SchemaRegistryCommand::Register {
+                    name: "Widget".to_owned(),
+                    version: 9,
+                },
+            )
+            .await
+            .unwrap();
+        let other = crate::test_store::<CompactableWidget>(pool.clone());
+        other.send(&REGISTRY_ID.to_owned(), ()).await.unwrap();
+
+        let payloads = sqlite_es::load_schema_registry_payloads(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|payload| serde_json::from_str::<serde_json::Value>(&payload).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            payloads,
+            [
+                json!({"VersionUpdated": {"name": "Widget", "version": 2}}),
+                json!({"VersionUpdated": {"name": "Widget", "version": 5}}),
+            ]
+        );
+    }
+
     /// Minimal compactable entity for testing the reconciliation guard.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct CompactableWidget;
