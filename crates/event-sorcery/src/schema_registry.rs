@@ -22,8 +22,8 @@
 //! [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
 
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
-use cqrs_es::persist::PersistenceError;
+use cqrs_es::persist::{PersistedEventRepository, PersistedEventStore, PersistenceError};
+use cqrs_es::{AggregateError, CqrsFramework};
 use serde::{Deserialize, Serialize};
 #[cfg(any(test, feature = "sqlite"))]
 use sqlx::SqlitePool;
@@ -31,13 +31,8 @@ use std::collections::BTreeMap;
 #[cfg(any(test, feature = "sqlite"))]
 use tracing::{debug, info};
 
-#[cfg(any(test, feature = "sqlite"))]
-use sqlite_es::SqliteCqrs;
-
 use crate::CompactionPolicy;
-#[cfg(any(test, feature = "sqlite"))]
-use crate::lifecycle::Lifecycle;
-use crate::lifecycle::{LifecycleError, Never};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::{DomainEvent, Effect, EventSourced, Nil, StreamIdentity, uneventful};
 
 /// Singleton aggregate ID for the schema registry.
@@ -290,6 +285,38 @@ impl From<Never> for ReconcileError {
     }
 }
 
+/// Records reconciled schema versions through the registry's existing aggregate.
+pub struct SchemaRegistryWriter<Repository: PersistedEventRepository> {
+    cqrs: CqrsFramework<
+        Lifecycle<SchemaRegistry>,
+        PersistedEventStore<Repository, Lifecycle<SchemaRegistry>>,
+    >,
+}
+
+impl<Repository: PersistedEventRepository> SchemaRegistryWriter<Repository> {
+    /// Opens the registry's command handler over caller-owned storage.
+    pub fn new(repository: Repository) -> Self {
+        let store = PersistedEventStore::new_event_store(repository);
+        let cqrs = crate::wire::es_cqrs::<SchemaRegistry, _>(store, vec![]);
+
+        Self { cqrs }
+    }
+
+    /// Marks a schema version after its recovery has durably completed.
+    pub async fn record(&self, target: &SchemaTarget) -> Result<(), ReconcileError> {
+        crate::job::with_pending_scope(self.cqrs.execute(
+            REGISTRY_ID,
+            SchemaRegistryCommand::Register {
+                name: target.aggregate_type.clone(),
+                version: target.version,
+            },
+        ))
+        .await?;
+
+        Ok(())
+    }
+}
+
 /// Handles schema version reconciliation at startup.
 ///
 /// Reads state by replaying all SchemaRegistry events from the event
@@ -297,16 +324,15 @@ impl From<Never> for ReconcileError {
 /// framework to maintain event sourcing invariants.
 #[cfg(any(test, feature = "sqlite"))]
 pub struct Reconciler {
-    cqrs: SqliteCqrs<Lifecycle<SchemaRegistry>>,
+    writer: SchemaRegistryWriter<sqlite_es::SqliteEventRepository>,
     pool: SqlitePool,
 }
 
 #[cfg(any(test, feature = "sqlite"))]
 impl Reconciler {
     pub fn new(pool: SqlitePool) -> Self {
-        #[allow(clippy::disallowed_methods)]
-        let cqrs = sqlite_es::sqlite_cqrs(pool.clone(), vec![], ());
-        Self { cqrs, pool }
+        let writer = SchemaRegistryWriter::new(sqlite_es::SqliteEventRepository::new(pool.clone()));
+        Self { writer, pool }
     }
 
     /// Reconciles language-neutral schema metadata through the same registry
@@ -362,17 +388,7 @@ impl Reconciler {
 
     /// Records a schema version only after its recovery has durably completed.
     pub async fn record_target(&self, target: &SchemaTarget) -> Result<(), ReconcileError> {
-        self.cqrs
-            .execute(
-                REGISTRY_ID,
-                SchemaRegistryCommand::Register {
-                    name: target.aggregate_type.clone(),
-                    version: target.version,
-                },
-            )
-            .await?;
-
-        Ok(())
+        self.writer.record(target).await
     }
 
     /// Rebuilds SchemaRegistry state from the full event log.

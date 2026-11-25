@@ -16,7 +16,7 @@ use sqlite_es::{NativeRepository, RepositoryPolicy, SnapshotInput, StoredEventRo
 use crate::engine::EngineError;
 #[cfg(any(test, feature = "sqlite"))]
 use crate::engine::{CommitRequest, SnapshotUpdate, commit_serialized};
-use crate::schema_registry::{REGISTRY_ID, SchemaRegistryCommand};
+use crate::schema_registry::{REGISTRY_ID, SchemaRegistryWriter};
 use crate::{
     CompactionPolicy, EventBackend, EventSourced, NativeProjectionBackend, Nil, Projection,
     ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, Table,
@@ -160,17 +160,12 @@ pub fn reconcile_schema<Entity: EventSourced>(
 pub async fn register_schema<Entity: EventSourced, Repository: PersistedEventRepository>(
     repository: Repository,
 ) -> Result<(), ReconcileError> {
-    let store = cqrs_es::persist::PersistedEventStore::new_event_store(repository);
-    let framework = crate::wire::es_cqrs::<SchemaRegistry, _>(store, vec![]);
-    crate::job::with_pending_scope(framework.execute(
-        REGISTRY_ID,
-        SchemaRegistryCommand::Register {
-            name: Entity::AGGREGATE_TYPE.to_string(),
-            version: Entity::SCHEMA_VERSION,
-        },
-    ))
-    .await?;
-    Ok(())
+    let target = SchemaTarget::new(
+        Entity::AGGREGATE_TYPE,
+        Entity::SCHEMA_VERSION,
+        Entity::COMPACTION_POLICY,
+    );
+    SchemaRegistryWriter::new(repository).record(&target).await
 }
 
 impl<Backend: EventBackend> PersistenceBackend for Backend {
