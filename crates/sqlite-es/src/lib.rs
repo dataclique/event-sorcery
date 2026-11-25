@@ -84,8 +84,8 @@ pub use cqrs::{SqliteCqrs, sqlite_cqrs};
 pub use cqrs_es::persist::ViewContext;
 pub use event_page::{EventPageReadError, load_events_page, load_events_page_bounded};
 pub use event_repository::{
-    SqliteAggregateError, SqliteEventRepository, insert_serialized_events_batch, load_event_rows,
-    replay_events,
+    SqliteAggregateError, SqliteEventRepository, StoredEventRow, insert_serialized_events_batch,
+    load_event_rows, replay_events,
 };
 pub use job_queue::{SqliteJobError, claim_job, enqueue_job, renew_job};
 pub use native_repository::{NativeRepository, RepositoryPolicy, SnapshotInput};

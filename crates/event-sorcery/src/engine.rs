@@ -536,54 +536,6 @@ fn reserves_engine_payload(metadata: &Value) -> bool {
     }
 }
 
-#[derive(sqlx::FromRow)]
-pub struct StoredEventRow {
-    aggregate_type: String,
-    aggregate_id: String,
-    sequence: i64,
-    event_type: String,
-    event_version: String,
-    payload: String,
-    metadata: String,
-}
-
-impl TryFrom<StoredEventRow> for SerializedEvent {
-    type Error = EngineError;
-
-    fn try_from(row: StoredEventRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            aggregate_type: row.aggregate_type,
-            aggregate_id: row.aggregate_id,
-            sequence: usize::try_from(row.sequence)?,
-            event_type: row.event_type,
-            event_version: row.event_version,
-            payload: serde_json::from_str(&row.payload)?,
-            metadata: serde_json::from_str(&row.metadata)?,
-        })
-    }
-}
-
-#[derive(sqlx::FromRow)]
-pub struct StoredSnapshotRow {
-    aggregate_id: String,
-    last_sequence: i64,
-    snapshot_version: i64,
-    payload: String,
-}
-
-impl TryFrom<StoredSnapshotRow> for SerializedSnapshot {
-    type Error = EngineError;
-
-    fn try_from(row: StoredSnapshotRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            aggregate_id: row.aggregate_id,
-            aggregate: serde_json::from_str(&row.payload)?,
-            current_sequence: usize::try_from(row.last_sequence)?,
-            current_snapshot: usize::try_from(row.snapshot_version)?,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Commit preparation validates batches independently of database version guards.

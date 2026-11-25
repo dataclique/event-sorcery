@@ -133,8 +133,8 @@ pub use dispatch::{
 };
 pub use engine::{
     CommitRequest, EngineError, JobSeed, OpaqueProposedEvent, OpaqueStoredEvent, PreparedCommit,
-    PreparedJob, PreparedSnapshot, SnapshotUpdate, StoredEventRow, StoredSnapshotRow,
-    StreamIdentity, decode_opaque_payload, encode_opaque_payload, validate_expected_version,
+    PreparedJob, PreparedSnapshot, SnapshotUpdate, StreamIdentity, decode_opaque_payload,
+    encode_opaque_payload, validate_expected_version,
 };
 #[cfg(any(test, feature = "sqlite"))]
 pub use engine::{Engine, OpaqueCommitRequest, SnapshotWrite};

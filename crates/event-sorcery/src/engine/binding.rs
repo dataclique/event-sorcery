@@ -6,15 +6,15 @@ use sqlx::SqlitePool;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use sqlite_es::{SqliteJobError, StoredEventRow};
+
 use super::{
     CommitRequest, ENGINE_PAYLOAD_PROVENANCE_KEY, EngineError, JobSeed, OpaqueProposedEvent,
-    OpaqueStoredEvent, StoredEventRow, StreamIdentity, decode_opaque_payload,
-    encode_opaque_payload,
+    OpaqueStoredEvent, StreamIdentity, decode_opaque_payload, encode_opaque_payload,
 };
 use crate::job::EnqueueRequest;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 use crate::schema_registry::{Reconciler, SchemaReconciliation, SchemaTarget};
-use sqlite_es::SqliteJobError;
 
 const ENGINE_PAYLOAD_PROVENANCE: &str = "opaque-v1";
 
@@ -159,7 +159,7 @@ impl Engine {
         )
         .await?
         .into_iter()
-        .map(SerializedEvent::try_from)
+        .map(|row| SerializedEvent::try_from(row).map_err(EngineError::from))
         .collect()
     }
 
@@ -180,7 +180,7 @@ impl Engine {
         )
         .await?
         .into_iter()
-        .map(SerializedEvent::try_from)
+        .map(|row| SerializedEvent::try_from(row).map_err(EngineError::from))
         .collect()
     }
 
@@ -202,7 +202,7 @@ impl Engine {
         )
         .await?
         .into_iter()
-        .map(SerializedEvent::try_from)
+        .map(|row| SerializedEvent::try_from(row).map_err(EngineError::from))
         .collect()
     }
 

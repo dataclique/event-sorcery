@@ -371,6 +371,34 @@ impl SqliteEventRepository {
     }
 }
 
+/// A stored event row selected with JSON payload and metadata as text.
+#[derive(FromRow)]
+pub struct StoredEventRow {
+    aggregate_type: String,
+    aggregate_id: String,
+    sequence: i64,
+    event_type: String,
+    event_version: String,
+    payload: String,
+    metadata: String,
+}
+
+impl TryFrom<StoredEventRow> for SerializedEvent {
+    type Error = SqliteAggregateError;
+
+    fn try_from(row: StoredEventRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            aggregate_type: row.aggregate_type,
+            aggregate_id: row.aggregate_id,
+            sequence: usize::try_from(row.sequence)?,
+            event_type: row.event_type,
+            event_version: row.event_version,
+            payload: serde_json::from_str(&row.payload)?,
+            metadata: serde_json::from_str(&row.metadata)?,
+        })
+    }
+}
+
 /// Loads ordered event rows, optionally after an exclusive checkpoint.
 pub async fn load_event_rows<EventRow>(
     pool: &SqlitePool,

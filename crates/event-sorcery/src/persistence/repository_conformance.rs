@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
+use sqlite_es::StoredEventRow;
 use sqlite_es::testing::create_test_pool;
 
 use super::*;

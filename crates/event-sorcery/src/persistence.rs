@@ -11,11 +11,11 @@ use cqrs_es::persist::SerializedEvent;
 use sqlx::SqlitePool;
 
 #[cfg(any(test, feature = "sqlite"))]
-use sqlite_es::{NativeRepository, RepositoryPolicy, SnapshotInput};
+use sqlite_es::{NativeRepository, RepositoryPolicy, SnapshotInput, StoredEventRow};
 
 use crate::engine::EngineError;
 #[cfg(any(test, feature = "sqlite"))]
-use crate::engine::{CommitRequest, SnapshotUpdate, StoredEventRow, commit_serialized};
+use crate::engine::{CommitRequest, SnapshotUpdate, commit_serialized};
 use crate::schema_registry::{REGISTRY_ID, SchemaRegistryCommand};
 use crate::{
     CompactionPolicy, EventBackend, EventSourced, NativeProjectionBackend, Nil, Projection,
