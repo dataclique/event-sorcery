@@ -132,12 +132,12 @@ pub use dispatch::{
     uneventful,
 };
 pub use engine::{
-    CommitRequest, EngineError, JobSeed, OpaqueProposedEvent, OpaqueStoredEvent, PreparedCommit,
-    PreparedJob, PreparedSnapshot, SnapshotUpdate, StreamIdentity, decode_opaque_payload,
-    encode_opaque_payload, validate_expected_version,
+    CheckedCommit, CommitRequest, EngineError, JobSeed, OpaqueCommitRequest, OpaqueProposedEvent,
+    OpaqueStoredEvent, PreparedCommit, PreparedJob, PreparedSnapshot, SnapshotUpdate,
+    StreamIdentity, decode_opaque_payload, encode_opaque_payload, validate_expected_version,
 };
 #[cfg(any(test, feature = "sqlite"))]
-pub use engine::{Engine, OpaqueCommitRequest, SnapshotWrite};
+pub use engine::{Engine, SnapshotWrite};
 pub use job::{
     DeadReason, JobContext, JobFailure, JobId, JobOutcome, JobStoreError, Label,
     PreparedPendingJobs, StandaloneJob,

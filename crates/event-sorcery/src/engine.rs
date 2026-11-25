@@ -13,9 +13,10 @@ mod binding;
 #[cfg(any(test, feature = "sqlite"))]
 pub(crate) use binding::commit_serialized;
 #[cfg(any(test, feature = "sqlite"))]
-pub use binding::{Engine, OpaqueCommitRequest, SnapshotWrite};
+pub use binding::{Engine, SnapshotWrite};
 
 const ENGINE_PAYLOAD_PROVENANCE_KEY: &str = "$event-sorcery-engine-owned";
+const ENGINE_PAYLOAD_PROVENANCE: &str = "opaque-v1";
 
 /// Identifies one serialized aggregate event stream at the storage boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +66,83 @@ impl OpaqueProposedEvent {
             event_version: event_version.into(),
             payload,
         }
+    }
+}
+
+/// One atomic opaque-payload commit for a single stream version.
+pub struct OpaqueCommitRequest<'events> {
+    stream: StreamIdentity,
+    expected_version: usize,
+    events: &'events [OpaqueProposedEvent],
+    jobs: Vec<EnqueueRequest>,
+}
+
+impl<'events> OpaqueCommitRequest<'events> {
+    /// Creates an opaque commit guarded by the exact current stream version.
+    pub fn new(
+        stream: StreamIdentity,
+        expected_version: usize,
+        events: &'events [OpaqueProposedEvent],
+    ) -> Self {
+        Self {
+            stream,
+            expected_version,
+            events,
+            jobs: vec![],
+        }
+    }
+
+    /// Includes one durable job intent in the same event-store transaction.
+    ///
+    /// The job's `Enqueued` event and its queue row are written by the
+    /// transaction that appends these events, so a binding never observes a
+    /// committed event whose job never reached the queue.
+    #[must_use]
+    pub fn with_job(mut self, job: JobSeed) -> Self {
+        let JobSeed(request) = job;
+        self.jobs.push(request);
+        self
+    }
+
+    /// Writes a checked batch whose payload provenance is owned by the binding.
+    pub async fn write_with(
+        self,
+        write: impl for<'batch> AsyncFnOnce(CheckedCommit<'batch>) -> Result<(), EngineError>,
+    ) -> Result<(), EngineError> {
+        let Self {
+            stream,
+            expected_version,
+            events,
+            jobs,
+        } = self;
+        let metadata = serde_json::json!({
+            (ENGINE_PAYLOAD_PROVENANCE_KEY): ENGINE_PAYLOAD_PROVENANCE,
+        });
+        let serialized = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let sequence = expected_version
+                    .checked_add(index)
+                    .and_then(|sequence| sequence.checked_add(1))
+                    .ok_or(EngineError::OptimisticLock)?;
+                Ok(SerializedEvent {
+                    aggregate_type: stream.aggregate_type.clone(),
+                    aggregate_id: stream.aggregate_id.clone(),
+                    sequence,
+                    event_type: event.event_type.clone(),
+                    event_version: event.event_version.clone(),
+                    payload: encode_opaque_payload(event.payload.clone())?,
+                    metadata: metadata.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        let commit = CommitRequest::new(stream, &serialized)
+            .at_expected_version(expected_version)
+            .with_jobs(jobs)
+            .check_stream()?;
+
+        write(commit).await
     }
 }
 
@@ -569,6 +647,57 @@ fn reserves_engine_payload(metadata: &Value) -> bool {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
             false
         }
+    }
+}
+
+fn has_engine_payload_provenance(metadata: &Value) -> bool {
+    match metadata {
+        Value::Object(object) if object.len() == 1 => {
+            match object.get(ENGINE_PAYLOAD_PROVENANCE_KEY) {
+                Some(Value::String(provenance)) => provenance == ENGINE_PAYLOAD_PROVENANCE,
+                None
+                | Some(
+                    Value::Null
+                    | Value::Bool(_)
+                    | Value::Number(_)
+                    | Value::Array(_)
+                    | Value::Object(_),
+                ) => false,
+            }
+        }
+        Value::Object(_)
+        | Value::Null
+        | Value::Bool(_)
+        | Value::Number(_)
+        | Value::String(_)
+        | Value::Array(_) => false,
+    }
+}
+
+impl TryFrom<SerializedEvent> for OpaqueStoredEvent {
+    type Error = EngineError;
+
+    fn try_from(event: SerializedEvent) -> Result<Self, Self::Error> {
+        let SerializedEvent {
+            sequence,
+            event_type,
+            event_version,
+            payload,
+            metadata,
+            ..
+        } = event;
+        let payload = if has_engine_payload_provenance(&metadata) {
+            decode_opaque_payload(payload)?
+        } else {
+            serde_json::to_vec(&payload)?
+        };
+
+        Ok(Self {
+            sequence,
+            event_type,
+            event_version,
+            payload,
+        })
     }
 }
 

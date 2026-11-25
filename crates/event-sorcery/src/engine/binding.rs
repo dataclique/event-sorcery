@@ -9,51 +9,11 @@ use std::sync::Arc;
 use sqlite_es::{SqliteJobError, StoredEventRow};
 
 use super::{
-    CheckedCommit, CommitRequest, ENGINE_PAYLOAD_PROVENANCE_KEY, EngineError, JobSeed,
-    OpaqueProposedEvent, OpaqueStoredEvent, StreamIdentity, decode_opaque_payload,
-    encode_opaque_payload,
+    CheckedCommit, CommitRequest, EngineError, JobSeed, OpaqueCommitRequest, OpaqueStoredEvent,
+    StreamIdentity,
 };
-use crate::job::EnqueueRequest;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 use crate::schema_registry::{Reconciler, SchemaReconciliation, SchemaTarget};
-
-const ENGINE_PAYLOAD_PROVENANCE: &str = "opaque-v1";
-
-/// One atomic opaque-payload commit for a single stream version.
-pub struct OpaqueCommitRequest<'events> {
-    stream: StreamIdentity,
-    expected_version: usize,
-    events: &'events [OpaqueProposedEvent],
-    jobs: Vec<EnqueueRequest>,
-}
-
-impl<'events> OpaqueCommitRequest<'events> {
-    /// Creates an opaque commit guarded by the exact current stream version.
-    pub fn new(
-        stream: StreamIdentity,
-        expected_version: usize,
-        events: &'events [OpaqueProposedEvent],
-    ) -> Self {
-        Self {
-            stream,
-            expected_version,
-            events,
-            jobs: vec![],
-        }
-    }
-
-    /// Includes one durable job intent in the same event-store transaction.
-    ///
-    /// The job's `Enqueued` event and its queue row are written by the
-    /// transaction that appends these events, so a binding never observes a
-    /// committed event whose job never reached the queue.
-    #[must_use]
-    pub fn with_job(mut self, job: JobSeed) -> Self {
-        let JobSeed(request) = job;
-        self.jobs.push(request);
-        self
-    }
-}
 
 /// Snapshot state stored independently after replaying through a known sequence.
 pub struct SnapshotWrite {
@@ -218,7 +178,7 @@ impl Engine {
         self.load_events_page_bounded(stream, after_sequence, item_limit, byte_limit)
             .await?
             .into_iter()
-            .map(decode_opaque_event)
+            .map(OpaqueStoredEvent::try_from)
             .collect()
     }
 
@@ -282,40 +242,9 @@ impl Engine {
 
     /// Atomically persists binding-owned payload bytes through the shared writer.
     pub async fn commit_opaque(&self, request: OpaqueCommitRequest<'_>) -> Result<(), EngineError> {
-        let OpaqueCommitRequest {
-            stream,
-            expected_version,
-            events,
-            jobs,
-        } = request;
-        let serialized = events
-            .iter()
-            .enumerate()
-            .map(|(index, event)| {
-                let sequence = expected_version
-                    .checked_add(index)
-                    .and_then(|sequence| sequence.checked_add(1))
-                    .ok_or(EngineError::OptimisticLock)?;
-                Ok(SerializedEvent {
-                    aggregate_type: stream.aggregate_type.clone(),
-                    aggregate_id: stream.aggregate_id.clone(),
-                    sequence,
-                    event_type: event.event_type.clone(),
-                    event_version: event.event_version.clone(),
-                    payload: encode_opaque_payload(event.payload.clone())?,
-                    metadata: engine_payload_metadata(),
-                })
-            })
-            .collect::<Result<Vec<_>, EngineError>>()?;
-
-        commit_serialized(
-            &self.pool,
-            CommitRequest::new(stream, &serialized)
-                .at_expected_version(expected_version)
-                .with_jobs(jobs)
-                .check_stream()?,
-        )
-        .await
+        request
+            .write_with(async |commit| commit_serialized(&self.pool, commit).await)
+            .await
     }
 }
 
@@ -398,62 +327,6 @@ impl From<sqlite_es::SqliteAggregateError> for EngineError {
     }
 }
 
-fn engine_payload_metadata() -> Value {
-    let mut metadata = serde_json::Map::new();
-    metadata.insert(
-        ENGINE_PAYLOAD_PROVENANCE_KEY.to_string(),
-        Value::String(ENGINE_PAYLOAD_PROVENANCE.to_string()),
-    );
-    Value::Object(metadata)
-}
-
-fn has_engine_payload_provenance(metadata: &Value) -> bool {
-    match metadata {
-        Value::Object(object) if object.len() == 1 => {
-            match object.get(ENGINE_PAYLOAD_PROVENANCE_KEY) {
-                Some(Value::String(provenance)) => provenance == ENGINE_PAYLOAD_PROVENANCE,
-                None
-                | Some(
-                    Value::Null
-                    | Value::Bool(_)
-                    | Value::Number(_)
-                    | Value::Array(_)
-                    | Value::Object(_),
-                ) => false,
-            }
-        }
-        Value::Object(_)
-        | Value::Null
-        | Value::Bool(_)
-        | Value::Number(_)
-        | Value::String(_)
-        | Value::Array(_) => false,
-    }
-}
-
-fn decode_opaque_event(event: SerializedEvent) -> Result<OpaqueStoredEvent, EngineError> {
-    let SerializedEvent {
-        sequence,
-        event_type,
-        event_version,
-        payload,
-        metadata,
-        ..
-    } = event;
-    let payload = if has_engine_payload_provenance(&metadata) {
-        decode_opaque_payload(payload)?
-    } else {
-        serde_json::to_vec(&payload)?
-    };
-
-    Ok(OpaqueStoredEvent {
-        sequence,
-        event_type,
-        event_version,
-        payload,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     //! Integration coverage for the serialized engine facade.
@@ -464,7 +337,8 @@ mod tests {
 
     use super::*;
     use crate::job::{
-        JobId, JobKind, JobStoreError, WorkerId, enqueued_event, pending_seed_payload, plan_claim,
+        EnqueueRequest, JobId, JobKind, JobStoreError, WorkerId, enqueued_event,
+        pending_seed_payload, plan_claim,
     };
     use crate::{CompactionPolicy, ReconcileError, SnapshotUpdate};
 
