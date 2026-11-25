@@ -42,3 +42,103 @@ pub async fn committed_stream_version(
 
     usize::try_from(version).map_err(SqliteAggregateError::from)
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use event_sorcery_core::CompactionPolicy;
+
+    use super::*;
+    use crate::{compact_events, testing::create_test_pool, write_snapshot};
+
+    #[tokio::test]
+    async fn version_is_scoped_to_both_parts_of_the_stream_key() {
+        let pool = create_test_pool().await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
+                                 event_version, payload, metadata)
+             VALUES ('invoice', 'one', 3, 'Issued', '1', '{}', '{}'),
+                    ('invoice', 'other', 41, 'Issued', '1', '{}', '{}'),
+                    ('order', 'one', 72, 'Placed', '1', '{}', '{}')",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        write_snapshot(&mut connection, "order", "other", 89, 103, &json!({}))
+            .await
+            .unwrap();
+
+        for (aggregate_type, aggregate_id, expected) in [
+            ("invoice", "one", 3),
+            ("invoice", "other", 41),
+            ("order", "one", 72),
+            ("order", "other", 89),
+            ("invoice", "missing", 0),
+        ] {
+            assert_eq!(
+                committed_stream_version(&mut connection, aggregate_type, aggregate_id)
+                    .await
+                    .unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compacted_prefix_and_retained_tail_both_contribute_to_the_version() {
+        let pool = create_test_pool().await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
+                                 event_version, payload, metadata)
+             VALUES ('invoice', 'one', 1, 'Issued', '1', '{}', '{}'),
+                    ('invoice', 'one', 2, 'Adjusted', '1', '{}', '{}')",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        write_snapshot(&mut connection, "invoice", "one", 2, 11, &json!({}))
+            .await
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            compact_events(&pool, "invoice", CompactionPolicy::CompactAfterSnapshot)
+                .await
+                .unwrap(),
+            2,
+        );
+        let mut transaction = pool.begin().await.unwrap();
+        assert_eq!(
+            committed_stream_version(&mut transaction, "invoice", "one")
+                .await
+                .unwrap(),
+            2,
+        );
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
+                                 event_version, payload, metadata)
+             VALUES ('invoice', 'one', 3, 'Adjusted', '1', '{}', '{}')",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        assert_eq!(
+            committed_stream_version(&mut transaction, "invoice", "one")
+                .await
+                .unwrap(),
+            3,
+        );
+        transaction.rollback().await.unwrap();
+
+        let mut connection = pool.acquire().await.unwrap();
+        assert_eq!(
+            committed_stream_version(&mut connection, "invoice", "one")
+                .await
+                .unwrap(),
+            2,
+        );
+    }
+}

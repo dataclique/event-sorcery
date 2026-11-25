@@ -211,3 +211,284 @@ pub async fn load_snapshot(
     })
     .transpose()
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::testing::create_test_pool;
+
+    async fn seed_events(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
+                                 event_version, payload, metadata)
+             VALUES ('invoice', 'one', 1, 'Issued', '1', '{}', '{}'),
+                    ('invoice', 'one', 2, 'Adjusted', '1', '{}', '{}'),
+                    ('invoice', 'one', 3, 'Adjusted', '1', '{}', '{}'),
+                    ('invoice', 'two', 1, 'Issued', '1', '{}', '{}')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn stored(
+        pool: &SqlitePool,
+        aggregate_type: &str,
+        id: &str,
+    ) -> Option<SerializedSnapshot> {
+        let mut connection = pool.acquire().await.unwrap();
+        load_snapshot(&mut connection, aggregate_type, id)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stores_snapshot_coverage_and_counter_independently() {
+        let pool = create_test_pool().await.unwrap();
+        seed_events(&pool).await;
+        assert_eq!(stored(&pool, "invoice", "one").await, None);
+
+        for (coverage, counter, balance) in [(0, 1, 0), (2, 2, 15), (2, 3, 18)] {
+            let state = json!({"balance": balance});
+            assert_eq!(
+                store_snapshot(&pool, "invoice", "one", coverage, &state)
+                    .await
+                    .unwrap(),
+                counter
+            );
+            assert_eq!(
+                stored(&pool, "invoice", "one").await,
+                Some(SerializedSnapshot {
+                    aggregate_id: "one".to_owned(),
+                    aggregate: state,
+                    current_sequence: coverage,
+                    current_snapshot: counter,
+                })
+            );
+        }
+        assert_eq!(stored(&pool, "invoice", "two").await, None);
+    }
+
+    #[tokio::test]
+    async fn refuses_empty_future_and_stale_snapshot_writes_without_mutation() {
+        let pool = create_test_pool().await.unwrap();
+        seed_events(&pool).await;
+        store_snapshot(&pool, "invoice", "one", 2, &json!({"balance": 15}))
+            .await
+            .unwrap();
+        let before = stored(&pool, "invoice", "one").await.unwrap();
+        let rejected = json!({"balance": 999});
+
+        assert!(matches!(
+            store_snapshot(&pool, "invoice", "missing", 0, &rejected)
+                .await
+                .unwrap_err(),
+            StoreSnapshotError::EmptyStream
+        ));
+        assert!(matches!(
+            store_snapshot(&pool, "invoice", "one", 4, &rejected)
+                .await
+                .unwrap_err(),
+            StoreSnapshotError::BeyondCurrentVersion {
+                proposed: 4,
+                current: 3
+            }
+        ));
+        assert!(matches!(
+            store_snapshot(&pool, "invoice", "one", 1, &rejected)
+                .await
+                .unwrap_err(),
+            StoreSnapshotError::Repository(SqliteAggregateError::OptimisticLock)
+        ));
+        assert_eq!(stored(&pool, "invoice", "one").await, Some(before));
+        assert_eq!(stored(&pool, "invoice", "missing").await, None);
+    }
+
+    #[tokio::test]
+    async fn corrupt_snapshot_returns_a_decode_error_without_replacing_its_bytes() {
+        let pool = create_test_pool().await.unwrap();
+        seed_events(&pool).await;
+        sqlx::query(
+            "INSERT INTO snapshots (aggregate_type, aggregate_id, last_sequence,
+                                    snapshot_version, payload, timestamp)
+             VALUES ('invoice', 'one', 1, 7, '{broken', 'fixture')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        let error = load_snapshot(&mut connection, "invoice", "one")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SqliteAggregateError::Deserialization(_)));
+        drop(connection);
+
+        let error = store_snapshot(&pool, "invoice", "one", 2, &json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreSnapshotError::Repository(SqliteAggregateError::Deserialization(_))
+        ));
+        let persisted: (i64, i64, String) =
+            sqlx::query_as("SELECT last_sequence, snapshot_version, payload FROM snapshots")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted, (1, 7, "{broken".to_owned()));
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum ClearError {
+        #[error(transparent)]
+        Sql(#[from] sqlx::Error),
+        #[error("history unavailable for {0}")]
+        MissingHistory(String),
+    }
+
+    #[tokio::test]
+    async fn clearing_snapshots_validates_all_covered_ranges_before_removing_rows() {
+        let pool = create_test_pool().await.unwrap();
+        seed_events(&pool).await;
+        let mut connection = pool.acquire().await.unwrap();
+        for (aggregate_type, id, coverage) in [
+            ("invoice", "one", 2),
+            ("invoice", "two", 2),
+            ("order", "one", 1),
+        ] {
+            write_snapshot(
+                &mut connection,
+                aggregate_type,
+                id,
+                coverage,
+                9,
+                &json!({"id": id}),
+            )
+            .await
+            .unwrap();
+        }
+        drop(connection);
+
+        let mut inspected = Vec::new();
+        let error = clear_snapshots(&pool, "invoice", |id, covered, retained| {
+            inspected.push((id.clone(), covered, retained));
+            if covered == retained {
+                Ok(())
+            } else {
+                Err(ClearError::MissingHistory(id))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ClearError::MissingHistory(id) if id == "two"));
+        assert!(inspected.contains(&("two".to_owned(), 2, 1)));
+        assert_eq!(
+            stored(&pool, "invoice", "one")
+                .await
+                .unwrap()
+                .current_snapshot,
+            9
+        );
+        assert_eq!(
+            stored(&pool, "invoice", "two")
+                .await
+                .unwrap()
+                .current_snapshot,
+            9
+        );
+
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
+                                 event_version, payload, metadata)
+             VALUES ('invoice', 'two', 2, 'Adjusted', '1', '{}', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut inspected = Vec::new();
+        clear_snapshots::<ClearError>(&pool, "invoice", |id, covered, retained| {
+            inspected.push((id, covered, retained));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        inspected.sort_unstable();
+        assert_eq!(
+            inspected,
+            [("one".to_owned(), 2, 2), ("two".to_owned(), 2, 2)]
+        );
+        assert_eq!(stored(&pool, "invoice", "one").await, None);
+        assert_eq!(stored(&pool, "invoice", "two").await, None);
+        assert_eq!(
+            stored(&pool, "order", "one")
+                .await
+                .unwrap()
+                .current_snapshot,
+            9
+        );
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(events, 5);
+    }
+
+    #[tokio::test]
+    async fn discard_is_idempotent_and_preserves_events_and_other_snapshots() {
+        let pool = create_test_pool().await.unwrap();
+        seed_events(&pool).await;
+        store_snapshot(&pool, "invoice", "one", 2, &json!({"balance": 15}))
+            .await
+            .unwrap();
+        store_snapshot(&pool, "invoice", "two", 1, &json!({"balance": 7}))
+            .await
+            .unwrap();
+        let other = stored(&pool, "invoice", "two").await.unwrap();
+
+        discard_snapshot(&pool, "invoice", "one").await.unwrap();
+        discard_snapshot(&pool, "invoice", "one").await.unwrap();
+
+        assert_eq!(stored(&pool, "invoice", "one").await, None);
+        assert_eq!(stored(&pool, "invoice", "two").await, Some(other));
+        let sequences: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM events
+             WHERE aggregate_type = 'invoice' AND aggregate_id = 'one' ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(sequences, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_replacement_failure_keeps_the_previous_snapshot() {
+        let pool = create_test_pool().await.unwrap();
+        seed_events(&pool).await;
+        store_snapshot(&pool, "invoice", "one", 2, &json!({"balance": 15}))
+            .await
+            .unwrap();
+        let before = stored(&pool, "invoice", "one").await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_snapshot BEFORE INSERT ON snapshots
+             WHEN NEW.snapshot_version > 1
+             BEGIN SELECT RAISE(ABORT, 'snapshot replacement rejected'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = store_snapshot(&pool, "invoice", "one", 3, &json!({"balance": 22}))
+            .await
+            .unwrap_err();
+        let StoreSnapshotError::Repository(SqliteAggregateError::Connection(
+            sqlx::Error::Database(source),
+        )) = error
+        else {
+            panic!("expected the snapshot write error, got {error:?}");
+        };
+        assert_eq!(source.message(), "snapshot replacement rejected");
+        assert_eq!(stored(&pool, "invoice", "one").await, Some(before));
+    }
+}
