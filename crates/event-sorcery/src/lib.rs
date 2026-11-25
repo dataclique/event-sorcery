@@ -98,8 +98,6 @@ mod projection;
 mod projection_recovery;
 mod reactor;
 mod schema_registry;
-#[cfg(any(test, feature = "sqlite"))]
-mod sqlite_store;
 #[cfg(any(test, feature = "test-support"))]
 mod testing;
 mod view_backend;
@@ -177,12 +175,6 @@ pub use sqlite_es::SqliteJobError;
 pub use sqlite_es::SqliteViewBackend;
 #[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_es::{incremental_vacuum, vacuum};
-#[cfg(all(any(test, feature = "test-support"), any(test, feature = "sqlite")))]
-pub use sqlite_store::test_store;
-#[cfg(any(test, feature = "sqlite"))]
-pub use sqlite_store::{
-    compact_events, count_aggregates, load_all_ids, load_entity, load_ids_paginated, send_command,
-};
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
     ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, buffer_pending_job, replay,
@@ -190,6 +182,12 @@ pub use testing::{
 };
 pub use view_backend::{NativeProjectionBackend, ViewBackend, ViewUpdateError};
 pub use wire::StoreBuilder;
+#[cfg(all(any(test, feature = "test-support"), any(test, feature = "sqlite")))]
+pub use wire::test_store;
+#[cfg(any(test, feature = "sqlite"))]
+pub use wire::{
+    compact_events, count_aggregates, load_all_ids, load_entity, load_ids_paginated, send_command,
+};
 
 pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
     Lifecycle<Entity>,

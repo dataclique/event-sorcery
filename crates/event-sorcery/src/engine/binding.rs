@@ -1,4 +1,4 @@
-//! SQLite serialized storage facade and transaction-bound operations.
+//! Typed command and opaque binding composition over sqlite-es.
 
 use cqrs_es::persist::{SerializedEvent, SerializedSnapshot};
 use serde_json::Value;

@@ -8,13 +8,12 @@ use crate::job::{EnqueueRequest, PreparedPendingJobs};
 use crate::schema_registry::ReconcileError;
 
 #[cfg(any(test, feature = "sqlite"))]
-#[path = "sqlite_engine.rs"]
-mod sqlite;
+mod binding;
 
 #[cfg(any(test, feature = "sqlite"))]
-pub(crate) use sqlite::commit_serialized;
+pub(crate) use binding::commit_serialized;
 #[cfg(any(test, feature = "sqlite"))]
-pub use sqlite::{Engine, OpaqueCommitRequest, SnapshotWrite};
+pub use binding::{Engine, OpaqueCommitRequest, SnapshotWrite};
 
 const ENGINE_PAYLOAD_PROVENANCE_KEY: &str = "$event-sorcery-engine-owned";
 
