@@ -12,6 +12,10 @@ use crate::{
     ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, Table,
 };
 
+/// SQLite backend configured for native command persistence.
+#[cfg(any(test, feature = "sqlite"))]
+pub type SqliteBackend = sqlite_es::SqliteBackend<crate::SqliteEventRepository>;
+
 /// Storage required to execute and reload native aggregates.
 ///
 /// Repositories must atomically persist command events, snapshots and dispatched
@@ -167,6 +171,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{guard_snapshot, reconcile_schema, register_schema};
+    use crate::engine::{CommitRequest, Engine, StreamIdentity};
     use crate::job::{
         ErasedJob, JobId, JobKind, PendingPush, buffer, take_pending, with_pending_scope,
     };
@@ -176,6 +181,37 @@ mod tests {
         EventBackend, EventSourced, LeaseRenewal, Never, Nil, PersistenceBackend, ReconcileError,
         SchemaReconciliation, SchemaRegistry, SqliteBackend, SqliteJobError, Store, StoreBuilder,
     };
+
+    #[tokio::test]
+    async fn event_backend_migrate_initializes_the_existing_sqlite_schema() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        let backend = SqliteBackend::new(pool);
+        EventBackend::migrate(&backend).await.unwrap();
+
+        let stream = StreamIdentity::new("backend-migration-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "backend-migration-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: json!({}),
+            metadata: json!({}),
+        };
+        let engine = Engine::new(backend.pool);
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), [event]);
+    }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     struct SchemaProbe<const VERSION: u64, const COMPACT: bool> {

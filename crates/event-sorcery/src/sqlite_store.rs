@@ -56,7 +56,7 @@ impl crate::ProjectedStoreBackend for SqliteBackend {
     where
         Entity: EventSourced<Materialized = Table> + 'static,
     {
-        let pool = self.pool().clone();
+        let pool = self.pool.clone();
         let reconciler = Reconciler::new(pool.clone());
         let reconciliation = reconciler.reconcile::<Entity>().await?;
 
@@ -100,7 +100,7 @@ impl UnmaterializedStoreBackend for SqliteBackend {
     async fn reconcile_unmaterialized<Entity: EventSourced<Materialized = Nil>>(
         &self,
     ) -> Result<(), ReconcileError> {
-        let reconciler = crate::Reconciler::new(self.pool().clone());
+        let reconciler = crate::Reconciler::new(self.pool.clone());
         let _ = reconciler.reconcile::<Entity>().await?;
         reconciler.record_version::<Entity>().await
     }

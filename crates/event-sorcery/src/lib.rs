@@ -91,8 +91,6 @@ mod dispatch;
 mod engine;
 mod job;
 mod job_backend;
-#[cfg(any(test, feature = "sqlite"))]
-mod job_sqlite;
 mod job_store;
 mod lifecycle;
 mod persistence;
@@ -157,11 +155,11 @@ pub use job_backend::{
     JobLeaseResult, JobRuntime, JobRuntimeError, JobScheduleError, JobSettlementResult,
     JobWorkerConfig, run_job,
 };
-#[cfg(any(test, feature = "sqlite"))]
-pub use job_sqlite::{SqliteBackend, SqliteJobError};
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
+#[cfg(any(test, feature = "sqlite"))]
+pub use persistence::SqliteBackend;
 pub use persistence::{
     PersistenceBackend, ProjectedStoreBackend, SCHEMA_REGISTRY_ID, UnmaterializedStoreBackend,
     guard_snapshot, reconcile_schema, register_schema,
@@ -179,6 +177,8 @@ pub use schema_registry::Reconciler;
 pub use schema_registry::{
     ReconcileError, SchemaReconciliation, SchemaRegistry, SchemaTarget, validate_snapshot_history,
 };
+#[cfg(any(test, feature = "sqlite"))]
+pub use sqlite_es::SqliteJobError;
 #[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_es::{incremental_vacuum, vacuum};
 #[cfg(any(test, feature = "sqlite"))]

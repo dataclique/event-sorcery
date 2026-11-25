@@ -12,9 +12,9 @@ use super::{
     encode_opaque_payload,
 };
 use crate::job::EnqueueRequest;
-use crate::job_sqlite::SqliteJobError;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 use crate::schema_registry::{Reconciler, SchemaReconciliation, SchemaTarget};
+use sqlite_es::SqliteJobError;
 
 const ENGINE_PAYLOAD_PROVENANCE: &str = "opaque-v1";
 
@@ -114,10 +114,6 @@ impl Engine {
         self.reconciler.record_target(target).await?;
 
         Ok(())
-    }
-
-    pub(crate) fn pool(&self) -> &SqlitePool {
-        &self.pool
     }
 
     pub async fn claim_job<Decide, Won>(
@@ -534,7 +530,7 @@ mod tests {
     async fn queue_row_count(engine: &Engine, job_id: &JobId) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM job_queue_projection WHERE view_id = ?1")
             .bind(job_id.to_string())
-            .fetch_one(engine.pool())
+            .fetch_one(&engine.pool)
             .await
             .unwrap()
     }

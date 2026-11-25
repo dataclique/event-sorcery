@@ -1,8 +1,10 @@
 //! Shared persistence contracts for event-sorcery and its storage adapters.
 
+mod job_backend;
 mod job_claim;
 mod projection_recovery;
 
+pub use job_backend::EventBackend;
 pub use job_claim::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 
 pub use projection_recovery::{

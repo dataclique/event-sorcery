@@ -2248,7 +2248,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            crate::job_sqlite::SqliteJobError::DuplicateEnqueue { job_id } if job_id == request.job_id.to_string()
+            crate::SqliteJobError::DuplicateEnqueue { job_id } if job_id == request.job_id.to_string()
         ));
     }
 

@@ -28,6 +28,12 @@ pub struct SqliteEventRepository {
     upcasters: Arc<Vec<Arc<dyn EventUpcaster>>>,
 }
 
+impl sqlite_es::CommandRepository for SqliteEventRepository {
+    fn for_pool(pool: SqlitePool, compaction: CompactionPolicy) -> Self {
+        Self::new(pool, compaction)
+    }
+}
+
 impl SqliteEventRepository {
     pub(crate) fn new(pool: SqlitePool, compaction_policy: CompactionPolicy) -> Self {
         Self {
