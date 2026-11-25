@@ -12,6 +12,8 @@ use crate::schema_registry::ReconcileError;
 mod sqlite;
 
 #[cfg(any(test, feature = "sqlite"))]
+pub(crate) use sqlite::commit_serialized;
+#[cfg(any(test, feature = "sqlite"))]
 pub use sqlite::{Engine, OpaqueCommitRequest, SnapshotWrite};
 
 const ENGINE_PAYLOAD_PROVENANCE_KEY: &str = "$event-sorcery-engine-owned";

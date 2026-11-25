@@ -1,6 +1,6 @@
 //! SQLite serialized storage facade and transaction-bound operations.
 
-use cqrs_es::persist::{ReplayStream, SerializedEvent, SerializedSnapshot};
+use cqrs_es::persist::{SerializedEvent, SerializedSnapshot};
 use serde_json::Value;
 use sqlx::SqlitePool;
 use std::num::NonZeroUsize;
@@ -279,30 +279,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Replays matching events through a bounded feed without materializing the full result.
-    pub(crate) fn stream_events<Transform>(
-        &self,
-        aggregate_type: &'static str,
-        aggregate_id: Option<String>,
-        channel_size: usize,
-        transform: Transform,
-    ) -> ReplayStream
-    where
-        Transform: Fn(SerializedEvent) -> SerializedEvent + Send + 'static,
-    {
-        sqlite_es::replay_events::<StoredEventRow>(
-            &self.pool,
-            aggregate_type,
-            aggregate_id,
-            channel_size,
-            transform,
-        )
-    }
-
     /// Atomically persists a validated event, snapshot, and durable-job batch.
     pub async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
         request.validate_metadata()?;
-        self.commit_serialized(request).await
+        commit_serialized(&self.pool, request).await
     }
 
     /// Atomically persists binding-owned payload bytes through the shared writer.
@@ -333,47 +313,52 @@ impl Engine {
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
 
-        self.commit_serialized(
+        commit_serialized(
+            &self.pool,
             CommitRequest::new(stream, &serialized)
                 .at_expected_version(expected_version)
                 .with_jobs(jobs),
         )
         .await
     }
+}
 
-    async fn commit_serialized(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
-        request.validate_stream()?;
-        let CommitRequest {
-            stream,
+/// Hands validated framework inputs to the shared SQLite writer.
+pub(crate) async fn commit_serialized(
+    pool: &SqlitePool,
+    request: CommitRequest<'_>,
+) -> Result<(), EngineError> {
+    request.validate_stream()?;
+    let CommitRequest {
+        stream,
+        expected_version,
+        events,
+        snapshot,
+        jobs,
+    } = request;
+    sqlite_es::commit_atomic(
+        pool,
+        sqlite_es::Commit {
+            aggregate_type: &stream.aggregate_type,
+            aggregate_id: &stream.aggregate_id,
             expected_version,
             events,
             snapshot,
             jobs,
-        } = request;
-        sqlite_es::commit_atomic(
-            &self.pool,
-            sqlite_es::Commit {
-                aggregate_type: &stream.aggregate_type,
-                aggregate_id: &stream.aggregate_id,
-                expected_version,
-                events,
-                snapshot,
-                jobs,
-            },
-            |snapshot| {
-                let current_sequence = snapshot.sequence_for(events)?;
-                Ok(SerializedSnapshot {
-                    aggregate_id: stream.aggregate_id.clone(),
-                    aggregate: snapshot.aggregate,
-                    current_sequence,
-                    current_snapshot: snapshot.snapshot_version,
-                })
-            },
-            |request| Ok(crate::job::enqueued_event(request)?),
-            |request| Ok(crate::job::pending_seed_payload(&request)?),
-        )
-        .await
-    }
+        },
+        |snapshot| {
+            let current_sequence = snapshot.sequence_for(events)?;
+            Ok(SerializedSnapshot {
+                aggregate_id: stream.aggregate_id.clone(),
+                aggregate: snapshot.aggregate,
+                current_sequence,
+                current_snapshot: snapshot.snapshot_version,
+            })
+        },
+        |request| Ok(crate::job::enqueued_event(request)?),
+        |request| Ok(crate::job::pending_seed_payload(&request)?),
+    )
+    .await
 }
 
 impl From<sqlite_es::StoreSnapshotError> for EngineError {

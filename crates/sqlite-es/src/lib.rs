@@ -52,6 +52,7 @@ mod cqrs;
 mod event_page;
 mod event_repository;
 mod job_queue;
+mod native_repository;
 mod projection_queries;
 mod projection_recovery;
 mod schema_registry;
@@ -87,6 +88,7 @@ pub use event_repository::{
     replay_events,
 };
 pub use job_queue::{SqliteJobError, claim_job, enqueue_job, renew_job};
+pub use native_repository::{NativeRepository, RepositoryPolicy, SnapshotInput};
 pub use projection_queries::{SqliteProjectionFilterError, filter_projection, projection_rows};
 pub use projection_recovery::SqliteProjectionRecovery;
 pub use schema_registry::load_schema_registry_payloads;

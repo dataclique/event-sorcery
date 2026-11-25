@@ -99,8 +99,6 @@ mod projection_recovery;
 mod reactor;
 mod schema_registry;
 #[cfg(any(test, feature = "sqlite"))]
-mod sqlite_event_repository;
-#[cfg(any(test, feature = "sqlite"))]
 mod sqlite_projection;
 #[cfg(any(test, feature = "sqlite"))]
 mod sqlite_reactor;
@@ -158,12 +156,12 @@ pub use job_backend::{
 pub use job_store::{ClaimDecision, ClaimOutcome, ClaimRead, EventBackend, LeaseRenewal};
 use lifecycle::Lifecycle;
 pub use lifecycle::{LifecycleError, Never};
-#[cfg(any(test, feature = "sqlite"))]
-pub use persistence::SqliteBackend;
 pub use persistence::{
     PersistenceBackend, ProjectedStoreBackend, SCHEMA_REGISTRY_ID, UnmaterializedStoreBackend,
     guard_snapshot, reconcile_schema, register_schema,
 };
+#[cfg(any(test, feature = "sqlite"))]
+pub use persistence::{SqliteBackend, SqliteEventRepository};
 pub use projection::{Column, Projection, ProjectionError};
 pub use projection_recovery::recover_projection;
 #[cfg(any(test, feature = "sqlite"))]
@@ -181,8 +179,6 @@ pub use schema_registry::{
 pub use sqlite_es::SqliteJobError;
 #[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_es::{incremental_vacuum, vacuum};
-#[cfg(any(test, feature = "sqlite"))]
-pub use sqlite_event_repository::SqliteEventRepository;
 #[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_projection::SqliteViewBackend;
 #[cfg(all(any(test, feature = "test-support"), any(test, feature = "sqlite")))]

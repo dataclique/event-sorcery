@@ -5,7 +5,17 @@ use cqrs_es::persist::{PersistedEventRepository, PersistenceError, SerializedSna
 use std::future::Future;
 use tracing::warn;
 
+#[cfg(any(test, feature = "sqlite"))]
+use cqrs_es::persist::SerializedEvent;
+#[cfg(any(test, feature = "sqlite"))]
+use sqlx::SqlitePool;
+
+#[cfg(any(test, feature = "sqlite"))]
+use sqlite_es::{NativeRepository, RepositoryPolicy, SnapshotInput};
+
 use crate::engine::EngineError;
+#[cfg(any(test, feature = "sqlite"))]
+use crate::engine::{CommitRequest, SnapshotUpdate, StoredEventRow, commit_serialized};
 use crate::schema_registry::{REGISTRY_ID, SchemaRegistryCommand};
 use crate::{
     CompactionPolicy, EventBackend, EventSourced, NativeProjectionBackend, Nil, Projection,
@@ -15,6 +25,54 @@ use crate::{
 /// SQLite backend configured for native command persistence.
 #[cfg(any(test, feature = "sqlite"))]
 pub type SqliteBackend = sqlite_es::SqliteBackend<crate::SqliteEventRepository>;
+
+/// Concrete native SQLite repository using the framework command policy.
+#[cfg(any(test, feature = "sqlite"))]
+pub type SqliteEventRepository = NativeRepository<NativeCommandPolicy>;
+
+/// Validates commands and handles pending job receipts after storage commits.
+#[cfg(any(test, feature = "sqlite"))]
+pub struct NativeCommandPolicy;
+
+#[cfg(any(test, feature = "sqlite"))]
+impl RepositoryPolicy for NativeCommandPolicy {
+    type EventRow = StoredEventRow;
+
+    async fn persist(
+        pool: &SqlitePool,
+        aggregate_type: &str,
+        events: &[SerializedEvent],
+        snapshot: Option<SnapshotInput>,
+    ) -> Result<(), PersistenceError> {
+        let update = snapshot.map(|snapshot| match snapshot {
+            SnapshotInput::BatchEnd {
+                aggregate_id,
+                aggregate,
+                snapshot_version,
+            } => (
+                aggregate_id,
+                SnapshotUpdate::new(aggregate, snapshot_version),
+            ),
+            SnapshotInput::Covered(snapshot) => SnapshotUpdate::from_serialized(snapshot),
+        });
+        let (request, pending_jobs) =
+            CommitRequest::prepare_repository(aggregate_type, events, update)?;
+        request.validate_metadata()?;
+        commit_serialized(pool, request).await?;
+        pending_jobs.mark_committed();
+        Ok(())
+    }
+
+    fn guard_snapshot<AggregateType: Aggregate>(
+        snapshot: SerializedSnapshot,
+        policy: CompactionPolicy,
+    ) -> Result<SerializedSnapshot, PersistenceError> {
+        guard_snapshot::<AggregateType>(snapshot, policy)
+    }
+}
+
+#[cfg(test)]
+mod repository_conformance;
 
 /// Storage required to execute and reload native aggregates.
 ///
