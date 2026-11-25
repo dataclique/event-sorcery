@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use sqlx::SqlitePool;
 
 use event_sorcery::{
-    Clock, JobInput, JobRuntime, JobWorkerConfig, StoreBuilder, build_supervised_worker,
+    Clock, JobInput, JobRuntime, JobWorkerConfig, SqliteBackend, StoreBuilder,
+    build_supervised_worker,
 };
 
 mod support_ticket;
@@ -83,7 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // The worker input bundles the notifier with the origin store the
     // framework delivers verdicts through. A standalone job (ADR-0007) rides
     // the same runtime with a plain input.
-    let runtime = JobRuntime::build(pool.clone()).await?;
+    let runtime = JobRuntime::build(SqliteBackend::new(pool.clone())).await?;
     runtime.enqueue(SweepStaleTickets).await?;
 
     let config = JobWorkerConfig {

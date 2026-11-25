@@ -283,7 +283,7 @@ pub unsafe extern "C" fn es_open(
             .block_on(engine.migrate())
             .map_err(AbiError::Migration)?;
         let jobs = runtime
-            .block_on(JobRuntime::build(pool))
+            .block_on(JobRuntime::build(SqliteBackend::new(pool)))
             .map_err(|error| AbiError::JobRuntime(Box::new(error)))?;
         let store = Arc::new(EsStore {
             state: Mutex::new(StoreState::Open { active_calls: 0 }),

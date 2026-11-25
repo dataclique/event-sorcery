@@ -33,9 +33,9 @@ A job is its own event stream (`aggregate_type = "job"`). `JobState` is an
 RetryScheduled / Dead; `JobCommand` = Succeed / RetrySchedule / Kill). The whole
 durable-jobs capability is built from one consumer-supplied **`EventBackend`** —
 a cqrs-es event repository plus two job-shaped primitives, `claim` and `renew`.
-`JobRuntime::build(pool)` wires the job `Store` (cqrs/es) and the
-`job_queue_projection` [`Projection`] via `StoreBuilder`; nothing else is
-required of the consumer.
+The backend must also implement `ProjectedStoreBackend` so
+`JobRuntime::build(backend)` can open the job `Store` and recover the
+`job_queue_projection` [`Projection`]. The caller applies migrations first.
 
 The ack rides cqrs-es `execute` (a `JobCommand`); only the **claim** is a
 backend transaction, because its runnable check must read the projection-only
@@ -187,7 +187,7 @@ idempotency contracts.
 ## 9. Worker wiring
 
 ```rust
-let runtime = JobRuntime::build(pool).await?;            // one per process
+let runtime = JobRuntime::build(backend).await?;
 let worker = EventStoreBackend::<MyJob, _>::new(runtime.clone(), "my-worker", cfg, Clock::system());
 WorkerBuilder::new(name).backend(worker).data(Arc::new(input)).build(run::<MyJob>);
 ```

@@ -911,20 +911,18 @@ changes.
 
 ## Running Jobs
 
-The worker API below requires a `SqlitePool`. PostgreSQL persistence uses
-`PostgresBackend` and the CQRS repository contract, not an operational
-`EventBackend` for worker execution. Do not use a PostgreSQL pool with
-`JobRuntime::build` or assume its workers can drain PostgreSQL jobs.
+SQLite supports worker execution through `SqliteBackend`. `PostgresBackend` can
+enqueue jobs but does not yet support worker execution.
 
 The worker host uses stable Apalis 1.0. Dispatching a job (see **Jobs Pattern**
 above) only writes a pending row; a worker has to drain it.
-`JobRuntime::build(pool)` wires the durable-jobs runtime over the same database,
-and `build_supervised_worker!` registers one supervised worker per job type --
-entity-kicked jobs get a `JobInput` (their dependencies plus the origin store
-verdicts are delivered through), standalone jobs get their plain input:
+`JobRuntime::build(backend)` opens the job store and recovers its queue
+projection. `build_supervised_worker!` registers one supervised worker per job
+type -- entity-kicked jobs get a `JobInput` (their dependencies plus the origin
+store verdicts are delivered through), standalone jobs get their plain input:
 
 ```rust
-let runtime = JobRuntime::build(pool.clone()).await?;
+let runtime = JobRuntime::build(SqliteBackend::new(pool.clone())).await?;
 
 let monitor = build_supervised_worker!(
     runtime,

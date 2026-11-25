@@ -50,10 +50,9 @@ use crate::job::{
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
 use crate::projection::Projection;
 use crate::view_backend::ViewBackend;
-use crate::{LifecycleError, ProjectionError, SendError, Store};
-
-#[cfg(any(test, feature = "sqlite"))]
-use crate::{ReconcileError, SqliteBackend, StoreBuilder};
+use crate::{
+    LifecycleError, ProjectedStoreBackend, ProjectionError, ReconcileError, SendError, Store,
+};
 
 /// The durable-jobs runtime over one [`EventBackend`].
 ///
@@ -66,20 +65,14 @@ pub struct JobRuntime<Backend: EventBackend> {
     queue: Arc<dyn JobQueueIndex>,
 }
 
-#[cfg(any(test, feature = "sqlite"))]
-impl JobRuntime<SqliteBackend> {
-    /// Wires the SQLite job runtime over `pool`: the job `Store` + `job_queue_projection`
-    /// projection. The canonical schema (events + snapshots + `job_queue_projection`) must
-    /// already be applied -- like [`StoreBuilder`], the consumer owns migrations,
-    /// so this composes with the consumer's own view migrations instead of
-    /// re-running event-sorcery's and conflicting. `pool` MUST satisfy the pool
-    /// contract (WAL, `busy_timeout>=5000ms`, `synchronous=FULL`); see
-    /// [`SqliteBackend`].
-    pub async fn build(pool: sqlx::SqlitePool) -> Result<Self, ReconcileError> {
-        let backend = SqliteBackend::new(pool);
-        let (jobs, queue) = StoreBuilder::<JobState, _>::with_backend(backend.clone())
+impl<Backend: EventBackend + ProjectedStoreBackend> JobRuntime<Backend> {
+    /// Opens the job store and recovers its queue projection on an already-migrated backend.
+    /// The caller owns migrations.
+    pub async fn build(backend: Backend) -> Result<Self, ReconcileError> {
+        let (jobs, queue) = crate::StoreBuilder::<JobState, _>::with_backend(backend.clone())
             .build()
             .await?;
+
         Ok(Self {
             backend,
             jobs,
@@ -1326,7 +1319,7 @@ fn lease_millis(duration: Duration) -> i64 {
 /// the `Monitor`; call `.run().await` to start processing.
 ///
 /// ```ignore
-/// let runtime = JobRuntime::build(pool).await?;
+/// let runtime = JobRuntime::build(backend).await?;
 /// let monitor = build_supervised_worker!(runtime, JobWorkerConfig::default(), Clock::system(), {
 ///     SendEmail => email_client.clone(),
 ///     ChargeCard => billing_client.clone(),
@@ -1475,7 +1468,9 @@ mod tests {
     #[tokio::test]
     async fn invalid_backoff_is_rejected_before_claiming() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1_000).await;
         let config = JobWorkerConfig {
             backoff: Backoff {
@@ -1506,7 +1501,9 @@ mod tests {
     #[tokio::test]
     async fn retry_timestamp_overflow_preserves_the_claim() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
         let config = JobWorkerConfig::default();
         let JobClaimResult::Claimed(claimed) = runtime
@@ -1548,7 +1545,9 @@ mod tests {
     #[tokio::test]
     async fn unrepresentable_deferral_does_not_schedule_a_fallback() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
         let config = JobWorkerConfig::default();
         let JobClaimResult::Claimed(claimed) = runtime
@@ -1590,7 +1589,9 @@ mod tests {
     #[tokio::test]
     async fn schedule_failure_returns_typed_error_and_stops_renewal() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
         let config = JobWorkerConfig {
             renew_interval: Duration::from_millis(10),
@@ -1801,7 +1802,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_facade_polls_claims_renews_and_acknowledges_the_job_stream() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1_000).await;
 
         let candidates = runtime.poll_jobs(TestJob::KIND, 1_000, 10).await.unwrap();
@@ -1836,7 +1839,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_facade_enqueues_an_erased_payload_through_the_job_stream() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = JobId::new();
 
         runtime
@@ -1859,7 +1864,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_facade_rejects_an_out_of_range_enqueue_instant() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = JobId::new();
 
         let error = runtime
@@ -1886,7 +1893,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_facade_rejects_a_lease_instant_outside_chronos_range() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1_000).await;
 
         // The sum stays inside i64 but far outside chrono's range, so only the
@@ -1909,7 +1918,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_facade_reports_a_refused_settlement_as_terminal() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1_000).await;
 
         let JobClaimResult::Claimed(claimed) = runtime
@@ -1951,7 +1962,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_facade_retries_defers_and_dead_letters_through_job_commands() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1_000).await;
 
         let JobClaimResult::Claimed(first) = runtime
@@ -2015,7 +2028,9 @@ mod tests {
     #[tokio::test]
     async fn perform_receives_the_claimed_jobs_identity() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
         let now_ms = Utc::now().timestamp_millis() + 1_000;
 
@@ -2121,7 +2136,9 @@ mod tests {
     #[tokio::test]
     async fn terminal_failure_dead_letters_without_retries() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let backend = SqliteBackend::new(pool.clone());
         let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
         let now_ms = Utc::now().timestamp_millis() + 1_000;
@@ -2169,7 +2186,9 @@ mod tests {
     #[tokio::test]
     async fn standalone_enqueue_seeds_a_claimable_pending_job() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
 
         let job_id = runtime.enqueue(TestJob { n: 7 }).await.unwrap();
 
@@ -2193,7 +2212,9 @@ mod tests {
     #[tokio::test]
     async fn job_queue_rebuilds_from_the_job_event_stream() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = runtime.enqueue(TestJob { n: 7 }).await.unwrap();
 
         sqlx::query(
@@ -2208,7 +2229,9 @@ mod tests {
         .unwrap();
         assert_eq!(queue_status(&pool, &job_id).await, None);
 
-        let _rebuilt = JobRuntime::build(pool.clone()).await.unwrap();
+        let _rebuilt = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
 
         assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
         assert_eq!(
@@ -2220,7 +2243,9 @@ mod tests {
     #[tokio::test]
     async fn standalone_enqueue_with_delay_is_not_runnable_until_run_at() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
 
         let job_id = runtime
             .enqueue_with_delay(TestJob { n: 1 }, std::time::Duration::from_hours(1))
@@ -2280,7 +2305,9 @@ mod tests {
     #[tokio::test]
     async fn deferred_job_reschedules_to_pending_and_resets_the_claim_budget() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let backend = SqliteBackend::new(pool.clone());
 
         let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
@@ -2405,7 +2432,9 @@ mod tests {
     #[tokio::test]
     async fn ack_retry_then_kill_via_commands() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1000).await;
 
         let ClaimOutcome::Won(won) = claim(&runtime.backend, &job_id, "w1", 1000, 50).await else {
@@ -2466,7 +2495,9 @@ mod tests {
     #[tokio::test]
     async fn ack_is_fenced_when_a_reclaimer_holds_the_job() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1000).await;
 
         // w1 claims.
@@ -2505,7 +2536,9 @@ mod tests {
     #[tokio::test]
     async fn facade_settlement_is_fenced_when_a_reclaimer_holds_the_job() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1_000).await;
 
         let outcome = runtime
@@ -2536,7 +2569,9 @@ mod tests {
     #[tokio::test]
     async fn the_native_worker_adapter_claims_through_the_shared_facade() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1_000).await;
         let mut worker = EventStoreBackend::<TestJob, _>::new(
             runtime,
@@ -2563,7 +2598,9 @@ mod tests {
     #[tokio::test]
     async fn native_worker_runs_a_send_only_job_and_durably_acknowledges_success() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = JobId::new();
         runtime
             .enqueue_job_payload(
@@ -2616,7 +2653,9 @@ mod tests {
     #[tokio::test]
     async fn native_worker_remains_live_after_an_empty_scan() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = JobId::new();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<(JobId, u32)>();
         let empty_scan = Arc::new(Notify::new());
@@ -2702,7 +2741,9 @@ mod tests {
     #[tokio::test]
     async fn closing_the_native_backend_prevents_further_claims() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool.clone()))
+            .await
+            .unwrap();
         let job_id = enqueue(&pool, 1_000).await;
         let mut worker = EventStoreBackend::<TestJob, _>::new(
             runtime,
@@ -2726,7 +2767,7 @@ mod tests {
     #[tokio::test]
     async fn a_task_without_claim_context_cannot_invoke_the_handler() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool)).await.unwrap();
         let invoked = Arc::new(AtomicBool::new(false));
         let observed = invoked.clone();
         let handler = apalis_core::task::task_fn::task_fn(move |_job: TestJob| {
@@ -2777,7 +2818,7 @@ mod tests {
     #[tokio::test]
     async fn build_supervised_worker_wires_a_monitor() {
         let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool).await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend::new(pool)).await.unwrap();
         // Build (but do not run) a supervised monitor: this type-checks the whole
         // worker wiring -- EventStoreBackend + its claim/ack middleware +
         // WorkerBuilder + run_job + Monitor::register's bounds all line up.

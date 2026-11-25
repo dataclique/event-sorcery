@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use sqlx::SqlitePool;
 
 use event_sorcery::{
-    Clock, JobInput, JobRuntime, JobWorkerConfig, StoreBuilder, build_supervised_worker,
-    compact_events, count_aggregates, load_entity,
+    Clock, JobInput, JobRuntime, JobWorkerConfig, SqliteBackend, StoreBuilder,
+    build_supervised_worker, compact_events, count_aggregates, load_entity,
 };
 
 mod audit_log;
@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
     }
 
-    let runtime = JobRuntime::build(pool.clone()).await?;
+    let runtime = JobRuntime::build(SqliteBackend::new(pool.clone())).await?;
     let config = JobWorkerConfig {
         poll_interval: Duration::from_millis(25),
         ..JobWorkerConfig::default()

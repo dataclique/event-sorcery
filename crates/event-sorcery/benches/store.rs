@@ -232,7 +232,7 @@ async fn fixture() -> Fixture {
     let store = ok(StoreBuilder::<BenchEntity, _>::new(pool.clone())
         .build()
         .await);
-    let jobs = ok(JobRuntime::build(pool).await);
+    let jobs = ok(JobRuntime::build(SqliteBackend::new(pool)).await);
     Fixture {
         store,
         jobs,
