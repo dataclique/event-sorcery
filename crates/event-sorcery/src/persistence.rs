@@ -199,7 +199,6 @@ pub fn guard_snapshot<AggregateType: Aggregate>(
                 Ok(_) => Ok(snapshot),
                 Err(source) => {
                     warn!(
-                        target: "cqrs",
                         aggregate_type = AggregateType::TYPE,
                         aggregate_id = snapshot.aggregate_id,
                         %source,

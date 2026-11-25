@@ -321,7 +321,6 @@ impl Reconciler {
             .and_then(|state| state.version_of(&target.aggregate_type));
 
         debug!(
-            target: "cqrs",
             aggregate = target.aggregate_type,
             ?stored_version,
             "Loaded stored schema version"
@@ -330,7 +329,6 @@ impl Reconciler {
         let reconciliation = target.reconciliation(registry.as_ref())?;
         if !reconciliation.clears_snapshots(target.compaction) {
             debug!(
-                target: "cqrs",
                 aggregate = target.aggregate_type,
                 version = target.version,
                 ?stored_version,
@@ -353,7 +351,6 @@ impl Reconciler {
         .await?;
 
         info!(
-            target: "cqrs",
             aggregate = target.aggregate_type,
             old_version = ?stored_version,
             new_version = target.version,

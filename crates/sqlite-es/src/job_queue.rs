@@ -137,7 +137,7 @@ where
         }
         Err(claim_error) => {
             if let Err(error) = transaction.rollback().await {
-                tracing::warn!(target: "cqrs", ?error, job_id, "job claim rollback failed");
+                tracing::warn!(?error, job_id, "job claim rollback failed");
             }
             Err(claim_error)
         }

@@ -647,7 +647,11 @@ pub(crate) fn plan_claim(
     let lifecycle: Lifecycle<JobState> = match serde_json::from_str(&read.payload) {
         Ok(lifecycle) => lifecycle,
         Err(error) => {
-            error!(target: "cqrs", job_id, ?error, "job_queue_projection payload undecodable; needs rebuild");
+            error!(
+                job_id,
+                ?error,
+                "job_queue_projection payload undecodable; needs rebuild"
+            );
             return ClaimDecision::Skip;
         }
     };
@@ -689,7 +693,7 @@ pub(crate) fn plan_claim(
 
     let claim_seq = read.version + 1;
     let Ok(claim_seq_usize) = usize::try_from(claim_seq) else {
-        error!(target: "cqrs", job_id, claim_seq, "job claim sequence out of range");
+        error!(job_id, claim_seq, "job claim sequence out of range");
         return ClaimDecision::Skip;
     };
 
@@ -698,11 +702,11 @@ pub(crate) fn plan_claim(
     }
 
     let Some(lease_until_ms) = now_ms.checked_add(lease_ms) else {
-        error!(target: "cqrs", job_id, now_ms, lease_ms, "job lease instant out of range");
+        error!(job_id, now_ms, lease_ms, "job lease instant out of range");
         return ClaimDecision::Skip;
     };
     let Ok(lease_until) = instant_from_millis(lease_until_ms) else {
-        error!(target: "cqrs", job_id, lease_until_ms, "job lease instant out of range");
+        error!(job_id, lease_until_ms, "job lease instant out of range");
         return ClaimDecision::Skip;
     };
     let claim_id = ClaimId::new();
@@ -724,7 +728,7 @@ pub(crate) fn plan_claim(
         claimed.serialized(job_id, claim_seq_usize),
         serde_json::to_string(&Lifecycle::Live(new_state)),
     ) else {
-        error!(target: "cqrs", job_id, "failed to encode Claimed");
+        error!(job_id, "failed to encode Claimed");
         return ClaimDecision::Skip;
     };
 
@@ -753,7 +757,7 @@ fn plan_abandon(job_id: &str, kind: &JobKind, claim_seq_usize: usize) -> ClaimDe
             reason: DeadReason::Abandoned,
         })),
     ) else {
-        error!(target: "cqrs", job_id, "failed to encode Dead{{Abandoned}}");
+        error!(job_id, "failed to encode Dead{{Abandoned}}");
         return ClaimDecision::Skip;
     };
     ClaimDecision::Abandon {

@@ -578,7 +578,7 @@ fn build_task<J: StandaloneJob>(claimed: ClaimedJob, config: &JobWorkerConfig) -
     let job: J = match serde_json::from_value(payload) {
         Ok(job) => job,
         Err(error) => {
-            error!(target: "cqrs", ?error, %job_id, "claimed job failed to decode; skipping");
+            error!(?error, %job_id, "claimed job failed to decode; skipping");
             return None;
         }
     };
@@ -694,55 +694,56 @@ fn poll_jobs<J: StandaloneJob, Backend: EventBackend>(
     poller: JobPoller<Backend>,
 ) -> BoxStream<'static, Task<J>> {
     stream::unfold(poller, |backend| async move {
-            let now_ms = backend.clock.now().timestamp_millis();
-            let predicate = poll_predicate(J::KIND, now_ms);
-            let order = poll_order();
-            let candidates = match backend
-                .runtime
-                .queue
-                .find(&predicate, Some(&order), backend.config.scan_limit)
-                .await
-            {
-                Ok(ids) => ids,
+        let now_ms = backend.clock.now().timestamp_millis();
+        let predicate = poll_predicate(J::KIND, now_ms);
+        let order = poll_order();
+        let candidates = match backend
+            .runtime
+            .queue
+            .find(&predicate, Some(&order), backend.config.scan_limit)
+            .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                warn!(?error, kind = J::KIND, "job poll failed; idling");
+                sleep(backend.config.poll_interval).await;
+                return Some((None, backend));
+            }
+        };
+
+        for view_id in candidates {
+            let job_id = match view_id.parse::<JobId>() {
+                Ok(job_id) => job_id,
                 Err(error) => {
-                    warn!(target: "cqrs", ?error, kind = J::KIND, "job poll failed; idling");
-                    sleep(backend.config.poll_interval).await;
-                    return Some((None, backend));
+                    error!(
+                        ?error,
+                        view_id, "queue candidate has a malformed id; skipping"
+                    );
+                    continue;
                 }
             };
-
-            for view_id in candidates {
-                let job_id = match view_id.parse::<JobId>() {
-                    Ok(job_id) => job_id,
-                    Err(error) => {
-                        error!(target: "cqrs", ?error, view_id, "queue candidate has a malformed id; skipping");
-                        continue;
-                    }
-                };
-                match backend.claim_one(job_id, now_ms).await {
-                    Ok(JobClaimResult::Claimed(claimed)) => {
-                        if let Some(task) = build_task::<J>(claimed, &backend.config) {
-                            return Some((Some(task), backend));
-                        }
-                    }
-                    // An abandoned dead-letter freed the slot; contended/skip move on.
-                    Ok(
-                        JobClaimResult::Abandoned
-                        | JobClaimResult::Contended
-                        | JobClaimResult::Skipped,
-                    ) => {}
-                    Err(error) => {
-                        warn!(target: "cqrs", ?error, "job claim error; idling");
-                        break;
+            match backend.claim_one(job_id, now_ms).await {
+                Ok(JobClaimResult::Claimed(claimed)) => {
+                    if let Some(task) = build_task::<J>(claimed, &backend.config) {
+                        return Some((Some(task), backend));
                     }
                 }
+                // An abandoned dead-letter freed the slot; contended/skip move on.
+                Ok(
+                    JobClaimResult::Abandoned | JobClaimResult::Contended | JobClaimResult::Skipped,
+                ) => {}
+                Err(error) => {
+                    warn!(?error, "job claim error; idling");
+                    break;
+                }
             }
+        }
 
-            sleep(backend.config.poll_interval).await;
-            Some((None, backend))
-        })
-        .filter_map(|task| async move { task })
-        .boxed()
+        sleep(backend.config.poll_interval).await;
+        Some((None, backend))
+    })
+    .filter_map(|task| async move { task })
+    .boxed()
 }
 
 /// Tuning for a job worker. Defaults target a single-host bot with sub-second
@@ -1027,12 +1028,15 @@ where
         let ctx = match task.data().get_checked::<JobContext>().cloned() {
             Ok(ctx) => ctx,
             Err(error) => {
-                error!(target: "cqrs", ?error, "job task is missing its claim context");
+                error!(?error, "job task is missing its claim context");
                 return async move { Err(Box::new(error) as BoxDynError) }.boxed();
             }
         };
         if let Err(error) = self.config.backoff.validate() {
-            error!(target: "cqrs", ?error, "Invalid retry configuration; refusing job execution");
+            error!(
+                ?error,
+                "Invalid retry configuration; refusing job execution"
+            );
             return async move { Err(Box::new(error) as BoxDynError) }.boxed();
         }
         let jobs = self.jobs.clone();
@@ -1069,7 +1073,7 @@ where
             let plan = ack_plan::<J>(&result);
 
             let settlement = if lost.load(Ordering::Relaxed) {
-                warn!(target: "cqrs", job_id = %ctx.job_id, "lease lost during execution; re-claimer owns the outcome");
+                warn!(job_id = %ctx.job_id, "lease lost during execution; re-claimer owns the outcome");
                 Ok(())
             } else {
                 ack(&jobs, &config, &clock, &ctx, plan).await
@@ -1143,13 +1147,13 @@ async fn renew_loop<Backend: EventBackend>(
                 let new_lease = clock.now() + lease_delta(config.lease_duration);
                 match backend.renew(&ctx.job_id.to_string(), ctx.claim_seq, new_lease.timestamp_millis()).await {
                     Ok(LeaseRenewal::Lost) => {
-                        error!(target: "cqrs", job_id = %ctx.job_id, claim_seq = ctx.claim_seq, "lease lost; stopping renewal");
+                        error!(job_id = %ctx.job_id, claim_seq = ctx.claim_seq, "lease lost; stopping renewal");
                         lost.store(true, Ordering::Relaxed);
                         break;
                     }
                     Ok(LeaseRenewal::Held) => {}
                     Err(error) => {
-                        warn!(target: "cqrs", ?error, "lease renewal transient error");
+                        warn!(?error, "lease renewal transient error");
                     }
                 }
             }
@@ -1181,11 +1185,11 @@ async fn ack<Backend: EventBackend>(
                 return Ok(());
             }
             SettlementVerdict::Transient(error) => {
-                warn!(target: "cqrs", ?error, job_id = %ctx.job_id, "ack transient error; retrying within lease");
+                warn!(?error, job_id = %ctx.job_id, "ack transient error; retrying within lease");
                 sleep(Duration::from_millis(50)).await;
             }
             SettlementVerdict::Rejected(error) => {
-                error!(target: "cqrs", ?error, job_id = %ctx.job_id, "ack rejected by the job aggregate; giving up");
+                error!(?error, job_id = %ctx.job_id, "ack rejected by the job aggregate; giving up");
                 return Ok(());
             }
         }
@@ -1242,10 +1246,10 @@ fn settled_outcome(command: &JobCommand) -> SettledOutcome {
 fn report_fenced_settlement(job_id: JobId, settled: SettledOutcome) {
     match settled {
         SettledOutcome::Succeeded => {
-            error!(target: "cqrs", %job_id, "DOUBLE-EXECUTION RISK: job succeeded but a re-claimer owns the outcome");
+            error!(%job_id, "DOUBLE-EXECUTION RISK: job succeeded but a re-claimer owns the outcome");
         }
         SettledOutcome::Unsuccessful => {
-            warn!(target: "cqrs", %job_id, "settlement fenced; a re-claimer owns the outcome");
+            warn!(%job_id, "settlement fenced; a re-claimer owns the outcome");
         }
     }
 }

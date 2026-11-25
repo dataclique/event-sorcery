@@ -162,12 +162,13 @@ where
             Ok(output) => return Ok(output),
             Err(error) if attempt < max_attempts && should_retry(&error) => {
                 let Some(delay) = delays.next() else {
-                    warn!(target: "cqrs", attempt, "Retry delay schedule exhausted");
+                    warn!(attempt, "Retry delay schedule exhausted");
                     return Err(error);
                 };
                 warn!(
-                    target: "cqrs",
-                    attempt = attempt + 1, max_attempts, ?delay,
+                    attempt = attempt + 1,
+                    max_attempts,
+                    ?delay,
                     "Retrying after transient error"
                 );
                 sleep(delay).await;
@@ -272,7 +273,6 @@ where
         .await
         .inspect_err(|error| {
             warn!(
-                target: "cqrs",
                 ?error,
                 "RetryOnBusy giving up: reactor error was not a retryable SQLite busy error, \
                  or the busy-retry budget was exhausted"

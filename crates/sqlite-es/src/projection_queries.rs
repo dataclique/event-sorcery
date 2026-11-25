@@ -36,7 +36,7 @@ where
         .fetch_all(pool)
         .await?;
     if !columns.iter().any(|name| name == column) {
-        warn!(target: "cqrs", %column, %table, "Column does not exist in table schema");
+        warn!(%column, %table, "Column does not exist in table schema");
         return Err(SqliteProjectionFilterError::ColumnNotFound);
     }
 
@@ -50,7 +50,7 @@ where
         .fetch_one(pool)
         .await?;
         if non_null_count == 0 {
-            warn!(target: "cqrs", %column, %table, row_count, "Generated column has all NULL values, likely stale JSON path");
+            warn!(%column, %table, row_count, "Generated column has all NULL values, likely stale JSON path");
             return Err(SqliteProjectionFilterError::StaleColumn { row_count });
         }
     }

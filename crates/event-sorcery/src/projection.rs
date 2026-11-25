@@ -178,7 +178,7 @@ where
                 let id: Entity::Id = match view_id.parse() {
                     Ok(id) => id,
                     Err(error) => {
-                        warn!(target: "cqrs", view_id, ?error, "Failed to parse view ID");
+                        warn!(view_id, ?error, "Failed to parse view ID");
                         return None;
                     }
                 };
@@ -186,7 +186,7 @@ where
                 let lifecycle: Lifecycle<Entity> = match serde_json::from_str(&payload) {
                     Ok(lifecycle) => lifecycle,
                     Err(error) => {
-                        warn!(target: "cqrs", %id, ?error, "Failed to deserialize view payload");
+                        warn!(%id, ?error, "Failed to deserialize view payload");
                         return None;
                     }
                 };
@@ -194,7 +194,7 @@ where
                 if let Lifecycle::Live(entity) = lifecycle {
                     Some((id, entity))
                 } else {
-                    warn!(target: "cqrs", %id, "Skipping non-live aggregate in view");
+                    warn!(%id, "Skipping non-live aggregate in view");
                     None
                 }
             })
@@ -220,7 +220,7 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
     pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, ProjectionError<Entity>> {
         let view_id = id.to_string();
 
-        trace!(target: "cqrs", %view_id, "Loading view");
+        trace!(%view_id, "Loading view");
 
         match self.repo.load(&view_id).await {
             Ok(Some(lifecycle)) => Ok(lifecycle.into_result()?),
@@ -309,15 +309,18 @@ where
 {
     async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Entity>>]) {
         let Ok(id) = aggregate_id.parse::<Entity::Id>() else {
-            warn!(target: "cqrs", aggregate_id, aggregate_type = Entity::AGGREGATE_TYPE,
-                "Failed to parse aggregate ID in projection query");
+            warn!(
+                aggregate_id,
+                aggregate_type = Entity::AGGREGATE_TYPE,
+                "Failed to parse aggregate ID in projection query"
+            );
             return;
         };
         let view_id = id.to_string();
         let mut gap_wait = GapWait::for_batch();
         for envelope in events {
             let Some(sequence) = NonZeroUsize::new(envelope.sequence) else {
-                error!(target: "cqrs", %view_id, sequence = envelope.sequence,
+                error!(%view_id, sequence = envelope.sequence,
                     "Persisted event has an invalid zero sequence; refusing projection delivery");
                 continue;
             };
@@ -332,7 +335,7 @@ where
                 .await;
             if let Some(DeliveryGap { covered, sequence }) = gap {
                 if let Err(error) = self.projection.catch_up().await {
-                    error!(target: "cqrs", %view_id, covered, sequence = sequence.get(), ?error,
+                    error!(%view_id, covered, sequence = sequence.get(), ?error,
                         "Projection catch-up failed after a delivery gap");
                 }
                 // Catch-up captures the durable events, including the rest of this batch.
@@ -372,7 +375,7 @@ where
             .deliver(&view_id, &event, sequence, &mut GapWait::for_batch())
             .await
         {
-            error!(target: "cqrs", %view_id, covered, sequence = sequence.get(),
+            error!(%view_id, covered, sequence = sequence.get(),
                 "Projection delivery is out of order; leaving checkpoint for recovery");
         }
         Ok(())
@@ -423,7 +426,7 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
             match outcome {
                 Ok(None | Some(SkippedDelivery::Covered)) => return None,
                 Ok(Some(SkippedDelivery::InvalidCheckpoint(version))) => {
-                    error!(target: "cqrs", %view_id, version,
+                    error!(%view_id, version,
                         "Invalid projection checkpoint; refusing event delivery");
                     return None;
                 }
@@ -437,7 +440,6 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
                 Err(Load(error)) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
                         warn!(
-                            target: "cqrs",
                             %view_id, attempt = attempt + 1, max_retries, ?delay,
                             "Storage contention loading view, retrying"
                         );
@@ -446,19 +448,17 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
                     }
 
                     error!(
-                        target: "cqrs",
                         %view_id, max_retries,
                         "View load lost: Storage contention conflict persisted after all retries"
                     );
                     return None;
                 }
                 Err(Load(error)) => {
-                    warn!(target: "cqrs", %view_id, ?error, "Failed to load view for update");
+                    warn!(%view_id, ?error, "Failed to load view for update");
                     return None;
                 }
                 Err(Write(PersistenceError::OptimisticLockError)) if attempt < max_retries => {
                     warn!(
-                        target: "cqrs",
                         %view_id, attempt = attempt + 1, max_retries, ?delay,
                         "Optimistic lock conflict, retrying view update"
                     );
@@ -466,7 +466,6 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
                 }
                 Err(Write(PersistenceError::OptimisticLockError)) => {
                     error!(
-                        target: "cqrs",
                         %view_id, max_retries,
                         "View update lost: optimistic lock conflict persisted after all retries"
                     );
@@ -475,14 +474,12 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
                 Err(Write(error)) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
                         warn!(
-                            target: "cqrs",
                             %view_id, attempt = attempt + 1, max_retries, ?delay,
                             "Storage contention, retrying view update"
                         );
                         sleep(delay).await;
                     } else {
                         error!(
-                            target: "cqrs",
                             %view_id, max_retries,
                             "View update lost: Storage contention conflict persisted after all retries"
                         );
@@ -490,7 +487,7 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
                     }
                 }
                 Err(Write(error)) => {
-                    warn!(target: "cqrs", %view_id, ?error, "Failed to save view update");
+                    warn!(%view_id, ?error, "Failed to save view update");
                     return None;
                 }
             }

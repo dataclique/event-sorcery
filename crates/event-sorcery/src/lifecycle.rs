@@ -159,7 +159,6 @@ where
             Self::Live(entity) => entity.transition(command).await,
             Self::Failed { error, .. } => {
                 warn!(
-                    target: "cqrs",
                     %error,
                     aggregate_type = Entity::AGGREGATE_TYPE,
                     "Rejecting command because lifecycle is already failed"
@@ -169,7 +168,6 @@ where
         }
         .inspect_err(|domain_error| {
             error!(
-                target: "cqrs",
                 %domain_error,
                 aggregate_type = Entity::AGGREGATE_TYPE,
                 "Command handler returned domain error"
@@ -217,7 +215,6 @@ where
 
             if let Self::Failed { error, .. } = &scratch {
                 error!(
-                    target: "cqrs",
                     %error,
                     aggregate_type = Entity::AGGREGATE_TYPE,
                     "Command produced an event the entity cannot apply"
@@ -234,7 +231,7 @@ where
             Self::Uninitialized => Entity::originate(&event).map_or_else(
                 || {
                     let err = LifecycleError::EventCantOriginate { event };
-                    error!(target: "cqrs", "lifecycle failed during originate: {err}");
+                    error!("lifecycle failed during originate: {err}");
                     Self::Failed {
                         error: err,
                         last_valid_entity: None,
@@ -250,7 +247,7 @@ where
                         entity: Box::new(entity.clone()),
                         event,
                     };
-                    error!(target: "cqrs", "lifecycle failed during evolve: {err}");
+                    error!("lifecycle failed during evolve: {err}");
                     Self::Failed {
                         error: err,
                         last_valid_entity: Some(Box::new(entity)),
@@ -258,7 +255,7 @@ where
                 }
                 Err(domain_err) => {
                     let err = LifecycleError::Apply(domain_err);
-                    error!(target: "cqrs", "lifecycle failed during evolve: {err}");
+                    error!("lifecycle failed during evolve: {err}");
                     Self::Failed {
                         error: err,
                         last_valid_entity: Some(Box::new(entity)),
@@ -274,7 +271,7 @@ where
                     failure: Box::new(error),
                     event,
                 };
-                error!(target: "cqrs", "lifecycle already failed, ignoring event: {err}");
+                error!("lifecycle already failed, ignoring event: {err}");
                 Self::Failed {
                     error: err,
                     last_valid_entity,
@@ -334,7 +331,6 @@ where
     async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Entity>>]) {
         let Ok(typed_id) = aggregate_id.parse::<Entity::Id>() else {
             warn!(
-                target: "cqrs",
                 aggregate_id = aggregate_id,
                 aggregate_type = Entity::AGGREGATE_TYPE,
                 "Failed to parse aggregate ID in reactor bridge"
@@ -352,8 +348,11 @@ where
             // (gated by `IdempotentReactor`) to retry on transient SQLite
             // busy errors. See `docs/cqrs.md`'s "Reactors" section.
             let Some(sequence) = NonZeroUsize::new(envelope.sequence) else {
-                error!(target: "cqrs", aggregate_id, sequence = envelope.sequence,
-                    "Persisted event has an invalid zero sequence; refusing reactor delivery");
+                error!(
+                    aggregate_id,
+                    sequence = envelope.sequence,
+                    "Persisted event has an invalid zero sequence; refusing reactor delivery"
+                );
                 continue;
             };
             let context = ReactorContext {
@@ -361,7 +360,6 @@ where
             };
             if let Err(error) = self.reactor.react_with_context(injected, context).await {
                 error!(
-                    target: "cqrs",
                     ?error,
                     aggregate_id = aggregate_id,
                     aggregate_type = Entity::AGGREGATE_TYPE,

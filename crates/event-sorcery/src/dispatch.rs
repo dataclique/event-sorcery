@@ -715,14 +715,14 @@ fn delivery_deferral(ctx: &JobContext, delivery_error: &OriginDeliveryError) -> 
     match delivery_error {
         OriginDeliveryError::Transport(_) => {
             warn!(
-                target: "cqrs", ?delivery_error, %job_id,
+                ?delivery_error, %job_id,
                 "settled verdict could not be delivered; deferring"
             );
             ctx.delivery.retry_delay
         }
         OriginDeliveryError::Refused(_) => {
             error!(
-                target: "cqrs", ?delivery_error, %job_id,
+                ?delivery_error, %job_id,
                 "VERDICT REFUSED: the origin entity rejected a settled verdict; \
                  backing off -- operator intervention needed"
             );
@@ -815,7 +815,7 @@ impl<J: Job> StandaloneJob for J {
                         wrapped.origin.deliver(&self.origin_id(), fail).await
                     {
                         error!(
-                            target: "cqrs", ?delivery_error, job_id = %ctx.job_id(),
+                            ?delivery_error, job_id = %ctx.job_id(),
                             "DISPATCH DANGLING: job dead-letters but the origin \
                              entity could not be told; operator intervention needed"
                         );
