@@ -181,13 +181,11 @@ pub use testing::{
     with_pending_jobs,
 };
 pub use view_backend::{NativeProjectionBackend, ViewBackend, ViewUpdateError};
-pub use wire::StoreBuilder;
 #[cfg(all(any(test, feature = "test-support"), any(test, feature = "sqlite")))]
 pub use wire::test_store;
+pub use wire::{StoreBuilder, load_entity, send_command};
 #[cfg(any(test, feature = "sqlite"))]
-pub use wire::{
-    compact_events, count_aggregates, load_all_ids, load_entity, load_ids_paginated, send_command,
-};
+pub use wire::{compact_events, count_aggregates, load_all_ids, load_ids_paginated};
 
 pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
     Lifecycle<Entity>,
@@ -686,10 +684,33 @@ mod tests {
             .await
             .unwrap();
 
-        let entity = load_entity::<Widget>(&pool, &NumericId(42)).await.unwrap();
+        let entity = load_entity::<Widget>(&SqliteBackend::new(pool.clone()), &NumericId(42))
+            .await
+            .unwrap();
 
         let widget = entity.expect("entity should exist after event replay");
         assert_eq!(widget.name, "test-widget");
+    }
+
+    #[tokio::test]
+    async fn standalone_command_persists_the_new_entity() {
+        let pool = test_pool().await;
+        let backend = SqliteBackend::new(pool.clone());
+        let id = NumericId(42);
+
+        send_command::<Widget>(
+            &backend,
+            &id,
+            WidgetCommand::Create {
+                name: "standalone".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let store = test_store::<Widget>(pool);
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(entity.name, "standalone");
     }
 
     #[tokio::test]
@@ -728,7 +749,9 @@ mod tests {
         .unwrap();
         assert_eq!(event_count, 0);
 
-        let entity = load_entity::<Widget>(&pool, &NumericId(42)).await.unwrap();
+        let entity = load_entity::<Widget>(&SqliteBackend::new(pool.clone()), &NumericId(42))
+            .await
+            .unwrap();
 
         let widget = entity.expect("entity should load from snapshot after compaction");
         assert_eq!(widget.name, "second");
@@ -765,7 +788,9 @@ mod tests {
             .await
             .unwrap();
 
-        let entity = load_entity::<Widget>(&pool, &NumericId(42)).await.unwrap();
+        let entity = load_entity::<Widget>(&SqliteBackend::new(pool.clone()), &NumericId(42))
+            .await
+            .unwrap();
         let widget = entity.expect("entity should exist after a post-compaction command");
         assert_eq!(widget.name, "second");
     }
@@ -818,10 +843,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(remaining, vec![4, 5]);
-        let entity = load_entity::<WindowedWidget<1, 3>>(&pool, &NumericId(7))
-            .await
-            .unwrap()
-            .unwrap();
+        let entity =
+            load_entity::<WindowedWidget<1, 3>>(&SqliteBackend::new(pool.clone()), &NumericId(7))
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(entity.name, "fifth");
     }
 
@@ -864,10 +890,11 @@ mod tests {
         .unwrap();
         assert_eq!(remaining, vec![4, 5], "the newest window survives");
 
-        let entity = load_entity::<WindowedWidget>(&pool, &NumericId(7))
-            .await
-            .unwrap()
-            .expect("the entity loads from snapshot plus the retained window");
+        let entity =
+            load_entity::<WindowedWidget>(&SqliteBackend::new(pool.clone()), &NumericId(7))
+                .await
+                .unwrap()
+                .expect("the entity loads from snapshot plus the retained window");
         assert_eq!(entity.name, "fifth");
     }
 
@@ -1088,7 +1115,9 @@ mod tests {
             .await
             .unwrap();
 
-        let entity = load_entity::<Tally>(&pool, &NumericId(1)).await.unwrap();
+        let entity = load_entity::<Tally>(&SqliteBackend::new(pool.clone()), &NumericId(1))
+            .await
+            .unwrap();
         let tally = entity.expect("tally should exist after three commands");
         assert_eq!(tally.count, 2);
 
@@ -1200,7 +1229,9 @@ mod tests {
     async fn load_entity_returns_none_when_no_events() {
         let pool = test_pool().await;
 
-        let entity = load_entity::<Widget>(&pool, &NumericId(999)).await.unwrap();
+        let entity = load_entity::<Widget>(&SqliteBackend::new(pool.clone()), &NumericId(999))
+            .await
+            .unwrap();
 
         assert!(entity.is_none(), "expected None for nonexistent aggregate");
     }

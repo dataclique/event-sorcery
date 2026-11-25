@@ -35,10 +35,10 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use cqrs_es::persist::{PersistedEventRepository, PersistedEventStore};
-use cqrs_es::{CqrsFramework, Query};
 #[cfg(any(test, feature = "sqlite"))]
-use cqrs_es::{EventStore, persist::PersistenceError};
+use cqrs_es::persist::PersistenceError;
+use cqrs_es::persist::{PersistedEventRepository, PersistedEventStore};
+use cqrs_es::{CqrsFramework, EventStore, Query};
 #[cfg(any(test, feature = "sqlite"))]
 use sqlx::SqlitePool;
 
@@ -51,13 +51,13 @@ use crate::projection::{Projection, ProjectionQuery};
 use crate::reactor::Reactor;
 use crate::schema_registry::ReconcileError;
 use crate::{
-    CompactionPolicy, EventSourced, PersistenceBackend, ProjectedStoreBackend, Store, Table,
-    UnmaterializedStoreBackend,
+    CompactionPolicy, EventSourced, PersistenceBackend, ProjectedStoreBackend, SendError, Store,
+    Table, UnmaterializedStoreBackend,
 };
 #[cfg(any(test, feature = "sqlite"))]
 use crate::{
-    LoadAllIdsError, ProjectionError, Reconciler, SchemaReconciliation, SendError, SqliteBackend,
-    SqliteEventRepository, SqliteViewBackend, job,
+    LoadAllIdsError, ProjectionError, Reconciler, SchemaReconciliation, SqliteBackend,
+    SqliteViewBackend,
 };
 
 /// Builder for a single CQRS framework.
@@ -188,30 +188,6 @@ impl<Entity: EventSourced<Materialized = Nil>, Backend: UnmaterializedStoreBacke
     }
 }
 
-/// SQLite-specific [`Store`] helpers.
-#[cfg(all(any(test, feature = "test-support"), any(test, feature = "sqlite")))]
-impl<Entity: EventSourced> Store<Entity, SqliteBackend> {
-    /// Reconstruct an entity's state from events without needing
-    /// a full `Store` (no services or CQRS framework required).
-    ///
-    /// Useful in test/CLI contexts where you only need to read
-    /// aggregate state and never send commands.
-    pub async fn load_from_pool(
-        pool: SqlitePool,
-        id: &Entity::Id,
-    ) -> Result<Option<Entity>, SendError<Entity>> {
-        let repo = SqliteEventRepository::new(pool, Entity::COMPACTION_POLICY);
-        let event_store =
-            PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-                repo,
-                Entity::SNAPSHOT_SIZE,
-            );
-        let context = event_store.load_aggregate(&id.to_string()).await?;
-
-        Ok(context.aggregate.into_result()?)
-    }
-}
-
 #[cfg(any(test, feature = "sqlite"))]
 impl<Entity: EventSourced> StoreBuilder<Entity, SqliteBackend> {
     /// Creates a new builder backed by SQLite over `pool`.
@@ -281,29 +257,19 @@ impl UnmaterializedStoreBackend for SqliteBackend {
     }
 }
 
-/// Load a single entity by replaying events from the store.
+/// Reconstructs an entity from its snapshot and events without a [`Store`].
 ///
-/// Creates a lightweight, temporary event store - no CQRS framework, no
-/// query processors. Suitable for read-only access from contexts that
-/// don't own a [`Store`] (e.g., dashboard transfer loading).
-///
-/// # Errors
-///
-/// Returns `SendError` if event store loading or lifecycle
-/// reconstruction fails.
-#[cfg(any(test, feature = "sqlite"))]
+/// Returns an error if reading storage or reconstructing the entity fails.
 pub async fn load_entity<Entity: EventSourced>(
-    pool: &SqlitePool,
+    backend: &impl PersistenceBackend,
     id: &Entity::Id,
 ) -> Result<Option<Entity>, SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
-    let event_store =
-        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-            repo,
-            Entity::SNAPSHOT_SIZE,
-        );
-
-    let context = event_store.load_aggregate(&id.to_string()).await?;
+    let repository = backend.persistence_repo(Entity::COMPACTION_POLICY);
+    let store = PersistedEventStore::<_, Lifecycle<Entity>>::new_snapshot_store(
+        repository,
+        Entity::SNAPSHOT_SIZE,
+    );
+    let context = store.load_aggregate(&id.to_string()).await?;
 
     Ok(context.aggregate.into_result()?)
 }
@@ -316,22 +282,16 @@ pub async fn load_entity<Entity: EventSourced>(
 /// handler enqueues flush with the events), and discards the framework.
 /// Useful in CLI contexts where you need to send a command but don't have
 /// (or need) a full server-lifetime Store.
-#[cfg(any(test, feature = "sqlite"))]
 pub async fn send_command<Entity: EventSourced>(
-    pool: &SqlitePool,
+    backend: &impl PersistenceBackend,
     id: &Entity::Id,
     command: Entity::Command,
 ) -> Result<(), SendError<Entity>> {
-    let repo = SqliteEventRepository::new(pool.clone(), Entity::COMPACTION_POLICY);
-    let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
-        repo,
-        Entity::SNAPSHOT_SIZE,
-    );
+    let repository = backend.persistence_repo(Entity::COMPACTION_POLICY);
+    let store = PersistedEventStore::new_snapshot_store(repository, Entity::SNAPSHOT_SIZE);
+    let cqrs = es_cqrs::<Entity, _>(store, vec![]);
 
-    #[allow(clippy::disallowed_methods)]
-    let cqrs = CqrsFramework::new(store, vec![], ());
-
-    job::with_pending_scope(cqrs.execute(&id.to_string(), command)).await
+    crate::job::with_pending_scope(cqrs.execute(&id.to_string(), command)).await
 }
 
 /// Delete compactable events that are already represented by snapshots.

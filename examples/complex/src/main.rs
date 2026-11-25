@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Standalone helpers -- useful for CLI / migration code that does not
     // hold a long-lived Store. `load_entity` replays from events; for
     // Materialized = Table entities a Projection::load would be cheaper.
-    let order_via_helper = load_entity::<Order>(&pool, &order_one)
+    let order_via_helper = load_entity::<Order>(&SqliteBackend::new(pool.clone()), &order_one)
         .await?
         .ok_or("order missing")?;
     println!(
