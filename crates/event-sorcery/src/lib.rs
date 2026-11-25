@@ -1121,7 +1121,7 @@ mod tests {
 
             const PROJECTION: Nil = Nil;
             const SCHEMA_VERSION: u64 = 1;
-            const SNAPSHOT_SIZE: usize = 10;
+            const SNAPSHOT_SIZE: usize = 1;
             const AGGREGATE_TYPE: &'static str = "RetainedWidget";
             const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
 
@@ -1175,17 +1175,25 @@ mod tests {
             .await
             .unwrap();
 
+        let snapshot = sqlite_es::load_snapshot(&pool, "RetainedWidget", "7")
+            .await
+            .unwrap()
+            .expect("the store wrote a snapshot covering the first event");
+        assert_eq!(snapshot.current_sequence, 1);
+
         let deleted = compact_events::<RetainedWidget>(&pool).await.unwrap();
 
         assert_eq!(deleted, 0);
-        let event_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events \
-             WHERE aggregate_type = 'RetainedWidget' AND aggregate_id = '7'",
+        let sequences: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence
+             FROM events
+             WHERE aggregate_type = 'RetainedWidget' AND aggregate_id = '7'
+             ORDER BY sequence",
         )
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(event_count, 1);
+        assert_eq!(sequences, [1]);
     }
 
     #[tokio::test]
