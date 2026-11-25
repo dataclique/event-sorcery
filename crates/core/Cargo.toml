@@ -10,5 +10,6 @@ workspace = true
 
 [dependencies]
 cqrs-es.workspace = true
+indexed-query.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true

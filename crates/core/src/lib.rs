@@ -3,6 +3,7 @@
 mod job_backend;
 mod job_claim;
 mod projection_recovery;
+mod view_backend;
 
 pub use job_backend::EventBackend;
 pub use job_claim::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
@@ -10,6 +11,7 @@ pub use job_claim::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 pub use projection_recovery::{
     ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow,
 };
+pub use view_backend::{ViewBackend, ViewUpdateError};
 
 /// A materialized view table name.
 #[derive(Debug, Clone, Copy)]

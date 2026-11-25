@@ -1,6 +1,7 @@
 //! SQLite storage operations for projection recovery.
 
-use sqlx::{AssertSqlSafe, SqliteConnection};
+use futures_util::future::BoxFuture;
+use sqlx::{AssertSqlSafe, SqliteConnection, SqlitePool};
 use std::num::NonZeroU64;
 
 use event_sorcery_core::{
@@ -11,6 +12,28 @@ use event_sorcery_core::{
 pub struct SqliteProjectionRecovery<'connection> {
     /// Connection borrowed from the caller-owned recovery transaction.
     pub connection: &'connection mut SqliteConnection,
+}
+
+/// Runs a replay and publishes its writes in one SQLite transaction.
+pub async fn recover_projection<Error>(
+    pool: &SqlitePool,
+    mode: ProjectionRecoveryMode,
+    replay: impl for<'connection> FnOnce(
+        SqliteProjectionRecovery<'connection>,
+        ProjectionRecoveryMode,
+    ) -> BoxFuture<'connection, Result<(), Error>>
+    + Send,
+) -> Result<(), Error>
+where
+    Error: From<sqlx::Error> + Send,
+{
+    let mut transaction = pool.begin().await?;
+    let storage = SqliteProjectionRecovery {
+        connection: &mut transaction,
+    };
+    replay(storage, mode).await?;
+    transaction.commit().await?;
+    Ok(())
 }
 
 impl ProjectionRecoveryStorage for SqliteProjectionRecovery<'_> {

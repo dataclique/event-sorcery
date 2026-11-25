@@ -7,7 +7,25 @@ use std::marker::PhantomData;
 
 pub use indexed_query::{Cmp, IndexedView, Order, Predicate, Term, Value};
 
+use event_sorcery_core::ViewBackend;
+
 use crate::sql_query::SqlQueryFactory;
+
+/// SQLite repository family for aggregate-state materialized views.
+#[derive(Debug, Clone, Copy)]
+pub struct SqliteViewBackend;
+
+impl ViewBackend for SqliteViewBackend {
+    type Repo<View, Agg>
+        = SqliteViewRepository<View, Agg>
+    where
+        View: cqrs_es::View<Agg> + Clone + 'static,
+        Agg: Aggregate + 'static;
+
+    fn is_retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
+        crate::is_retryable_sqlite_busy(error)
+    }
+}
 
 /// Errors that can occur during SQLite view repository operations
 #[derive(Debug, thiserror::Error)]

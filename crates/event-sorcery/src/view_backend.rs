@@ -1,103 +1,16 @@
-//! Pluggable storage backend for materialized views.
-//!
-//! [`ViewBackend`] is a higher-kinded-type emulation: it supplies,
-//! for each `(View, Aggregate)` pair, a concrete [`ViewRepository`]
-//! implementation. Database integrations supply their repository family;
-//! custom backends can also provide in-memory storage for tests.
-
-use std::ops::ControlFlow;
+//! Native construction and recovery of materialized views.
 
 use cqrs_es::Aggregate;
-use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
+#[cfg(any(test, feature = "sqlite"))]
+use sqlx::{Sqlite, SqlitePool};
 
-use indexed_query::IndexedView;
+pub use event_sorcery_core::{ViewBackend, ViewUpdateError};
+#[cfg(any(test, feature = "sqlite"))]
+use sqlite_es::{SqliteProjectionFilterError, SqliteViewBackend, SqliteViewRepository};
 
+#[cfg(any(test, feature = "sqlite"))]
+use crate::Projection;
 use crate::{Column, EventSourced, ProjectionError, ProjectionRecoveryMode, Table};
-
-/// Pluggable storage backend for materialized views, supplying a
-/// concrete [`ViewRepository`] for each `(View, Aggregate)` pair.
-///
-/// Implemented as a higher-kinded type emulation: the GAT
-/// [`Repo`](Self::Repo) is a "type-level function"
-/// `(View, Aggregate) -> SomeRepo` that [`crate::Projection`]
-/// applies internally to obtain a repository for
-/// `(Lifecycle<Entity>, Lifecycle<Entity>)`. This lets
-/// `Projection<Entity, Backend>` express its repository requirement
-/// without naming the `pub(crate)` `Lifecycle` type in any public
-/// bound — the `Lifecycle` saturation happens inside the struct,
-/// not in the impl `where` clauses.
-///
-/// Why this exists: Rust lacks native HKT, so we cannot write
-/// `Projection<Entity, Repo<_, _>>` and have the compiler apply
-/// `Repo` to `Lifecycle<Entity>`. The GAT-on-trait pattern below
-/// is the standard workaround. The `Send + Sync + 'static` bound
-/// on the GAT itself means downstream impls don't have to repeat
-/// these bounds (and so don't reintroduce `Lifecycle` into their
-/// `where` clauses).
-pub trait ViewBackend: Send + Sync + 'static {
-    /// View repository for views of `View` over `Aggregate`. Carries
-    /// [`IndexedView`] so [`crate::Projection::find`] can run a predicate scan
-    /// without naming the `pub(crate)` `Lifecycle` type in a public bound.
-    type Repo<View, Agg>: ViewRepository<View, Agg> + IndexedView<View, Agg> + Send + Sync + 'static
-    where
-        View: cqrs_es::View<Agg> + Clone + 'static,
-        Agg: Aggregate + 'static;
-
-    /// Runs one live delivery against the observed state and its optimistic context.
-    ///
-    /// Backends can override this to compare more than the optimistic version when
-    /// saving, for example when recovery can replace a payload at the same checkpoint.
-    /// A failed comparison must report `PersistenceError::OptimisticLockError` as
-    /// a write error. Returning `Break` from `apply` skips the write entirely.
-    fn try_update<ViewState, AggregateType, Skip>(
-        repository: &Self::Repo<ViewState, AggregateType>,
-        view_id: &str,
-        apply: impl FnOnce(Option<ViewState>, &ViewContext) -> ControlFlow<Skip, ViewState> + Send,
-    ) -> impl Future<Output = Result<Option<Skip>, ViewUpdateError>> + Send
-    where
-        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
-        AggregateType: Aggregate + 'static,
-        Skip: Send,
-    {
-        async move {
-            let (stored, context) = match repository
-                .load_with_context(view_id)
-                .await
-                .map_err(ViewUpdateError::Load)?
-            {
-                Some((stored, context)) => (Some(stored), context),
-                None => (None, ViewContext::new(view_id.to_owned(), 0)),
-            };
-            match apply(stored, &context) {
-                ControlFlow::Break(skipped) => Ok(Some(skipped)),
-                ControlFlow::Continue(view) => {
-                    repository
-                        .update_view(view, context)
-                        .await
-                        .map_err(ViewUpdateError::Write)?;
-                    Ok(None)
-                }
-            }
-        }
-    }
-
-    /// Classifies storage contention that can safely retry a complete projection update.
-    /// Unknown errors are returned without retrying unless the backend opts in.
-    fn is_retryable_error(_error: &(dyn std::error::Error + 'static)) -> bool {
-        false
-    }
-}
-
-/// Storage phase that failed during one live projection delivery.
-#[derive(Debug, thiserror::Error)]
-pub enum ViewUpdateError {
-    /// The previous view state could not be loaded.
-    #[error("failed to load the view for update")]
-    Load(#[source] PersistenceError),
-    /// The new view state could not be saved.
-    #[error("failed to save the view update")]
-    Write(#[source] PersistenceError),
-}
 
 /// Optional native construction, queries and retained-history recovery.
 ///
@@ -160,4 +73,91 @@ pub trait NativeProjectionBackend: ViewBackend {
     ) -> impl Future<Output = Result<(), ProjectionError<Entity>>> + Send
     where
         Entity: EventSourced<Materialized = Table>;
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl<Entity: EventSourced<Materialized = Table>> Projection<Entity, SqliteViewBackend> {
+    /// Constructs the SQLite materialized view using the caller-owned pool.
+    pub fn sqlite(pool: SqlitePool) -> Self {
+        Self::with_backend(pool)
+    }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl NativeProjectionBackend for SqliteViewBackend {
+    type Source = SqlitePool;
+    type Database = Sqlite;
+
+    fn repository<ViewState, AggregateType>(
+        source: SqlitePool,
+        Table(table): Table,
+    ) -> Self::Repo<ViewState, AggregateType>
+    where
+        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static,
+    {
+        SqliteViewRepository::new(source, table.to_string())
+    }
+
+    fn source<ViewState, AggregateType>(
+        repository: &Self::Repo<ViewState, AggregateType>,
+    ) -> &SqlitePool
+    where
+        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static,
+    {
+        repository.as_ref()
+    }
+
+    async fn rows(
+        source: &SqlitePool,
+        Table(table): Table,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlite_es::projection_rows(source, table).await
+    }
+
+    async fn filter<Entity, Value>(
+        source: &SqlitePool,
+        Table(table): Table,
+        column: Column,
+        value: &Value,
+    ) -> Result<Vec<(String, String)>, ProjectionError<Entity>>
+    where
+        Entity: EventSourced,
+        for<'query> &'query Value: sqlx::Encode<'query, Sqlite>,
+        Value: sqlx::Type<Sqlite> + Send + Sync,
+    {
+        let Column(column_name) = column;
+        sqlite_es::filter_projection(source, table, column_name, value)
+            .await
+            .map_err(|error| {
+                use SqliteProjectionFilterError::{ColumnNotFound, Sql, StaleColumn};
+
+                match error {
+                    ColumnNotFound => ProjectionError::ColumnNotFound {
+                        column,
+                        table: table.to_string(),
+                    },
+                    StaleColumn { row_count } => ProjectionError::StaleColumn {
+                        column,
+                        table: table.to_string(),
+                        row_count,
+                    },
+                    Sql(source) => ProjectionError::Sqlx(source),
+                }
+            })
+    }
+
+    async fn recover<Entity>(
+        source: &SqlitePool,
+        mode: &crate::ProjectionRecoveryMode,
+    ) -> Result<(), ProjectionError<Entity>>
+    where
+        Entity: EventSourced<Materialized = Table>,
+    {
+        sqlite_es::recover_projection(source, mode.clone(), |mut storage, mode| {
+            Box::pin(async move { crate::recover_projection::<Entity>(&mut storage, &mode).await })
+        })
+        .await
+    }
 }

@@ -90,7 +90,7 @@ pub use event_repository::{
 pub use job_queue::{SqliteJobError, claim_job, enqueue_job, renew_job};
 pub use native_repository::{NativeRepository, RepositoryPolicy, SnapshotInput};
 pub use projection_queries::{SqliteProjectionFilterError, filter_projection, projection_rows};
-pub use projection_recovery::SqliteProjectionRecovery;
+pub use projection_recovery::{SqliteProjectionRecovery, recover_projection};
 pub use schema_registry::load_schema_registry_payloads;
 pub use snapshot::{
     StoreSnapshotError, clear_snapshots, discard_snapshot, load_snapshot, store_snapshot,
@@ -99,7 +99,8 @@ pub use snapshot::{
 pub use stream_version::committed_stream_version;
 pub use vacuum::{incremental_vacuum, vacuum};
 pub use view_repository::{
-    Cmp, IndexedView, Order, Predicate, SqliteViewError, SqliteViewRepository, Term, Value,
+    Cmp, IndexedView, Order, Predicate, SqliteViewBackend, SqliteViewError, SqliteViewRepository,
+    Term, Value,
 };
 
 #[cfg(test)]

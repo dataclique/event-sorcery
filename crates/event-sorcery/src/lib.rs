@@ -99,8 +99,6 @@ mod projection_recovery;
 mod reactor;
 mod schema_registry;
 #[cfg(any(test, feature = "sqlite"))]
-mod sqlite_projection;
-#[cfg(any(test, feature = "sqlite"))]
 mod sqlite_reactor;
 #[cfg(any(test, feature = "sqlite"))]
 mod sqlite_store;
@@ -178,9 +176,9 @@ pub use schema_registry::{
 #[cfg(any(test, feature = "sqlite"))]
 pub use sqlite_es::SqliteJobError;
 #[cfg(any(test, feature = "sqlite"))]
-pub use sqlite_es::{incremental_vacuum, vacuum};
+pub use sqlite_es::SqliteViewBackend;
 #[cfg(any(test, feature = "sqlite"))]
-pub use sqlite_projection::SqliteViewBackend;
+pub use sqlite_es::{incremental_vacuum, vacuum};
 #[cfg(all(any(test, feature = "test-support"), any(test, feature = "sqlite")))]
 pub use sqlite_store::test_store;
 #[cfg(any(test, feature = "sqlite"))]
