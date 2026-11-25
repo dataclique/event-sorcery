@@ -9,8 +9,9 @@ use std::sync::Arc;
 use sqlite_es::{SqliteJobError, StoredEventRow};
 
 use super::{
-    CommitRequest, ENGINE_PAYLOAD_PROVENANCE_KEY, EngineError, JobSeed, OpaqueProposedEvent,
-    OpaqueStoredEvent, StreamIdentity, decode_opaque_payload, encode_opaque_payload,
+    CheckedCommit, CommitRequest, ENGINE_PAYLOAD_PROVENANCE_KEY, EngineError, JobSeed,
+    OpaqueProposedEvent, OpaqueStoredEvent, StreamIdentity, decode_opaque_payload,
+    encode_opaque_payload,
 };
 use crate::job::EnqueueRequest;
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
@@ -276,8 +277,7 @@ impl Engine {
 
     /// Atomically persists a validated event, snapshot, and durable-job batch.
     pub async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
-        request.validate_metadata()?;
-        commit_serialized(&self.pool, request).await
+        commit_serialized(&self.pool, request.check()?).await
     }
 
     /// Atomically persists binding-owned payload bytes through the shared writer.
@@ -312,7 +312,8 @@ impl Engine {
             &self.pool,
             CommitRequest::new(stream, &serialized)
                 .at_expected_version(expected_version)
-                .with_jobs(jobs),
+                .with_jobs(jobs)
+                .check_stream()?,
         )
         .await
     }
@@ -321,10 +322,9 @@ impl Engine {
 /// Hands validated framework inputs to the shared SQLite writer.
 pub(crate) async fn commit_serialized(
     pool: &SqlitePool,
-    request: CommitRequest<'_>,
+    request: CheckedCommit<'_>,
 ) -> Result<(), EngineError> {
-    request.validate_stream()?;
-    let CommitRequest {
+    let CheckedCommit {
         stream,
         expected_version,
         events,
@@ -350,8 +350,8 @@ pub(crate) async fn commit_serialized(
                 current_snapshot: snapshot.snapshot_version,
             })
         },
-        |request| Ok(crate::job::enqueued_event(request)?),
-        |request| Ok(crate::job::pending_seed_payload(&request)?),
+        |JobSeed(request)| Ok(crate::job::enqueued_event(request)?),
+        |JobSeed(request)| Ok(crate::job::pending_seed_payload(&request)?),
     )
     .await
 }

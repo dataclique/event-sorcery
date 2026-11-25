@@ -57,8 +57,7 @@ impl RepositoryPolicy for NativeCommandPolicy {
         });
         let (request, pending_jobs) =
             CommitRequest::prepare_repository(aggregate_type, events, update)?;
-        request.validate_metadata()?;
-        commit_serialized(pool, request).await?;
+        commit_serialized(pool, request.check()?).await?;
         pending_jobs.mark_committed();
         Ok(())
     }

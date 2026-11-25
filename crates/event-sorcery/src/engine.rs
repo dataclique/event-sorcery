@@ -176,6 +176,21 @@ pub struct CommitRequest<'events> {
     pub(crate) jobs: Vec<EnqueueRequest>,
 }
 
+/// Validated batch whose snapshot and jobs are prepared at their write steps.
+#[non_exhaustive]
+pub struct CheckedCommit<'events> {
+    /// Identity shared by all events in this batch.
+    pub stream: StreamIdentity,
+    /// Durable stream version the writer must check before appending.
+    pub expected_version: Option<usize>,
+    /// Contiguous events belonging to the identified stream.
+    pub events: &'events [SerializedEvent],
+    /// Snapshot to prepare after appending the batch, when supplied.
+    pub snapshot: Option<SnapshotUpdate>,
+    /// Durable job intents to prepare and write in order after the snapshot.
+    pub jobs: Vec<JobSeed>,
+}
+
 /// Validated storage data consumed by a concrete database writer.
 #[non_exhaustive]
 pub struct PreparedCommit<'events> {
@@ -357,25 +372,46 @@ impl<'events> CommitRequest<'events> {
         Ok((request, pending_jobs))
     }
 
+    /// Checks typed metadata and stream identity without preparing snapshot or job writes.
+    pub fn check(self) -> Result<CheckedCommit<'events>, EngineError> {
+        self.validate_metadata()?;
+        self.check_stream()
+    }
+
+    fn check_stream(self) -> Result<CheckedCommit<'events>, EngineError> {
+        self.validate_stream()?;
+
+        Ok(CheckedCommit {
+            stream: self.stream,
+            expected_version: self.expected_version,
+            events: self.events,
+            snapshot: self.snapshot,
+            jobs: self.jobs.into_iter().map(JobSeed).collect(),
+        })
+    }
+
     /// Validates and serializes shared domain decisions before database-specific SQL.
     pub fn prepare(self) -> Result<PreparedCommit<'events>, EngineError> {
-        self.validate_metadata()?;
-        self.validate_stream()?;
-        let snapshot = self
-            .snapshot
-            .as_ref()
+        let CheckedCommit {
+            stream,
+            expected_version,
+            events,
+            snapshot,
+            jobs,
+        } = self.check()?;
+        let snapshot = snapshot
             .map(|snapshot| {
+                let last_sequence = snapshot.sequence_for(events)?;
                 Ok::<_, EngineError>(PreparedSnapshot {
-                    aggregate: snapshot.aggregate.clone(),
+                    aggregate: snapshot.aggregate,
                     snapshot_version: snapshot.snapshot_version,
-                    last_sequence: snapshot.sequence_for(self.events)?,
+                    last_sequence,
                 })
             })
             .transpose()?;
-        let jobs = self
-            .jobs
+        let jobs = jobs
             .iter()
-            .map(|request| {
+            .map(|JobSeed(request)| {
                 Ok::<_, EngineError>(PreparedJob {
                     event: crate::job::enqueued_event(request)?,
                     queue_payload: crate::job::pending_seed_payload(request)?,
@@ -383,10 +419,10 @@ impl<'events> CommitRequest<'events> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(PreparedCommit {
-            aggregate_type: self.stream.aggregate_type,
-            aggregate_id: self.stream.aggregate_id,
-            expected_version: self.expected_version,
-            events: self.events,
+            aggregate_type: stream.aggregate_type,
+            aggregate_id: stream.aggregate_id,
+            expected_version,
+            events,
             snapshot,
             jobs,
         })
