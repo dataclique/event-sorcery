@@ -99,8 +99,6 @@ mod projection_recovery;
 mod reactor;
 mod schema_registry;
 #[cfg(any(test, feature = "sqlite"))]
-mod sqlite_reactor;
-#[cfg(any(test, feature = "sqlite"))]
 mod sqlite_store;
 #[cfg(any(test, feature = "test-support"))]
 mod testing;

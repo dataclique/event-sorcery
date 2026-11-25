@@ -53,8 +53,7 @@ use crate::view_backend::ViewBackend;
 use crate::{LifecycleError, ProjectionError, SendError, Store};
 
 #[cfg(any(test, feature = "sqlite"))]
-#[path = "sqlite_job_runtime.rs"]
-mod sqlite;
+use crate::{ReconcileError, SqliteBackend, StoreBuilder};
 
 /// The durable-jobs runtime over one [`EventBackend`].
 ///
@@ -65,6 +64,28 @@ pub struct JobRuntime<Backend: EventBackend> {
     backend: Backend,
     jobs: Arc<Store<JobState, Backend>>,
     queue: Arc<dyn JobQueueIndex>,
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl JobRuntime<SqliteBackend> {
+    /// Wires the SQLite job runtime over `pool`: the job `Store` + `job_queue_projection`
+    /// projection. The canonical schema (events + snapshots + `job_queue_projection`) must
+    /// already be applied -- like [`StoreBuilder`], the consumer owns migrations,
+    /// so this composes with the consumer's own view migrations instead of
+    /// re-running event-sorcery's and conflicting. `pool` MUST satisfy the pool
+    /// contract (WAL, `busy_timeout>=5000ms`, `synchronous=FULL`); see
+    /// [`SqliteBackend`].
+    pub async fn build(pool: sqlx::SqlitePool) -> Result<Self, ReconcileError> {
+        let backend = SqliteBackend::new(pool);
+        let (jobs, queue) = StoreBuilder::<JobState, _>::with_backend(backend.clone())
+            .build()
+            .await?;
+        Ok(Self {
+            backend,
+            jobs,
+            queue,
+        })
+    }
 }
 
 /// A won claim capability used by a worker adapter to renew or settle execution.
