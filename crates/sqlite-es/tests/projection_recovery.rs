@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catch_up_tolerates_non_contiguous_global_sequencing() {
+    async fn catch_up_and_rebuild_accept_sparse_unsnapshotted_history() {
         let pool = setup_catch_up_db().await;
 
         // Some stores assign sequences from a counter shared across aggregates,
@@ -449,6 +449,25 @@ mod tests {
                 .unwrap();
 
         assert_eq!(version, 4561);
+
+        // Explicit rebuild must replay sparse history too, even when the
+        // existing checkpoint would make catch-up skip the row.
+        sqlx::query("UPDATE counter_view SET payload = ? WHERE view_id = 'counter-1'")
+            .bind(r#"{"Live":{"value":99}}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        projection.rebuild(&"counter-1".to_owned()).await.unwrap();
+        assert_eq!(
+            projection.load(&"counter-1".to_owned()).await.unwrap(),
+            Some(Counter { value: 3 })
+        );
+        let rebuilt_version: i64 =
+            sqlx::query_scalar("SELECT version FROM counter_view WHERE view_id = 'counter-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rebuilt_version, 4561);
     }
 
     #[tokio::test]
