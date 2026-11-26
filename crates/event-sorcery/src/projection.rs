@@ -51,8 +51,9 @@ pub enum ProjectionError<Entity: EventSourced> {
         /// Entity type whose projection cannot be recovered from compactable history.
         aggregate_type: &'static str,
     },
+    /// This operation requires a projection associated with a native view table.
     #[error("operation requires a projection backed by a native persistence adapter")]
-    NotSqliteBacked,
+    MissingViewTable,
     #[error("column '{column}' does not exist in table '{table}'")]
     ColumnNotFound { column: Column, table: String },
     #[error(
@@ -87,7 +88,7 @@ impl<Entity: EventSourced> From<LifecycleError<Entity>> for ProjectionError<Enti
 /// Materialized view of an event-sourced entity.
 ///
 /// Provides [`load`](Self::load) to retrieve a single entity by ID.
-/// SQLite-backed projections also provide [`load_all`](Self::load_all) and
+/// Native projections also provide [`load_all`](Self::load_all) and
 /// [`filter`](Self::filter) for typed column queries.
 /// The backend is explicit in named types: `Projection<Position, Backend>`.
 /// Constructed through the selected native backend during wiring or directly
@@ -165,7 +166,7 @@ where
     }
 
     fn native_backing(&self) -> Result<(&Backend::Source, Table), ProjectionError<Entity>> {
-        let table = self.table.ok_or(ProjectionError::NotSqliteBacked)?;
+        let table = self.table.ok_or(ProjectionError::MissingViewTable)?;
         Ok((Backend::source(self.repo.as_ref()), table))
     }
 

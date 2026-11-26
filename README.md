@@ -28,14 +28,13 @@ persistence.
 - **[`crates/postgr-es`](crates/postgr-es)** — PostgreSQL repositories,
   migrations, and native backend integration for `event-sorcery`.
 
-`event-sorcery` is the recommended entry point. Use `sqlite-es` directly only if
-you need lower-level control.
+Use `event-sorcery` for the framework and select `sqlite-es` or `postgr-es` for
+persistence. Pass the adapter's backend to `StoreBuilder::with_backend`. The
+framework and its tests depend on neither adapter.
 
-Enable the `sqlite` feature on `event-sorcery` for SQLite constructors, the
-serialized `Engine`, schema reconciliation and maintenance helpers. SQLite is
-opt-in: default core and PostgreSQL-only builds do not depend on SQLite. The FFI
-crate and SQLite examples enable it explicitly. Custom view backends can
-classify retryable storage errors through `ViewBackend::is_retryable_error`.
+The serialized `Engine` and SQLite maintenance operations live in `sqlite-es`.
+The FFI crate uses that adapter directly. Custom view backends can classify
+retryable storage errors through `ViewBackend::is_retryable_error`.
 
 `EventSourced` implementations must declare `SNAPSHOT_SIZE` and
 `COMPACTION_POLICY`; `StandaloneJob` implementations must declare

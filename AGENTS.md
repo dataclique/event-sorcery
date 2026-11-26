@@ -214,9 +214,8 @@ workspace has no application binaries:
   repository traits. Standalone; usable wherever a `cqrs-es` backend is needed.
 - **`crates/postgr-es`** — PostgreSQL repositories, migrations, and native
   backend integration for `event-sorcery`.
-- **`crates/event-sorcery`** — higher-level ergonomics on top of `sqlite-es`:
-  the `EventSourced` trait, `Lifecycle` adapter, typed `Store`, projections,
-  schema registry, reactor.
+- **`crates/event-sorcery`** — backend-independent framework: `EventSourced`,
+  typed stores, projections, schema registry, reactors, and durable job policy.
 - **`crates/event-sorcery-ffi`** — C ABI over the shared Rust engine, with a
   generated C header and static library for language bindings.
 
@@ -341,13 +340,14 @@ needs a stable on-disk path, point it at `.tmp/<name>` and let the existing
 
 ### Library Layering
 
-`event-sorcery` and `sqlite-es` both use `event-sorcery-core` for shared
-persistence contracts. The public framework depends on `sqlite-es` only with its
-`sqlite` feature. The `Lifecycle` enum is `pub(crate)` deliberately — it's an
-implementation detail of the `EventSourced` ↔ cqrs-es bridge and must not leak
-through any public bound. See the `ViewBackend` GAT in `view_backend.rs` for how
-to express `(Lifecycle<Entity>, Lifecycle<Entity>)`-shaped repository
-requirements without naming the private type in any public bound.
+`event-sorcery-core` owns shared persistence contracts. The `sqlite-es` and
+`postgr-es` adapters depend on `event-sorcery`, never the reverse. Keep the
+framework's normal and test dependency graphs free of both drivers. The
+`Lifecycle` enum is `pub(crate)` deliberately — it implements the `EventSourced`
+bridge to cqrs-es and must not leak through any public bound. See the
+`ViewBackend` GAT in `view_backend.rs` for how to express
+`(Lifecycle<Entity>, Lifecycle<Entity>)`-shaped repository requirements without
+naming the private type in any public bound.
 
 ### Naming Conventions
 
@@ -382,9 +382,9 @@ derived state distinguishable from the authoritative event store.
   `execute_with_metadata()` to emit events through aggregate commands. The
   framework handles persistence, sequence numbers, and consistency
 - **CRITICAL: Single CQRS Framework Instance Per Aggregate**: In any consuming
-  application, each aggregate must have exactly ONE `SqliteCqrs<A>`, constructed
-  once at startup. Never call `sqlite_cqrs()` or `CqrsFramework::new()` per
-  request. Direct construction is fine in test/CLI/migration code
+  application, build exactly one CQRS framework per aggregate at startup. Never
+  construct one per request. Direct construction is fine in test/CLI/migration
+  code
 - **CQRS Aggregate Services Pattern**: Use cqrs-es Services for side-effects in
   `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates

@@ -345,16 +345,13 @@ pub trait EventSourced:
 
 /// Type-safe command dispatch for an event-sourced entity.
 ///
-/// Wraps `SqliteCqrs<Lifecycle<Entity>>` and enforces that
-/// commands are addressed to the correct entity type via
-/// strongly-typed IDs. This prevents a class of bugs where
-/// string aggregate IDs are mixed up between different entity
-/// types.
+/// Uses the selected backend's repository and accepts only the entity's
+/// typed IDs, so a command cannot address another entity type's stream.
 ///
 /// # Usage
 ///
 /// ```ignore
-/// let positions: Store<Position, SqliteBackend> = /* built by StoreBuilder */;
+/// let positions: Store<Position, Backend> = /* built by StoreBuilder */;
 ///
 /// // Typed ID -- can't accidentally pass an OffchainOrderId
 /// let symbol = Symbol::new("AAPL").unwrap();

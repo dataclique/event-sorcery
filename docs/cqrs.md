@@ -215,7 +215,7 @@ aggregates directly:
 
 ```rust
 // Projection is returned by StoreBuilder::build() for Table entities
-let (store, projection) = StoreBuilder::<Position, _>::new(pool)
+let (store, projection) = StoreBuilder::<Position, _>::with_backend(backend)
     .build()
     .await?;
 
@@ -239,6 +239,10 @@ let pending_orders: Vec<OffchainOrder> = projection
 
 ## Wiring: StoreBuilder
 
+Pass the selected adapter to `StoreBuilder::with_backend`. For SQLite, use
+`sqlite_es::SqliteBackend { pool }`; for PostgreSQL, use
+`postgr_es::PostgresBackend { pool }`.
+
 `StoreBuilder` wires reactors to a `Store` at startup and auto-wires projections
 based on the entity's `Materialized` type. It uses type-level linked lists
 (`Cons`/`Nil`) to ensure all required processors are wired at compile time.
@@ -247,7 +251,7 @@ For **projected entities** (`type Materialized = Table`), `build()` returns
 `(Arc<Store>, Arc<Projection>)`:
 
 ```rust
-let (store, projection) = StoreBuilder::<Position, _>::new(pool)
+let (store, projection) = StoreBuilder::<Position, _>::with_backend(backend)
     .with(rebalancing_trigger)  // wire a reactor
     .build()
     .await?;
@@ -257,15 +261,14 @@ For **non-projected entities** (`type Materialized = Nil`), `build()` returns
 `Arc<Store>`:
 
 ```rust
-let store = StoreBuilder::<OnChainTrade, _>::new(pool)
+let store = StoreBuilder::<OnChainTrade, _>::with_backend(backend)
     .build()
     .await?;
 ```
 
-Projections are created and wired automatically - no manual
-`Projection::sqlite()` or `.with(projection)` calls needed. This eliminates a
-class of bugs where forgetting to wire a projection causes silent data
-staleness.
+Projections are created and wired automatically - no manual projection
+constructor or `.with(projection)` call needed. This eliminates a class of bugs
+where forgetting to wire a projection causes silent data staleness.
 
 The `QueryManifest` pattern in `conductor/manifest.rs` ensures exhaustive wiring
 by destructuring all processors.
@@ -335,7 +338,7 @@ aggregate, message-queue publish) that would double-fire on retry:
 ```rust
 impl IdempotentReactor for MyReactor {}
 
-let store = StoreBuilder::<MyEntity, _>::new(pool)
+let store = StoreBuilder::<MyEntity, _>::with_backend(backend)
     .with(Arc::new(RetryOnBusy { inner: my_reactor }))
     // ...
 ```
@@ -922,7 +925,7 @@ type -- entity-kicked jobs get a `JobInput` (their dependencies plus the origin
 store verdicts are delivered through), standalone jobs get their plain input:
 
 ```rust
-let runtime = JobRuntime::build(SqliteBackend::new(pool.clone())).await?;
+let runtime = JobRuntime::build(sqlite_es::SqliteBackend { pool: pool.clone() }).await?;
 
 let monitor = build_supervised_worker!(
     runtime,
