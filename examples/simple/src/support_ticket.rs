@@ -464,7 +464,10 @@ mod tests {
     async fn delivered_verdict_settles_the_ticket_through_the_store() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let (store, projection) = StoreBuilder::<SupportTicket, _>::new(pool.clone())
+        let (store, projection) =
+            StoreBuilder::<SupportTicket, _>::with_backend(sqlite_es::SqliteBackend {
+                pool: pool.clone(),
+            })
             .build()
             .await
             .unwrap();
@@ -520,7 +523,10 @@ mod tests {
     async fn projection_filter_returns_only_matching_status() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let (store, projection) = StoreBuilder::<SupportTicket, _>::new(pool.clone())
+        let (store, projection) =
+            StoreBuilder::<SupportTicket, _>::with_backend(sqlite_es::SqliteBackend {
+                pool: pool.clone(),
+            })
             .build()
             .await
             .unwrap();

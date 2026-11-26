@@ -9,15 +9,18 @@ use cqrs_es::persist::{
     SerializedSnapshot,
 };
 use serde_json::Value;
-use sqlx::sqlite::SqliteRow;
-use sqlx::{FromRow, SqlitePool};
+
+use sqlx::SqlitePool;
 
 use event_sorcery_core::CompactionPolicy;
 
-use crate::{CommandRepository, load_event_rows, load_snapshot, replay_events};
+use event_sorcery::{CommitRequest, SnapshotUpdate, guard_snapshot};
+
+use crate::engine::commit_serialized;
+use crate::{StoredEventRow, load_event_rows, load_snapshot, replay_events};
 
 /// Snapshot inputs supplied by the two CQRS persistence entry points.
-pub enum SnapshotInput {
+enum SnapshotInput {
     /// Snapshot at the end of the event batch.
     BatchEnd {
         /// Aggregate ID associated with the snapshot.
@@ -31,40 +34,15 @@ pub enum SnapshotInput {
     Covered(SerializedSnapshot),
 }
 
-/// Domain policy supplied by the framework, without exposing its aggregate adapter.
-pub trait RepositoryPolicy: Send + Sync + 'static {
-    /// Row decoder retaining the framework's public error contract.
-    type EventRow: for<'row> FromRow<'row, SqliteRow>
-        + TryInto<SerializedEvent, Error: Into<PersistenceError>>
-        + Send
-        + Unpin
-        + 'static;
-
-    /// Prepares a native commit, delegates to the writer and acknowledges pending jobs.
-    fn persist(
-        pool: &SqlitePool,
-        aggregate_type: &str,
-        events: &[SerializedEvent],
-        snapshot: Option<SnapshotInput>,
-    ) -> impl Future<Output = Result<(), PersistenceError>> + Send;
-
-    /// Checks whether the repository can safely return the stored snapshot.
-    fn guard_snapshot<AggregateType: Aggregate>(
-        snapshot: SerializedSnapshot,
-        policy: CompactionPolicy,
-    ) -> Result<SerializedSnapshot, PersistenceError>;
-}
-
 /// SQLite CQRS repository with atomic writes and ordered read-time upcasting.
-pub struct NativeRepository<Policy: RepositoryPolicy> {
+pub struct NativeRepository {
     pool: SqlitePool,
     compaction: CompactionPolicy,
     upcasters: Arc<Vec<Arc<dyn EventUpcaster>>>,
     channel_size: usize,
-    policy: std::marker::PhantomData<Policy>,
 }
 
-impl<Policy: RepositoryPolicy> NativeRepository<Policy> {
+impl NativeRepository {
     /// Uses a caller-owned pool without applying migrations.
     #[must_use]
     pub fn new(pool: SqlitePool, compaction: CompactionPolicy) -> Self {
@@ -73,7 +51,6 @@ impl<Policy: RepositoryPolicy> NativeRepository<Policy> {
             compaction,
             upcasters: Arc::new(Vec::new()),
             channel_size: 1000,
-            policy: std::marker::PhantomData,
         }
     }
 
@@ -96,7 +73,7 @@ impl<Policy: RepositoryPolicy> NativeRepository<Policy> {
         aggregate_id: &str,
         after: Option<usize>,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        load_event_rows::<Policy::EventRow>(&self.pool, AggregateType::TYPE, aggregate_id, after)
+        load_event_rows::<StoredEventRow>(&self.pool, AggregateType::TYPE, aggregate_id, after)
             .await?
             .into_iter()
             .map(|row| {
@@ -109,7 +86,7 @@ impl<Policy: RepositoryPolicy> NativeRepository<Policy> {
 
     fn replay<AggregateType: Aggregate>(&self, aggregate_id: Option<String>) -> ReplayStream {
         let upcasters = Arc::clone(&self.upcasters);
-        replay_events::<Policy::EventRow>(
+        replay_events::<StoredEventRow>(
             &self.pool,
             AggregateType::TYPE,
             aggregate_id,
@@ -119,13 +96,7 @@ impl<Policy: RepositoryPolicy> NativeRepository<Policy> {
     }
 }
 
-impl<Policy: RepositoryPolicy> CommandRepository for NativeRepository<Policy> {
-    fn for_pool(pool: SqlitePool, compaction: CompactionPolicy) -> Self {
-        Self::new(pool, compaction)
-    }
-}
-
-impl<Policy: RepositoryPolicy> PersistedEventRepository for NativeRepository<Policy> {
+impl PersistedEventRepository for NativeRepository {
     async fn get_events<AggregateType: Aggregate>(
         &self,
         aggregate_id: &str,
@@ -148,7 +119,7 @@ impl<Policy: RepositoryPolicy> PersistedEventRepository for NativeRepository<Pol
     ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
         load_snapshot(&self.pool, AggregateType::TYPE, aggregate_id)
             .await?
-            .map(|snapshot| Policy::guard_snapshot::<AggregateType>(snapshot, self.compaction))
+            .map(|snapshot| guard_snapshot::<AggregateType>(snapshot, self.compaction))
             .transpose()
     }
 
@@ -165,7 +136,7 @@ impl<Policy: RepositoryPolicy> PersistedEventRepository for NativeRepository<Pol
                     snapshot_version,
                 },
             );
-        Policy::persist(&self.pool, AggregateType::TYPE, events, snapshot).await
+        persist(&self.pool, AggregateType::TYPE, events, snapshot).await
     }
 
     async fn persist_with_snapshot<AggregateType: Aggregate>(
@@ -173,7 +144,7 @@ impl<Policy: RepositoryPolicy> PersistedEventRepository for NativeRepository<Pol
         events: &[SerializedEvent],
         snapshot: Option<SerializedSnapshot>,
     ) -> Result<(), PersistenceError> {
-        Policy::persist(
+        persist(
             &self.pool,
             AggregateType::TYPE,
             events,
@@ -194,6 +165,30 @@ impl<Policy: RepositoryPolicy> PersistedEventRepository for NativeRepository<Pol
     ) -> Result<ReplayStream, PersistenceError> {
         Ok(self.replay::<AggregateType>(None))
     }
+}
+
+async fn persist(
+    pool: &SqlitePool,
+    aggregate_type: &str,
+    events: &[SerializedEvent],
+    snapshot: Option<SnapshotInput>,
+) -> Result<(), PersistenceError> {
+    let update = snapshot.map(|snapshot| match snapshot {
+        SnapshotInput::BatchEnd {
+            aggregate_id,
+            aggregate,
+            snapshot_version,
+        } => (
+            aggregate_id,
+            SnapshotUpdate::new(aggregate, snapshot_version),
+        ),
+        SnapshotInput::Covered(snapshot) => SnapshotUpdate::from_serialized(snapshot),
+    });
+    let (request, pending_jobs) =
+        CommitRequest::prepare_repository(aggregate_type, events, update)?;
+    commit_serialized(pool, request.check()?).await?;
+    pending_jobs.mark_committed();
+    Ok(())
 }
 
 fn upcast(mut event: SerializedEvent, upcasters: &[Arc<dyn EventUpcaster>]) -> SerializedEvent {

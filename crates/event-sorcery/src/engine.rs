@@ -7,14 +7,6 @@ use serde_json::Value;
 use crate::job::{EnqueueRequest, PreparedPendingJobs};
 use crate::schema_registry::ReconcileError;
 
-#[cfg(any(test, feature = "sqlite"))]
-mod binding;
-
-#[cfg(any(test, feature = "sqlite"))]
-pub(crate) use binding::commit_serialized;
-#[cfg(any(test, feature = "sqlite"))]
-pub use binding::{Engine, SnapshotWrite};
-
 const ENGINE_PAYLOAD_PROVENANCE_KEY: &str = "$event-sorcery-engine-owned";
 const ENGINE_PAYLOAD_PROVENANCE: &str = "opaque-v1";
 

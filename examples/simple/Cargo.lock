@@ -376,7 +376,6 @@ dependencies = [
  "indexed-query",
  "serde",
  "serde_json",
- "sqlite-es",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1257,6 +1256,7 @@ dependencies = [
  "cqrs-es",
  "event-sorcery",
  "serde",
+ "sqlite-es",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1300,8 +1300,10 @@ dependencies = [
 name = "sqlite-es"
 version = "0.6.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "cqrs-es",
+ "event-sorcery",
  "event-sorcery-core",
  "futures-util",
  "indexed-query",

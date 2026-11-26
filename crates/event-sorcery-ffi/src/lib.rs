@@ -25,12 +25,13 @@ use url::form_urlencoded;
 #[cfg(test)]
 use event_sorcery::CommitRequest;
 use event_sorcery::{
-    CompactionPolicy, DeadReason, Engine, EngineError, JobClaimHandle, JobClaimResult, JobId,
+    CompactionPolicy, DeadReason, EngineError, JobClaimHandle, JobClaimResult, JobId,
     JobLeaseResult, JobRuntime, JobRuntimeError, JobSeed, JobSettlementResult, JobStoreError,
     OpaqueCommitRequest, OpaqueProposedEvent, OpaqueStoredEvent, ReconcileError,
-    SchemaReconciliation, SchemaTarget, SnapshotWrite, SqliteBackend, SqliteJobError,
-    StreamIdentity, decode_opaque_payload, encode_opaque_payload,
+    SchemaReconciliation, SchemaTarget, StreamIdentity, decode_opaque_payload,
+    encode_opaque_payload,
 };
+use sqlite_es::{Engine, SnapshotWrite, SqliteBackend, SqliteJobError};
 
 const ABI_MAJOR: u32 = 0;
 const ABI_MINOR: u32 = 5;
@@ -283,7 +284,7 @@ pub unsafe extern "C" fn es_open(
             .block_on(engine.migrate())
             .map_err(AbiError::Migration)?;
         let jobs = runtime
-            .block_on(JobRuntime::build(SqliteBackend::new(pool)))
+            .block_on(JobRuntime::build(SqliteBackend { pool }))
             .map_err(|error| AbiError::JobRuntime(Box::new(error)))?;
         let store = Arc::new(EsStore {
             state: Mutex::new(StoreState::Open { active_calls: 0 }),

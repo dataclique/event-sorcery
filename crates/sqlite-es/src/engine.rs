@@ -6,14 +6,13 @@ use sqlx::SqlitePool;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use sqlite_es::{SqliteJobError, StoredEventRow};
-
-use super::{
-    CheckedCommit, CommitRequest, EngineError, OpaqueCommitRequest, OpaqueStoredEvent,
+use event_sorcery::{
+    CheckedCommit, ClaimDecision, ClaimOutcome, ClaimRead, CommitRequest, EngineError,
+    LeaseRenewal, OpaqueCommitRequest, OpaqueStoredEvent, SchemaReconciliation, SchemaTarget,
     StreamIdentity,
 };
-use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
-use crate::schema_registry::{Reconciler, SchemaReconciliation, SchemaTarget};
+
+use crate::{Reconciler, SqliteJobError, StoredEventRow};
 
 /// Snapshot state stored independently after replaying through a known sequence.
 pub struct SnapshotWrite {
@@ -55,7 +54,7 @@ impl Engine {
 
     /// Migrates the engine's existing SQLite schema.
     pub async fn migrate(&self) -> Result<(), SqliteJobError> {
-        sqlite_es::MIGRATOR
+        crate::MIGRATOR
             .run(&self.pool)
             .await
             .map_err(|error| SqliteJobError::Sql(error.into()))?;
@@ -86,7 +85,7 @@ impl Engine {
         Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won> + Send,
         Won: Send,
     {
-        sqlite_es::claim_job(&self.pool, job_id, decide).await
+        crate::claim_job(&self.pool, job_id, decide).await
     }
 
     pub async fn renew_job(
@@ -95,7 +94,7 @@ impl Engine {
         claim_seq: i64,
         new_lease_until_ms: i64,
     ) -> Result<LeaseRenewal, SqliteJobError> {
-        sqlite_es::renew_job(&self.pool, job_id, claim_seq, new_lease_until_ms).await
+        crate::renew_job(&self.pool, job_id, claim_seq, new_lease_until_ms).await
     }
 
     pub async fn enqueue_job(
@@ -103,7 +102,7 @@ impl Engine {
         event: SerializedEvent,
         payload: String,
     ) -> Result<(), SqliteJobError> {
-        sqlite_es::enqueue_job(&self.pool, event, payload).await
+        crate::enqueue_job(&self.pool, event, payload).await
     }
 
     /// Loads one stream, optionally after an exclusive sequence checkpoint.
@@ -112,7 +111,7 @@ impl Engine {
         stream: &StreamIdentity,
         after_sequence: Option<usize>,
     ) -> Result<Vec<SerializedEvent>, EngineError> {
-        sqlite_es::load_event_rows::<StoredEventRow>(
+        crate::load_event_rows::<StoredEventRow>(
             &self.pool,
             &stream.aggregate_type,
             &stream.aggregate_id,
@@ -132,7 +131,7 @@ impl Engine {
         after_sequence: Option<usize>,
         limit: NonZeroUsize,
     ) -> Result<Vec<SerializedEvent>, EngineError> {
-        sqlite_es::load_events_page::<StoredEventRow>(
+        crate::load_events_page::<StoredEventRow>(
             &self.pool,
             &stream.aggregate_type,
             &stream.aggregate_id,
@@ -153,7 +152,7 @@ impl Engine {
         item_limit: NonZeroUsize,
         byte_limit: NonZeroUsize,
     ) -> Result<Vec<SerializedEvent>, EngineError> {
-        sqlite_es::load_events_page_bounded::<StoredEventRow>(
+        crate::load_events_page_bounded::<StoredEventRow>(
             &self.pool,
             &stream.aggregate_type,
             &stream.aggregate_id,
@@ -189,7 +188,7 @@ impl Engine {
     /// compacted stream reports the version its snapshot still covers rather
     /// than the lower maximum sequence its surviving events show.
     pub async fn current_version(&self, stream: &StreamIdentity) -> Result<usize, EngineError> {
-        Ok(sqlite_es::committed_stream_version(
+        Ok(crate::committed_stream_version(
             &self.pool,
             &stream.aggregate_type,
             &stream.aggregate_id,
@@ -202,10 +201,7 @@ impl Engine {
         &self,
         stream: &StreamIdentity,
     ) -> Result<Option<SerializedSnapshot>, EngineError> {
-        Ok(
-            sqlite_es::load_snapshot(&self.pool, &stream.aggregate_type, &stream.aggregate_id)
-                .await?,
-        )
+        Ok(crate::load_snapshot(&self.pool, &stream.aggregate_type, &stream.aggregate_id).await?)
     }
 
     /// Writes one snapshot under the same write lock the commit path takes.
@@ -218,7 +214,7 @@ impl Engine {
         stream: &StreamIdentity,
         snapshot: SnapshotWrite,
     ) -> Result<usize, EngineError> {
-        Ok(sqlite_es::store_snapshot(
+        Ok(crate::store_snapshot(
             &self.pool,
             &stream.aggregate_type,
             &stream.aggregate_id,
@@ -229,8 +225,7 @@ impl Engine {
     }
 
     pub async fn discard_snapshot(&self, stream: &StreamIdentity) -> Result<(), EngineError> {
-        sqlite_es::discard_snapshot(&self.pool, &stream.aggregate_type, &stream.aggregate_id)
-            .await?;
+        crate::discard_snapshot(&self.pool, &stream.aggregate_type, &stream.aggregate_id).await?;
 
         Ok(())
     }
@@ -259,10 +254,11 @@ pub(crate) async fn commit_serialized(
         events,
         snapshot,
         jobs,
+        ..
     } = request;
-    sqlite_es::commit_atomic(
+    crate::commit_atomic(
         pool,
-        sqlite_es::Commit {
+        crate::Commit {
             aggregate_type: &stream.aggregate_type,
             aggregate_id: &stream.aggregate_id,
             expected_version,
@@ -285,9 +281,9 @@ pub(crate) async fn commit_serialized(
     .await
 }
 
-impl From<sqlite_es::StoreSnapshotError> for EngineError {
-    fn from(error: sqlite_es::StoreSnapshotError) -> Self {
-        use sqlite_es::StoreSnapshotError::{
+impl From<crate::StoreSnapshotError> for EngineError {
+    fn from(error: crate::StoreSnapshotError) -> Self {
+        use crate::StoreSnapshotError::{
             BeyondCurrentVersion, EmptyStream, Repository, Sql, VersionExhausted,
         };
 
@@ -303,9 +299,9 @@ impl From<sqlite_es::StoreSnapshotError> for EngineError {
     }
 }
 
-impl From<sqlite_es::EventPageReadError> for EngineError {
-    fn from(error: sqlite_es::EventPageReadError) -> Self {
-        use sqlite_es::EventPageReadError::{Integer, Sql, TooLarge};
+impl From<crate::EventPageReadError> for EngineError {
+    fn from(error: crate::EventPageReadError) -> Self {
+        use crate::EventPageReadError::{Integer, Sql, TooLarge};
 
         match error {
             Sql(source) => Self::Sql(source),
@@ -315,14 +311,14 @@ impl From<sqlite_es::EventPageReadError> for EngineError {
     }
 }
 
-impl From<sqlite_es::SqliteAggregateError> for EngineError {
-    fn from(error: sqlite_es::SqliteAggregateError) -> Self {
+impl From<crate::SqliteAggregateError> for EngineError {
+    fn from(error: crate::SqliteAggregateError) -> Self {
         match error {
-            sqlite_es::SqliteAggregateError::OptimisticLock => Self::OptimisticLock,
-            sqlite_es::SqliteAggregateError::Connection(source) => Self::Sql(source),
-            sqlite_es::SqliteAggregateError::Deserialization(source) => Self::Json(source),
-            sqlite_es::SqliteAggregateError::TryFromInt(source) => Self::Integer(source),
-            sqlite_es::SqliteAggregateError::EmptySnapshotUpdate => Self::EmptySnapshotUpdate,
+            crate::SqliteAggregateError::OptimisticLock => Self::OptimisticLock,
+            crate::SqliteAggregateError::Connection(source) => Self::Sql(source),
+            crate::SqliteAggregateError::Deserialization(source) => Self::Json(source),
+            crate::SqliteAggregateError::TryFromInt(source) => Self::Integer(source),
+            crate::SqliteAggregateError::EmptySnapshotUpdate => Self::EmptySnapshotUpdate,
         }
     }
 }
@@ -333,14 +329,15 @@ mod tests {
 
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use sqlite_es::testing::create_test_pool;
+    use crate::testing::create_test_pool;
 
     use super::*;
-    use crate::job::{
-        EnqueueRequest, JobId, JobKind, JobStoreError, WorkerId, enqueued_event,
-        pending_seed_payload, plan_claim,
+    use event_sorcery::{
+        CompactionPolicy, JobClaimResult, JobId, JobRuntime, JobSeed, JobStoreError,
+        ReconcileError, SnapshotUpdate,
     };
-    use crate::{CompactionPolicy, JobSeed, ReconcileError, SnapshotUpdate};
+
+    use crate::SqliteBackend;
 
     #[tokio::test]
     async fn migrate_initializes_the_existing_sqlite_schema() {
@@ -894,31 +891,32 @@ mod tests {
     #[tokio::test]
     async fn job_operations_preserve_the_existing_claim_protocol() {
         let engine = Engine::new(create_test_pool().await.unwrap());
-        let request = EnqueueRequest {
-            job_id: JobId::new(),
-            kind: JobKind::new("engine-test"),
-            payload: serde_json::json!({ "value": 42 }),
-            run_at_ms: 1_000,
-        };
-        let job_id = request.job_id.to_string();
-        let event = enqueued_event(&request).unwrap();
-        let payload = pending_seed_payload(&request).unwrap();
-
-        engine.enqueue_job(event, payload).await.unwrap();
-        let worker = WorkerId::new("engine-test-worker");
-        let outcome = engine
-            .claim_job(&job_id, |read| {
-                plan_claim(&job_id, read, &worker, 1_000, 30_000, 50)
-            })
+        let id = JobId::new();
+        let seed = JobSeed::new(id, "engine-test", serde_json::json!({"value": 42}), 1_000);
+        engine
+            .enqueue_job(seed.event().unwrap(), seed.queue_payload().unwrap())
             .await
             .unwrap();
-        let ClaimOutcome::Won(claim) = outcome else {
+
+        let jobs = JobRuntime::build(SqliteBackend {
+            pool: engine.pool.clone(),
+        })
+        .await
+        .unwrap();
+        let outcome = jobs
+            .claim_job(id, "engine-test-worker", 1_000, 30_000, 50)
+            .await
+            .unwrap();
+        let JobClaimResult::Claimed(claim) = outcome else {
             panic!("expected the existing claim decision to win");
         };
-
-        assert_eq!(claim.claim_seq, 2);
+        assert_eq!(claim.handle.job_id(), id);
+        assert_eq!(claim.payload, serde_json::json!({"value": 42}));
+        let job_id = id.to_string();
         let job_stream = StreamIdentity::new("job", &job_id);
         let events = engine.load_events(&job_stream, None).await.unwrap();
+        let claim_seq = i64::try_from(events.last().unwrap().sequence).unwrap();
+        assert_eq!(claim_seq, 2);
         assert_eq!(
             events
                 .iter()
@@ -927,11 +925,11 @@ mod tests {
             ["JobEnqueued", "JobClaimed"]
         );
         assert!(matches!(
-            engine.renew_job(&job_id, claim.claim_seq, 60_000).await,
+            engine.renew_job(&job_id, claim_seq, 60_000).await,
             Ok(LeaseRenewal::Held)
         ));
         assert!(matches!(
-            engine.renew_job(&job_id, claim.claim_seq + 1, 90_000).await,
+            engine.renew_job(&job_id, claim_seq + 1, 90_000).await,
             Ok(LeaseRenewal::Lost)
         ));
         assert_eq!(engine.load_events(&job_stream, None).await.unwrap(), events);

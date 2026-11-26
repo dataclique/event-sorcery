@@ -49,15 +49,20 @@ mod commit;
 mod compaction;
 mod contention;
 mod cqrs;
+mod engine;
 mod event_page;
 mod event_repository;
 mod job_queue;
+mod native_projection;
 mod native_repository;
 mod projection_queries;
 mod projection_recovery;
+mod reactor;
+mod reconciler;
 mod schema_registry;
 mod snapshot;
 mod sql_query;
+mod startup;
 mod stream_version;
 pub mod testing;
 mod vacuum;
@@ -76,21 +81,24 @@ mod view_repository;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub use aggregate_ids::{LoadAllIdsError, count_aggregates, load_all_ids, load_ids_paginated};
-pub use backend::{CommandRepository, SqliteBackend};
+pub use backend::SqliteBackend;
 pub use commit::{Commit, commit_atomic};
 pub use compaction::compact_events;
 pub use contention::is_retryable_sqlite_busy;
 pub use cqrs::{SqliteCqrs, sqlite_cqrs};
 pub use cqrs_es::persist::ViewContext;
+pub use engine::{Engine, SnapshotWrite};
 pub use event_page::{EventPageReadError, load_events_page, load_events_page_bounded};
 pub use event_repository::{
     SqliteAggregateError, SqliteEventRepository, StoredEventRow, insert_serialized_events_batch,
     load_event_rows, replay_events,
 };
 pub use job_queue::{SqliteJobError, claim_job, enqueue_job, renew_job};
-pub use native_repository::{NativeRepository, RepositoryPolicy, SnapshotInput};
+pub use native_repository::NativeRepository;
 pub use projection_queries::{SqliteProjectionFilterError, filter_projection, projection_rows};
 pub use projection_recovery::{SqliteProjectionRecovery, recover_projection};
+pub use reactor::{IdempotentReactor, RetryOnBusy};
+pub use reconciler::Reconciler;
 pub use schema_registry::load_schema_registry_payloads;
 pub use snapshot::{
     StoreSnapshotError, clear_snapshots, discard_snapshot, load_snapshot, store_snapshot,

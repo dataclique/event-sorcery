@@ -1,15 +1,9 @@
 //! Native construction and recovery of materialized views.
 
 use cqrs_es::Aggregate;
-#[cfg(any(test, feature = "sqlite"))]
-use sqlx::{Sqlite, SqlitePool};
 
 pub use event_sorcery_core::{ViewBackend, ViewUpdateError};
-#[cfg(any(test, feature = "sqlite"))]
-use sqlite_es::{SqliteProjectionFilterError, SqliteViewBackend, SqliteViewRepository};
 
-#[cfg(any(test, feature = "sqlite"))]
-use crate::Projection;
 use crate::{Column, EventSourced, ProjectionError, ProjectionRecoveryMode, Table};
 
 /// Optional native construction, queries and retained-history recovery.
@@ -73,91 +67,4 @@ pub trait NativeProjectionBackend: ViewBackend {
     ) -> impl Future<Output = Result<(), ProjectionError<Entity>>> + Send
     where
         Entity: EventSourced<Materialized = Table>;
-}
-
-#[cfg(any(test, feature = "sqlite"))]
-impl<Entity: EventSourced<Materialized = Table>> Projection<Entity, SqliteViewBackend> {
-    /// Constructs the SQLite materialized view using the caller-owned pool.
-    pub fn sqlite(pool: SqlitePool) -> Self {
-        Self::with_backend(pool)
-    }
-}
-
-#[cfg(any(test, feature = "sqlite"))]
-impl NativeProjectionBackend for SqliteViewBackend {
-    type Source = SqlitePool;
-    type Database = Sqlite;
-
-    fn repository<ViewState, AggregateType>(
-        source: SqlitePool,
-        Table(table): Table,
-    ) -> Self::Repo<ViewState, AggregateType>
-    where
-        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
-        AggregateType: Aggregate + 'static,
-    {
-        SqliteViewRepository::new(source, table.to_string())
-    }
-
-    fn source<ViewState, AggregateType>(
-        repository: &Self::Repo<ViewState, AggregateType>,
-    ) -> &SqlitePool
-    where
-        ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
-        AggregateType: Aggregate + 'static,
-    {
-        repository.as_ref()
-    }
-
-    async fn rows(
-        source: &SqlitePool,
-        Table(table): Table,
-    ) -> Result<Vec<(String, String)>, sqlx::Error> {
-        sqlite_es::projection_rows(source, table).await
-    }
-
-    async fn filter<Entity, Value>(
-        source: &SqlitePool,
-        Table(table): Table,
-        column: Column,
-        value: &Value,
-    ) -> Result<Vec<(String, String)>, ProjectionError<Entity>>
-    where
-        Entity: EventSourced,
-        for<'query> &'query Value: sqlx::Encode<'query, Sqlite>,
-        Value: sqlx::Type<Sqlite> + Send + Sync,
-    {
-        let Column(column_name) = column;
-        sqlite_es::filter_projection(source, table, column_name, value)
-            .await
-            .map_err(|error| {
-                use SqliteProjectionFilterError::{ColumnNotFound, Sql, StaleColumn};
-
-                match error {
-                    ColumnNotFound => ProjectionError::ColumnNotFound {
-                        column,
-                        table: table.to_string(),
-                    },
-                    StaleColumn { row_count } => ProjectionError::StaleColumn {
-                        column,
-                        table: table.to_string(),
-                        row_count,
-                    },
-                    Sql(source) => ProjectionError::Sqlx(source),
-                }
-            })
-    }
-
-    async fn recover<Entity>(
-        source: &SqlitePool,
-        mode: &crate::ProjectionRecoveryMode,
-    ) -> Result<(), ProjectionError<Entity>>
-    where
-        Entity: EventSourced<Materialized = Table>,
-    {
-        sqlite_es::recover_projection(source, mode.clone(), |mut storage, mode| {
-            Box::pin(async move { crate::recover_projection::<Entity>(&mut storage, &mode).await })
-        })
-        .await
-    }
 }

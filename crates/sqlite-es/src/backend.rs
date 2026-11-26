@@ -1,53 +1,29 @@
 //! SQLite implementation of the shared durable storage contract.
 
-use cqrs_es::persist::{PersistedEventRepository, SerializedEvent};
+use cqrs_es::persist::SerializedEvent;
 use sqlx::SqlitePool;
-use std::marker::PhantomData;
 
 use event_sorcery_core::{
     ClaimDecision, ClaimOutcome, ClaimRead, CompactionPolicy, EventBackend, LeaseRenewal,
 };
 
-use crate::{MIGRATOR, SqliteJobError, claim_job, enqueue_job, renew_job};
-
-/// Constructs a command repository over the backend's application-owned pool.
-pub trait CommandRepository: PersistedEventRepository + Send + Sync + 'static {
-    /// Selects the retention policy for the aggregate handled by the repository.
-    fn for_pool(pool: SqlitePool, compaction: CompactionPolicy) -> Self;
-}
+use crate::{MIGRATOR, NativeRepository, SqliteJobError, claim_job, enqueue_job, renew_job};
 
 /// SQLite backend for atomic native commands and durable job operations.
 ///
-/// The application's pool must use WAL, a busy timeout of at least 5 seconds,
-/// and full synchronous writes.
-pub struct SqliteBackend<Repository> {
+/// The application pool must use WAL, a busy timeout of at least 5 seconds, and full synchronous writes.
+#[derive(Clone)]
+pub struct SqliteBackend {
     /// Pool shared by the repository, registry, views and job queue.
     pub pool: SqlitePool,
-    repository: PhantomData<fn() -> Repository>,
 }
 
-impl<Repository> SqliteBackend<Repository> {
-    /// Uses a caller-owned pool without applying migrations.
-    pub fn new(pool: SqlitePool) -> Self {
-        Self {
-            pool,
-            repository: PhantomData,
-        }
-    }
-}
-
-impl<Repository> Clone for SqliteBackend<Repository> {
-    fn clone(&self) -> Self {
-        Self::new(self.pool.clone())
-    }
-}
-
-impl<Repository: CommandRepository> EventBackend for SqliteBackend<Repository> {
-    type EventRepo = Repository;
+impl EventBackend for SqliteBackend {
+    type EventRepo = NativeRepository;
     type Error = SqliteJobError;
 
-    fn event_repo(&self, compaction_policy: CompactionPolicy) -> Repository {
-        Repository::for_pool(self.pool.clone(), compaction_policy)
+    fn event_repo(&self, compaction_policy: CompactionPolicy) -> NativeRepository {
+        NativeRepository::new(self.pool.clone(), compaction_policy)
     }
 
     async fn migrate(&self) -> Result<(), SqliteJobError> {
