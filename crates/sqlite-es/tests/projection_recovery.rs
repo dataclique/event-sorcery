@@ -127,7 +127,7 @@ mod tests {
     impl EventSourced for Counter {
         type Id = String;
         type Error = Never;
-        type Command = ();
+        type Command = usize;
         type Event = CounterEvent;
         type Materialized = Table;
         type Jobs = Nil;
@@ -154,12 +154,12 @@ mod tests {
             }
         }
 
-        async fn initialize((): ()) -> Result<Effect<Self>, Never> {
+        async fn initialize(_increments: usize) -> Result<Effect<Self>, Never> {
             Ok(Effect::Events(vec![CounterEvent::Created { initial: 4 }]))
         }
 
-        async fn transition(&self, (): ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![CounterEvent::Incremented]))
+        async fn transition(&self, increments: usize) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![CounterEvent::Incremented; increments]))
         }
     }
 
@@ -185,14 +185,15 @@ mod tests {
             .unwrap();
         let current_id = "z-current".to_owned();
         let unrelated_id = "a-unrelated".to_owned();
-        store.send(&current_id, ()).await.unwrap();
-        store.send(&current_id, ()).await.unwrap();
-        store.send(&unrelated_id, ()).await.unwrap();
+        store.send(&current_id, 0).await.unwrap();
+        store.send(&current_id, 1).await.unwrap();
+        store.send(&unrelated_id, 0).await.unwrap();
         sqlx::query("DELETE FROM counter_view")
             .execute(&pool)
             .await
             .unwrap();
-        insert_stale_view(&pool, &current_id, 1, &Counter { value: 4 }).await;
+        // A distinguishable checkpoint catches accidental replay from sequence zero.
+        insert_stale_view(&pool, &current_id, 1, &Counter { value: 10 }).await;
         sqlx::query(
             "CREATE TRIGGER reject_unrelated_recovery
              BEFORE INSERT ON counter_view WHEN NEW.view_id = 'a-unrelated'
@@ -202,11 +203,11 @@ mod tests {
         .await
         .unwrap();
 
-        store.send(&current_id, ()).await.unwrap();
+        store.send(&current_id, 2).await.unwrap();
 
         assert_eq!(
             projection.load(&current_id).await.unwrap(),
-            Some(Counter { value: 6 })
+            Some(Counter { value: 13 })
         );
         let checkpoint: i64 =
             sqlx::query_scalar("SELECT version FROM counter_view WHERE view_id = ?")
@@ -214,7 +215,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(checkpoint, 3);
+        assert_eq!(checkpoint, 4);
         assert_eq!(projection.load(&unrelated_id).await.unwrap(), None);
     }
 

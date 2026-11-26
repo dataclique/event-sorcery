@@ -674,12 +674,6 @@ pub(crate) mod tests {
         let delivered_id = "z-delivered".to_owned();
         let unrelated_id = "a-unrelated".to_owned();
         store.send(&delivered_id, "first".to_owned()).await.unwrap();
-        let checkpoint_payload: serde_json::Value =
-            sqlx::query_scalar("SELECT payload FROM note_projection WHERE view_id = $1")
-                .bind(&delivered_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
         store
             .send(&delivered_id, "second".to_owned())
             .await
@@ -688,8 +682,9 @@ pub(crate) mod tests {
             .send(&unrelated_id, "unrelated".to_owned())
             .await
             .unwrap();
+        // A distinguishable checkpoint catches accidental replay from sequence zero.
         sqlx::query("UPDATE note_projection SET version = 1, payload = $1 WHERE view_id = $2")
-            .bind(checkpoint_payload)
+            .bind(serde_json::json!({"Live": {"text": "checkpoint", "history": ["checkpoint"]}}))
             .bind(&delivered_id)
             .execute(&pool)
             .await
@@ -704,7 +699,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        store.send(&delivered_id, "third".to_owned()).await.unwrap();
+        store
+            .send(&delivered_id, "third\nfourth".to_owned())
+            .await
+            .unwrap();
 
         assert_eq!(
             projection
@@ -713,7 +711,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap()
                 .history,
-            ["first", "second", "third"]
+            ["checkpoint", "second", "third", "fourth"]
         );
         let version: i64 =
             sqlx::query_scalar("SELECT version FROM note_projection WHERE view_id = $1")
@@ -721,7 +719,7 @@ pub(crate) mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(projection.load(&unrelated_id).await.unwrap(), None);
     }
 
