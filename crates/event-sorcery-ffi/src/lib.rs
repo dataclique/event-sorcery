@@ -4962,15 +4962,75 @@ mod tests {
     }
 
     #[test]
-    fn unproven_snapshot_history_is_a_nonretryable_state_error() {
-        let error = AbiError::from(EngineError::Schema(
-            ReconcileError::UnprovenSnapshotHistory {
-                stream: StreamIdentity::new("ffi-schema", "one"),
-                covered_sequence: 2,
-                retained_events: 1,
+    fn schema_reconcile_reports_unproven_history_and_preserves_the_snapshot() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let stream = StreamIdentity::new("ffi-schema", "one");
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let snapshot = lease.inner.runtime.block_on(async {
+            let engine = &lease.inner.engine;
+            // Import only the event retained after compaction of an older stream.
+            let event = SerializedEvent {
+                aggregate_type: "ffi-schema".to_owned(),
+                aggregate_id: "one".to_owned(),
+                sequence: 2,
+                event_type: "Renamed".to_owned(),
+                event_version: "1.0".to_owned(),
+                payload: serde_json::json!({"name": "one"}),
+                metadata: serde_json::json!({}),
+            };
+            engine
+                .commit(CommitRequest::new(stream.clone(), &[event]))
+                .await
+                .unwrap();
+            let payload = encode_opaque_payload(vec![0, 1, 255]).unwrap();
+            engine
+                .store_snapshot(&stream, SnapshotWrite::new(payload, 2))
+                .await
+                .unwrap();
+            engine.load_snapshot(&stream).await.unwrap().unwrap()
+        });
+        drop(lease);
+
+        let mut error = empty_buffer();
+        let mut recorded = encode_request(&(1_u8, "ffi-schema", 1_u64, 0_u8));
+        let record_request = caller_buffer(&mut recorded);
+        assert_eq!(
+            unsafe { es_schema_record(&raw mut store, &raw const record_request, &raw mut error) },
+            ES_OK
+        );
+        let mut advanced = encode_request(&(1_u8, "ffi-schema", 2_u64, 0_u8));
+        let reconcile_request = caller_buffer(&mut advanced);
+        let mut reconciliation = u8::MAX;
+        assert_eq!(
+            unsafe {
+                es_schema_reconcile(
+                    &raw mut store,
+                    &raw const reconcile_request,
+                    &raw mut reconciliation,
+                    &raw mut error,
+                )
             },
-        ));
-        assert_eq!(error.code(), ES_ERR_STATE);
+            ES_ERR_STATE
+        );
+        assert_eq!(reconciliation, 0);
+        let (version, code, _) = decode_error(&error);
+        assert_eq!((version, code), (1, ES_ERR_STATE));
+        unsafe { es_buf_free(&raw mut error) };
+
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable after refusal");
+        };
+        let after = lease
+            .inner
+            .runtime
+            .block_on(lease.inner.engine.load_snapshot(&stream))
+            .unwrap();
+        assert_eq!(after, Some(snapshot));
+        drop(lease);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
     }
 
     #[test]
