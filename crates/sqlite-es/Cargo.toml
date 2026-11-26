@@ -28,5 +28,8 @@ async-trait.workspace = true
 workspace = true
 
 [dev-dependencies]
+apalis-core.workspace = true
+chrono = "0.4.45"
 event-sorcery = { workspace = true, features = ["test-support"] }
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "test-util"] }
+tower-service = "0.3.3"

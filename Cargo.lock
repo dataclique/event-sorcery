@@ -1789,6 +1789,7 @@ dependencies = [
 name = "sqlite-es"
 version = "0.6.0"
 dependencies = [
+ "apalis-core",
  "async-trait",
  "chrono",
  "cqrs-es",
@@ -1801,6 +1802,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tower-service",
  "tracing",
 ]
 
