@@ -42,9 +42,4 @@ tokio = { workspace = true, features = ["test-util"] }
 [[bench]]
 name = "dispatch"
 harness = false
-required-features = ["test-support", "sqlite"]
-
-[[bench]]
-name = "store"
-harness = false
-required-features = ["test-support", "sqlite"]
+required-features = ["test-support"]
