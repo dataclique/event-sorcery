@@ -661,6 +661,70 @@ pub(crate) mod tests {
         assert_eq!(version, 2);
     }
 
+    #[sqlx::test(migrations = false)]
+    async fn native_dispatch_catches_up_only_the_delivered_postgres_stream(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, _>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let delivered_id = "z-delivered".to_owned();
+        let unrelated_id = "a-unrelated".to_owned();
+        store.send(&delivered_id, "first".to_owned()).await.unwrap();
+        let checkpoint_payload: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM note_projection WHERE view_id = $1")
+                .bind(&delivered_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        store
+            .send(&delivered_id, "second".to_owned())
+            .await
+            .unwrap();
+        store
+            .send(&unrelated_id, "unrelated".to_owned())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE note_projection SET version = 1, payload = $1 WHERE view_id = $2")
+            .bind(checkpoint_payload)
+            .bind(&delivered_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM note_projection WHERE view_id = $1")
+            .bind(&unrelated_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE note_projection ADD CHECK (view_id <> 'a-unrelated')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        store.send(&delivered_id, "third".to_owned()).await.unwrap();
+
+        assert_eq!(
+            projection
+                .load(&delivered_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .history,
+            ["first", "second", "third"]
+        );
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM note_projection WHERE view_id = $1")
+                .bind(&delivered_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 3);
+        assert_eq!(projection.load(&unrelated_id).await.unwrap(), None);
+    }
+
     struct PendingProjection {
         store: Arc<Store<ProjectedNote<1>, PostgresBackend>>,
         projection: Arc<Projection<ProjectedNote<1>, PostgresViewBackend>>,

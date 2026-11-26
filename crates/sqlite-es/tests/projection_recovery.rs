@@ -154,13 +154,68 @@ mod tests {
             }
         }
 
-        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
-            uneventful()
+        async fn initialize((): ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![CounterEvent::Created { initial: 4 }]))
         }
 
-        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
-            uneventful()
+        async fn transition(&self, (): ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![CounterEvent::Incremented]))
         }
+    }
+
+    #[tokio::test]
+    async fn native_dispatch_recovers_its_stream_even_if_an_unrelated_stream_cannot_replay() {
+        let pool = sqlite_es::testing::create_test_pool().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE counter_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (store, projection) =
+            StoreBuilder::<Counter, SqliteBackend>::with_backend(SqliteBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let current_id = "z-current".to_owned();
+        let unrelated_id = "a-unrelated".to_owned();
+        store.send(&current_id, ()).await.unwrap();
+        store.send(&current_id, ()).await.unwrap();
+        store.send(&unrelated_id, ()).await.unwrap();
+        sqlx::query("DELETE FROM counter_view")
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_stale_view(&pool, &current_id, 1, &Counter { value: 4 }).await;
+        sqlx::query(
+            "CREATE TRIGGER reject_unrelated_recovery
+             BEFORE INSERT ON counter_view WHEN NEW.view_id = 'a-unrelated'
+             BEGIN SELECT RAISE(ABORT, 'unrelated projection write rejected'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        store.send(&current_id, ()).await.unwrap();
+
+        assert_eq!(
+            projection.load(&current_id).await.unwrap(),
+            Some(Counter { value: 6 })
+        );
+        let checkpoint: i64 =
+            sqlx::query_scalar("SELECT version FROM counter_view WHERE view_id = ?")
+                .bind(&current_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(checkpoint, 3);
+        assert_eq!(projection.load(&unrelated_id).await.unwrap(), None);
     }
 
     async fn setup_catch_up_db() -> SqlitePool {

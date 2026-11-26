@@ -9,6 +9,11 @@ use crate::Table;
 pub enum ProjectionRecoveryMode {
     /// Replay only streams whose materialized row is missing or behind.
     CatchUp,
+    /// Replay missing events for one stream without resetting its checkpoint.
+    CatchUpOne {
+        /// Persisted aggregate identity selected for catch-up.
+        aggregate_id: String,
+    },
     /// Rebuild every materialized row from retained history.
     RebuildAll,
     /// Rebuild one materialized row from its retained stream.

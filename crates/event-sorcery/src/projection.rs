@@ -335,7 +335,11 @@ where
                 )
                 .await;
             if let Some(DeliveryGap { covered, sequence }) = gap {
-                if let Err(error) = self.projection.catch_up().await {
+                let mode = crate::ProjectionRecoveryMode::CatchUpOne {
+                    aggregate_id: aggregate_id.to_owned(),
+                };
+                let source = Backend::source(&self.projection.repo);
+                if let Err(error) = Backend::recover::<Entity>(source, &mode).await {
                     error!(%view_id, covered, sequence = sequence.get(), ?error,
                         "Projection catch-up failed after a delivery gap");
                 }
@@ -1099,7 +1103,9 @@ mod tests {
         where
             Entity: EventSourced<Materialized = Table>,
         {
-            assert!(matches!(mode, crate::ProjectionRecoveryMode::CatchUp));
+            assert!(
+                matches!(mode, crate::ProjectionRecoveryMode::CatchUpOne { aggregate_id } if aggregate_id == "id-1")
+            );
             recoveries.fetch_add(1, Ordering::SeqCst);
             // A storage failure leaves the gap unresolved, so processing another
             // envelope would request catch-up again.

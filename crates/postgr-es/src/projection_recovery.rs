@@ -19,7 +19,7 @@ impl ProjectionRecoveryStorage for PostgresProjectionRecovery<'_> {
         Table(table): Table,
         mode: &ProjectionRecoveryMode,
     ) -> Result<(), sqlx::Error> {
-        use ProjectionRecoveryMode::{CatchUp, RebuildAll, RebuildOne};
+        use ProjectionRecoveryMode::{CatchUp, CatchUpOne, RebuildAll, RebuildOne};
 
         let table = quote_identifier(table);
         sqlx::query(AssertSqlSafe(format!(
@@ -28,7 +28,7 @@ impl ProjectionRecoveryStorage for PostgresProjectionRecovery<'_> {
         .execute(&mut *self.connection)
         .await?;
         match mode {
-            CatchUp => {}
+            CatchUp | CatchUpOne { .. } => {}
             RebuildAll => {
                 sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
                     .execute(&mut *self.connection)
@@ -52,11 +52,14 @@ impl ProjectionRecoveryStorage for PostgresProjectionRecovery<'_> {
         aggregate_type: &str,
         mode: &ProjectionRecoveryMode,
     ) -> Result<Vec<ProjectionReplayRow>, sqlx::Error> {
-        use ProjectionRecoveryMode::{CatchUp, RebuildAll, RebuildOne};
+        use ProjectionRecoveryMode::{CatchUp, CatchUpOne, RebuildAll, RebuildOne};
 
         let table = quote_identifier(table);
         let selection = match mode {
             CatchUp => "v.version IS NULL OR e.max_seq > v.version",
+            CatchUpOne { .. } => {
+                "e.aggregate_id = $2 AND (v.version IS NULL OR e.max_seq > v.version)"
+            }
             RebuildAll => "TRUE",
             RebuildOne { .. } => "e.aggregate_id = $2",
         };
@@ -70,7 +73,7 @@ impl ProjectionRecoveryStorage for PostgresProjectionRecovery<'_> {
         let mut query =
             sqlx::query_as::<_, (String, Option<i64>, Option<String>, i64)>(AssertSqlSafe(sql))
                 .bind(aggregate_type);
-        if let RebuildOne { aggregate_id } = mode {
+        if let CatchUpOne { aggregate_id } | RebuildOne { aggregate_id } = mode {
             query = query.bind(aggregate_id);
         }
         query
