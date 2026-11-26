@@ -75,11 +75,22 @@ in
             --locked --offline --package "$package" --lib --no-default-features
           cargo check ''${CARGO_PROFILE:+--profile $CARGO_PROFILE} \
             --locked --offline --package "$package" --lib
-          graph="$TMPDIR/$package-normal-dependencies"
-          cargo tree --locked --offline --package "$package" \
-            --edges normal > "$graph"
-          if grep -E 'sqlite-es|sqlx-sqlite|libsqlite3-sys' "$graph"; then
-            echo "SQLite leaked into $package normal dependencies" >&2
+        done
+
+        for package in event-sorcery-core event-sorcery sqlite-es postgr-es; do
+          case "$package" in
+            event-sorcery-core|event-sorcery)
+              forbidden='sqlite-es|postgr-es|postgres-es|sqlx-sqlite|sqlx-postgres|libsqlite3-sys'
+              ;;
+            sqlite-es) forbidden='postgr-es|postgres-es|sqlx-postgres' ;;
+            postgr-es) forbidden='sqlite-es|sqlx-sqlite|libsqlite3-sys' ;;
+          esac
+
+          graph="$TMPDIR/$package-dependencies"
+          cargo tree --locked --offline --package "$package" --all-features \
+            --edges normal,dev,build --prefix none --format '{p}' > "$graph"
+          if grep -E "^($forbidden) v" "$graph"; then
+            echo "Unexpected database adapter or driver in $package dependencies" >&2
             exit 1
           fi
         done
