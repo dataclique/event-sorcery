@@ -396,8 +396,8 @@ mod tests {
             Ok(Some(entity.clone()))
         }
 
-        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
-            uneventful()
+        async fn initialize((): ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![TestEvent]))
         }
 
         async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
@@ -553,5 +553,55 @@ mod tests {
         assert!(matches!(error, FlakyReactorError::Permanent));
         assert!(!wrapped.inner.applied.load(Ordering::SeqCst));
         assert_eq!(wrapped.inner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_retries_busy_error_via_retry_on_busy_and_succeeds() {
+        let reactor = Arc::new(RetryOnBusy {
+            inner: FlakyReactor {
+                remaining_busy_failures: AtomicU32::new(2),
+                permanent_failure: false,
+                calls: AtomicU32::new(0),
+                applied: AtomicBool::new(false),
+            },
+        });
+        let store = event_sorcery::TestStore::<TestEntity>::with_reactor(Arc::clone(&reactor));
+        let id = "counter-1".to_owned();
+
+        store.send(&id, ()).await.unwrap();
+
+        assert!(reactor.inner.applied.load(Ordering::SeqCst));
+        assert_eq!(reactor.inner.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_swallows_retry_on_busy_exhaustion_after_full_schedule() {
+        // Never reaches zero within RETRY_MAX_ATTEMPTS + 1 calls -- exercises
+        // the real production schedule end to end (~4.3s), proving dispatch
+        // still swallows the error once RetryOnBusy exhausts its budget.
+        let reactor = Arc::new(RetryOnBusy {
+            inner: FlakyReactor {
+                remaining_busy_failures: AtomicU32::new(u32::MAX),
+                permanent_failure: false,
+                calls: AtomicU32::new(0),
+                applied: AtomicBool::new(false),
+            },
+        });
+        let store = event_sorcery::TestStore::<TestEntity>::with_reactor(Arc::clone(&reactor));
+        let id = "counter-1".to_owned();
+        let full_schedule = std::time::Duration::from_millis(4_270);
+        let started = tokio::time::Instant::now();
+
+        store.send(&id, ()).await.unwrap();
+
+        // Paused Tokio time advances only through the retry sleeps, so the
+        // elapsed virtual time IS the backoff schedule -- immediate retries
+        // or removed delays fail this exactly.
+        assert_eq!(started.elapsed(), full_schedule);
+        assert!(!reactor.inner.applied.load(Ordering::SeqCst));
+        assert_eq!(
+            reactor.inner.calls.load(Ordering::SeqCst),
+            RETRY_MAX_ATTEMPTS + 1
+        );
     }
 }
