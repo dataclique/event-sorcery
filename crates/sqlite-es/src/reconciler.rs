@@ -200,7 +200,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let registry = test_store::<SchemaRegistry, _>(SqliteBackend { pool: pool.clone() });
+        let registry = test_store::<SchemaRegistry, _>(&SqliteBackend { pool: pool.clone() });
         registry
             .send(
                 &"not-the-registry".to_owned(),
@@ -209,7 +209,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let other = test_store::<CompactableWidget, _>(SqliteBackend { pool: pool.clone() });
+        let other = test_store::<CompactableWidget, _>(&SqliteBackend { pool: pool.clone() });
         other
             .send(&SCHEMA_REGISTRY_ID.to_owned(), ())
             .await
@@ -302,7 +302,7 @@ mod tests {
             CompactionPolicy::RetainLast { events: 2 },
         ] {
             let pool = crate::testing::create_test_pool().await.unwrap();
-            let store = test_store::<CompactableWidget, _>(SqliteBackend { pool: pool.clone() });
+            let store = test_store::<CompactableWidget, _>(&SqliteBackend { pool: pool.clone() });
             let id = "legacy-widget".to_string();
             store.send(&id, ()).await.unwrap();
             assert_eq!(

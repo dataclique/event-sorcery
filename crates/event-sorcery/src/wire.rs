@@ -217,12 +217,12 @@ pub async fn send_command<Entity: EventSourced>(
 #[cfg(any(test, feature = "test-support"))]
 /// Opens a store without startup recovery or reactors for isolated behavior tests.
 pub fn test_store<Entity: EventSourced, Backend: PersistenceBackend>(
-    backend: Backend,
+    backend: &Backend,
 ) -> Store<Entity, Backend> {
     let event_store = PersistedEventStore::new_snapshot_store(
         backend.persistence_repo(Entity::COMPACTION_POLICY),
         Entity::SNAPSHOT_SIZE,
     );
     let cqrs = es_cqrs(event_store, vec![]);
-    Store::new(cqrs, &backend)
+    Store::new(cqrs, backend)
 }

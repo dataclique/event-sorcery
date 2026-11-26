@@ -194,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn load_entity_replays_events_into_entity() {
         let pool = test_pool().await;
-        let store = test_store::<Widget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
 
         store
             .send(
@@ -230,7 +230,7 @@ mod tests {
         .await
         .unwrap();
 
-        let store = test_store::<Widget, _>(SqliteBackend { pool: pool });
+        let store = test_store::<Widget, _>(&SqliteBackend { pool });
         let entity = store.load(&id).await.unwrap().unwrap();
         assert_eq!(entity.name, "standalone");
     }
@@ -238,7 +238,7 @@ mod tests {
     #[tokio::test]
     async fn load_entity_uses_snapshot_after_events_are_compacted() {
         let pool = test_pool().await;
-        let store = test_store::<Widget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
 
         store
             .send(
@@ -285,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn commands_still_commit_after_events_are_compacted() {
         let pool = test_pool().await;
-        let store = test_store::<Widget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
 
         store
             .send(
@@ -342,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn windowed_compaction_preserves_the_unsnapshotted_tail() {
         let pool = test_pool().await;
-        let store = test_store::<WindowedWidget<1, 3>, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<WindowedWidget<1, 3>, _>(&SqliteBackend { pool: pool.clone() });
         store
             .send(
                 &NumericId(7),
@@ -394,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn retain_last_keeps_the_newest_window_and_the_entity_loads() {
         let pool = test_pool().await;
-        let store = test_store::<WindowedWidget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<WindowedWidget, _>(&SqliteBackend { pool: pool.clone() });
 
         store
             .send(
@@ -447,8 +447,8 @@ mod tests {
     #[tokio::test]
     async fn windowed_compaction_isolates_streams_and_preserves_unsnapshotted_events() {
         let pool = test_pool().await;
-        let windowed = test_store::<WindowedWidget<2, 5>, _>(SqliteBackend { pool: pool.clone() });
-        let unrelated = test_store::<Widget, _>(SqliteBackend { pool: pool.clone() });
+        let windowed = test_store::<WindowedWidget<2, 5>, _>(&SqliteBackend { pool: pool.clone() });
+        let unrelated = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
 
         for (aggregate_id, event_count) in [(7, 6), (8, 11), (9, 4)] {
             windowed
@@ -540,7 +540,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_version_advances_across_loads() {
         let pool = test_pool().await;
-        let store = test_store::<Widget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
 
         store
             .send(
@@ -647,7 +647,7 @@ mod tests {
         }
 
         let pool = test_pool().await;
-        let store = test_store::<Tally, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<Tally, _>(&SqliteBackend { pool: pool.clone() });
 
         // SNAPSHOT_SIZE = 1 forces commit's snapshot rebuild
         // (`update_snapshot_with_events`) after every command, exercising the
@@ -745,7 +745,7 @@ mod tests {
         }
 
         let pool = test_pool().await;
-        let store = test_store::<RetainedWidget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<RetainedWidget, _>(&SqliteBackend { pool: pool.clone() });
         store
             .send(
                 &NumericId(7),
@@ -810,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn aggregate_ids_deduplicate_event_and_snapshot_rows_before_sorting_and_counting() {
         let pool = test_pool().await;
-        let store = test_store::<Widget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
 
         for id in [2, 10, 3] {
             store
@@ -845,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn load_ids_paginated_orders_by_maximum_rowid_after_an_append() {
         let pool = test_pool().await;
-        let store = test_store::<Widget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
         for id in [1, 2] {
             store
                 .send(
@@ -890,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn load_all_ids_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
-        let store = test_store::<Widget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
         store
             .send(
                 &NumericId(30),
@@ -965,7 +965,7 @@ mod tests {
     #[tokio::test]
     async fn count_aggregates_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
-        let store = test_store::<Widget, _>(SqliteBackend { pool: pool.clone() });
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
         store
             .send(
                 &NumericId(30),
