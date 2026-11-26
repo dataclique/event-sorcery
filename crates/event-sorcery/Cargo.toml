@@ -36,6 +36,7 @@ workspace = true
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 proptest = "1.11.0"
+sqlx = { workspace = true, features = ["any"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
