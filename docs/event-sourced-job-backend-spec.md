@@ -32,14 +32,15 @@ A job is its own event stream (`aggregate_type = "job"`). `JobState` is an
 [`EventSourced`] aggregate (`JobEvent` = Enqueued / Claimed / Succeeded /
 RetryScheduled / Dead; `JobCommand` = Succeed / RetrySchedule / Kill). The whole
 durable-jobs capability is built from one consumer-supplied **`EventBackend`** —
-a cqrs-es event repository plus two job-shaped primitives, `claim` and `renew`.
-The backend must also implement `ProjectedStoreBackend` so
-`JobRuntime::build(backend)` can open the job `Store` and recover the
-`job_queue_projection` [`Projection`]. The caller applies migrations first.
+a cqrs-es event repository plus `claim`, `renew`, and atomic standalone
+[`enqueue`](#8-command-born-and-standalone-enqueue). The backend also implements
+`ProjectedStoreBackend` so `JobRuntime::build(backend)` opens the job `Store`
+and recovers the `job_queue_projection` [`Projection`]. The caller applies
+migrations first.
 
-The ack rides cqrs-es `execute` (a `JobCommand`); only the **claim** is a
-backend transaction, because its runnable check must read the projection-only
-lease column, which cqrs-es cannot express.
+Acknowledgement runs a `JobCommand` through cqrs-es `execute`. Claiming owns its
+transaction because the runnable check must read the projection-only lease
+column, which cqrs-es cannot express.
 
 ## 2. Keystone decisions (each closes a specific adversarial finding)
 
