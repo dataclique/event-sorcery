@@ -3,7 +3,8 @@
 #[cfg(test)]
 mod tests {
     use apalis_core::{
-        backend::Backend as ApalisBackend,
+        backend::{Backend as ApalisBackend, BackendConfig},
+        error::BoxDynError,
         task::{Task, data::MissingDataError, from_request::FromRequest},
         worker::{context::WorkerContext, event::Event},
     };
@@ -16,12 +17,14 @@ mod tests {
         future::{Future, poll_fn, ready},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU32, Ordering},
         },
         task::Poll,
         time::Duration,
     };
     use tokio::{sync::Notify, time::timeout};
+    use tower_layer::Layer;
+    use tower_service::Service;
 
     use event_sorcery::*;
     use sqlite_es::{SqliteBackend, insert_serialized_events_batch, testing::create_test_pool};
@@ -34,7 +37,7 @@ mod tests {
     impl StandaloneJob for TestJob {
         type Input = ();
         type Output = ();
-        type Error = std::convert::Infallible;
+        type Error = TestPerformError;
 
         const WORKER_NAME: &'static str = "test-worker";
         const KIND: &'static str = "test-job";
@@ -48,8 +51,7 @@ mod tests {
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<std::convert::Infallible>>> + Send
-        {
+        ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<Self::Error>>> + Send {
             ready(Ok(JobOutcome::Done(())))
         }
     }
@@ -831,6 +833,396 @@ mod tests {
             outcome,
             JobClaimResult::Claimed(ref job) if job.handle.attempt() == 0 && !job.handle.is_first_execution()
         ));
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("external system said no")]
+    struct TestPerformError;
+
+    async fn poll_task(runtime: &JobRuntime<SqliteBackend>, now_ms: i64) -> Task<TestJob> {
+        let mut worker = EventStoreBackend::<TestJob, _>::new(
+            runtime.clone(),
+            "poll-test",
+            JobWorkerConfig::default(),
+            Clock::from_fn(move || from_millis(now_ms)),
+        );
+        let context = WorkerContext::new("poll-test");
+        timeout(
+            Duration::from_secs(2),
+            poll_fn(|cx| worker.poll_next(cx, &context)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn process_task(
+        runtime: &JobRuntime<SqliteBackend>,
+        task: Task<TestJob>,
+        config: JobWorkerConfig,
+        clock: Clock,
+        handler: impl Fn(TestJob) -> Result<JobOutcome<()>, JobFailure<TestPerformError>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<JobOutcome<()>, BoxDynError> {
+        let mut worker =
+            EventStoreBackend::<TestJob, _>::new(runtime.clone(), "ack-test", config, clock);
+        let mut context = WorkerContext::new("ack-test");
+        let layer = worker.middleware(&mut context);
+        let mut service = layer.layer(apalis_core::task::task_fn::task_fn(move |job: TestJob| {
+            ready(handler(job))
+        }));
+        poll_fn(|cx| service.poll_ready(cx)).await?;
+        service.call(task).await
+    }
+
+    #[tokio::test]
+    async fn retry_timestamp_overflow_preserves_the_claim() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1_000).await;
+        let task = poll_task(&runtime, 1_000).await;
+
+        let error = process_task(
+            &runtime,
+            task,
+            JobWorkerConfig::default(),
+            Clock::from_fn(|| DateTime::<Utc>::MAX_UTC),
+            |_| Err(JobFailure::Transient(TestPerformError)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<JobScheduleError>(),
+            Some(JobScheduleError::TimestampOverflow)
+        ));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed"]
+        );
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("claimed")
+        );
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_deferral_does_not_schedule_a_fallback() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1_000).await;
+        let task = poll_task(&runtime, 1_000).await;
+
+        let error = process_task(
+            &runtime,
+            task,
+            JobWorkerConfig::default(),
+            Clock::from_fn(|| from_millis(1_000)),
+            |_| Ok(JobOutcome::Defer(Duration::MAX)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<JobScheduleError>(),
+            Some(JobScheduleError::DelayOutOfRange(_))
+        ));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed"]
+        );
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("claimed")
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_failure_returns_typed_error_and_stops_renewal() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1_000).await;
+        let task = poll_task(&runtime, 1_000).await;
+        let performed = Arc::new(AtomicU32::new(0));
+        let observed = Arc::clone(&performed);
+        let clock_reads = Arc::new(AtomicU32::new(0));
+        let observed_clock = Arc::clone(&clock_reads);
+        let config = JobWorkerConfig {
+            renew_interval: Duration::from_millis(10),
+            ..JobWorkerConfig::default()
+        };
+        let clock = Clock::from_fn(move || {
+            observed_clock.fetch_add(1, Ordering::SeqCst);
+            DateTime::<Utc>::MAX_UTC
+        });
+
+        tokio::time::pause();
+        let error = process_task(&runtime, task, config, clock, move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err(JobFailure::Transient(TestPerformError))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<JobScheduleError>(),
+            Some(JobScheduleError::TimestampOverflow)
+        ));
+        assert_eq!(performed.load(Ordering::SeqCst), 1);
+        assert_eq!(clock_reads.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(clock_reads.load(Ordering::SeqCst), 1);
+        tokio::time::resume();
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_receives_the_claimed_jobs_identity() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1_000).await;
+        let first = poll_task(&runtime, 1_000).await;
+
+        let context = JobContext::from_request(&first).await.unwrap();
+        assert_eq!(context.job_id(), job_id);
+        assert_eq!(context.attempt(), 0);
+        let error = process_task(
+            &runtime,
+            first,
+            JobWorkerConfig::default(),
+            Clock::from_fn(|| from_millis(1_000)),
+            |_| Err(JobFailure::Transient(TestPerformError)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(JobFailure::Transient(TestPerformError))
+        ));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobRetryScheduled"]
+        );
+
+        let retried = poll_task(&runtime, 3_601_000).await;
+        let context = JobContext::from_request(&retried).await.unwrap();
+        assert_eq!(context.job_id(), job_id);
+        assert_eq!(context.attempt(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_dead_letters_without_retries() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1_000).await;
+        let task = poll_task(&runtime, 1_000).await;
+
+        let error = process_task(
+            &runtime,
+            task,
+            JobWorkerConfig::default(),
+            Clock::from_fn(|| from_millis(1_000)),
+            |_| Err(JobFailure::Terminal(TestPerformError)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(JobFailure::Terminal(TestPerformError))
+        ));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobDead"]
+        );
+        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("dead"));
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM job_queue_projection WHERE view_id = ?1")
+                .bind(job_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(state["Live"]["Dead"]["reason"], "Rejected");
+    }
+
+    #[tokio::test]
+    async fn deferred_job_reschedules_to_pending_and_resets_the_claim_budget() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1_000).await;
+        let task = poll_task(&runtime, 1_000).await;
+
+        let outcome = process_task(
+            &runtime,
+            task,
+            JobWorkerConfig::default(),
+            Clock::from_fn(|| from_millis(1_000)),
+            |_| Ok(JobOutcome::Defer(Duration::from_hours(1))),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, JobOutcome::Defer(delay) if delay == Duration::from_hours(1)));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobRescheduled"]
+        );
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
+        );
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM job_queue_projection WHERE view_id = ?1")
+                .bind(job_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(state["Live"]["Pending"]["claims"], 0);
+        assert_eq!(
+            runtime.poll_jobs(TestJob::KIND, 1_000, 16).await.unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_retry_then_kill_via_commands() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1_000).await;
+        let JobClaimResult::Claimed(first) = runtime
+            .claim_job(job_id, "w1", 1_000, 30_000, 50)
+            .await
+            .unwrap()
+        else {
+            panic!("expected claim");
+        };
+        assert_eq!(
+            runtime
+                .retry_job(first.handle, 2_000, "boom".to_owned())
+                .await
+                .unwrap(),
+            JobSettlementResult::Applied
+        );
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobRetryScheduled"]
+        );
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
+        );
+
+        let JobClaimResult::Claimed(second) = runtime
+            .claim_job(job_id, "w1", 2_000, 30_000, 50)
+            .await
+            .unwrap()
+        else {
+            panic!("expected re-claim");
+        };
+        assert_eq!(
+            runtime
+                .dead_letter_job(
+                    second.handle,
+                    DeadReason::RetriesExhausted,
+                    "boom".to_owned()
+                )
+                .await
+                .unwrap(),
+            JobSettlementResult::Applied
+        );
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            [
+                "JobEnqueued",
+                "JobClaimed",
+                "JobRetryScheduled",
+                "JobClaimed",
+                "JobDead"
+            ]
+        );
+        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("dead"));
+    }
+
+    #[tokio::test]
+    async fn ack_is_fenced_when_a_reclaimer_holds_the_job() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1_000).await;
+        let stale_task = poll_task(&runtime, 1_000).await;
+        let JobClaimResult::Claimed(_) = runtime
+            .claim_job(job_id, "w2", 1_000 + 31_000, 30_000, 50)
+            .await
+            .unwrap()
+        else {
+            panic!("expected re-claim");
+        };
+
+        let outcome = process_task(
+            &runtime,
+            stale_task,
+            JobWorkerConfig::default(),
+            Clock::from_fn(|| from_millis(32_000)),
+            |_| Ok(JobOutcome::Done(())),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, JobOutcome::Done(())));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobClaimed"]
+        );
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("claimed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_without_claim_context_cannot_invoke_the_handler() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool }).await.unwrap();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&invoked);
+        let error = process_task(
+            &runtime,
+            Task::new(TestJob { n: 1 }),
+            JobWorkerConfig::default(),
+            Clock::system(),
+            move |_| {
+                observed.store(true, Ordering::SeqCst);
+                Ok(JobOutcome::Done(()))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error.downcast_ref::<MissingDataError>(), Some(MissingDataError::NotFound(name)) if name == std::any::type_name::<JobContext>())
+        );
+        assert!(!invoked.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
