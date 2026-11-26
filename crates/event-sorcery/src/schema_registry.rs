@@ -246,8 +246,8 @@ pub enum ReconcileError {
     },
     /// Snapshot clearing requires proof that its entire covered history is retained.
     #[error(
-        "Cannot clear snapshot for {stream:?}: covered sequence {covered_sequence}, \
-         retained covered events {retained_events}; complete history is unproven. \
+        "Snapshot history for {stream:?} cannot be proven complete: covered sequence \
+         {covered_sequence}, retained covered events {retained_events}. \
          An explicit snapshot-preserving migration is required."
     )]
     UnprovenSnapshotHistory {

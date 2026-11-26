@@ -5,7 +5,7 @@ use sqlx::{AssertSqlSafe, SqliteConnection, SqlitePool};
 use std::num::NonZeroU64;
 
 use event_sorcery_core::{
-    ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow, Table,
+    ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow, SnapshotHistory, Table,
 };
 
 /// SQLite projection recovery over a borrowed connection.
@@ -37,6 +37,14 @@ where
 }
 
 impl ProjectionRecoveryStorage for SqliteProjectionRecovery<'_> {
+    async fn snapshot_histories(
+        &mut self,
+        aggregate_type: &str,
+        aggregate_id: Option<&str>,
+    ) -> Result<Vec<SnapshotHistory>, sqlx::Error> {
+        crate::snapshot::snapshot_histories(self.connection, aggregate_type, aggregate_id).await
+    }
+
     async fn reset(
         &mut self,
         Table(table): Table,

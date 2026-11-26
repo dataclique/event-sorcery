@@ -78,12 +78,41 @@ impl TryFrom<(String, Option<i64>, Option<String>, i64)> for ProjectionReplayRow
     }
 }
 
+/// Evidence of retained events through a persisted snapshot boundary.
+#[derive(Debug)]
+pub struct SnapshotHistory {
+    /// Persisted ID of the snapshotted aggregate.
+    pub aggregate_id: String,
+    /// Last event sequence included in the snapshot.
+    pub covered_sequence: i64,
+    /// Number of retained events in sequences 1 through `covered_sequence`.
+    pub retained_events: i64,
+}
+
+impl From<(String, i64, i64)> for SnapshotHistory {
+    fn from((aggregate_id, covered_sequence, retained_events): (String, i64, i64)) -> Self {
+        Self {
+            aggregate_id,
+            covered_sequence,
+            retained_events,
+        }
+    }
+}
+
 /// Database operations performed inside the caller's recovery transaction.
 ///
 /// Implementations never commit through this interface. The caller owns commit
 /// and schema-registration ordering; schema versions must not advance over
 /// failed replay. A backend may include registration in the same transaction.
 pub trait ProjectionRecoveryStorage: Send {
+    /// Reads history evidence for snapshots within the requested rebuild scope.
+    /// A missing ID selects all snapshots for the aggregate type.
+    fn snapshot_histories(
+        &mut self,
+        aggregate_type: &str,
+        aggregate_id: Option<&str>,
+    ) -> impl Future<Output = Result<Vec<SnapshotHistory>, sqlx::Error>> + Send;
+
     /// Deletes only rows selected by an explicit rebuild; catch-up keeps rows.
     fn reset(
         &mut self,

@@ -4,7 +4,7 @@ use sqlx::{AssertSqlSafe, PgConnection};
 use std::num::NonZeroU64;
 
 use event_sorcery::{
-    ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow, Table,
+    ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow, SnapshotHistory, Table,
 };
 use indexed_query::quote_identifier;
 
@@ -13,7 +13,36 @@ pub(crate) struct PostgresProjectionRecovery<'connection> {
     pub(crate) connection: &'connection mut PgConnection,
 }
 
+pub(crate) async fn snapshot_histories(
+    connection: &mut PgConnection,
+    aggregate_type: &str,
+    aggregate_id: Option<&str>,
+) -> Result<Vec<SnapshotHistory>, sqlx::Error> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT s.aggregate_id, s.last_sequence,
+                (SELECT COUNT(*) FROM events e
+                 WHERE e.aggregate_type = s.aggregate_type
+                   AND e.aggregate_id = s.aggregate_id
+                   AND e.sequence BETWEEN 1 AND s.last_sequence)
+         FROM snapshots s
+         WHERE s.aggregate_type = $1 AND ($2::text IS NULL OR s.aggregate_id = $2)",
+    )
+    .bind(aggregate_type)
+    .bind(aggregate_id)
+    .fetch_all(connection)
+    .await?;
+    Ok(rows.into_iter().map(SnapshotHistory::from).collect())
+}
+
 impl ProjectionRecoveryStorage for PostgresProjectionRecovery<'_> {
+    async fn snapshot_histories(
+        &mut self,
+        aggregate_type: &str,
+        aggregate_id: Option<&str>,
+    ) -> Result<Vec<SnapshotHistory>, sqlx::Error> {
+        snapshot_histories(self.connection, aggregate_type, aggregate_id).await
+    }
+
     async fn reset(
         &mut self,
         Table(table): Table,

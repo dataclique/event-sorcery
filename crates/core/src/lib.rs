@@ -10,6 +10,7 @@ pub use job_claim::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
 
 pub use projection_recovery::{
     ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow,
+    SnapshotHistory,
 };
 pub use view_backend::{ViewBackend, ViewUpdateError};
 

@@ -51,6 +51,9 @@ pub enum ProjectionError<Entity: EventSourced> {
         /// Entity type whose projection cannot be recovered from compactable history.
         aggregate_type: &'static str,
     },
+    /// A rebuild needs history covered by a snapshot that cannot be proven complete.
+    #[error("cannot rebuild projection: {0}")]
+    UnprovenSnapshotHistory(#[source] crate::ReconcileError),
     /// This operation requires a projection associated with a native view table.
     #[error("operation requires a projection backed by a native persistence adapter")]
     MissingViewTable,
@@ -148,6 +151,8 @@ where
     }
 
     /// Rebuilds one materialized row from retained history.
+    ///
+    /// Refuses to replace the row if history covered by a snapshot is unproven.
     pub async fn rebuild(&self, id: &Entity::Id) -> Result<(), ProjectionError<Entity>> {
         let (source, _) = self.native_backing()?;
         Backend::recover::<Entity>(
@@ -160,6 +165,8 @@ where
     }
 
     /// Rebuilds all materialized rows from retained history.
+    ///
+    /// Refuses the entire rebuild if any snapshot's covered history is unproven.
     pub async fn rebuild_all(&self) -> Result<(), ProjectionError<Entity>> {
         let (source, _) = self.native_backing()?;
         Backend::recover::<Entity>(source, &crate::ProjectionRecoveryMode::RebuildAll).await

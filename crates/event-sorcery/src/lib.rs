@@ -116,7 +116,7 @@ use std::str::FromStr;
 
 pub use event_sorcery_core::{
     CompactionPolicy, ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage,
-    ProjectionReplayRow, Table,
+    ProjectionReplayRow, SnapshotHistory, Table,
 };
 
 #[doc(hidden)]

@@ -4,6 +4,8 @@ use cqrs_es::persist::SerializedSnapshot;
 use serde_json::Value;
 use sqlx::{SqliteConnection, SqliteExecutor, SqlitePool};
 
+use event_sorcery_core::SnapshotHistory;
+
 use crate::{SqliteAggregateError, committed_stream_version};
 
 /// Stores a snapshot independently of an event append, under the SQLite write lock.
@@ -138,19 +140,12 @@ where
     Error: From<sqlx::Error>,
 {
     let mut transaction = pool.begin().await?;
-    let histories: Vec<(String, i64, i64)> = sqlx::query_as(
-        "SELECT s.aggregate_id, s.last_sequence, \
-         (SELECT COUNT(*) FROM events e \
-          WHERE e.aggregate_type = s.aggregate_type \
-            AND e.aggregate_id = s.aggregate_id \
-            AND e.sequence BETWEEN 1 AND s.last_sequence) \
-         FROM snapshots s WHERE s.aggregate_type = ?1",
-    )
-    .bind(aggregate_type)
-    .fetch_all(&mut *transaction)
-    .await?;
-    for (aggregate_id, covered_sequence, retained_events) in histories {
-        validate(aggregate_id, covered_sequence, retained_events)?;
+    for history in snapshot_histories(&mut transaction, aggregate_type, None).await? {
+        validate(
+            history.aggregate_id,
+            history.covered_sequence,
+            history.retained_events,
+        )?;
     }
 
     sqlx::query("DELETE FROM snapshots WHERE aggregate_type = ?1")
@@ -159,6 +154,27 @@ where
         .await?;
     transaction.commit().await?;
     Ok(())
+}
+
+pub(crate) async fn snapshot_histories(
+    connection: &mut SqliteConnection,
+    aggregate_type: &str,
+    aggregate_id: Option<&str>,
+) -> Result<Vec<SnapshotHistory>, sqlx::Error> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT s.aggregate_id, s.last_sequence,
+                (SELECT COUNT(*) FROM events e
+                 WHERE e.aggregate_type = s.aggregate_type
+                   AND e.aggregate_id = s.aggregate_id
+                   AND e.sequence BETWEEN 1 AND s.last_sequence)
+         FROM snapshots s
+         WHERE s.aggregate_type = ?1 AND (?2 IS NULL OR s.aggregate_id = ?2)",
+    )
+    .bind(aggregate_type)
+    .bind(aggregate_id)
+    .fetch_all(connection)
+    .await?;
+    Ok(rows.into_iter().map(SnapshotHistory::from).collect())
 }
 
 /// Deletes the snapshot for one stream, without changing its events.

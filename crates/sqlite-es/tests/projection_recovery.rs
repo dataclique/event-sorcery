@@ -7,7 +7,7 @@ mod tests {
 
     use event_sorcery::{
         CompactionPolicy, Effect, EventSourced, LifecycleError, Never, Nil, Projection,
-        ProjectionError, StoreBuilder, Table, uneventful,
+        ProjectionError, ReconcileError, StoreBuilder, StreamIdentity, Table, uneventful,
     };
     use sqlite_es::{SqliteBackend, SqliteViewBackend};
 
@@ -220,40 +220,13 @@ mod tests {
     }
 
     async fn setup_catch_up_db() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-
-        sqlx::query(
-            "CREATE TABLE events ( \
-                 aggregate_type TEXT NOT NULL, \
-                 aggregate_id TEXT NOT NULL, \
-                 sequence BIGINT NOT NULL, \
-                 event_type TEXT NOT NULL, \
-                 event_version TEXT NOT NULL, \
-                 payload TEXT NOT NULL, \
-                 metadata TEXT NOT NULL, \
-                 PRIMARY KEY (aggregate_type, aggregate_id, sequence) \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let pool = sqlite_es::testing::create_test_pool().await.unwrap();
 
         sqlx::query(
             "CREATE TABLE counter_view ( \
                  view_id TEXT NOT NULL PRIMARY KEY, \
                  version BIGINT NOT NULL, \
                  payload TEXT NOT NULL \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Also need schema_registry for Projection::sqlite
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS schema_registry ( \
-                 aggregate_type TEXT NOT NULL PRIMARY KEY, \
-                 version BIGINT NOT NULL \
              )",
         )
         .execute(&pool)
@@ -551,6 +524,73 @@ mod tests {
             matches!(error, ProjectionError::Serde { .. }),
             "expected Serde error, got: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_snapshot_only_history_after_switching_to_retain() {
+        let pool = sqlite_es::testing::create_test_pool().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE counter_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let engine = sqlite_es::Engine::new(pool.clone());
+        let (store, projection) =
+            StoreBuilder::<Counter, _>::with_backend(SqliteBackend { pool: pool.clone() })
+                .build()
+                .await
+                .unwrap();
+        let id = "compacted".to_owned();
+        store.send(&id, 0).await.unwrap();
+        let stream = StreamIdentity::new(Counter::AGGREGATE_TYPE, id.clone());
+        engine
+            .store_snapshot(
+                &stream,
+                sqlite_es::SnapshotWrite::new(serde_json::json!({"Live": {"value": 4}}), 1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlite_es::compact_events(
+                &pool,
+                Counter::AGGREGATE_TYPE,
+                CompactionPolicy::CompactAfterSnapshot
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let snapshot = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        let rows = sqlite_es::projection_rows(&pool, "counter_view")
+            .await
+            .unwrap();
+
+        for result in [
+            projection.rebuild(&id).await,
+            projection.rebuild_all().await,
+        ] {
+            assert!(matches!(result,
+                Err(ProjectionError::UnprovenSnapshotHistory(ReconcileError::UnprovenSnapshotHistory {
+                    stream: rejected, covered_sequence: 1, retained_events: 0,
+                })) if rejected == stream
+            ));
+        }
+        assert_eq!(
+            sqlite_es::projection_rows(&pool, "counter_view")
+                .await
+                .unwrap(),
+            rows
+        );
+        assert_eq!(
+            projection.load(&id).await.unwrap(),
+            Some(Counter { value: 4 })
+        );
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), Some(snapshot));
     }
 
     #[tokio::test]

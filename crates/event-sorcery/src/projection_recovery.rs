@@ -7,13 +7,17 @@ use event_sorcery_core::{
 use tracing::warn;
 
 use crate::lifecycle::Lifecycle;
-use crate::{CompactionPolicy, EventSourced, ProjectionError, Table};
+use crate::{
+    CompactionPolicy, EventSourced, ProjectionError, StreamIdentity, Table,
+    validate_snapshot_history,
+};
 
 /// Replays materialized state without acquiring or committing a connection.
 ///
 /// # Errors
 ///
-/// Rejects compactable entities before modifying the projection. Preserves
+/// Rejects compactable entities and rebuilds with unproven snapshot history
+/// before modifying the projection. Preserves
 /// database, payload-decoding and lifecycle failures. The caller must roll back
 /// on failure and register the schema before committing on successful startup.
 pub async fn recover_projection<Entity: EventSourced<Materialized = Table>>(
@@ -28,6 +32,26 @@ pub async fn recover_projection<Entity: EventSourced<Materialized = Table>>(
         CompactAfterSnapshot | RetainLast { .. } => {
             return Err(ProjectionError::RequiresRetainedHistory { aggregate_type });
         }
+    }
+
+    use ProjectionRecoveryMode::{CatchUp, CatchUpOne, RebuildAll, RebuildOne};
+
+    let histories = match mode {
+        RebuildAll => storage.snapshot_histories(aggregate_type, None).await?,
+        RebuildOne { aggregate_id } => {
+            storage
+                .snapshot_histories(aggregate_type, Some(aggregate_id))
+                .await?
+        }
+        CatchUp | CatchUpOne { .. } => Vec::new(),
+    };
+    for history in histories {
+        validate_snapshot_history(
+            StreamIdentity::new(aggregate_type, history.aggregate_id),
+            history.covered_sequence,
+            history.retained_events,
+        )
+        .map_err(ProjectionError::UnprovenSnapshotHistory)?;
     }
 
     let table = Entity::PROJECTION;

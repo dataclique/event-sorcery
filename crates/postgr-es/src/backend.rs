@@ -433,6 +433,64 @@ pub(crate) mod tests {
         assert_eq!(projection.load(&id).await.unwrap(), Some(before));
     }
 
+    #[sqlx::test(migrations = false)]
+    async fn standalone_rebuild_refuses_partial_snapshot_history_without_replacing_views(
+        pool: PgPool,
+    ) {
+        let pool = projected_pool(pool).await;
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, _>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let id = "projected".to_owned();
+        let sibling = "sibling".to_owned();
+        store.send(&id, "first".to_owned()).await.unwrap();
+        store.send(&id, "second".to_owned()).await.unwrap();
+        store
+            .send(&sibling, "independent".to_owned())
+            .await
+            .unwrap();
+        let snapshot_query = "SELECT last_sequence, snapshot_version, payload
+                              FROM snapshots WHERE aggregate_type = 'ProjectedNote' AND aggregate_id = $1";
+        let snapshot: (i64, i64, serde_json::Value) = sqlx::query_as(snapshot_query)
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.0, 2);
+        // Simulate importing a stream whose covered prefix was compacted.
+        assert_eq!(sqlx::query("DELETE FROM events WHERE aggregate_type = 'ProjectedNote' AND aggregate_id = $1 AND sequence = 1")
+            .bind(&id).execute(&pool).await.unwrap().rows_affected(), 1);
+        let before = projection.load_all().await.unwrap();
+        let stream = event_sorcery::StreamIdentity::new("ProjectedNote", id.clone());
+        for result in [
+            projection.rebuild(&id).await,
+            projection.rebuild_all().await,
+        ] {
+            assert!(
+                matches!(result, Err(ProjectionError::UnprovenSnapshotHistory(ReconcileError::UnprovenSnapshotHistory {
+                stream: rejected, covered_sequence: 2, retained_events: 1,
+            })) if rejected == stream)
+            );
+        }
+        assert_eq!(projection.load_all().await.unwrap(), before);
+        let after: (i64, i64, serde_json::Value) = sqlx::query_as(snapshot_query)
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, snapshot);
+
+        projection.rebuild(&sibling).await.unwrap();
+        assert_eq!(
+            projection.load(&sibling).await.unwrap().unwrap().history,
+            ["independent"]
+        );
+    }
+
     struct FilterValueAfterConcurrentUpdate(PgConnectOptions);
 
     impl Type<Postgres> for FilterValueAfterConcurrentUpdate {
