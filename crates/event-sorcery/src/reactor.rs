@@ -110,9 +110,8 @@ impl<R: Reactor> Reactor for Arc<R> {
 
 /// Default retry schedule: 10ms base delay, doubling, capped at 1s, 10 retries.
 ///
-/// That is a ~4.3s total retry budget. Shared between `Projection::react`'s own
-/// retry loop and the adapter's call to [`retry_with_backoff`], so the two
-/// stay in sync without sharing the loop itself.
+/// With the default delays this allows up to 4,270 ms of scheduled wait.
+/// The projection and adapter loops use the same schedule, not a common budget.
 pub const RETRY_MAX_ATTEMPTS: u32 = 10;
 pub const RETRY_BASE_DELAY_MS: u64 = 10;
 pub const RETRY_MAX_DELAY_MS: u64 = 1000;

@@ -917,7 +917,13 @@ mod tests {
             SqliteViewRepository::<TestView, TestAggregate>::new(pool, "test_view".to_owned());
         let (view, context) = repository.load_with_context("one").await.unwrap().unwrap();
         assert_eq!(context.version, 1);
-        assert_eq!(view.values, ["rebuilt"]);
+        assert_eq!(
+            view,
+            TestView {
+                count: 1,
+                values: vec!["rebuilt".to_owned()]
+            }
+        );
     }
 
     #[tokio::test]
@@ -959,7 +965,13 @@ mod tests {
         ));
         let (view, context) = repository.load_with_context("one").await.unwrap().unwrap();
         assert_eq!(context.version, i64::MAX);
-        assert_eq!(view.values, ["original"]);
+        assert_eq!(
+            view,
+            TestView {
+                count: 1,
+                values: vec!["original".to_owned()]
+            }
+        );
     }
 
     #[tokio::test]

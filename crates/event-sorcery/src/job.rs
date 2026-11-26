@@ -838,7 +838,7 @@ impl PreparedPendingJobs {
         std::mem::take(&mut self.requests)
     }
 
-    /// Removes the retained source pushes included in a successful database commit.
+    /// Marks the committed pushes so the next preparation prunes them from the buffer.
     pub fn mark_committed(self) {
         for acknowledgement in self.acknowledgements {
             acknowledgement.store(true, Ordering::Release);
@@ -847,16 +847,15 @@ impl PreparedPendingJobs {
 }
 
 tokio::task_local! {
-    /// Per-command buffer of jobs awaiting flush, cleared by the event
-    /// repository only after its commit transaction succeeds.
+    /// Per-command buffer whose entries are acknowledged only after a successful commit.
     static PENDING_JOBS: RefCell<Vec<PendingBufferEntry>>;
 }
 
 /// Runs `command_execution` with a fresh pending-job scope active, so the
 /// framework's [`buffer`] of a [`crate::Effect::Dispatch`] lands where the
 /// repository's [`prepare_pending`] can prepare it for the event transaction.
-/// [`PreparedPendingJobs::mark_committed`] clears the prepared entries only
-/// after that transaction commits successfully.
+/// After the transaction succeeds, [`PreparedPendingJobs::mark_committed`]
+/// acknowledges only the prepared entries.
 pub(crate) async fn with_pending_scope<Output>(
     command_execution: impl Future<Output = Output>,
 ) -> Output {

@@ -5016,8 +5016,14 @@ mod tests {
             ES_ERR_STATE
         );
         assert_eq!(reconciliation, 0);
-        let (version, code, _) = decode_error(&error);
-        assert_eq!((version, code), (1, ES_ERR_STATE));
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_STATE,
+                Value::Text("snapshot history cannot be proven complete".to_owned()),
+            )
+        );
         unsafe { es_buf_free(&raw mut error) };
 
         let Ok(lease) = EsStore::acquire(&raw mut store) else {

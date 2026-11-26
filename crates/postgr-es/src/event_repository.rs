@@ -795,6 +795,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             (1..=sequence).collect::<Vec<_>>()
         );
+        assert_eq!(
+            events
+                .into_iter()
+                .map(|event| event.payload)
+                .collect::<Vec<_>>(),
+            expected
+                .into_iter()
+                .map(|value| serde_json::json!({"Recorded": {"value": value}}))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[sqlx::test(migrations = false)]

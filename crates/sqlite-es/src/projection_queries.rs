@@ -3,7 +3,7 @@
 use sqlx::{AssertSqlSafe, Sqlite, SqlitePool};
 use tracing::warn;
 
-/// Reads the IDs and serialized payloads in a projection table.
+/// Reads projection IDs and serialized payloads in ascending ID order.
 ///
 /// The table must be a trusted SQL identifier from the projection declaration.
 pub async fn projection_rows(
