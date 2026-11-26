@@ -723,13 +723,26 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn competing_commands_preserve_one_winning_snapshot(pool: PgPool) {
+        assert_one_winning_snapshot(pool, &["seed"]).await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn competing_first_commands_preserve_one_winning_snapshot(pool: PgPool) {
+        assert_one_winning_snapshot(pool, &[]).await;
+    }
+
+    async fn assert_one_winning_snapshot(pool: PgPool, prefix: &[&str]) {
         MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
-        CqrsFramework::new(store, vec![], None)
-            .execute("stream", "seed".to_string())
-            .await
-            .unwrap();
+        let framework = CqrsFramework::new(store, vec![], None);
+        for value in prefix {
+            framework
+                .execute("stream", (*value).to_owned())
+                .await
+                .unwrap();
+        }
+
         let left = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(
             PostgresEventRepository { pool: pool.clone() },
             1,
@@ -762,9 +775,26 @@ mod tests {
             results => panic!("expected one durable winner and one conflict, got {results:?}"),
         };
         let restored = left.load_aggregate("stream").await.unwrap();
-        assert_eq!(restored.aggregate.values, ["seed", winner]);
-        assert_eq!(restored.current_sequence, 2);
-        assert_eq!(restored.current_snapshot, Some(2));
+        let expected: Vec<_> = prefix
+            .iter()
+            .copied()
+            .chain(std::iter::once(winner))
+            .collect();
+        let sequence = expected.len();
+        assert_eq!(restored.aggregate.values, expected);
+        assert_eq!(restored.current_sequence, sequence);
+        assert_eq!(restored.current_snapshot, Some(sequence));
+        let events = PostgresEventRepository { pool }
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=sequence).collect::<Vec<_>>()
+        );
     }
 
     #[sqlx::test(migrations = false)]
