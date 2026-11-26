@@ -75,7 +75,7 @@ mod view_repository;
 /// edit them afterwards.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-pub use aggregate_ids::{count_aggregates, load_all_ids, load_ids_paginated};
+pub use aggregate_ids::{LoadAllIdsError, count_aggregates, load_all_ids, load_ids_paginated};
 pub use backend::{CommandRepository, SqliteBackend};
 pub use commit::{Commit, commit_atomic};
 pub use compaction::compact_events;

@@ -183,6 +183,7 @@ dependencies = [
  "cqrs-es",
  "event-sorcery",
  "serde",
+ "sqlite-es",
  "sqlx",
  "thiserror",
  "tokio",

@@ -181,11 +181,11 @@ pub use testing::{
     with_pending_jobs,
 };
 pub use view_backend::{NativeProjectionBackend, ViewBackend, ViewUpdateError};
+#[cfg(any(test, feature = "sqlite"))]
+pub use wire::compact_events;
 #[cfg(all(any(test, feature = "test-support"), any(test, feature = "sqlite")))]
 pub use wire::test_store;
 pub use wire::{StoreBuilder, load_entity, send_command};
-#[cfg(any(test, feature = "sqlite"))]
-pub use wire::{compact_events, count_aggregates, load_all_ids, load_ids_paginated};
 
 pub(crate) type EsCqrs<Entity, Backend> = CqrsFramework<
     Lifecycle<Entity>,
@@ -461,23 +461,6 @@ pub trait DomainError:
 impl<T> DomainError for T where
     T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync
 {
-}
-
-/// Errors that can occur when loading all aggregate IDs.
-#[derive(Debug, thiserror::Error)]
-pub enum LoadAllIdsError {
-    #[error("Database error: {0}")]
-    Sql(#[from] sqlx::Error),
-    #[error(
-        "Found unparseable aggregate IDs for {aggregate_type}: \
-         {ids:?}"
-    )]
-    InvalidIds {
-        aggregate_type: &'static str,
-        ids: Vec<String>,
-    },
-    #[error("Numeric conversion error: {0}")]
-    NumericConversion(#[from] std::num::TryFromIntError),
 }
 
 #[cfg(test)]
@@ -1242,9 +1225,46 @@ mod tests {
         insert_event(&pool, "Widget", "10").await;
         insert_event(&pool, "Widget", "20").await;
 
-        let ids = load_all_ids::<Widget>(&pool).await.unwrap();
+        let ids = sqlite_es::load_all_ids::<NumericId>(&pool, Widget::AGGREGATE_TYPE)
+            .await
+            .unwrap();
 
         assert_eq!(ids, vec![NumericId(10), NumericId(20)]);
+    }
+
+    #[tokio::test]
+    async fn aggregate_ids_deduplicate_event_and_snapshot_rows_before_sorting_and_counting() {
+        let pool = test_pool().await;
+        let store = test_store::<Widget>(pool.clone());
+
+        for id in [2, 10, 3] {
+            store
+                .send(
+                    &NumericId(id),
+                    WidgetCommand::Create {
+                        name: id.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        for id in ["2", "10", "3"] {
+            let snapshot = sqlite_es::load_snapshot(&pool, Widget::AGGREGATE_TYPE, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.current_sequence, 1);
+        }
+
+        let ids = sqlite_es::load_all_ids::<NumericId>(&pool, Widget::AGGREGATE_TYPE)
+            .await
+            .unwrap();
+        let count = sqlite_es::count_aggregates(&pool, Widget::AGGREGATE_TYPE)
+            .await
+            .unwrap();
+
+        assert_eq!(ids, [NumericId(10), NumericId(2), NumericId(3)]);
+        assert_eq!(count, 3);
     }
 
     #[tokio::test]
@@ -1273,14 +1293,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            load_ids_paginated::<Widget>(&pool, 1, 0).await.unwrap(),
+            sqlite_es::load_ids_paginated::<NumericId>(&pool, Widget::AGGREGATE_TYPE, 1, 0)
+                .await
+                .unwrap(),
             [NumericId(1)]
         );
         assert_eq!(
-            load_ids_paginated::<Widget>(&pool, 1, 1).await.unwrap(),
+            sqlite_es::load_ids_paginated::<NumericId>(&pool, Widget::AGGREGATE_TYPE, 1, 1)
+                .await
+                .unwrap(),
             [NumericId(2)]
         );
-        assert_eq!(load_ids_paginated::<Widget>(&pool, 1, 2).await.unwrap(), []);
+        assert_eq!(
+            sqlite_es::load_ids_paginated::<NumericId>(&pool, Widget::AGGREGATE_TYPE, 1, 2)
+                .await
+                .unwrap(),
+            []
+        );
     }
 
     #[tokio::test]
@@ -1298,7 +1327,9 @@ mod tests {
             .unwrap();
         compact_events::<Widget>(&pool).await.unwrap();
 
-        let ids = load_all_ids::<Widget>(&pool).await.unwrap();
+        let ids = sqlite_es::load_all_ids::<NumericId>(&pool, Widget::AGGREGATE_TYPE)
+            .await
+            .unwrap();
 
         assert_eq!(ids, vec![NumericId(30)]);
     }
@@ -1307,7 +1338,9 @@ mod tests {
     async fn load_all_ids_returns_empty_when_no_events() {
         let pool = test_pool().await;
 
-        let ids = load_all_ids::<Widget>(&pool).await.unwrap();
+        let ids = sqlite_es::load_all_ids::<NumericId>(&pool, Widget::AGGREGATE_TYPE)
+            .await
+            .unwrap();
 
         assert!(ids.is_empty());
     }
@@ -1318,22 +1351,22 @@ mod tests {
         insert_event(&pool, "Widget", "42").await;
         insert_event(&pool, "Widget", "not-a-number").await;
 
-        let error = load_all_ids::<Widget>(&pool)
+        let error = sqlite_es::load_all_ids::<NumericId>(&pool, Widget::AGGREGATE_TYPE)
             .await
             .expect_err("should fail when an ID cannot parse");
 
         match error {
-            LoadAllIdsError::InvalidIds {
+            sqlite_es::LoadAllIdsError::InvalidIds {
                 aggregate_type,
                 ids,
             } => {
                 assert_eq!(aggregate_type, "Widget");
                 assert_eq!(ids, vec!["not-a-number"]);
             }
-            LoadAllIdsError::Sql(sql_error) => {
+            sqlite_es::LoadAllIdsError::Sql(sql_error) => {
                 panic!("expected InvalidIds, got Sql: {sql_error}")
             }
-            LoadAllIdsError::NumericConversion(conv_error) => {
+            sqlite_es::LoadAllIdsError::NumericConversion(conv_error) => {
                 panic!("expected InvalidIds, got NumericConversion: {conv_error}")
             }
         }
@@ -1345,7 +1378,9 @@ mod tests {
         insert_event(&pool, "Widget", "1").await;
         insert_event(&pool, "OtherAggregate", "should-be-excluded").await;
 
-        let ids = load_all_ids::<Widget>(&pool).await.unwrap();
+        let ids = sqlite_es::load_all_ids::<NumericId>(&pool, Widget::AGGREGATE_TYPE)
+            .await
+            .unwrap();
 
         assert_eq!(ids, vec![NumericId(1)]);
     }
@@ -1365,7 +1400,9 @@ mod tests {
             .unwrap();
         compact_events::<Widget>(&pool).await.unwrap();
 
-        let count = count_aggregates::<Widget>(&pool).await.unwrap();
+        let count = sqlite_es::count_aggregates(&pool, Widget::AGGREGATE_TYPE)
+            .await
+            .unwrap();
 
         assert_eq!(count, 1);
     }

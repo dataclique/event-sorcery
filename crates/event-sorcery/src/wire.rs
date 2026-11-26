@@ -55,10 +55,7 @@ use crate::{
     Table, UnmaterializedStoreBackend,
 };
 #[cfg(any(test, feature = "sqlite"))]
-use crate::{
-    LoadAllIdsError, ProjectionError, Reconciler, SchemaReconciliation, SqliteBackend,
-    SqliteViewBackend,
-};
+use crate::{ProjectionError, Reconciler, SchemaReconciliation, SqliteBackend, SqliteViewBackend};
 
 /// Builder for a single CQRS framework.
 ///
@@ -309,125 +306,6 @@ pub async fn send_command<Entity: EventSourced>(
 #[cfg(any(test, feature = "sqlite"))]
 pub async fn compact_events<Entity: EventSourced>(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
     sqlite_es::compact_events(pool, Entity::AGGREGATE_TYPE, Entity::COMPACTION_POLICY).await
-}
-
-/// Load all aggregate IDs for a given entity type.
-///
-/// Queries events and snapshots for distinct aggregate IDs. Used by dashboard
-/// transfer loading to enumerate all transfer aggregates without requiring
-/// access to a [`Store`].
-///
-/// Returns an error if any stored aggregate ID fails to parse,
-/// since that indicates data corruption or a schema mismatch.
-///
-/// # Errors
-///
-/// Returns `LoadAllIdsError` on database errors or if stored aggregate
-/// IDs fail to parse.
-#[cfg(any(test, feature = "sqlite"))]
-pub async fn load_all_ids<Entity: EventSourced>(
-    pool: &SqlitePool,
-) -> Result<Vec<Entity::Id>, LoadAllIdsError>
-where
-    <Entity::Id as FromStr>::Err: Debug,
-{
-    let rows = sqlite_es::load_all_ids(pool, Entity::AGGREGATE_TYPE).await?;
-
-    let (ids, invalid) = rows.into_iter().fold(
-        (Vec::new(), Vec::new()),
-        |(mut ids, mut invalid), id_str| {
-            match id_str.parse::<Entity::Id>() {
-                Ok(id) => ids.push(id),
-                Err(parse_error) => {
-                    tracing::warn!(
-                        aggregate_id = id_str,
-                        aggregate_type = Entity::AGGREGATE_TYPE,
-                        ?parse_error,
-                        "Failed to parse aggregate ID"
-                    );
-                    invalid.push(id_str);
-                }
-            }
-            (ids, invalid)
-        },
-    );
-
-    if invalid.is_empty() {
-        Ok(ids)
-    } else {
-        Err(LoadAllIdsError::InvalidIds {
-            aggregate_type: Entity::AGGREGATE_TYPE,
-            ids: invalid,
-        })
-    }
-}
-
-/// Load up to `limit` aggregate IDs starting from `offset`.
-///
-/// Orders IDs by descending maximum rowid across each aggregate's events and
-/// snapshot, not by creation time. An append can change the order; ties have
-/// no guaranteed order.
-///
-/// # Errors
-///
-/// Returns `LoadAllIdsError` on database errors or unparseable IDs.
-#[cfg(any(test, feature = "sqlite"))]
-pub async fn load_ids_paginated<Entity: EventSourced>(
-    pool: &SqlitePool,
-    limit: usize,
-    offset: usize,
-) -> Result<Vec<Entity::Id>, LoadAllIdsError>
-where
-    <Entity::Id as FromStr>::Err: Debug,
-{
-    let rows = sqlite_es::load_ids_paginated(
-        pool,
-        Entity::AGGREGATE_TYPE,
-        i64::try_from(limit)?,
-        i64::try_from(offset)?,
-    )
-    .await?;
-
-    let (ids, invalid) = rows.into_iter().fold(
-        (Vec::new(), Vec::new()),
-        |(mut ids, mut invalid), id_str| {
-            match id_str.parse::<Entity::Id>() {
-                Ok(id) => ids.push(id),
-                Err(parse_error) => {
-                    tracing::warn!(
-                        aggregate_id = id_str,
-                        aggregate_type = Entity::AGGREGATE_TYPE,
-                        ?parse_error,
-                        "Failed to parse aggregate ID (paginated)"
-                    );
-                    invalid.push(id_str);
-                }
-            }
-            (ids, invalid)
-        },
-    );
-
-    if invalid.is_empty() {
-        Ok(ids)
-    } else {
-        Err(LoadAllIdsError::InvalidIds {
-            aggregate_type: Entity::AGGREGATE_TYPE,
-            ids: invalid,
-        })
-    }
-}
-
-/// Count the total number of distinct aggregates of this type.
-///
-/// # Errors
-///
-/// Returns `LoadAllIdsError` on database failure or numeric conversion error.
-#[cfg(any(test, feature = "sqlite"))]
-pub async fn count_aggregates<Entity: EventSourced>(
-    pool: &SqlitePool,
-) -> Result<usize, LoadAllIdsError> {
-    let count = sqlite_es::count_aggregates(pool, Entity::AGGREGATE_TYPE).await?;
-    Ok(usize::try_from(count)?)
 }
 
 #[cfg(any(test, feature = "test-support"))]

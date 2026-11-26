@@ -17,9 +17,10 @@ use std::time::{Duration, Instant};
 use sqlx::SqlitePool;
 
 use event_sorcery::{
-    Clock, JobInput, JobRuntime, JobWorkerConfig, SqliteBackend, StoreBuilder,
-    build_supervised_worker, compact_events, count_aggregates, load_entity,
+    Clock, EventSourced, JobInput, JobRuntime, JobWorkerConfig, SqliteBackend, StoreBuilder,
+    build_supervised_worker, compact_events, load_entity,
 };
+use sqlite_es::count_aggregates;
 
 mod audit_log;
 mod inventory;
@@ -158,8 +159,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         order_via_helper.item, order_via_helper.quantity, order_via_helper.status
     );
 
-    let total_orders = count_aggregates::<Order>(&pool).await?;
-    println!("count_aggregates::<Order>    = {total_orders}");
+    let total_orders = count_aggregates(&pool, Order::AGGREGATE_TYPE).await?;
+    println!("order aggregate count        = {total_orders}");
 
     // Order opts into CompactionPolicy::CompactAfterSnapshot so events
     // covered by a snapshot can be reclaimed. SNAPSHOT_SIZE = 1 means every
