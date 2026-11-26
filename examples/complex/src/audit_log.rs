@@ -65,7 +65,7 @@ mod tests {
 
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let store = StoreBuilder::<Order, _>::with_backend(sqlite_es::SqliteBackend { pool: pool })
+        let store = StoreBuilder::<Order, _>::with_backend(sqlite_es::SqliteBackend { pool })
             .with(log.clone())
             .build()
             .await
@@ -103,7 +103,7 @@ mod tests {
 
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let store = StoreBuilder::<Order, _>::with_backend(sqlite_es::SqliteBackend { pool: pool })
+        let store = StoreBuilder::<Order, _>::with_backend(sqlite_es::SqliteBackend { pool })
             .with(Arc::new(spy.clone()))
             .build()
             .await
