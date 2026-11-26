@@ -26,8 +26,8 @@ where
                        sequence,
                        event_type,
                        event_version,
-                       payload,
-                       metadata
+                       CAST(payload AS TEXT) AS payload,
+                       CAST(metadata AS TEXT) AS metadata
                 FROM events
                 WHERE aggregate_type = ?1 AND aggregate_id = ?2
                 ORDER BY sequence
@@ -49,8 +49,8 @@ where
                        sequence,
                        event_type,
                        event_version,
-                       payload,
-                       metadata
+                       CAST(payload AS TEXT) AS payload,
+                       CAST(metadata AS TEXT) AS metadata
                 FROM events
                 WHERE aggregate_type = ?1
                   AND aggregate_id = ?2
@@ -174,8 +174,8 @@ where
                        sequence,
                        event_type,
                        event_version,
-                       payload,
-                       metadata
+                       CAST(payload AS TEXT) AS payload,
+                       CAST(metadata AS TEXT) AS metadata
                 FROM events
                 WHERE aggregate_type = ?1 AND aggregate_id = ?2
                 ORDER BY sequence
@@ -197,8 +197,8 @@ where
                        sequence,
                        event_type,
                        event_version,
-                       payload,
-                       metadata
+                       CAST(payload AS TEXT) AS payload,
+                       CAST(metadata AS TEXT) AS metadata
                 FROM events
                 WHERE aggregate_type = ?1
                   AND aggregate_id = ?2

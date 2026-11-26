@@ -915,6 +915,27 @@ mod tests {
                 .unwrap(),
             events[1..]
         );
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new(TestAggregate::TYPE, "numeric");
+        let page_size = std::num::NonZeroUsize::new(2).unwrap();
+        let byte_budget = std::num::NonZeroUsize::new(512).unwrap();
+        for (checkpoint, expected) in [(None, events.as_slice()), (Some(1), &events[1..])] {
+            assert_eq!(
+                engine
+                    .load_events_page(&stream, checkpoint, page_size)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                engine
+                    .load_events_page_bounded(&stream, checkpoint, page_size, byte_budget)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+
         for aggregate_id in [Some("numeric".to_string()), None] {
             let mut replay = sqlite_es::replay_events::<StoredEventRow>(
                 &pool,
