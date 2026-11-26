@@ -11,7 +11,9 @@ pub async fn projection_rows(
     table: &'static str,
 ) -> Result<Vec<(String, String)>, sqlx::Error> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT view_id, payload FROM {table}"
+        "SELECT view_id, payload
+         FROM {table}
+         ORDER BY view_id ASC"
     )))
     .fetch_all(pool)
     .await

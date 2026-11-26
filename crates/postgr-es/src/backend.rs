@@ -501,6 +501,32 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn load_all_orders_views_by_id_not_insertion_order(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, _>::with_backend(PostgresBackend { pool })
+                .build()
+                .await
+                .unwrap();
+        for (id, text) in [("z", "last"), ("a", "first")] {
+            store.send(&id.to_owned(), text.to_owned()).await.unwrap();
+        }
+
+        let rows = projection.load_all().await.unwrap();
+        let entries: Vec<_> = rows
+            .into_iter()
+            .map(|(id, note)| (id, note.history))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("a".to_owned(), vec!["first".to_owned()]),
+                ("z".to_owned(), vec!["last".to_owned()])
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn projected_builder_queries_and_recovers_with_one_connection(pool: PgPool) {
         let pool = projected_pool(pool).await;
         let backend = PostgresBackend { pool: pool.clone() };

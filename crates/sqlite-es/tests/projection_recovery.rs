@@ -244,6 +244,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_all_orders_views_by_id_not_insertion_order() {
+        let pool = setup_catch_up_db().await;
+        insert_stale_view(&pool, "z", 1, &Counter { value: 2 }).await;
+        insert_stale_view(&pool, "a", 1, &Counter { value: 1 }).await;
+        let projection = Projection::<Counter, SqliteViewBackend>::with_backend(pool);
+
+        assert_eq!(
+            projection.load_all().await.unwrap(),
+            [
+                ("a".to_owned(), Counter { value: 1 }),
+                ("z".to_owned(), Counter { value: 2 })
+            ],
+        );
+    }
+
+    #[tokio::test]
     async fn catch_up_replays_missed_events() {
         let pool = setup_catch_up_db().await;
 

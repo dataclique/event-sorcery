@@ -194,7 +194,9 @@ impl NativeProjectionBackend for PostgresViewBackend {
     ) -> Result<Vec<(String, String)>, sqlx::Error> {
         let table = indexed_query::quote_identifier(table);
         sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT view_id, payload::text FROM {table}"
+            "SELECT view_id, payload::text
+             FROM {table}
+             ORDER BY view_id ASC"
         )))
         .fetch_all(source)
         .await
