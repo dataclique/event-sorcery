@@ -22,9 +22,9 @@ const ENGINE_PAYLOAD_PROVENANCE: &str = "opaque-v1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamIdentity {
     /// Aggregate type namespace stored with each event.
-    pub(crate) aggregate_type: String,
+    pub aggregate_type: String,
     /// Aggregate identifier within that namespace.
-    pub(crate) aggregate_id: String,
+    pub aggregate_id: String,
 }
 
 /// Constructs and compares storage-boundary stream identities.
@@ -224,7 +224,17 @@ impl SnapshotUpdate {
         )
     }
 
-    pub(crate) fn sequence_for(&self, events: &[SerializedEvent]) -> Result<usize, EngineError> {
+    /// Resolves the snapshot's coverage against the events in the committed batch.
+    pub fn prepare(self, events: &[SerializedEvent]) -> Result<PreparedSnapshot, EngineError> {
+        let last_sequence = self.sequence_for(events)?;
+        Ok(PreparedSnapshot {
+            aggregate: self.aggregate,
+            snapshot_version: self.snapshot_version,
+            last_sequence,
+        })
+    }
+
+    fn sequence_for(&self, events: &[SerializedEvent]) -> Result<usize, EngineError> {
         let current = events
             .last()
             .ok_or(EngineError::EmptySnapshotUpdate)?
@@ -360,6 +370,18 @@ impl JobSeed {
             run_at_ms,
         })
     }
+
+    /// Serializes the enqueue event that starts this job's durable stream.
+    pub fn event(&self) -> Result<SerializedEvent, crate::JobStoreError> {
+        let Self(request) = self;
+        crate::job::enqueued_event(request)
+    }
+
+    /// Serializes the initial queue row for the same job.
+    pub fn queue_payload(&self) -> Result<String, crate::JobStoreError> {
+        let Self(request) = self;
+        crate::job::pending_seed_payload(request)
+    }
 }
 
 impl<'events> CommitRequest<'events> {
@@ -478,21 +500,14 @@ impl<'events> CommitRequest<'events> {
             jobs,
         } = self.check()?;
         let snapshot = snapshot
-            .map(|snapshot| {
-                let last_sequence = snapshot.sequence_for(events)?;
-                Ok::<_, EngineError>(PreparedSnapshot {
-                    aggregate: snapshot.aggregate,
-                    snapshot_version: snapshot.snapshot_version,
-                    last_sequence,
-                })
-            })
+            .map(|snapshot| snapshot.prepare(events))
             .transpose()?;
         let jobs = jobs
             .iter()
-            .map(|JobSeed(request)| {
+            .map(|job| {
                 Ok::<_, EngineError>(PreparedJob {
-                    event: crate::job::enqueued_event(request)?,
-                    queue_payload: crate::job::pending_seed_payload(request)?,
+                    event: job.event()?,
+                    queue_payload: job.queue_payload()?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;

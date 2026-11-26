@@ -9,7 +9,7 @@ use std::sync::Arc;
 use sqlite_es::{SqliteJobError, StoredEventRow};
 
 use super::{
-    CheckedCommit, CommitRequest, EngineError, JobSeed, OpaqueCommitRequest, OpaqueStoredEvent,
+    CheckedCommit, CommitRequest, EngineError, OpaqueCommitRequest, OpaqueStoredEvent,
     StreamIdentity,
 };
 use crate::job_store::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
@@ -271,16 +271,16 @@ pub(crate) async fn commit_serialized(
             jobs,
         },
         |snapshot| {
-            let current_sequence = snapshot.sequence_for(events)?;
+            let snapshot = snapshot.prepare(events)?;
             Ok(SerializedSnapshot {
                 aggregate_id: stream.aggregate_id.clone(),
                 aggregate: snapshot.aggregate,
-                current_sequence,
+                current_sequence: snapshot.last_sequence,
                 current_snapshot: snapshot.snapshot_version,
             })
         },
-        |JobSeed(request)| Ok(crate::job::enqueued_event(request)?),
-        |JobSeed(request)| Ok(crate::job::pending_seed_payload(&request)?),
+        |job| Ok(job.event()?),
+        |job| Ok(job.queue_payload()?),
     )
     .await
 }
@@ -340,7 +340,7 @@ mod tests {
         EnqueueRequest, JobId, JobKind, JobStoreError, WorkerId, enqueued_event,
         pending_seed_payload, plan_claim,
     };
-    use crate::{CompactionPolicy, ReconcileError, SnapshotUpdate};
+    use crate::{CompactionPolicy, JobSeed, ReconcileError, SnapshotUpdate};
 
     #[tokio::test]
     async fn migrate_initializes_the_existing_sqlite_schema() {
@@ -778,6 +778,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(engine.current_version(&stream).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn durable_conflict_precedes_snapshot_validation() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("inventory", "widget");
+        let first = [serialized_event(&stream, 1)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &first))
+            .await
+            .unwrap();
+
+        let (_, snapshot) = SnapshotUpdate::from_serialized(SerializedSnapshot {
+            aggregate_id: stream.aggregate_id.clone(),
+            aggregate: serde_json::json!({"quantity": 9}),
+            current_sequence: 2,
+            current_snapshot: 1,
+        });
+        let stale = [serialized_event(&stream, 1)];
+        let error = engine
+            .commit(
+                CommitRequest::new(stream.clone(), &stale)
+                    .at_expected_version(0)
+                    .with_snapshot(snapshot)
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EngineError::OptimisticLock));
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), first);
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
     }
 
     /// Deletes exactly the event prefix the stream's snapshot already covers.
