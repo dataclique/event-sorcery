@@ -236,6 +236,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_after_snapshot_preserves_suffix_and_uncovered_streams() {
+        type PartialSnapshot = WindowedWidget<2, 3>;
+
+        let pool = test_pool().await;
+        let backend = SqliteBackend { pool: pool.clone() };
+        let store = test_store::<PartialSnapshot, _>(&backend);
+        let unrelated = test_store::<Widget, _>(&backend);
+        let covered = NumericId(1);
+        let uncovered = NumericId(2);
+        for id in [&covered, &uncovered] {
+            store
+                .send(
+                    id,
+                    WidgetCommand::Create {
+                        name: "first".to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        unrelated
+            .send(
+                &covered,
+                WidgetCommand::Create {
+                    name: "unrelated".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        for name in ["second", "third", "fourth"] {
+            store
+                .send(
+                    &covered,
+                    WidgetCommand::Rename {
+                        name: name.to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let snapshots: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT aggregate_type, aggregate_id, last_sequence
+             FROM snapshots ORDER BY aggregate_type, aggregate_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshots,
+            [
+                ("Widget".to_owned(), "1".to_owned(), 1),
+                ("WindowedWidget".to_owned(), "1".to_owned(), 3)
+            ]
+        );
+
+        let deleted = sqlite_es::compact_events(
+            &pool,
+            PartialSnapshot::AGGREGATE_TYPE,
+            CompactionPolicy::CompactAfterSnapshot,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(deleted, 3);
+        let retained: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT aggregate_type, aggregate_id, sequence
+             FROM events ORDER BY aggregate_type, aggregate_id, sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            [
+                ("Widget".to_owned(), "1".to_owned(), 1),
+                ("WindowedWidget".to_owned(), "1".to_owned(), 4),
+                ("WindowedWidget".to_owned(), "2".to_owned(), 1)
+            ]
+        );
+        assert_eq!(
+            store.load(&covered).await.unwrap(),
+            Some(PartialSnapshot {
+                name: "fourth".to_owned()
+            })
+        );
+        assert_eq!(
+            store.load(&uncovered).await.unwrap(),
+            Some(PartialSnapshot {
+                name: "first".to_owned()
+            })
+        );
+        assert_eq!(
+            unrelated.load(&covered).await.unwrap(),
+            Some(Widget {
+                name: "unrelated".to_owned()
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn load_entity_uses_snapshot_after_events_are_compacted() {
         let pool = test_pool().await;
         let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
@@ -909,6 +1009,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(ids, vec![NumericId(30)]);
+    }
+
+    #[tokio::test]
+    async fn paginated_ids_use_descending_snapshot_rowids_for_snapshot_only_streams() {
+        let pool = test_pool().await;
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
+        for id in [3, 12, 2] {
+            store
+                .send(
+                    &NumericId(id),
+                    WidgetCommand::Create {
+                        name: id.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            sqlite_es::compact_events(&pool, Widget::AGGREGATE_TYPE, Widget::COMPACTION_POLICY)
+                .await
+                .unwrap(),
+            3
+        );
+
+        let first = sqlite_es::load_ids_paginated::<NumericId>(&pool, Widget::AGGREGATE_TYPE, 2, 0)
+            .await
+            .unwrap();
+        let second =
+            sqlite_es::load_ids_paginated::<NumericId>(&pool, Widget::AGGREGATE_TYPE, 2, 2)
+                .await
+                .unwrap();
+
+        assert_eq!(first, [NumericId(2), NumericId(12)]);
+        assert_eq!(second, [NumericId(3)]);
     }
 
     #[tokio::test]
