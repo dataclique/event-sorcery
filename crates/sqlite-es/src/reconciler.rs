@@ -100,7 +100,6 @@ impl Reconciler {
     /// marker, and a crash before it leaves the version unadvanced so the whole
     /// recovery re-runs on the next startup. The snapshot clear is idempotent,
     /// so re-running is safe.
-    #[allow(clippy::cognitive_complexity)]
     pub async fn reconcile<Entity: EventSourced>(
         &self,
     ) -> Result<SchemaReconciliation, ReconcileError> {

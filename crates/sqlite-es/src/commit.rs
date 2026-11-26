@@ -9,19 +9,19 @@ use crate::{
 };
 
 /// Validated event batch with domain inputs that the caller prepares at write time.
-pub struct Commit<'events, Snapshot, Job> {
+pub(crate) struct Commit<'events, Snapshot, Job> {
     /// Aggregate type of the stream being written.
-    pub aggregate_type: &'events str,
+    pub(crate) aggregate_type: &'events str,
     /// ID of the stream being written.
-    pub aggregate_id: &'events str,
+    pub(crate) aggregate_id: &'events str,
     /// Required durable stream version, if the caller supplied one.
-    pub expected_version: Option<usize>,
+    pub(crate) expected_version: Option<usize>,
     /// Validated contiguous events for the stream.
-    pub events: &'events [SerializedEvent],
+    pub(crate) events: &'events [SerializedEvent],
     /// Optional snapshot input, with coverage resolved after the event append.
-    pub snapshot: Option<Snapshot>,
+    pub(crate) snapshot: Option<Snapshot>,
     /// Job intents whose events and queue rows are part of the same transaction.
-    pub jobs: Vec<Job>,
+    pub(crate) jobs: Vec<Job>,
 }
 
 /// Persists an event batch, its snapshot, and its jobs under one SQLite write lock.
@@ -29,7 +29,7 @@ pub struct Commit<'events, Snapshot, Job> {
 /// Preparation does not borrow the connection. It runs at the corresponding write
 /// step so stale writers and database failures keep their existing precedence over
 /// later validation failures. Dropping the transaction rolls back every write.
-pub async fn commit_atomic<Snapshot, Job, Error>(
+pub(crate) async fn commit_atomic<Snapshot, Job, Error>(
     pool: &SqlitePool,
     commit: Commit<'_, Snapshot, Job>,
     prepare_snapshot: impl FnOnce(Snapshot) -> Result<SerializedSnapshot, Error> + Send,

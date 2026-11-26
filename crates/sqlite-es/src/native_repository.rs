@@ -9,12 +9,10 @@ use cqrs_es::persist::{
     SerializedSnapshot,
 };
 use serde_json::Value;
-
 use sqlx::SqlitePool;
 
-use event_sorcery_core::CompactionPolicy;
-
 use event_sorcery::{CommitRequest, SnapshotUpdate, guard_snapshot};
+use event_sorcery_core::CompactionPolicy;
 
 use crate::engine::commit_serialized;
 use crate::{StoredEventRow, load_event_rows, load_snapshot, replay_events};

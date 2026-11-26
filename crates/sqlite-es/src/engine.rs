@@ -12,6 +12,7 @@ use event_sorcery::{
     StreamIdentity,
 };
 
+use crate::commit::{Commit, commit_atomic};
 use crate::{Reconciler, SqliteJobError, StoredEventRow};
 
 /// Snapshot state stored independently after replaying through a known sequence.
@@ -256,9 +257,9 @@ pub(crate) async fn commit_serialized(
         jobs,
         ..
     } = request;
-    crate::commit_atomic(
+    commit_atomic(
         pool,
-        crate::Commit {
+        Commit {
             aggregate_type: &stream.aggregate_type,
             aggregate_id: &stream.aggregate_id,
             expected_version,

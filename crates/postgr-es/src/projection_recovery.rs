@@ -1,12 +1,12 @@
 //! PostgreSQL I/O for the shared materialized-view replay algorithm.
 
-use indexed_query::quote_identifier;
 use sqlx::{AssertSqlSafe, PgConnection};
 use std::num::NonZeroU64;
 
 use event_sorcery::{
     ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow, Table,
 };
+use indexed_query::quote_identifier;
 
 pub(crate) struct PostgresProjectionRecovery<'connection> {
     /// Connection borrowed from the transaction that also owns schema registration.
