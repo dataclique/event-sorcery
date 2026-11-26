@@ -24,7 +24,7 @@ mod tests {
     use tokio::{sync::Notify, time::timeout};
 
     use event_sorcery::*;
-    use sqlite_es::{SqliteBackend, testing::create_test_pool};
+    use sqlite_es::{SqliteBackend, insert_serialized_events_batch, testing::create_test_pool};
 
     #[derive(Serialize, Deserialize)]
     struct TestJob {
@@ -582,6 +582,287 @@ mod tests {
             JobWorkerConfig::default(),
             Clock::system(),
             { TestJob => () }
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_appends_claimed_and_marks_the_row() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1000).await;
+
+        let outcome = runtime
+            .claim_job(job_id, "w1", 1000, 30_000, 50)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            JobClaimResult::Claimed(ref job) if job.handle.is_first_execution()
+        ));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed"]
+        );
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("claimed")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_facade_reports_a_refused_settlement_as_terminal() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1_000).await;
+
+        let JobClaimResult::Claimed(claimed) = runtime
+            .claim_job(job_id, "ffi-worker", 1_000, 30_000, 50)
+            .await
+            .unwrap()
+        else {
+            panic!("expected the facade to win the claim");
+        };
+
+        // A stray `Enqueued` on an already-claimed stream is an event the job
+        // entity cannot evolve, so replay lands the lifecycle in `Failed` and
+        // the aggregate refuses every later command.
+        let mut stray = JobSeed::new(job_id, TestJob::KIND, serde_json::json!({"n": 1}), 1_000)
+            .event()
+            .unwrap();
+        stray.sequence = 3;
+        let mut connection = pool.acquire().await.unwrap();
+        insert_serialized_events_batch(&mut connection, "events", std::slice::from_ref(&stray))
+            .await
+            .unwrap();
+        drop(connection);
+
+        let error = runtime.acknowledge_job(claimed.handle).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            JobRuntimeError::SettlementRefused { job_id: refused, .. } if refused == job_id
+        ));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed", "JobEnqueued"]
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_enqueue_seeds_a_claimable_pending_job() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+
+        let job_id = runtime.enqueue(TestJob { n: 7 }).await.unwrap();
+
+        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
+        );
+
+        // A standalone-enqueued job is claimable like any handler-pushed one.
+
+        let now_ms = Utc::now().timestamp_millis() + 1_000;
+        let outcome = runtime
+            .claim_job(job_id, "w1", now_ms, 30_000, 50)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, JobClaimResult::Claimed(_)));
+        assert_eq!(
+            event_types(&pool, &job_id).await,
+            ["JobEnqueued", "JobClaimed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn job_queue_rebuilds_from_the_job_event_stream() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = runtime.enqueue(TestJob { n: 7 }).await.unwrap();
+
+        sqlx::query(
+            r"
+            DELETE FROM job_queue_projection
+            WHERE view_id = ?1
+            ",
+        )
+        .bind(job_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(queue_status(&pool, &job_id).await, None);
+
+        let _rebuilt = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+
+        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_enqueue_with_delay_is_not_runnable_until_run_at() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+
+        let job_id = runtime
+            .enqueue_with_delay(TestJob { n: 1 }, std::time::Duration::from_hours(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            queue_status(&pool, &job_id).await.as_deref(),
+            Some("pending")
+        );
+
+        // run_at is an hour out, so a poll at "now" finds nothing runnable.
+        let now_ms = Utc::now().timestamp_millis();
+        let found = runtime.poll_jobs(TestJob::KIND, now_ms, 16).await.unwrap();
+        assert!(
+            found.is_empty(),
+            "a delayed standalone enqueue must not be runnable before its run_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_a_reused_job_id() {
+        let pool = create_test_pool().await.unwrap();
+
+        let backend = SqliteBackend { pool: pool.clone() };
+        let id = JobId::new();
+        let seed = JobSeed::new(id, TestJob::KIND, serde_json::json!({"n": 1}), 1_000);
+        let payload = seed.queue_payload().unwrap();
+
+        backend
+            .enqueue(seed.event().unwrap(), payload.clone())
+            .await
+            .unwrap();
+        let error = backend
+            .enqueue(seed.event().unwrap(), payload)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            sqlite_es::SqliteJobError::DuplicateEnqueue { job_id } if job_id == id.to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn second_sequential_claim_is_not_runnable() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1000).await;
+
+        let first = runtime
+            .claim_job(job_id, "w1", 1000, 30_000, 50)
+            .await
+            .unwrap();
+        let second = runtime
+            .claim_job(job_id, "w2", 1000, 30_000, 50)
+            .await
+            .unwrap();
+
+        assert!(matches!(first, JobClaimResult::Claimed(_)));
+        assert!(matches!(second, JobClaimResult::Skipped));
+        let claimed = event_types(&pool, &job_id)
+            .await
+            .iter()
+            .filter(|event| *event == "JobClaimed")
+            .count();
+        assert_eq!(claimed, 1);
+    }
+
+    #[tokio::test]
+    async fn claimed_job_is_not_runnable_before_its_lease_expires() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1000).await;
+        runtime
+            .claim_job(job_id, "w1", 1000, 30_000, 50)
+            .await
+            .unwrap();
+
+        let found = runtime
+            .poll_jobs(TestJob::KIND, 1000 + 5_000, 16)
+            .await
+            .unwrap();
+        assert_eq!(found, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn expired_lease_is_reclaimable_without_counting_an_attempt() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1000).await;
+        runtime
+            .claim_job(job_id, "w1", 1000, 30_000, 50)
+            .await
+            .unwrap();
+
+        let later = 1000 + 31_000;
+        let outcome = runtime
+            .claim_job(job_id, "w2", later, 30_000, 50)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            JobClaimResult::Claimed(ref job) if job.handle.attempt() == 0 && !job.handle.is_first_execution()
+        ));
+    }
+
+    #[tokio::test]
+    async fn claim_budget_dead_letters_a_crash_loop() {
+        let pool = create_test_pool().await.unwrap();
+        let runtime = JobRuntime::build(SqliteBackend { pool: pool.clone() })
+            .await
+            .unwrap();
+        let job_id = enqueue(&runtime, 1000).await;
+
+        // max_claims = 2: claim twice (advancing past each lease), the third
+        // claim exhausts the budget and dead-letters as abandoned.
+        let mut now = 1000;
+        for _ in 0..2 {
+            let outcome = runtime
+                .claim_job(job_id, "w1", now, 30_000, 2)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, JobClaimResult::Claimed(_)));
+            now += 31_000;
+        }
+
+        let outcome = runtime
+            .claim_job(job_id, "w1", now, 30_000, 2)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, JobClaimResult::Abandoned));
+        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("dead"));
+        assert!(
+            event_types(&pool, &job_id)
+                .await
+                .contains(&"JobDead".to_string())
         );
     }
 }
