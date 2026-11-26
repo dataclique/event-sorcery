@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-    struct Tally {
+    struct Tally<const VERSION: u64 = 1> {
         count: u64,
     }
 
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl EventSourced for Tally {
+    impl<const VERSION: u64> EventSourced for Tally<VERSION> {
         type Id = String;
         type Error = Never;
         type Command = ();
@@ -214,7 +214,7 @@ mod tests {
         type Jobs = Nil;
 
         const PROJECTION: Table = Table("tally_view");
-        const SCHEMA_VERSION: u64 = 1;
+        const SCHEMA_VERSION: u64 = VERSION;
         const SNAPSHOT_SIZE: usize = 10;
         const AGGREGATE_TYPE: &'static str = "Tally";
         const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
@@ -233,13 +233,102 @@ mod tests {
             }
         }
 
-        async fn initialize(_command: ()) -> Result<Effect<Self>, Never> {
-            uneventful()
+        async fn initialize((): ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![TallyEvent::Bumped]))
         }
 
-        async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
-            uneventful()
+        async fn transition(&self, (): ()) -> Result<Effect<Self>, Never> {
+            Self::initialize(()).await
         }
+    }
+
+    #[tokio::test]
+    async fn startup_rebuild_failure_restores_views_and_leaves_registry_unchanged() {
+        let pool = sqlite_es::testing::create_test_pool().await.unwrap();
+        let backend = SqliteBackend { pool: pool.clone() };
+        sqlx::query(
+            "CREATE TABLE tally_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (store, _) = StoreBuilder::<Tally, _>::with_backend(backend.clone())
+            .build()
+            .await
+            .unwrap();
+        for id in ["a", "z"] {
+            store.send(&id.to_owned(), ()).await.unwrap();
+        }
+        drop(store);
+
+        sqlx::query("UPDATE tally_view SET payload = ?")
+            .bind(r#"{"Live":{"count":77}}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = sqlite_es::projection_rows(&pool, "tally_view")
+            .await
+            .unwrap();
+        let registry = sqlite_es::load_schema_registry_payloads(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_second_rebuild
+             BEFORE INSERT ON tally_view
+             WHEN NEW.view_id = 'z' AND EXISTS (SELECT 1 FROM tally_view WHERE view_id = 'a')
+             BEGIN SELECT RAISE(ABORT, 'second stream rejected'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = StoreBuilder::<Tally<2>, _>::with_backend(backend.clone())
+            .build()
+            .await;
+
+        let Err(event_sorcery::ReconcileError::Sqlx(sqlx::Error::Database(error))) = result else {
+            panic!("expected the second rebuild write to fail");
+        };
+        assert_eq!(error.message(), "second stream rejected");
+        assert_eq!(
+            sqlite_es::projection_rows(&pool, "tally_view")
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            sqlite_es::load_schema_registry_payloads(&pool)
+                .await
+                .unwrap(),
+            registry
+        );
+
+        sqlx::query("DROP TRIGGER reject_second_rebuild")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, projection) = StoreBuilder::<Tally<2>, _>::with_backend(backend)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            projection.load_all().await.unwrap(),
+            [
+                ("a".to_owned(), Tally { count: 1 }),
+                ("z".to_owned(), Tally { count: 1 })
+            ]
+        );
+        let registry = sqlite_es::load_schema_registry_payloads(&pool)
+            .await
+            .unwrap();
+        let registry = event_sorcery::SchemaRegistry::from_payloads(registry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.version_of("Tally"), Some(2));
     }
 
     /// A schema-version change (here, the first build, when no stored version
