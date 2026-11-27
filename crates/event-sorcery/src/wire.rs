@@ -179,6 +179,9 @@ impl<Entity: EventSourced<Materialized = Nil>, Backend: UnmaterializedStoreBacke
 
 /// Reconstructs an entity from its snapshot and events without a [`Store`].
 ///
+/// The caller must reconcile the entity's schema before loading. This helper
+/// does not invalidate snapshots after a schema change.
+///
 /// Returns an error if reading storage or reconstructing the entity fails.
 pub async fn load_entity<Entity: EventSourced>(
     backend: &impl PersistenceBackend,
@@ -202,6 +205,9 @@ pub async fn load_entity<Entity: EventSourced>(
 /// handler enqueues flush with the events), and discards the framework.
 /// Useful in CLI contexts where you need to send a command but don't have
 /// (or need) a full server-lifetime Store.
+///
+/// The caller must reconcile the entity's schema before sending commands.
+/// This helper loads state without running startup reconciliation.
 pub async fn send_command<Entity: EventSourced>(
     backend: &impl PersistenceBackend,
     id: &Entity::Id,
