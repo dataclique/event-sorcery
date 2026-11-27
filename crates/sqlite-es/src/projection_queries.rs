@@ -21,7 +21,8 @@ pub async fn projection_rows(
 
 /// Validates a projection column and reads matching rows in ID order.
 ///
-/// The table and column must be trusted SQL identifiers from application code.
+/// The table must be a trusted SQL identifier from application code. The
+/// column is the literal name as stored in the table schema.
 /// The filter value is bound as a query parameter.
 pub async fn filter_projection<Value>(
     pool: &SqlitePool,
@@ -42,23 +43,19 @@ where
         return Err(SqliteProjectionFilterError::ColumnNotFound);
     }
 
-    let row_count: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
-        .fetch_one(pool)
-        .await?;
-    if row_count > 0 {
-        let non_null_count: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL"
-        )))
-        .fetch_one(pool)
-        .await?;
-        if non_null_count == 0 {
-            warn!(%column, %table, row_count, "Generated column has all NULL values, likely stale JSON path");
-            return Err(SqliteProjectionFilterError::StaleColumn { row_count });
-        }
+    let quoted_column = indexed_query::quote_identifier(column);
+    let (row_count, non_null_count): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT COUNT(*), COUNT({quoted_column}) FROM {table}"
+    )))
+    .fetch_one(pool)
+    .await?;
+    if row_count > 0 && non_null_count == 0 {
+        warn!(%column, %table, row_count, "Generated column has all NULL values, likely stale JSON path");
+        return Err(SqliteProjectionFilterError::StaleColumn { row_count });
     }
 
     Ok(sqlx::query_as(AssertSqlSafe(format!(
-        "SELECT view_id, payload FROM {table} WHERE {column} = ?1 ORDER BY view_id"
+        "SELECT view_id, payload FROM {table} WHERE {quoted_column} = ?1 ORDER BY view_id"
     )))
     .bind(value)
     .fetch_all(pool)
@@ -87,6 +84,30 @@ mod tests {
     use sqlx::SqlitePool;
 
     use super::{SqliteProjectionFilterError, filter_projection, projection_rows};
+
+    #[tokio::test]
+    async fn filter_accepts_a_column_whose_name_is_a_sql_keyword() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE note_projection (
+                view_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                \"select\" TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO note_projection VALUES ('note', '{}', 'wanted')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = filter_projection(&pool, "note_projection", "select", &"wanted")
+            .await
+            .unwrap();
+        assert_eq!(rows, [("note".to_owned(), "{}".to_owned())]);
+    }
 
     #[tokio::test]
     async fn filter_distinguishes_missing_stale_and_real_matches() {
