@@ -16,7 +16,13 @@ use crate::{Column, EventSourced, ProjectionError, ProjectionRecoveryMode, Table
 /// advances the expected version by exactly one and reports competing writes as
 /// `PersistenceError::OptimisticLockError`, including competing initial inserts.
 /// Recovery may instead install the captured event maximum atomically with its payload.
-/// These rules do not apply to plain `ViewBackend` implementations with opaque revisions.
+/// A live write must not replace a payload that recovery changed after the live
+/// read, even at the same checkpoint. Native backends must fence this race in
+/// [`ViewBackend::try_update`], for example by comparing the observed payload
+/// as well as the checkpoint. The default version-only implementation is valid
+/// only if the backend prevents recovery from replacing state between that read
+/// and write. These rules do not apply to plain `ViewBackend` implementations
+/// with opaque revisions.
 /// Mixing direct unsequenced `Reactor::react` writes with native framework delivery is
 /// unsupported: direct writes cannot establish event coverage.
 pub trait NativeProjectionBackend: ViewBackend {
