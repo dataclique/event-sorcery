@@ -187,10 +187,16 @@ idempotency contracts.
 
 ## 9. Worker wiring
 
+Use `build_supervised_worker!` with a configured SQLite backend and the job's
+input. The macro supports jobs that are `Send` but not `Sync`.
+
 ```rust
 let runtime = JobRuntime::build(backend).await?;
-let worker = EventStoreBackend::<MyJob, _>::new(runtime.clone(), "my-worker", cfg, Clock::system());
-WorkerBuilder::new(name).backend(worker).data(Arc::new(input)).build(run::<MyJob>);
+let monitor = build_supervised_worker!(
+    runtime, JobWorkerConfig::default(), Clock::system(),
+    { MyJob => input }
+);
+monitor.run().await?;
 ```
 
 NO user retry/timeout layer; NO buffering layer outside the ack layer (must
