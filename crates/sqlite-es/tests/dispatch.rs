@@ -143,7 +143,7 @@ mod tests {
             _ctx: &JobContext,
             _input: &(),
         ) -> Result<Reconciliation<String>, JobFailure<OrderRejected>> {
-            Ok(Reconciliation::Settled("filled".to_string()))
+            Ok(Reconciliation::Settled("reconciled".to_string()))
         }
     }
 
