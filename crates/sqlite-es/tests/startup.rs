@@ -351,18 +351,11 @@ mod tests {
         .await
         .unwrap();
 
-        let payload = serde_json::to_string(&TallyEvent::Bumped).unwrap();
-        for sequence in 1..=3 {
-            sqlx::query(
-                "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
-                 event_version, payload, metadata) \
-                 VALUES ('Tally', 'tally-1', ?1, 'TallyEvent::Bumped', '1.0', ?2, '{}')",
-            )
-            .bind(sequence)
-            .bind(&payload)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let backend = SqliteBackend { pool: pool.clone() };
+        let store = event_sorcery::test_store::<Tally, _>(&backend);
+        let id = "tally-1".to_owned();
+        for _ in 0..3 {
+            store.send(&id, ()).await.unwrap();
         }
 
         // A view that is CURRENT (version == max_seq == 3) but holds an
@@ -418,7 +411,22 @@ mod tests {
         let id = "tally-1".to_owned();
         old_store.send(&id, ()).await.unwrap();
         old_store.send(&id, ()).await.unwrap();
+        let incompatible_id = "incompatible".to_owned();
+        old_store.send(&incompatible_id, ()).await.unwrap();
         drop(old_store);
+        let payloads = sqlite_es::load_schema_registry_payloads(&pool)
+            .await
+            .unwrap();
+        let registry = event_sorcery::SchemaRegistry::from_payloads(payloads)
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.version_of("Tally"), Some(0));
+        sqlx::query("UPDATE tally_view SET payload = ? WHERE view_id = ?")
+            .bind(r#"{"Completed":{"count":0}}"#)
+            .bind(&incompatible_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         // A legacy duplicate delivery advanced the revision, not the event stream.
         sqlx::query("UPDATE tally_view SET version = 3 WHERE view_id = ?")
             .bind(&id)
@@ -433,6 +441,10 @@ mod tests {
         assert_eq!(
             projection.load(&id).await.unwrap(),
             Some(Tally { count: 2 })
+        );
+        assert_eq!(
+            projection.load(&incompatible_id).await.unwrap(),
+            Some(Tally { count: 1 })
         );
         let version_query = "SELECT version FROM tally_view WHERE view_id = ?";
         let version: i64 = sqlx::query_scalar(version_query)
