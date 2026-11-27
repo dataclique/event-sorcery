@@ -241,7 +241,10 @@ let pending_orders: Vec<OffchainOrder> = projection
 
 Pass the selected adapter to `StoreBuilder::with_backend`. For SQLite, use
 `sqlite_es::SqliteBackend { pool }`; for PostgreSQL, use
-`postgr_es::PostgresBackend { pool }`.
+`postgr_es::PostgresBackend { pool }`. Before calling `build()`, apply the
+library migrations for the chosen backend, either through
+`PersistenceBackend::bootstrap_persistence()` or your migration runner. For
+projected entities, also apply the application's projection-table migration.
 
 `StoreBuilder` wires reactors to a `Store` at startup and auto-wires projections
 based on the entity's `Materialized` type. It uses type-level linked lists
@@ -336,6 +339,8 @@ SQLite writes with no side effect (HTTP/RPC call, `Store::send` to another
 aggregate, message-queue publish) that would double-fire on retry:
 
 ```rust
+use sqlite_es::{IdempotentReactor, RetryOnBusy};
+
 impl IdempotentReactor for MyReactor {}
 
 let store = StoreBuilder::<MyEntity, _>::with_backend(backend)
@@ -348,14 +353,14 @@ end-to-end -- a reactor that orchestrates across aggregates (like
 `RebalancingTrigger` above) must not, unless the downstream command handler is
 independently confirmed idempotent under re-invocation. For a reactor whose
 `react()` has side effects before its write, call `retry_with_backoff` and
-`is_retryable_sqlite_busy` directly around just the write instead, leaving the
-earlier side effects outside the retry boundary and outside `IdempotentReactor`
-entirely. A `react()` that issues two or more separate, non-transactional SQLite
-statements is unsafe to mark too: if the first commits and a later one hits
-`SQLITE_BUSY`, the retry replays the whole `react()`, re-running the
-already-committed statement. A conforming `react()` must be atomic as a whole --
-a single statement, a single transaction, or written so replaying it is safe
-(upserts, not bare inserts).
+`sqlite_es::is_retryable_sqlite_busy` directly around just the write instead,
+leaving the earlier side effects outside the retry boundary and outside
+`IdempotentReactor` entirely. A `react()` that issues two or more separate,
+non-transactional SQLite statements is unsafe to mark too: if the first commits
+and a later one hits `SQLITE_BUSY`, the retry replays the whole `react()`,
+re-running the already-committed statement. A conforming `react()` must be
+atomic as a whole -- a single statement, a single transaction, or written so
+replaying it is safe (upserts, not bare inserts).
 
 A reactor that does neither still swallows a busy error without retry, leaving
 its write outcome unknown, exactly as before this exists -- opting in is a
@@ -953,8 +958,9 @@ again inside the current execution. The failed-attempt index remains capped at
 implicitly. It must be finite and at least one. The initial delay is capped at
 `cap`; delay scaling and timestamp conversion must fit their supported ranges.
 `Backoff::validate()` checks the configuration, and worker polling rejects an
-invalid configuration with `JobScheduleError` before claiming a job. Worker
-constructors and `build_supervised_worker!` keep their existing signatures.
+invalid configuration with `JobScheduleError` before claiming a job.
+`JobRuntime::build` now takes a backend rather than a SQLite pool.
+`EventStoreBackend::new` and `build_supervised_worker!` keep their call shapes.
 Custom fractional schedules follow `backon` duration rounding rather than the
 former indexed `f64` calculation.
 
