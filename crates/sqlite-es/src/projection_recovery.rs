@@ -27,7 +27,8 @@ pub async fn recover_projection<Error>(
 where
     Error: From<sqlx::Error> + Send,
 {
-    let mut transaction = pool.begin().await?;
+    // Reserve the writer before taking a snapshot that recovery will write from.
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let storage = SqliteProjectionRecovery {
         connection: &mut transaction,
     };
@@ -149,5 +150,53 @@ impl ProjectionRecoveryStorage for SqliteProjectionRecovery<'_> {
         .execute(&mut *self.connection)
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::Connection;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_reserves_the_writer_before_reading() {
+        let options = "sqlite::memory:"
+            .parse::<SqliteConnectOptions>()
+            .unwrap()
+            .busy_timeout(Duration::ZERO);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let mut competitor = pool.acquire().await.unwrap();
+        let (started, wait_for_start) = tokio::sync::oneshot::channel();
+        let (finished, mut wait_for_finish) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            wait_for_start.await.unwrap();
+            let transaction = competitor.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            let _ = finished.send(());
+            transaction.rollback().await.unwrap();
+        });
+
+        recover_projection::<sqlx::Error>(&pool, ProjectionRecoveryMode::CatchUp, |_, _| {
+            Box::pin(async move {
+                started.send(()).unwrap();
+                let pending_writer =
+                    tokio::time::timeout(Duration::from_millis(200), &mut wait_for_finish).await;
+                pending_writer.expect_err("competing writer must wait for recovery to finish");
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
