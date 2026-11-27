@@ -42,13 +42,10 @@ use crate::is_retryable_sqlite_busy;
 ///
 /// `CqrsFramework::execute_with_metadata` awaits every registered reactor's
 /// `dispatch()` synchronously before returning to the command caller, once per
-/// event. Wrapping an `IdempotentReactor` in [`RetryOnBusy`] means a
-/// busy/busy-snapshot conflict -- including one caused by an unrelated writer
-/// on the same database file -- can block that caller for up to the full
-/// retry budget (~4.3s) *per reacted event*: a command that emits multiple
-/// events dispatches the reactor once per event, so the worst-case block is
-/// that budget multiplied by the event count. See `docs/cqrs.md`'s "Retrying
-/// on transient SQLite busy errors" section for the full writeup.
+/// event. With [`RetryOnBusy`], the caller waits for each attempt, including
+/// SQLite's own busy wait, plus up to 4,270 ms of retry sleeps per event.
+/// The sleep budget is not a command timeout. Even writes to other streams
+/// in the same SQLite file can cause contention.
 pub trait IdempotentReactor: Reactor {}
 
 /// Wraps an [`IdempotentReactor`] to retry on transient SQLite busy errors.

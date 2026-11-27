@@ -361,19 +361,12 @@ A reactor that does neither still swallows a busy error without retry, leaving
 its write outcome unknown, exactly as before this exists -- opting in is a
 per-reactor decision, not a blanket fix.
 
-**Latency tradeoff:** `CqrsFramework::execute_with_metadata` awaits every
-registered reactor's `dispatch()` synchronously before returning to the command
-caller, once per event, so a `RetryOnBusy`-wrapped reactor can block that caller
-for up to the full retry budget (~4.3s, see `RETRY_MAX_ATTEMPTS`/
-`RETRY_BASE_DELAY_MS`/`RETRY_MAX_DELAY_MS`) _per reacted event_ whenever a
-busy/busy-snapshot conflict occurs -- including conflicts caused by an unrelated
-writer committing anywhere in the same database file, not just writes to the
-aggregate the command touched. A single command that emits multiple events
-dispatches the reactor once per event, so the worst-case block for that command
-is the retry budget multiplied by the event count, not a flat ~4.3s. Callers
-with tight request timeouts need a budget larger than the retry schedule. This
-is a real behavioral tradeoff (latency vs. lost updates), not just an
-idempotency question -- weigh it before wrapping a reactor in `RetryOnBusy`.
+**Latency tradeoff:** `CqrsFramework::execute_with_metadata` awaits reactor
+delivery before returning to the command caller. For each event, `RetryOnBusy`
+can add up to 4,270 ms of retry sleeps. That is not a timeout: the caller also
+waits for each reactor attempt, including any wait under SQLite's busy timeout.
+Writes to unrelated streams in the same database file can cause contention, and
+a command that emits multiple events can incur those waits for each event.
 
 ## Jobs Pattern
 

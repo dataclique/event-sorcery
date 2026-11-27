@@ -116,7 +116,7 @@ impl Reconciler {
     /// and, for projected entities, view rebuild) has durably completed, so a
     /// recorded version always implies its recovery finished.
     ///
-    /// [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
+    /// [`SCHEMA_VERSION`]: event_sorcery::EventSourced::SCHEMA_VERSION
     pub async fn record_version<Entity: EventSourced>(&self) -> Result<(), ReconcileError> {
         self.record_target(&SchemaTarget::new(
             Entity::AGGREGATE_TYPE,

@@ -803,7 +803,11 @@ pub(crate) struct PendingPush {
     pub(crate) delay: Option<Duration>,
 }
 
-/// Encoded pending jobs whose source buffer remains intact until commit.
+/// Receipt for a batch of prepared jobs.
+///
+/// Call [`Self::mark_committed`] only after the transaction that wrote these
+/// jobs commits. On failure, drop the receipt so the original entries remain
+/// eligible for preparation.
 pub struct PreparedPendingJobs {
     requests: Vec<EnqueueRequest>,
     acknowledgements: Vec<Arc<AtomicBool>>,
