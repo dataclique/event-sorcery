@@ -2,6 +2,9 @@
 
 use cqrs_es::persist::SerializedEvent;
 
+/// Persisted aggregate type shared by job events and queue adapters.
+pub const JOB_AGGREGATE_TYPE: &str = "job";
+
 /// The `job_queue_projection` row as the claim transaction re-reads it, raw. The crate
 /// deserializes `payload` into `Lifecycle<JobState>` itself.
 pub struct ClaimRead {

@@ -28,13 +28,14 @@ use std::time::Duration;
 use tracing::error;
 use ulid::Ulid;
 
+use event_sorcery_core::JOB_AGGREGATE_TYPE;
+
 use crate::dependency::Nil;
 use crate::dispatch::DeliveryPolicy;
 use crate::job_store::{ClaimDecision, ClaimRead};
 use crate::lifecycle::Lifecycle;
 use crate::{CompactionPolicy, EventSourced, Table};
 
-const JOB_AGGREGATE_TYPE: &str = "job";
 const JOB_EVENT_VERSION: &str = "1.0";
 
 /// A durable, retryable worker job with no origin entity.

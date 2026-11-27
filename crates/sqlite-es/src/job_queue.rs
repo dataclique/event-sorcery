@@ -3,7 +3,9 @@
 use cqrs_es::persist::SerializedEvent;
 use sqlx::{SqliteConnection, SqlitePool};
 
-use event_sorcery_core::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
+use event_sorcery_core::{
+    ClaimDecision, ClaimOutcome, ClaimRead, JOB_AGGREGATE_TYPE, LeaseRenewal,
+};
 
 use crate::{SqliteAggregateError, insert_serialized_events_batch};
 
@@ -89,6 +91,9 @@ pub async fn enqueue_job(
 /// Backend-native error for the SQLite job store.
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteJobError {
+    /// The claim decision did not target the next event of the locked job row.
+    #[error("claim event must target the next sequence of the locked job stream")]
+    InvalidClaimEvent,
     /// A direct SQL statement failed.
     #[error("job store SQL error")]
     Sql(#[from] sqlx::Error),
@@ -153,7 +158,21 @@ where
     Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won>,
 {
     let read = read_job_projection_for_claim(connection, job_id).await?;
-    match decide(read) {
+    let version = read.as_ref().map(|row| row.version);
+    let decision = decide(read);
+    let event = match &decision {
+        ClaimDecision::Skip => return Ok(ClaimOutcome::Skip),
+        ClaimDecision::Claim { event, .. } | ClaimDecision::Abandon { event, .. } => event,
+    };
+    let event_sequence = i64::try_from(event.sequence)?;
+    if event.aggregate_type != JOB_AGGREGATE_TYPE
+        || event.aggregate_id != job_id
+        || version.and_then(|version| version.checked_add(1)) != Some(event_sequence)
+    {
+        return Err(SqliteJobError::InvalidClaimEvent);
+    }
+
+    match decision {
         ClaimDecision::Skip => Ok(ClaimOutcome::Skip),
         ClaimDecision::Claim {
             event,
@@ -248,8 +267,65 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Notify;
 
-    use super::{SqliteJobError, TransactionOutcome, immediate_transaction};
+    use event_sorcery::{JobId, JobSeed};
+
+    use super::{
+        ClaimDecision, SqliteJobError, TransactionOutcome, claim_job, enqueue_job,
+        immediate_transaction,
+    };
     use crate::testing::create_test_pool;
+
+    #[tokio::test]
+    async fn claim_decisions_cannot_append_to_a_different_job_or_skip_versions() {
+        let pool = create_test_pool().await.unwrap();
+        let target = JobId::new();
+        let other = JobId::new();
+        let seed = JobSeed::new(target, "fixture", serde_json::json!({}), 0);
+        let initial_event = seed.event().unwrap();
+        let initial_payload = seed.queue_payload().unwrap();
+        enqueue_job(&pool, initial_event.clone(), initial_payload.clone())
+            .await
+            .unwrap();
+        let target_id = target.to_string();
+        for (aggregate_type, aggregate_id, sequence) in [
+            (initial_event.aggregate_type.clone(), other.to_string(), 2),
+            ("other".to_owned(), target_id.clone(), 2),
+            (initial_event.aggregate_type.clone(), target_id.clone(), 3),
+        ] {
+            let event = cqrs_es::persist::SerializedEvent {
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                ..initial_event.clone()
+            };
+            let result = claim_job::<_, ()>(&pool, &target_id, |_| ClaimDecision::Abandon {
+                event,
+                payload: initial_payload.clone(),
+            })
+            .await;
+            assert!(
+                matches!(result, Err(SqliteJobError::InvalidClaimEvent)),
+                "invalid claim event must be refused"
+            );
+            let events: Vec<(String, String, i64)> =
+                sqlx::query_as("SELECT aggregate_type, aggregate_id, sequence FROM events")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                events,
+                [(initial_event.aggregate_type.clone(), target_id.clone(), 1)]
+            );
+            let queue: (i64, String, Option<i64>) = sqlx::query_as(
+                "SELECT version, payload, lease_until FROM job_queue_projection WHERE view_id = ?",
+            )
+            .bind(&target_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(queue, (1, initial_payload.clone(), None));
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_immediate_transaction_does_not_poison_the_pooled_connection() {

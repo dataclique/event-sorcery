@@ -6,7 +6,7 @@ mod projection_recovery;
 mod view_backend;
 
 pub use job_backend::EventBackend;
-pub use job_claim::{ClaimDecision, ClaimOutcome, ClaimRead, LeaseRenewal};
+pub use job_claim::{ClaimDecision, ClaimOutcome, ClaimRead, JOB_AGGREGATE_TYPE, LeaseRenewal};
 
 pub use projection_recovery::{
     ProjectionCheckpoint, ProjectionRecoveryMode, ProjectionRecoveryStorage, ProjectionReplayRow,
