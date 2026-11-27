@@ -912,6 +912,11 @@ changes.
 
 ## Running Jobs
 
+In Rust 0.6, dispatch diagnostics such as `VERDICT REFUSED` use the
+`event_sorcery::dispatch` tracing target. Job-planning diagnostics use
+`event_sorcery::job`. If your log filter enabled only the old `cqrs` target,
+enable warnings and errors for these module targets too.
+
 SQLite supports worker execution through `SqliteBackend`. `PostgresBackend` can
 enqueue jobs but does not yet support worker execution.
 
