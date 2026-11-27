@@ -292,20 +292,20 @@ mod tests {
     async fn catch_up_replays_missed_events() {
         let pool = setup_catch_up_db().await;
 
-        // Insert 3 events: Created(0), Incremented, Incremented
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
-        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
-        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
+        let store = event_sorcery::test_store::<Counter, _>(&SqliteBackend { pool: pool.clone() });
+        let id = "counter-1".to_owned();
+        store.send(&id, 0).await.unwrap();
+        store.send(&id, 2).await.unwrap();
 
         // View is stale at version 1 (only saw Created)
-        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
+        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 4 }).await;
 
         let projection = Projection::<Counter, SqliteViewBackend>::with_backend(pool);
 
         projection.catch_up().await.unwrap();
 
         let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 2 }));
+        assert_eq!(result, Some(Counter { value: 6 }));
     }
 
     #[tokio::test]
@@ -338,11 +338,12 @@ mod tests {
     async fn catch_up_is_idempotent() {
         let pool = setup_catch_up_db().await;
 
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
-        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
-        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
+        let store = event_sorcery::test_store::<Counter, _>(&SqliteBackend { pool: pool.clone() });
+        let id = "counter-1".to_owned();
+        store.send(&id, 0).await.unwrap();
+        store.send(&id, 2).await.unwrap();
 
-        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
+        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 4 }).await;
 
         let projection = Projection::<Counter, SqliteViewBackend>::with_backend(pool.clone());
 
@@ -350,7 +351,7 @@ mod tests {
         projection.catch_up().await.unwrap();
 
         let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 2 }));
+        assert_eq!(result, Some(Counter { value: 6 }));
 
         // Verify version is correct (should be 3, matching max event sequence)
         let (version,): (i64,) =
