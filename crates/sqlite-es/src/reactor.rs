@@ -114,9 +114,10 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
     use std::borrow::Cow;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::*;
-    use std::{sync::Arc, time::Duration};
 
     use event_sorcery::{
         CompactionPolicy, Effect, EventSourced, Never, Nil, OneOf, ProjectionError, deps,
@@ -472,7 +473,7 @@ mod tests {
     }
 
     struct SequencedReactor {
-        sequence: AtomicU32,
+        sequences: Mutex<Vec<usize>>,
         inner: FlakyReactor,
     }
 
@@ -494,10 +495,10 @@ mod tests {
             event: <Self::Dependencies as EntityList>::Event,
             context: ReactorContext,
         ) -> Result<(), Self::Error> {
-            self.sequence.store(
-                u32::try_from(context.sequence.unwrap().get()).unwrap(),
-                Ordering::SeqCst,
-            );
+            self.sequences
+                .lock()
+                .unwrap()
+                .push(context.sequence.unwrap().get());
             self.inner.react(event).await
         }
     }
@@ -508,7 +509,7 @@ mod tests {
     async fn arc_and_busy_retries_preserve_persisted_delivery_context() {
         let wrapped = Arc::new(RetryOnBusy {
             inner: SequencedReactor {
-                sequence: AtomicU32::new(0),
+                sequences: Mutex::new(Vec::new()),
                 inner: FlakyReactor {
                     remaining_busy_failures: AtomicU32::new(2),
                     permanent_failure: false,
@@ -527,7 +528,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(wrapped.inner.sequence.load(Ordering::SeqCst), 7);
+        assert_eq!(*wrapped.inner.sequences.lock().unwrap(), [7, 7, 7]);
         assert_eq!(wrapped.inner.inner.calls.load(Ordering::SeqCst), 3);
         assert!(wrapped.inner.inner.applied.load(Ordering::SeqCst));
     }

@@ -572,6 +572,9 @@ mod tests {
                 .persist::<TestAggregate>(&covering_events("conflict", 1), None)
                 .await;
             assert!(matches!(failed, Err(PersistenceError::OptimisticLockError)));
+            let persisted_id = job_id.to_string();
+            assert_eq!(count_events(&pool, "job", &persisted_id).await, 0);
+            assert_eq!(count_queue_rows(&pool, &persisted_id).await, 0);
 
             repo.persist::<TestAggregate>(&covering_events("retry", 1), None)
                 .await

@@ -314,15 +314,15 @@ mod tests {
 
         insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 5 }).await;
 
-        // View is up to date at version 1
-        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 5 }).await;
+        // A different value makes replay from scratch observable.
+        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 99 }).await;
 
         let projection = Projection::<Counter, SqliteViewBackend>::with_backend(pool);
 
         projection.catch_up().await.unwrap();
 
         let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 5 }));
+        assert_eq!(result, Some(Counter { value: 99 }));
     }
 
     #[tokio::test]
