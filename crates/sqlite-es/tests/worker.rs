@@ -1019,7 +1019,16 @@ mod tests {
             ["JobEnqueued", "JobClaimed", "JobRetryScheduled"]
         );
 
-        let retried = poll_task(&runtime, 3_601_000).await;
+        // The failure occurred at 1,000 ms and the first retry waits 1,000 ms.
+        assert_eq!(
+            runtime.poll_jobs(TestJob::KIND, 1_999, 16).await.unwrap(),
+            [] as [String; 0]
+        );
+        assert_eq!(
+            runtime.poll_jobs(TestJob::KIND, 2_000, 16).await.unwrap(),
+            [job_id.to_string()]
+        );
+        let retried = poll_task(&runtime, 2_000).await;
         let context = JobContext::from_request(&retried).await.unwrap();
         assert_eq!(context.job_id(), job_id);
         assert_eq!(context.attempt(), 1);
