@@ -27,11 +27,10 @@ pub async fn compact_events(
             sqlx::query(
                 "DELETE FROM events \
                  WHERE aggregate_type = ?1 \
-                   AND sequence <= COALESCE( \
-                       (SELECT last_sequence FROM snapshots \
-                        WHERE snapshots.aggregate_type = events.aggregate_type \
-                          AND snapshots.aggregate_id = events.aggregate_id), \
-                       0 \
+                   AND sequence <= ( \
+                       SELECT last_sequence FROM snapshots \
+                       WHERE snapshots.aggregate_type = events.aggregate_type \
+                         AND snapshots.aggregate_id = events.aggregate_id \
                    )",
             )
             .bind(aggregate_type)
@@ -45,11 +44,10 @@ pub async fn compact_events(
             sqlx::query(
                 "DELETE FROM events \
                  WHERE aggregate_type = ?1 \
-                   AND sequence <= COALESCE( \
-                       (SELECT last_sequence FROM snapshots \
-                        WHERE snapshots.aggregate_type = events.aggregate_type \
-                          AND snapshots.aggregate_id = events.aggregate_id), \
-                       0 \
+                   AND sequence <= ( \
+                       SELECT last_sequence FROM snapshots \
+                       WHERE snapshots.aggregate_type = events.aggregate_type \
+                         AND snapshots.aggregate_id = events.aggregate_id \
                    ) \
                    AND sequence <= ( \
                        SELECT MAX(newest.sequence) FROM events newest \

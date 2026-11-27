@@ -704,6 +704,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_keeps_a_sequence_zero_event_without_a_snapshot() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("compaction-probe", "unsnapshotted");
+        let events = [serialized_event(&stream, 0), serialized_event(&stream, 1)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await
+            .unwrap();
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), events);
+        assert!(engine.load_snapshot(&stream).await.unwrap().is_none());
+
+        for policy in [
+            CompactionPolicy::CompactAfterSnapshot,
+            CompactionPolicy::RetainLast { events: 0 },
+        ] {
+            let removed = crate::compact_events(&pool, &stream.aggregate_type, policy)
+                .await
+                .unwrap();
+            assert_eq!(removed, 0, "{policy:?}");
+            assert_eq!(engine.load_events(&stream, None).await.unwrap(), events);
+        }
+    }
+
+    #[tokio::test]
     async fn current_version_reports_the_sequence_a_snapshot_covers_after_compaction() {
         let pool = create_test_pool().await.unwrap();
         let engine = Engine::new(pool.clone());
