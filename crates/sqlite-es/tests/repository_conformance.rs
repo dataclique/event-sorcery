@@ -80,6 +80,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_rejects_a_snapshot_for_a_different_stream() {
+        let pool = create_test_pool().await.unwrap();
+        let repository = NativeRepository::new(pool.clone(), CompactionPolicy::Retain);
+        let events = covering_events("event-stream", 1);
+        let snapshot = SerializedSnapshot {
+            aggregate_id: "snapshot-stream".to_owned(),
+            aggregate: serde_json::json!({"events": ["Created"]}),
+            current_sequence: 1,
+            current_snapshot: 1,
+        };
+
+        let error = repository
+            .persist_with_snapshot::<TestAggregate>(&events, Some(snapshot))
+            .await
+            .unwrap_err();
+
+        let PersistenceError::UnknownError(source) = error else {
+            panic!("expected stream identity mismatch, got {error:?}");
+        };
+        assert!(
+            matches!(source.downcast_ref::<EngineError>(), Some(EngineError::StreamIdentityMismatch { expected, actual })
+            if expected == &StreamIdentity::new(TestAggregate::TYPE, "snapshot-stream")
+                && actual == &StreamIdentity::new(TestAggregate::TYPE, "event-stream"))
+        );
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM events), (SELECT COUNT(*) FROM snapshots)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[tokio::test]
     async fn repository_rejects_gapped_appends_without_writing() {
         let pool = create_test_pool().await.unwrap();
         let repository = NativeRepository::new(pool, CompactionPolicy::Retain);

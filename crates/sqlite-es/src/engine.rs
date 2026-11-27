@@ -653,17 +653,15 @@ mod tests {
     async fn noncontiguous_sequence_rejects_without_writing() {
         let engine = Engine::new(create_test_pool().await.unwrap());
         let stream = StreamIdentity::new("engine-sequence-test", "one");
-        let event = serialized_event(&stream, 2);
+        let events = [serialized_event(&stream, 1), serialized_event(&stream, 3)];
 
         let result = engine
-            .commit(
-                CommitRequest::new(stream.clone(), std::slice::from_ref(&event))
-                    .at_expected_version(0),
-            )
+            .commit(CommitRequest::new(stream.clone(), &events))
             .await;
 
         assert!(matches!(result, Err(EngineError::OptimisticLock)));
         assert_eq!(engine.current_version(&stream).await.unwrap(), 0);
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), []);
     }
 
     #[tokio::test]
