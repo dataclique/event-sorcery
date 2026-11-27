@@ -249,14 +249,7 @@ pub(crate) async fn commit_serialized(
     pool: &SqlitePool,
     request: CheckedCommit<'_>,
 ) -> Result<(), EngineError> {
-    let CheckedCommit {
-        stream,
-        expected_version,
-        events,
-        snapshot,
-        jobs,
-        ..
-    } = request;
+    let (stream, expected_version, events, snapshot, jobs) = request.into_parts();
     commit_atomic(
         pool,
         Commit {

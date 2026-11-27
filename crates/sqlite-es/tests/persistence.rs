@@ -367,7 +367,7 @@ mod tests {
                     .unwrap();
             assert_eq!(committed_jobs, 0);
             let (request, _) = CommitRequest::prepare_repository("caller", &[], None).unwrap();
-            let remaining = request.check().unwrap().jobs;
+            let (_, _, _, _, remaining) = request.check().unwrap().into_parts();
             assert_eq!(remaining.len(), 1);
             assert_eq!(
                 remaining[0].event().unwrap().aggregate_id,

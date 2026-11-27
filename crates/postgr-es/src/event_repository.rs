@@ -7,7 +7,7 @@ use cqrs_es::persist::{
 use serde_json::Value;
 
 use event_sorcery::{
-    CommitRequest, EngineError, JobSeed, PreparedCommit, SnapshotUpdate, validate_expected_version,
+    CommitRequest, EngineError, JobSeed, SnapshotUpdate, StreamIdentity, validate_expected_version,
 };
 
 /// Pool-backed PostgreSQL repository for the CQRS persistence contract.
@@ -115,15 +115,11 @@ impl PostgresEventRepository {
     }
 
     async fn commit(&self, request: CommitRequest<'_>) -> Result<(), PersistenceError> {
-        let PreparedCommit {
+        let (stream, expected_version, events, snapshot, jobs) = request.prepare()?.into_parts();
+        let StreamIdentity {
             aggregate_type,
             aggregate_id,
-            expected_version,
-            events,
-            snapshot,
-            jobs,
-            ..
-        } = request.prepare()?;
+        } = stream;
         let mut transaction = self.pool.begin().await.map_err(EngineError::from)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .execute(&mut *transaction)

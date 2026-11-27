@@ -257,35 +257,65 @@ pub struct CommitRequest<'events> {
 }
 
 /// Validated batch whose snapshot and jobs are prepared at their write steps.
-#[non_exhaustive]
 pub struct CheckedCommit<'events> {
-    /// Identity shared by all events in this batch.
-    pub stream: StreamIdentity,
-    /// Durable stream version the writer must check before appending.
-    pub expected_version: Option<usize>,
-    /// Contiguous events belonging to the identified stream.
-    pub events: &'events [SerializedEvent],
-    /// Snapshot to prepare after appending the batch, when supplied.
-    pub snapshot: Option<SnapshotUpdate>,
-    /// Durable job intents to prepare and write in order after the snapshot.
-    pub jobs: Vec<JobSeed>,
+    stream: StreamIdentity,
+    expected_version: Option<usize>,
+    events: &'events [SerializedEvent],
+    snapshot: Option<SnapshotUpdate>,
+    jobs: Vec<JobSeed>,
+}
+
+impl<'events> CheckedCommit<'events> {
+    /// Consumes the checked batch at the write boundary. The writer checks the
+    /// expected version, appends the events, then prepares the snapshot and jobs.
+    pub fn into_parts(
+        self,
+    ) -> (
+        StreamIdentity,
+        Option<usize>,
+        &'events [SerializedEvent],
+        Option<SnapshotUpdate>,
+        Vec<JobSeed>,
+    ) {
+        (
+            self.stream,
+            self.expected_version,
+            self.events,
+            self.snapshot,
+            self.jobs,
+        )
+    }
 }
 
 /// Validated storage data consumed by a concrete database writer.
-#[non_exhaustive]
 pub struct PreparedCommit<'events> {
-    /// Aggregate type namespace validated against the proposed events.
-    pub aggregate_type: String,
-    /// Aggregate identifier validated against the proposed events.
-    pub aggregate_id: String,
-    /// Optional caller-supplied stream version guard.
-    pub expected_version: Option<usize>,
-    /// Contiguous serialized event batch validated for this stream.
-    pub events: &'events [SerializedEvent],
-    /// Snapshot with validated event coverage and an independent write counter.
-    pub snapshot: Option<PreparedSnapshot>,
-    /// Canonical job events and queue payloads committed atomically with this batch.
-    pub jobs: Vec<PreparedJob>,
+    stream: StreamIdentity,
+    expected_version: Option<usize>,
+    events: &'events [SerializedEvent],
+    snapshot: Option<PreparedSnapshot>,
+    jobs: Vec<PreparedJob>,
+}
+
+impl<'events> PreparedCommit<'events> {
+    /// Consumes the prepared batch at the write boundary. The writer checks the
+    /// expected version and writes the events, snapshot, and jobs atomically.
+    pub fn into_parts(
+        self,
+    ) -> (
+        StreamIdentity,
+        Option<usize>,
+        &'events [SerializedEvent],
+        Option<PreparedSnapshot>,
+        Vec<PreparedJob>,
+    ) {
+        (
+            self.stream,
+            self.expected_version,
+            self.events,
+            self.snapshot,
+            self.jobs,
+        )
+    }
 }
 
 /// Snapshot data with its independently validated coverage and counter.
@@ -504,8 +534,7 @@ impl<'events> CommitRequest<'events> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(PreparedCommit {
-            aggregate_type: stream.aggregate_type,
-            aggregate_id: stream.aggregate_id,
+            stream,
             expected_version,
             events,
             snapshot,
