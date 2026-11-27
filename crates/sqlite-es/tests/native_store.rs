@@ -988,6 +988,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paginated_ids_break_event_and_snapshot_rowid_ties_by_id() {
+        let pool = test_pool().await;
+        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
+        for id in [10, 2] {
+            store
+                .send(
+                    &NumericId(id),
+                    WidgetCommand::Create {
+                        name: id.to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let stream = StreamIdentity::new(Widget::AGGREGATE_TYPE, "2");
+        sqlite_es::Engine::new(pool.clone())
+            .discard_snapshot(&stream)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlite_es::compact_events(&pool, Widget::AGGREGATE_TYPE, Widget::COMPACTION_POLICY)
+                .await
+                .unwrap(),
+            1
+        );
+        // The tables have independent rowids; make the surviving entries tie.
+        let event_rowid: i64 =
+            sqlx::query_scalar("SELECT rowid FROM events WHERE aggregate_id = '2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE snapshots SET rowid = ? WHERE aggregate_id = '10'")
+            .bind(event_rowid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let first = sqlite_es::load_ids_paginated::<NumericId>(&pool, Widget::AGGREGATE_TYPE, 1, 0)
+            .await
+            .unwrap();
+        let second =
+            sqlite_es::load_ids_paginated::<NumericId>(&pool, Widget::AGGREGATE_TYPE, 1, 1)
+                .await
+                .unwrap();
+
+        assert_eq!(first, [NumericId(10)]);
+        assert_eq!(second, [NumericId(2)]);
+    }
+
+    #[tokio::test]
     async fn load_all_ids_includes_snapshot_only_aggregates() {
         let pool = test_pool().await;
         let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });

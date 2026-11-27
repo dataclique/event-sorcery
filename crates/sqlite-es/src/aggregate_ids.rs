@@ -29,8 +29,8 @@ where
 
 /// Lists distinct IDs, ordered by descending maximum event or snapshot rowid.
 ///
-/// Appending to an existing aggregate can change its position; ties have no
-/// guaranteed order. An offset skips distinct IDs, not individual rows.
+/// Ties are ordered by ascending stored ID. Appending to an existing aggregate
+/// can change its position. An offset skips distinct IDs, not individual rows.
 pub async fn load_ids_paginated<Id: FromStr>(
     pool: &SqlitePool,
     aggregate_type: &'static str,
@@ -54,7 +54,7 @@ where
              GROUP BY aggregate_id
          )
          GROUP BY aggregate_id
-         ORDER BY MAX(latest_rowid) DESC
+         ORDER BY MAX(latest_rowid) DESC, aggregate_id ASC
          LIMIT ?2 OFFSET ?3",
     )
     .bind(aggregate_type)
