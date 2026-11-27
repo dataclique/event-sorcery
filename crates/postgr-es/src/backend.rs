@@ -536,6 +536,12 @@ pub(crate) mod tests {
             .build()
             .await
             .unwrap();
+        let empty = projection
+            .filter(Column("text_value"), &"matching".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(empty, []);
+
         let id = "note".to_string();
         store.send(&id, "matching".to_string()).await.unwrap();
         let expected = projection.load(&id).await.unwrap().unwrap();

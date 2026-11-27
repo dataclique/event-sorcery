@@ -234,17 +234,24 @@ impl NativeProjectionBackend for PostgresViewBackend {
             });
         }
         let quoted_column = indexed_query::quote_identifier(column_name);
-        let (rows, non_null): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT COUNT(*), COUNT({quoted_column}) FROM {quoted_table}"
+        let has_values: bool = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {quoted_table} WHERE {quoted_column} IS NOT NULL)"
         )))
         .fetch_one(&mut *transaction)
         .await?;
-        if rows > 0 && non_null == 0 {
-            return Err(ProjectionError::StaleColumn {
-                column,
-                table: table.to_string(),
-                row_count: rows,
-            });
+        if !has_values {
+            let row_count: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {quoted_table}"
+            )))
+            .fetch_one(&mut *transaction)
+            .await?;
+            if row_count > 0 {
+                return Err(ProjectionError::StaleColumn {
+                    column,
+                    table: table.to_string(),
+                    row_count,
+                });
+            }
         }
         let matches = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT view_id, payload::text FROM {quoted_table}
