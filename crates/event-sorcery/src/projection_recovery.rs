@@ -62,6 +62,7 @@ pub async fn recover_projection<Entity: EventSourced<Materialized = Table>>(
             aggregate_id,
             checkpoint,
             maximum_sequence,
+            snapshot_sequence,
         } = stream;
         let (mut lifecycle, after) = match checkpoint {
             None => (Lifecycle::<Entity>::default(), 0),
@@ -75,10 +76,29 @@ pub async fn recover_projection<Entity: EventSourced<Materialized = Table>>(
                 }
             }
         };
-        let payloads = storage
+        let events = storage
             .events(aggregate_type, &aggregate_id, after, maximum_sequence)
             .await?;
-        for payload in payloads {
+        if let Some(covered_through) = snapshot_sequence.filter(|&sequence| sequence > after) {
+            let boundary = i64::try_from(covered_through)
+                .map_err(|source| sqlx::Error::Decode(Box::new(source)))?;
+            let retained_events = u64::try_from(
+                events
+                    .iter()
+                    .take_while(|(sequence, _)| *sequence <= boundary)
+                    .count(),
+            )
+            .map_err(|source| sqlx::Error::Decode(Box::new(source)))?;
+            if retained_events != covered_through - after {
+                return Err(ProjectionError::UnprovenReplayRange {
+                    stream: StreamIdentity::new(aggregate_type, aggregate_id),
+                    after,
+                    covered_through,
+                    retained_events,
+                });
+            }
+        }
+        for (_, payload) in events {
             let event =
                 serde_json::from_str(&payload).map_err(|source| ProjectionError::Serde {
                     aggregate_id: aggregate_id.clone(),

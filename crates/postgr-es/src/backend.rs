@@ -491,6 +491,86 @@ pub(crate) mod tests {
         );
     }
 
+    #[sqlx::test(migrations = false)]
+    async fn catch_up_refuses_missing_snapshot_covered_events(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let backend = PostgresBackend { pool: pool.clone() };
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, _>::with_backend(backend.clone())
+                .build()
+                .await
+                .unwrap();
+        let id = "projected".to_owned();
+        store.send(&id, "first".to_owned()).await.unwrap();
+        let first_view: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM note_projection")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        store.send(&id, "second".to_owned()).await.unwrap();
+        store.send(&id, "third".to_owned()).await.unwrap();
+        let snapshot_sequence: i64 = sqlx::query_scalar(
+            "SELECT last_sequence FROM snapshots WHERE aggregate_type = 'ProjectedNote'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot_sequence, 2);
+        sqlx::query("UPDATE note_projection SET version = 1, payload = $1")
+            .bind(&first_view)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Simulate imported history missing the event covered by the snapshot but not the view.
+        sqlx::query("DELETE FROM events WHERE aggregate_type = 'ProjectedNote' AND sequence = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = projection.catch_up().await.unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectionError::UnprovenReplayRange {
+                after: 1,
+                covered_through: 2,
+                retained_events: 0,
+                ..
+            }
+        ));
+        let view: (i64, serde_json::Value) =
+            sqlx::query_as("SELECT version, payload FROM note_projection")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(view, (1, first_view));
+
+        sqlx::query("DELETE FROM events WHERE aggregate_type = 'ProjectedNote'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM note_projection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let restarted = StoreBuilder::<ProjectedNote<1>, _>::with_backend(backend)
+            .build()
+            .await;
+        let Err(ReconcileError::Persistence(PersistenceError::UnknownError(source))) = restarted
+        else {
+            panic!("startup must reject missing history for a snapshot-only stream");
+        };
+        assert!(matches!(
+            source.downcast_ref::<ProjectionError<ProjectedNote<1>>>(),
+            Some(ProjectionError::UnprovenReplayRange {
+                after: 0,
+                covered_through: 2,
+                retained_events: 0,
+                ..
+            })
+        ));
+        assert_eq!(projection.load(&id).await.unwrap(), None);
+    }
+
     struct FilterValueAfterConcurrentUpdate(PgConnectOptions);
 
     impl Type<Postgres> for FilterValueAfterConcurrentUpdate {

@@ -89,15 +89,24 @@ impl ProjectionRecoveryStorage for SqliteProjectionRecovery<'_> {
             RebuildOne { .. } => "e.aggregate_id = ?2",
         };
         let sql = format!(
-            "SELECT e.aggregate_id, v.version, v.payload, e.max_seq FROM (
-                SELECT aggregate_id, MAX(sequence) AS max_seq FROM events
-                WHERE aggregate_type = ?1 GROUP BY aggregate_id
+            "SELECT e.aggregate_id, v.version, v.payload, e.max_seq, e.snapshot_seq
+             FROM (
+                SELECT aggregate_id, MAX(sequence) AS max_seq, MAX(snapshot_seq) AS snapshot_seq
+                FROM (
+                    SELECT aggregate_id, sequence, NULL AS snapshot_seq FROM events
+                    WHERE aggregate_type = ?1
+                    UNION ALL
+                    SELECT aggregate_id, last_sequence, last_sequence FROM snapshots
+                    WHERE aggregate_type = ?1 AND last_sequence > 0
+                ) history GROUP BY aggregate_id
              ) e LEFT JOIN {table} v ON v.view_id = e.aggregate_id
              WHERE {selection} ORDER BY e.aggregate_id"
         );
         let mut query =
-            sqlx::query_as::<_, (String, Option<i64>, Option<String>, i64)>(AssertSqlSafe(sql))
-                .bind(aggregate_type);
+            sqlx::query_as::<_, (String, Option<i64>, Option<String>, i64, Option<i64>)>(
+                AssertSqlSafe(sql),
+            )
+            .bind(aggregate_type);
         if let CatchUpOne { aggregate_id } | RebuildOne { aggregate_id } = mode {
             query = query.bind(aggregate_id);
         }
@@ -115,12 +124,12 @@ impl ProjectionRecoveryStorage for SqliteProjectionRecovery<'_> {
         aggregate_id: &str,
         after: u64,
         through: NonZeroU64,
-    ) -> Result<Vec<String>, sqlx::Error> {
+    ) -> Result<Vec<(i64, String)>, sqlx::Error> {
         let after = i64::try_from(after).map_err(|source| sqlx::Error::Encode(Box::new(source)))?;
         let through =
             i64::try_from(through.get()).map_err(|source| sqlx::Error::Encode(Box::new(source)))?;
-        sqlx::query_scalar(
-            "SELECT payload FROM events WHERE aggregate_type = ?1 AND aggregate_id = ?2
+        sqlx::query_as(
+            "SELECT sequence, payload FROM events WHERE aggregate_type = ?1 AND aggregate_id = ?2
              AND sequence > ?3 AND sequence <= ?4 ORDER BY sequence",
         )
         .bind(aggregate_type)

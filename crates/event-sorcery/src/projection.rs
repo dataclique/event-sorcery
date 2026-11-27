@@ -54,6 +54,21 @@ pub enum ProjectionError<Entity: EventSourced> {
     /// A rebuild needs history covered by a snapshot that cannot be proven complete.
     #[error("cannot rebuild projection: {0}")]
     UnprovenSnapshotHistory(#[source] crate::ReconcileError),
+    /// Catch-up cannot prove coverage between the view and the stored snapshot.
+    #[error(
+        "incomplete snapshot-covered replay for {stream:?}: \
+         after {after}, through {covered_through}, retained {retained_events}"
+    )]
+    UnprovenReplayRange {
+        /// Aggregate whose projection could not catch up.
+        stream: crate::StreamIdentity,
+        /// Last event already covered by the decoded view, or zero for replay from scratch.
+        after: u64,
+        /// Last event covered by the aggregate snapshot.
+        covered_through: u64,
+        /// Number of retained events in the required snapshot-covered range.
+        retained_events: u64,
+    },
     /// This operation requires a projection associated with a native view table.
     #[error("operation requires a projection backed by a native persistence adapter")]
     MissingViewTable,

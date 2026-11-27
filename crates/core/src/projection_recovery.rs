@@ -41,17 +41,25 @@ pub struct ProjectionReplayRow {
     pub checkpoint: Option<ProjectionCheckpoint>,
     /// Positive event maximum captured in the same query as the checkpoint.
     pub maximum_sequence: NonZeroU64,
+    /// Last event covered by a stored snapshot, if one exists.
+    pub snapshot_sequence: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("materialized view checkpoint and payload must both be present or absent")]
 struct IncompleteProjectionCheckpoint;
 
-impl TryFrom<(String, Option<i64>, Option<String>, i64)> for ProjectionReplayRow {
+impl TryFrom<(String, Option<i64>, Option<String>, i64, Option<i64>)> for ProjectionReplayRow {
     type Error = sqlx::Error;
 
     fn try_from(
-        (aggregate_id, sequence, payload, maximum): (String, Option<i64>, Option<String>, i64),
+        (aggregate_id, sequence, payload, maximum, snapshot): (
+            String,
+            Option<i64>,
+            Option<String>,
+            i64,
+            Option<i64>,
+        ),
     ) -> Result<Self, Self::Error> {
         let maximum =
             u64::try_from(maximum).map_err(|source| sqlx::Error::Decode(Box::new(source)))?;
@@ -74,6 +82,10 @@ impl TryFrom<(String, Option<i64>, Option<String>, i64)> for ProjectionReplayRow
             aggregate_id,
             checkpoint,
             maximum_sequence,
+            snapshot_sequence: snapshot
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|source| sqlx::Error::Decode(Box::new(source)))?,
         })
     }
 }
@@ -128,14 +140,14 @@ pub trait ProjectionRecoveryStorage: Send {
         mode: &ProjectionRecoveryMode,
     ) -> impl Future<Output = Result<Vec<ProjectionReplayRow>, sqlx::Error>> + Send;
 
-    /// Reads ordered payloads after `after` and through the captured maximum.
+    /// Reads ordered (sequence, payload) rows after `after` through the captured maximum.
     fn events(
         &mut self,
         aggregate_type: &str,
         aggregate_id: &str,
         after: u64,
         through: NonZeroU64,
-    ) -> impl Future<Output = Result<Vec<String>, sqlx::Error>> + Send;
+    ) -> impl Future<Output = Result<Vec<(i64, String)>, sqlx::Error>> + Send;
 
     /// Writes replayed state at the captured event checkpoint, not version + 1.
     fn save(
@@ -154,7 +166,7 @@ mod tests {
     #[test]
     fn replay_row_decodes_missing_and_present_checkpoints() {
         let missing =
-            ProjectionReplayRow::try_from(("missing".to_string(), None, None, 7)).unwrap();
+            ProjectionReplayRow::try_from(("missing".to_string(), None, None, 7, None)).unwrap();
         assert_eq!(missing.aggregate_id, "missing");
         assert_eq!(missing.maximum_sequence.get(), 7);
         let None = missing.checkpoint else {
@@ -165,12 +177,14 @@ mod tests {
             Some(3),
             Some("{}".to_string()),
             7,
+            Some(6),
         ))
         .unwrap();
         let Some(checkpoint) = present.checkpoint else {
             panic!("stored state and sequence must be retained together");
         };
         assert_eq!(present.maximum_sequence.get(), 7);
+        assert_eq!(present.snapshot_sequence, Some(6));
         assert_eq!(checkpoint.sequence, 3);
         assert_eq!(checkpoint.payload, "{}");
     }
@@ -184,9 +198,14 @@ mod tests {
             (None, None, 0),
             (None, None, -1),
         ] {
-            let error =
-                ProjectionReplayRow::try_from(("invalid".to_string(), sequence, payload, maximum))
-                    .unwrap_err();
+            let error = ProjectionReplayRow::try_from((
+                "invalid".to_string(),
+                sequence,
+                payload,
+                maximum,
+                None,
+            ))
+            .unwrap_err();
             assert!(matches!(error, sqlx::Error::Decode(_)));
         }
     }
