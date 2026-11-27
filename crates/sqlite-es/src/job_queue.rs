@@ -70,9 +70,9 @@ pub async fn enqueue_job(
     let mut transaction = pool.begin().await?;
 
     let seeded = match append_job_event(&mut transaction, &event).await? {
-        Some(version) => {
-            write_job_projection(&mut transaction, &job_id, version, &payload, None).await
-        }
+        Some(version) => seed_job_projection(&mut transaction, &job_id, version, &payload)
+            .await
+            .map_err(SqliteJobError::from),
         None => Err(SqliteJobError::DuplicateEnqueue { job_id }),
     };
 
@@ -229,6 +229,25 @@ async fn read_job_projection_for_claim(
     .await?)
 }
 
+/// Inserts a new queue row without replacing an existing job projection.
+pub(crate) async fn seed_job_projection(
+    connection: &mut SqliteConnection,
+    job_id: &str,
+    version: i64,
+    payload: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
+         VALUES (?1, ?2, ?3, NULL)",
+    )
+    .bind(job_id)
+    .bind(version)
+    .bind(payload)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
 async fn write_job_projection(
     connection: &mut SqliteConnection,
     job_id: &str,
@@ -274,6 +293,57 @@ mod tests {
         immediate_transaction,
     };
     use crate::testing::create_test_pool;
+
+    #[tokio::test]
+    async fn enqueue_preserves_an_existing_queue_row_without_a_job_stream() {
+        let pool = create_test_pool().await.unwrap();
+        let job_id = JobId::new();
+        let id = job_id.to_string();
+        let existing = JobSeed::new(
+            job_id,
+            "fixture",
+            serde_json::json!({"value": "existing"}),
+            0,
+        )
+        .queue_payload()
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_queue_projection (view_id, version, payload)
+             VALUES (?, 1, ?)",
+        )
+        .bind(&id)
+        .bind(&existing)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let replacement = JobSeed::new(job_id, "fixture", serde_json::json!({"value": "new"}), 0);
+
+        let error = enqueue_job(
+            &pool,
+            replacement.event().unwrap(),
+            replacement.queue_payload().unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+        let SqliteJobError::Sql(sqlx::Error::Database(source)) = error else {
+            panic!("expected queue identity conflict, got {error:?}");
+        };
+        assert!(source.is_unique_violation());
+        let stored: (i64, String) =
+            sqlx::query_as("SELECT version, payload FROM job_queue_projection WHERE view_id = ?")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, (1, existing));
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE aggregate_id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(events, 0);
+    }
 
     #[tokio::test]
     async fn claim_decisions_cannot_append_to_a_different_job_or_skip_versions() {

@@ -3,6 +3,7 @@
 use cqrs_es::persist::{SerializedEvent, SerializedSnapshot};
 use sqlx::SqlitePool;
 
+use crate::job_queue::seed_job_projection;
 use crate::{
     SqliteAggregateError, committed_stream_version, insert_serialized_events_batch, load_snapshot,
     write_snapshot,
@@ -85,14 +86,7 @@ where
             .await?;
 
         let payload = prepare_payload(job)?;
-        sqlx::query(
-            "INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
-             VALUES (?1, 1, ?2, NULL)",
-        )
-        .bind(&event.aggregate_id)
-        .bind(payload)
-        .execute(&mut *transaction)
-        .await?;
+        seed_job_projection(&mut transaction, &event.aggregate_id, 1, &payload).await?;
     }
 
     transaction.commit().await?;
