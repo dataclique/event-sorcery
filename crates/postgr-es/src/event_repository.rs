@@ -115,7 +115,7 @@ impl PostgresEventRepository {
     }
 
     async fn commit(&self, request: CommitRequest<'_>) -> Result<(), PersistenceError> {
-        let (stream, expected_version, events, snapshot, jobs) = request.prepare()?.into_parts();
+        let (stream, expected_version, events, snapshot, jobs) = request.check()?.into_parts();
         let StreamIdentity {
             aggregate_type,
             aggregate_id,
@@ -155,6 +155,7 @@ impl PostgresEventRepository {
             .map_err(PersistenceError::from)
             .map_err(adapter_error)?;
         if let Some(snapshot) = snapshot {
+            let snapshot = snapshot.prepare(events)?;
             let previous = repository
                 .get_snapshot_in(&mut transaction, &aggregate_type, &aggregate_id)
                 .await?;
@@ -188,11 +189,12 @@ impl PostgresEventRepository {
         }
 
         for job in jobs {
+            let event = job.event().map_err(EngineError::from)?;
             repository
                 .append_serialized_events_in(
                     &mut transaction,
-                    &job.event.aggregate_type,
-                    std::slice::from_ref(&job.event),
+                    &event.aggregate_type,
+                    std::slice::from_ref(&event),
                 )
                 .await
                 .map_err(PersistenceError::from)
@@ -203,8 +205,8 @@ impl PostgresEventRepository {
                 VALUES ($1, 1, $2::JSONB, NULL)
                 ",
             )
-            .bind(&job.event.aggregate_id)
-            .bind(job.queue_payload)
+            .bind(&event.aggregate_id)
+            .bind(job.queue_payload().map_err(EngineError::from)?)
             .execute(&mut *transaction)
             .await
             .map_err(write_error)?;
@@ -841,6 +843,99 @@ mod tests {
                 .await
                 .map(|event| event.unwrap().sequence),
             None
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn stale_version_takes_precedence_over_invalid_snapshot_coverage(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let store =
+            PersistedEventStore::<_, RecordedValues>::new_event_store(PostgresEventRepository {
+                pool: pool.clone(),
+            });
+        let repository = PostgresEventRepository { pool };
+        let framework = CqrsFramework::new(store, vec![], None);
+        framework
+            .execute("stream", "first".to_owned())
+            .await
+            .unwrap();
+        let mut event = repository
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap()
+            .remove(0);
+        event.sequence = 2;
+        let invalid_snapshot = || cqrs_es::persist::SerializedSnapshot {
+            aggregate_id: "stream".to_owned(),
+            aggregate: json!({"values": ["first", "second", "third"]}),
+            current_sequence: 3,
+            current_snapshot: 1,
+        };
+
+        let error = repository
+            .persist_with_snapshot::<RecordedValues>(
+                std::slice::from_ref(&event),
+                Some(invalid_snapshot()),
+            )
+            .await
+            .unwrap_err();
+        let PersistenceError::UnknownError(source) = error else {
+            panic!("expected invalid snapshot coverage, got {error:?}");
+        };
+        assert!(matches!(
+            source.downcast_ref::<event_sorcery::EngineError>(),
+            Some(event_sorcery::EngineError::SnapshotBeyondCurrentVersion {
+                proposed: 3,
+                current: 2
+            })
+        ));
+        let events = repository
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 1);
+        assert!(
+            repository
+                .get_snapshot::<RecordedValues>("stream")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        framework
+            .execute("stream", "winner".to_owned())
+            .await
+            .unwrap();
+        let before = repository
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap();
+        assert_eq!(before[1].payload, json!({"Recorded": {"value": "winner"}}));
+        let error = repository
+            .persist_with_snapshot::<RecordedValues>(
+                std::slice::from_ref(&event),
+                Some(invalid_snapshot()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, PersistenceError::OptimisticLockError),
+            "{error:?}"
+        );
+        assert_eq!(
+            repository
+                .get_events::<RecordedValues>("stream")
+                .await
+                .unwrap(),
+            before
+        );
+        assert!(
+            repository
+                .get_snapshot::<RecordedValues>("stream")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
