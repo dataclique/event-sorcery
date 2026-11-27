@@ -192,9 +192,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_entity_replays_events_into_entity() {
+    async fn load_entity_replays_events_without_a_snapshot() {
+        type ReplayWidget = WindowedWidget<2, 3>;
+
         let pool = test_pool().await;
-        let store = test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() });
+        let backend = SqliteBackend { pool: pool.clone() };
+        let store = test_store::<ReplayWidget, _>(&backend);
 
         store
             .send(
@@ -206,12 +209,20 @@ mod tests {
             .await
             .unwrap();
 
-        let entity = load_entity::<Widget>(&SqliteBackend { pool: pool.clone() }, &NumericId(42))
-            .await
-            .unwrap();
-
-        let widget = entity.expect("entity should exist after event replay");
-        assert_eq!(widget.name, "test-widget");
+        assert_eq!(
+            sqlite_es::load_snapshot(&pool, ReplayWidget::AGGREGATE_TYPE, "42")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            load_entity::<ReplayWidget>(&backend, &NumericId(42))
+                .await
+                .unwrap(),
+            Some(ReplayWidget {
+                name: "test-widget".to_owned()
+            })
+        );
     }
 
     #[tokio::test]
