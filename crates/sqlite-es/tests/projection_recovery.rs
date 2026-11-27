@@ -609,6 +609,30 @@ mod tests {
             projection.load(&id).await.unwrap(),
             Some(Counter { value: 4 })
         );
+        assert_eq!(
+            engine.load_snapshot(&stream).await.unwrap().as_ref(),
+            Some(&snapshot)
+        );
+
+        // Catch-up needs no history when the existing view covers the snapshot.
+        projection.catch_up().await.unwrap();
+        assert_eq!(
+            sqlite_es::projection_rows(&pool, "counter_view")
+                .await
+                .unwrap(),
+            rows
+        );
+
+        sqlx::query("DELETE FROM counter_view WHERE view_id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = projection.catch_up().await.unwrap_err();
+        assert!(matches!(error, ProjectionError::UnprovenReplayRange {
+            stream: rejected, after: 0, covered_through: 1, retained_events: 0,
+        } if rejected == stream));
+        assert_eq!(projection.load(&id).await.unwrap(), None);
         assert_eq!(engine.load_snapshot(&stream).await.unwrap(), Some(snapshot));
     }
 
