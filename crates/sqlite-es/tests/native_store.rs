@@ -177,18 +177,16 @@ mod tests {
         pool
     }
 
-    async fn insert_event(pool: &SqlitePool, aggregate_type: &str, aggregate_id: &str) {
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
-             event_type, event_version, payload, metadata) \
-             VALUES (?1, ?2, 1, 'WidgetEvent::Created', '1.0', ?3, '{}')",
-        )
-        .bind(aggregate_type)
-        .bind(aggregate_id)
-        .bind(r#"{"Created":{"name":"test-widget"}}"#)
-        .execute(pool)
-        .await
-        .unwrap();
+    async fn create_widget(pool: &SqlitePool, id: u64) {
+        test_store::<Widget, _>(&SqliteBackend { pool: pool.clone() })
+            .send(
+                &NumericId(id),
+                WidgetCommand::Create {
+                    name: "test-widget".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -908,8 +906,8 @@ mod tests {
     #[tokio::test]
     async fn load_all_ids_returns_parsed_ids() {
         let pool = test_pool().await;
-        insert_event(&pool, "Widget", "10").await;
-        insert_event(&pool, "Widget", "20").await;
+        create_widget(&pool, 10).await;
+        create_widget(&pool, 20).await;
 
         let ids = sqlite_es::load_all_ids::<NumericId>(&pool, Widget::AGGREGATE_TYPE)
             .await
@@ -1120,8 +1118,21 @@ mod tests {
     #[tokio::test]
     async fn load_all_ids_errors_on_unparseable_id() {
         let pool = test_pool().await;
-        insert_event(&pool, "Widget", "42").await;
-        insert_event(&pool, "Widget", "not-a-number").await;
+        create_widget(&pool, 42).await;
+        let stream = StreamIdentity::new(Widget::AGGREGATE_TYPE, "not-a-number");
+        let event = cqrs_es::persist::SerializedEvent {
+            aggregate_type: stream.aggregate_type.clone(),
+            aggregate_id: stream.aggregate_id.clone(),
+            sequence: 1,
+            event_type: "WidgetEvent::Created".to_owned(),
+            event_version: "1.0".to_owned(),
+            payload: serde_json::json!({"Created": {"name": "test-widget"}}),
+            metadata: serde_json::json!({}),
+        };
+        sqlite_es::Engine::new(pool.clone())
+            .commit(CommitRequest::new(stream, &[event]))
+            .await
+            .unwrap();
 
         let error = sqlite_es::load_all_ids::<NumericId>(&pool, Widget::AGGREGATE_TYPE)
             .await
@@ -1147,8 +1158,16 @@ mod tests {
     #[tokio::test]
     async fn load_all_ids_ignores_other_aggregate_types() {
         let pool = test_pool().await;
-        insert_event(&pool, "Widget", "1").await;
-        insert_event(&pool, "OtherAggregate", "should-be-excluded").await;
+        create_widget(&pool, 1).await;
+        test_store::<WindowedWidget, _>(&SqliteBackend { pool: pool.clone() })
+            .send(
+                &NumericId(2),
+                WidgetCommand::Create {
+                    name: "unrelated".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
 
         let ids = sqlite_es::load_all_ids::<NumericId>(&pool, Widget::AGGREGATE_TYPE)
             .await
