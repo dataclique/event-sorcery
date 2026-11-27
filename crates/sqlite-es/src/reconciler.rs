@@ -134,9 +134,7 @@ mod tests {
     use serde_json::json;
     use sqlx::SqlitePool;
 
-    use event_sorcery::{
-        CompactionPolicy, Effect, Never, Nil, SCHEMA_REGISTRY_ID, test_store, uneventful,
-    };
+    use event_sorcery::{CompactionPolicy, Effect, Never, Nil, SCHEMA_REGISTRY_ID, test_store};
 
     use super::*;
     use crate::SqliteBackend;
@@ -232,7 +230,7 @@ mod tests {
 
     /// Minimal compactable entity for testing the reconciliation guard.
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct CompactableWidget;
+    struct CompactableWidget<const WINDOWED: bool = false>;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     enum CompactableEvent {
@@ -249,7 +247,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl EventSourced for CompactableWidget {
+    impl<const WINDOWED: bool> EventSourced for CompactableWidget<WINDOWED> {
         type Id = String;
         type Error = Never;
         type Command = ();
@@ -261,7 +259,11 @@ mod tests {
         const SCHEMA_VERSION: u64 = 2;
         const SNAPSHOT_SIZE: usize = 1;
         const AGGREGATE_TYPE: &'static str = "CompactableWidget";
-        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
+        const COMPACTION_POLICY: CompactionPolicy = if WINDOWED {
+            CompactionPolicy::RetainLast { events: 2 }
+        } else {
+            CompactionPolicy::CompactAfterSnapshot
+        };
 
         fn originate(_event: &Self::Event) -> Option<Self> {
             Some(Self)
@@ -276,7 +278,7 @@ mod tests {
         }
 
         async fn transition(&self, _command: Self::Command) -> Result<Effect<Self>, Never> {
-            uneventful()
+            Ok(Effect::Events(vec![CompactableEvent::Created]))
         }
     }
 
@@ -296,56 +298,59 @@ mod tests {
 
     #[tokio::test]
     async fn first_registration_preserves_existing_compactable_snapshots() {
-        for policy in [
-            CompactionPolicy::CompactAfterSnapshot,
-            CompactionPolicy::RetainLast { events: 2 },
-        ] {
-            let pool = crate::testing::create_test_pool().await.unwrap();
-            let store = test_store::<CompactableWidget, _>(&SqliteBackend { pool: pool.clone() });
-            let id = "legacy-widget".to_string();
+        assert_first_registration_preserves_snapshot::<false>(1, &[]).await;
+        assert_first_registration_preserves_snapshot::<true>(3, &[2, 3]).await;
+    }
+
+    async fn assert_first_registration_preserves_snapshot<const WINDOWED: bool>(
+        commands: i64,
+        expected_suffix: &[i64],
+    ) {
+        let pool = crate::testing::create_test_pool().await.unwrap();
+        let store =
+            test_store::<CompactableWidget<WINDOWED>, _>(&SqliteBackend { pool: pool.clone() });
+        let id = "legacy-widget".to_string();
+        for _ in 0..commands {
             store.send(&id, ()).await.unwrap();
-            assert_eq!(
-                crate::compact_events(
-                    &pool,
-                    CompactableWidget::AGGREGATE_TYPE,
-                    CompactableWidget::COMPACTION_POLICY
-                )
+        }
+        let policy = CompactableWidget::<WINDOWED>::COMPACTION_POLICY;
+        assert_eq!(
+            crate::compact_events(&pool, CompactableWidget::<false>::AGGREGATE_TYPE, policy)
                 .await
                 .unwrap(),
-                1
-            );
-            let retained_events: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM events WHERE aggregate_type = ?1 AND aggregate_id = ?2",
+            1
+        );
+        let retained_events: Vec<i64> = sqlx::query_scalar(
+                "SELECT sequence FROM events WHERE aggregate_type = ?1 AND aggregate_id = ?2 ORDER BY sequence",
             )
             .bind("CompactableWidget")
             .bind(&id)
-            .fetch_one(&pool)
+            .fetch_all(&pool)
             .await
             .unwrap();
-            assert_eq!(retained_events, 0);
+        assert_eq!(retained_events, expected_suffix);
 
-            let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
+        let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
                                 WHERE aggregate_type = 'CompactableWidget'";
-            let before: (i64, i64, String) =
-                sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
-            assert_eq!((before.0, before.1), (1, 1));
-            let reconciler = Reconciler::new(pool.clone());
-            assert_eq!(reconciler.load_registry().await.unwrap(), None);
-            let target = SchemaTarget::new("CompactableWidget", 2, policy);
+        let before: (i64, i64, String) =
+            sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+        assert_eq!((before.0, before.1), (commands, commands));
+        let reconciler = Reconciler::new(pool.clone());
+        assert_eq!(reconciler.load_registry().await.unwrap(), None);
+        let target = SchemaTarget::new("CompactableWidget", 2, policy);
 
-            assert_eq!(
-                reconciler.reconcile_target(&target).await.unwrap(),
-                SchemaReconciliation::Changed
-            );
-            reconciler.record_target(&target).await.unwrap();
+        assert_eq!(
+            reconciler.reconcile_target(&target).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        reconciler.record_target(&target).await.unwrap();
 
-            let after: (i64, i64, String) =
-                sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
-            assert_eq!(after, before);
-            let registry = reconciler.load_registry().await.unwrap().unwrap();
-            assert_eq!(registry.version_of("CompactableWidget"), Some(2));
-            store.load(&id).await.unwrap().unwrap();
-        }
+        let after: (i64, i64, String) =
+            sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
+        assert_eq!(after, before);
+        let registry = reconciler.load_registry().await.unwrap().unwrap();
+        assert_eq!(registry.version_of("CompactableWidget"), Some(2));
+        store.load(&id).await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -389,24 +394,14 @@ mod tests {
 
         let reconciler = Reconciler::new(pool.clone());
 
-        // First registration succeeds (stored=None) and records version 2.
-        let _ = reconciler.reconcile::<CompactableWidget>().await.unwrap();
         reconciler
-            .record_version::<CompactableWidget>()
+            .record_target(&SchemaTarget::new(
+                CompactableWidget::<false>::AGGREGATE_TYPE,
+                999,
+                CompactableWidget::<false>::COMPACTION_POLICY,
+            ))
             .await
             .unwrap();
-
-        // Manually update the stored version to simulate a version
-        // bump (we can't change the const at runtime).
-        sqlx::query(
-            "UPDATE events SET payload = \
-             '{\"VersionUpdated\":{\"name\":\"CompactableWidget\",\"version\":999}}' \
-             WHERE aggregate_type = 'SchemaRegistry' \
-             AND payload LIKE '%CompactableWidget%'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
 
         // Second reconcile: stored=999, current=2. The entity is
         // compactable, so reconcile should refuse.
