@@ -805,6 +805,8 @@ impl Default for Backoff {
 }
 
 impl Backoff {
+    const MAX_RETRY_INDEX: u32 = 32;
+
     /// Checks that delay generation fits the durable scheduling contract.
     pub fn validate(&self) -> Result<(), JobScheduleError> {
         if !self.factor.is_finite() || self.factor < 1.0 {
@@ -814,8 +816,19 @@ impl Backoff {
         }
         let _maximum_delta = TimeDelta::from_std(self.cap)?;
         let minimum = self.base.min(self.cap);
-        if !minimum.is_zero() && minimum < self.cap {
-            let _scaled_bound = Duration::try_from_secs_f32(self.cap.as_secs_f32() * self.factor)
+        if self.factor <= 1.0 || minimum.is_zero() || minimum == self.cap {
+            return Ok(());
+        }
+
+        let mut delays = self.delays();
+        for _ in 0..Self::MAX_RETRY_INDEX {
+            let current = delays.next().ok_or(JobScheduleError::Exhausted)?;
+            if current >= self.cap {
+                break;
+            }
+            // backon saturates overflow before applying the configured cap.
+            // Check only the multiplications it can actually perform.
+            Duration::try_from_secs_f32(current.as_secs_f32() * self.factor)
                 .map_err(JobScheduleError::BackoffScale)?;
         }
         Ok(())
@@ -823,15 +836,20 @@ impl Backoff {
 
     fn delay(&self, attempt: u32) -> Result<Duration, JobScheduleError> {
         self.validate()?;
-        let index = usize::try_from(attempt.min(32))?;
+        if self.factor <= 1.0 {
+            return Ok(self.base.min(self.cap));
+        }
+        let index = usize::try_from(attempt.min(Self::MAX_RETRY_INDEX))?;
+        self.delays().nth(index).ok_or(JobScheduleError::Exhausted)
+    }
+
+    fn delays(&self) -> impl Iterator<Item = Duration> {
         ExponentialBuilder::default()
             .with_min_delay(self.base.min(self.cap))
             .with_max_delay(self.cap)
             .with_factor(self.factor)
             .without_max_times()
             .build()
-            .nth(index)
-            .ok_or(JobScheduleError::Exhausted)
     }
 }
 
@@ -1414,6 +1432,32 @@ mod tests {
                 custom.delay(attempt).unwrap(),
                 Duration::from_millis(millis)
             );
+        }
+    }
+
+    #[test]
+    fn durable_backoff_allows_scaling_that_reaches_the_cap_without_overflow() {
+        let backoff = Backoff {
+            base: Duration::from_nanos(1),
+            factor: 1e20,
+            cap: Duration::from_secs(1),
+        };
+        backoff.validate().unwrap();
+        assert_eq!(backoff.delay(0).unwrap(), Duration::from_nanos(1));
+        assert_eq!(backoff.delay(1).unwrap(), Duration::from_secs(1));
+        assert_eq!(backoff.delay(32).unwrap(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_unit_backoff_factor_preserves_the_exact_delay() {
+        let base = Duration::from_millis(65_536_003);
+        let backoff = Backoff {
+            base,
+            factor: 1.0,
+            cap: Duration::from_hours(24),
+        };
+        for attempt in [0, 1, 32, u32::MAX] {
+            assert_eq!(backoff.delay(attempt).unwrap(), base);
         }
     }
 
