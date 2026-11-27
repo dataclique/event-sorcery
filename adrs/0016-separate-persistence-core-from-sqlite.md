@@ -26,6 +26,8 @@ own their concrete types and errors, migrations, repository operations,
 transactions, and startup wiring. The framework depends on neither adapter,
 including in test builds. Neither adapter depends on the other.
 
+The dependency graph for the Rust 0.6 split is:
+
 ```mermaid
 flowchart LR
     sqlite[sqlite-es] --> framework[event-sorcery]
@@ -38,6 +40,23 @@ Rust applications select an adapter by passing its backend to the framework's
 generic store constructor. Adapter-specific operations come from the owning
 crate. The Rust 0.6 release removes the old SQLite feature, constructors, and
 reexports from `event-sorcery`; it does not provide compatibility shims.
+
+### Follow-up: Backend-independent FFI
+
+The Rust 0.6 split leaves the SQLite binding and ABI unchanged. The SQLite
+dependency in the diagram is the shipped Rust 0.6 dependency, not the intended
+boundary.
+
+In [#162](https://github.com/dataclique/event-sorcery/issues/162),
+`event-sorcery-ffi` will own the shared ABI contract, codecs, and handle
+lifecycle. It will call the erased engine facade without depending on an adapter
+or driver. The code assembling the shipped SQLite binding will supply the
+adapter and own SQLite configuration and connection setup outside the common
+crate. The exported `es_open` contract stays unchanged. Native Rust and FFI
+writes will continue to use the same SQLite repository writer.
+
+Caller-facing PostgreSQL selection is separate work, tracked in
+[#124](https://github.com/dataclique/event-sorcery/issues/124).
 
 ## Storage guarantees
 
@@ -68,3 +87,6 @@ and drivers. Run the real SQLite and PostgreSQL suites, preserving the existing
 SQLite-backed cases on the adapter side. Assert exact conflict and decode
 errors, snapshot coverage and counters, and rollback of partial event, snapshot,
 job, and recovery writes. Run FFI conformance against the same SQLite writer.
+
+For #162, check the common FFI crate's dependency graph for adapters and drivers
+separately from running ABI conformance on the shipped SQLite library.
