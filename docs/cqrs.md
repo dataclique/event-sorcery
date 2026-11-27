@@ -782,10 +782,10 @@ Native framework delivery uses the persisted envelope's aggregate-local
 sequence. Projection updates skip events already covered by recovery or another
 successful delivery. A gap never applies a live event out of order. The native
 builder's projection shares one gap-wait budget across the committed batch. If
-that wait runs out, it calls `catch_up` once to replay durable history instead
-of retrying each remaining event. Catch-up can touch other streams in the same
-projection table; if it fails, delivery logs the failure without undoing the
-committed command.
+that wait runs out, live delivery makes one recovery attempt for the affected
+stream instead of retrying each remaining event. It does not repair other
+streams. An explicit `catch_up()` checks all streams for the projection. If live
+recovery fails, delivery logs the failure without undoing the committed command.
 
 Other reactors receive the sequence through `Reactor::react_with_context`. `Arc`
 and `RetryOnBusy` preserve it, and custom reactors default to their `react`
@@ -910,12 +910,13 @@ changes.
 SQLite supports worker execution through `SqliteBackend`. `PostgresBackend` can
 enqueue jobs but does not yet support worker execution.
 
-The worker host uses stable Apalis 1.0. Dispatching a job (see **Jobs Pattern**
-above) only writes a pending row; a worker has to drain it.
-`JobRuntime::build(backend)` opens the job store and recovers its queue
-projection. `build_supervised_worker!` registers one supervised worker per job
-type -- entity-kicked jobs get a `JobInput` (their dependencies plus the origin
-store verdicts are delivered through), standalone jobs get their plain input:
+The worker host uses stable Apalis 1.0. Dispatch commits the origin's
+`Dispatched` event, the job's enqueue event, and the pending queue row in one
+transaction. A worker executes the job later. `JobRuntime::build(backend)` opens
+the job store and recovers its queue projection. `build_supervised_worker!`
+registers one supervised worker per job type -- entity-kicked jobs get a
+`JobInput` (their dependencies plus the origin store verdicts are delivered
+through), standalone jobs get their plain input:
 
 ```rust
 let runtime = JobRuntime::build(sqlite_es::SqliteBackend { pool: pool.clone() }).await?;

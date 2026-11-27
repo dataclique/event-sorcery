@@ -2,9 +2,12 @@
 
 PostgreSQL persistence integration for `event-sorcery`, built on the maintained
 CQRS fork's `postgres-es` adapter. Event, snapshot, replay, and ordinary view
-I/O delegate to that adapter. This crate adds atomic job writes, startup
-recovery, and indexed view queries; entity definitions and shared
-schema/snapshot policy remain in `event-sorcery`.
+I/O delegate to that adapter. This crate adds atomic job writes, native store
+startup and projection recovery, and indexed view queries. Entity definitions
+and shared schema and snapshot policy remain in `event-sorcery`.
+
+PostgreSQL can persist job events and queue rows, but this adapter does not yet
+run workers or recover the job queue at startup.
 
 ## Public API
 
