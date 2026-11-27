@@ -394,13 +394,8 @@ mod tests {
         assert_eq!(version, 3);
     }
 
-    /// A real version transition (a prior version is already recorded, then the
-    /// code's `SCHEMA_VERSION` differs) also rebuilds incompatible current
-    /// views. This distinguishes the genuine-mismatch trigger from the
-    /// first-registration trigger above: a regression that gated `rebuild_all`
-    /// on `stored_version.is_some()` would pass the test above but fail here.
     #[tokio::test]
-    async fn schema_version_bump_rebuilds_incompatible_current_view() {
+    async fn schema_version_bump_repairs_legacy_revision_before_live_delivery() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlite_es::MIGRATOR.run(&pool).await.unwrap();
 
@@ -415,58 +410,48 @@ mod tests {
         .await
         .unwrap();
 
-        // Seed a PRIOR recorded schema version (0) for Tally, so build() sees a
-        // genuine 0 -> 1 mismatch rather than a first registration.
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
-             event_version, payload, metadata) \
-             VALUES ('SchemaRegistry', 'schema', 1, 'SchemaRegistryEvent::VersionUpdated', '1.0', \
-             '{\"VersionUpdated\":{\"name\":\"Tally\",\"version\":0}}', '{}')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let payload = serde_json::to_string(&TallyEvent::Bumped).unwrap();
-        for sequence in 1..=3 {
-            sqlx::query(
-                "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
-                 event_version, payload, metadata) \
-                 VALUES ('Tally', 'tally-1', ?1, 'TallyEvent::Bumped', '1.0', ?2, '{}')",
-            )
-            .bind(sequence)
-            .bind(&payload)
-            .execute(&pool)
+        let backend = SqliteBackend { pool: pool.clone() };
+        let (old_store, _) = StoreBuilder::<Tally<0>, _>::with_backend(backend.clone())
+            .build()
             .await
             .unwrap();
-        }
-
-        sqlx::query("INSERT INTO tally_view (view_id, version, payload) VALUES ('tally-1', 3, ?1)")
-            .bind(r#"{"Completed": {"count": 0}}"#)
+        let id = "tally-1".to_owned();
+        old_store.send(&id, ()).await.unwrap();
+        old_store.send(&id, ()).await.unwrap();
+        drop(old_store);
+        // A legacy duplicate delivery advanced the revision, not the event stream.
+        sqlx::query("UPDATE tally_view SET version = 3 WHERE view_id = ?")
+            .bind(&id)
             .execute(&pool)
             .await
             .unwrap();
 
-        let (_store, projection) =
-            StoreBuilder::<Tally, _>::with_backend(SqliteBackend { pool: pool.clone() })
-                .build()
-                .await
-                .unwrap();
-
-        let healed = projection
-            .load(&"tally-1".to_owned())
+        let (store, projection) = StoreBuilder::<Tally, _>::with_backend(backend)
+            .build()
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(healed.count, 3);
+        assert_eq!(
+            projection.load(&id).await.unwrap(),
+            Some(Tally { count: 2 })
+        );
+        let version_query = "SELECT version FROM tally_view WHERE view_id = ?";
+        let version: i64 = sqlx::query_scalar(version_query)
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
 
-        // The version bookmark must advance to max_seq; otherwise the next
-        // catch_up would re-replay every event and double-apply increments.
-        let version: i64 =
-            sqlx::query_scalar("SELECT version FROM tally_view WHERE view_id = 'tally-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        store.send(&id, ()).await.unwrap();
+        assert_eq!(
+            projection.load(&id).await.unwrap(),
+            Some(Tally { count: 3 })
+        );
+        let version: i64 = sqlx::query_scalar(version_query)
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(version, 3);
     }
 }

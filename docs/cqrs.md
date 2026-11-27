@@ -804,6 +804,14 @@ writes as optimistic conflicts. Direct unsequenced `react` writes must not be
 mixed with native framework delivery because they cannot establish event
 coverage.
 
+**Upgrading existing SQLite projections to Rust 0.6:** Bump each projected
+entity's `SCHEMA_VERSION` before starting the new store, even when its payload
+schema is unchanged. Startup rebuilds the view from retained history before it
+accepts commands. Legacy view revisions may count duplicate deliveries rather
+than represent event checkpoints; carrying those revisions forward can cause new
+events to be skipped. If history is incomplete, recover it before upgrading; do
+not reset the revision by hand.
+
 ### Lifecycle Serialization in View Payloads
 
 All our aggregates use `Lifecycle<Entity>` (where `Entity: EventSourced`) as
