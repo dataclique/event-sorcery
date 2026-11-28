@@ -1710,6 +1710,106 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn cancelling_queue_recovery_before_registration_rolls_back_replay(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let job_id = JobId::new();
+        PostgresEventRepository { pool: pool.clone() }
+            .enqueue(JobSeed::new(
+                job_id,
+                "standalone",
+                json!({"value": 1}),
+                1_700_000_000_000,
+            ))
+            .await
+            .unwrap();
+        let deleted = sqlx::query("DELETE FROM job_queue_projection WHERE view_id = $1")
+            .bind(job_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+
+        // Registration follows replay. Block its insert without locking out replay reads.
+        sqlx::raw_sql(
+            "CREATE FUNCTION wait_for_queue_registration() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 PERFORM pg_advisory_xact_lock(782341, 9);
+                 RETURN NEW;
+             END;
+             $$;
+             CREATE TRIGGER wait_for_queue_registration BEFORE INSERT ON events
+             FOR EACH ROW WHEN (NEW.aggregate_type = 'SchemaRegistry')
+             EXECUTE FUNCTION wait_for_queue_registration();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let singleton = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let recovery_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&singleton)
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(782341, 9)")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let backend = PostgresBackend { pool: singleton };
+        let recovering = backend.pool.clone();
+        let recovery = tokio::spawn(async move {
+            recover_job_queue_row(&PostgresBackend { pool: recovering }, &job_id).await
+        });
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks
+                     WHERE pid = $1 AND locktype = 'advisory' AND NOT granted
+                       AND classid = 782341 AND objid = 9 AND objsubid = 2)",
+                )
+                .bind(recovery_pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery must reach registration after writing the queue row");
+        recovery.abort();
+        assert!(recovery.await.unwrap_err().is_cancelled());
+        blocker.rollback().await.unwrap();
+
+        let counts: (i64, i64, i64) = timeout(
+            Duration::from_secs(5),
+            sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM job_queue_projection),
+                        (SELECT COUNT(*) FROM events WHERE aggregate_type = 'SchemaRegistry'),
+                        (SELECT COUNT(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1)",
+            )
+            .bind(job_id.to_string())
+            .fetch_one(&backend.pool),
+        )
+        .await
+        .expect("cancellation must release the recovery connection")
+        .unwrap();
+        assert_eq!(counts, (0, 0, 1));
+        assert_eq!(
+            recover_job_queue_row(&backend, &job_id).await.unwrap(),
+            Some(json!({"Pending": {
+                "kind": "standalone", "payload": {"value": 1},
+                "run_at": 1_700_000_000_000_i64, "attempt": 0, "claims": 0
+            }}))
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn standalone_enqueue_preserves_first_event_and_queue_row_on_duplicate(pool: PgPool) {
         MIGRATOR.run(&pool).await.unwrap();
         let job_id = JobId::new();
