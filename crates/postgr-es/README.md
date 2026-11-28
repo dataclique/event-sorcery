@@ -6,8 +6,8 @@ I/O delegate to that adapter. This crate adds atomic job writes, native store
 startup and projection recovery, and indexed view queries. Entity definitions
 and shared schema and snapshot policy remain in `event-sorcery`.
 
-PostgreSQL can persist job events and queue rows, but this adapter does not yet
-run workers or recover the job queue at startup.
+PostgreSQL supports atomic job enqueue. The adapter exposes neither worker
+startup nor a public job-queue recovery entry point.
 
 ## Public API
 
@@ -148,7 +148,9 @@ not execute the job's external effects.
 The `job` event stream is authoritative; `job_queue_projection` is derived
 state. The adapter's PostgreSQL conformance tests exercise the library-owned job
 fold through native projection recovery and indexed reads, without starting a
-worker. This does not add a public job-queue startup API.
+worker. The tests use the same indexed `find` contract as other native
+projections: they locate a recovered job by `status`, `run_at` (Unix
+milliseconds), and whether `lease_until` is unset.
 
 Recovery restores the lifecycle and the scheduled time of pending or claimed
 jobs. Catch-up leaves an existing lease column intact; recreating a missing row
