@@ -1456,6 +1456,92 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn snapshot_constraint_failure_keeps_database_identity_and_rolls_back(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        sqlx::query("CREATE UNIQUE INDEX unique_snapshot_payload ON snapshots (payload)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
+        let framework = CqrsFramework::new(store, vec![], None);
+        framework.execute("first", "same".to_owned()).await.unwrap();
+
+        let error = framework
+            .execute("second", "same".to_owned())
+            .await
+            .unwrap_err();
+        let AggregateError::DatabaseConnectionError(source) = error else {
+            panic!("expected the database constraint error: {error:?}");
+        };
+        let database = source
+            .downcast_ref::<sqlx::Error>()
+            .unwrap()
+            .as_database_error()
+            .unwrap();
+        assert_eq!(database.code().as_deref(), Some("23505"));
+        assert_eq!(database.constraint(), Some("unique_snapshot_payload"));
+        let repository = PostgresEventRepository { pool };
+        assert_eq!(
+            repository
+                .get_events::<RecordedValues>("second")
+                .await
+                .unwrap(),
+            []
+        );
+        assert_eq!(
+            repository
+                .get_snapshot::<RecordedValues>("second")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn zero_snapshot_counter_preserves_reload_and_the_next_snapshot(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 2);
+        let framework = CqrsFramework::new(store, vec![], None);
+        for value in ["first", "second", "third"] {
+            framework.execute("stream", value.to_owned()).await.unwrap();
+        }
+        sqlx::query(
+            "UPDATE snapshots SET snapshot_version = DEFAULT WHERE aggregate_id = 'stream'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = PostgresEventRepository { pool };
+        let snapshot = repository
+            .get_snapshot::<RecordedValues>("stream")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (snapshot.current_sequence, snapshot.current_snapshot),
+            (2, 0)
+        );
+        assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
+
+        framework
+            .execute("stream", "fourth".to_owned())
+            .await
+            .unwrap();
+        let updated = repository
+            .get_snapshot::<RecordedValues>("stream")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((updated.current_sequence, updated.current_snapshot), (4, 1));
+        assert_eq!(
+            updated.aggregate,
+            json!({"values": ["first", "second", "third", "fourth"]})
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn append_preserves_application_unique_constraint_identity(pool: PgPool) {
         MIGRATOR.run(&pool).await.unwrap();
         sqlx::query(
