@@ -2058,7 +2058,7 @@ mod tests {
 
         let (left, right, ()) = timeout(Duration::from_secs(5), async {
             tokio::join!(
-                first.claim_job(job_key, |read| decide(job_key, read)),
+                Box::pin(first.claim_job(job_key, |read| decide(job_key, read))),
                 async {
                     wait_for_blocker(
                         pool,
@@ -2067,9 +2067,7 @@ mod tests {
                         "%UPDATE job_queue_projection%",
                     )
                     .await;
-                    second
-                        .claim_job(job_key, |read| decide(job_key, read))
-                        .await
+                    Box::pin(second.claim_job(job_key, |read| decide(job_key, read))).await
                 },
                 async {
                     wait_for_blocker(pool, second_pid, first_pid, "%FOR UPDATE").await;
