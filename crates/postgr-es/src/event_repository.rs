@@ -290,31 +290,43 @@ impl PostgresEventRepository {
 
         for job in jobs {
             let event = job.event().map_err(EngineError::from)?;
-            repository
-                .append_serialized_events_in(
-                    &mut transaction,
-                    &event.aggregate_type,
-                    std::slice::from_ref(&event),
-                )
-                .await
-                .map_err(PersistenceError::from)
-                .map_err(adapter_error)?;
-            sqlx::query(
-                r"
-                INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
-                VALUES ($1, 1, $2::JSONB, NULL)
-                ",
-            )
-            .bind(&event.aggregate_id)
-            .bind(job.queue_payload().map_err(EngineError::from)?)
-            .execute(&mut *transaction)
-            .await
-            .map_err(write_error)?;
+            append_and_seed_job(&repository, &mut transaction, &event, || {
+                Ok(job.queue_payload().map_err(EngineError::from)?)
+            })
+            .await?;
         }
 
         transaction.commit().await.map_err(write_error)?;
         Ok(())
     }
+}
+
+async fn append_and_seed_job(
+    repository: &postgres_es::PostgresEventRepository,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &SerializedEvent,
+    encode_queue_payload: impl FnOnce() -> Result<String, PersistenceError> + Send,
+) -> Result<(), PersistenceError> {
+    if let Err(error) = repository
+        .append_serialized_events_in(
+            transaction,
+            &event.aggregate_type,
+            std::slice::from_ref(event),
+        )
+        .await
+    {
+        return Err(adapter_error(error.into()));
+    }
+    sqlx::query(
+        "INSERT INTO job_queue_projection (view_id, version, payload, lease_until)
+         VALUES ($1, 1, $2::JSONB, NULL)",
+    )
+    .bind(&event.aggregate_id)
+    .bind(encode_queue_payload()?)
+    .execute(&mut **transaction)
+    .await
+    .map_err(write_error)?;
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
