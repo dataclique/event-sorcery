@@ -202,6 +202,17 @@ impl PostgresEventRepository {
         Ok(())
     }
 
+    pub(crate) async fn enqueue_encoded(
+        &self,
+        event: SerializedEvent,
+        payload: String,
+    ) -> Result<(), PersistenceError> {
+        let mut transaction = self.pool.begin().await.map_err(write_error)?;
+        append_and_seed_job(&self.official(), &mut transaction, &event, || Ok(payload)).await?;
+        transaction.commit().await.map_err(write_error)?;
+        Ok(())
+    }
+
     async fn persist_updates<A: Aggregate>(
         &self,
         events: &[SerializedEvent],
@@ -1518,6 +1529,59 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(counts, (0, 0));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn encoded_enqueue_commits_event_and_seed_together(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let job_id = JobId::new();
+        let seed = JobSeed::new(job_id, "standalone", json!({"value": 1}), 1_700_000_000_000);
+
+        sqlx::query(
+            "ALTER TABLE job_queue_projection ADD CONSTRAINT reject_encoded_seed CHECK (FALSE)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let failure = repository
+            .enqueue_encoded(seed.event().unwrap(), seed.queue_payload().unwrap())
+            .await;
+        let PersistenceError::ConnectionError(source) = failure.unwrap_err() else {
+            panic!("expected queue seed constraint error");
+        };
+        let database = source
+            .downcast_ref::<sqlx::Error>()
+            .unwrap()
+            .as_database_error()
+            .unwrap();
+        assert_eq!(database.constraint(), Some("reject_encoded_seed"));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("ALTER TABLE job_queue_projection DROP CONSTRAINT reject_encoded_seed")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        repository
+            .enqueue_encoded(seed.event().unwrap(), seed.queue_payload().unwrap())
+            .await
+            .unwrap();
+        let stored: (i64, String, i64, String, Option<i64>) = sqlx::query_as(
+            "SELECT events.sequence, events.event_type, queue.version, queue.status, queue.lease_until
+             FROM events JOIN job_queue_projection queue ON queue.view_id = events.aggregate_id
+             WHERE events.aggregate_type = 'job' AND events.aggregate_id = $1",
+        ).bind(job_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            stored,
+            (1, "JobEnqueued".to_owned(), 1, "pending".to_owned(), None)
+        );
     }
 
     #[sqlx::test(migrations = false)]
