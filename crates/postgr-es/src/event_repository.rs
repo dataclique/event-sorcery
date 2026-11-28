@@ -7,7 +7,7 @@ use cqrs_es::persist::{
 use serde_json::Value;
 
 use event_sorcery::{
-    CommitRequest, EngineError, JobSeed, PreparedCommit, SnapshotUpdate, validate_expected_version,
+    CommitRequest, EngineError, JobSeed, SnapshotUpdate, StreamIdentity, validate_expected_version,
 };
 
 /// Pool-backed PostgreSQL repository for the CQRS persistence contract.
@@ -115,15 +115,11 @@ impl PostgresEventRepository {
     }
 
     async fn commit(&self, request: CommitRequest<'_>) -> Result<(), PersistenceError> {
-        let PreparedCommit {
+        let (stream, expected_version, events, snapshot, jobs) = request.check()?.into_parts();
+        let StreamIdentity {
             aggregate_type,
             aggregate_id,
-            expected_version,
-            events,
-            snapshot,
-            jobs,
-            ..
-        } = request.prepare()?;
+        } = stream;
         let mut transaction = self.pool.begin().await.map_err(EngineError::from)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .execute(&mut *transaction)
@@ -159,6 +155,7 @@ impl PostgresEventRepository {
             .map_err(PersistenceError::from)
             .map_err(adapter_error)?;
         if let Some(snapshot) = snapshot {
+            let snapshot = snapshot.prepare(events)?;
             let previous = repository
                 .get_snapshot_in(&mut transaction, &aggregate_type, &aggregate_id)
                 .await?;
@@ -192,11 +189,12 @@ impl PostgresEventRepository {
         }
 
         for job in jobs {
+            let event = job.event().map_err(EngineError::from)?;
             repository
                 .append_serialized_events_in(
                     &mut transaction,
-                    &job.event.aggregate_type,
-                    std::slice::from_ref(&job.event),
+                    &event.aggregate_type,
+                    std::slice::from_ref(&event),
                 )
                 .await
                 .map_err(PersistenceError::from)
@@ -207,8 +205,8 @@ impl PostgresEventRepository {
                 VALUES ($1, 1, $2::JSONB, NULL)
                 ",
             )
-            .bind(&job.event.aggregate_id)
-            .bind(job.queue_payload)
+            .bind(&event.aggregate_id)
+            .bind(job.queue_payload().map_err(EngineError::from)?)
             .execute(&mut *transaction)
             .await
             .map_err(write_error)?;
@@ -723,13 +721,26 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn competing_commands_preserve_one_winning_snapshot(pool: PgPool) {
+        assert_one_winning_snapshot(pool, &["seed"]).await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn competing_first_commands_preserve_one_winning_snapshot(pool: PgPool) {
+        assert_one_winning_snapshot(pool, &[]).await;
+    }
+
+    async fn assert_one_winning_snapshot(pool: PgPool, prefix: &[&str]) {
         MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
         let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
-        CqrsFramework::new(store, vec![], None)
-            .execute("stream", "seed".to_string())
-            .await
-            .unwrap();
+        let framework = CqrsFramework::new(store, vec![], None);
+        for value in prefix {
+            framework
+                .execute("stream", (*value).to_owned())
+                .await
+                .unwrap();
+        }
+
         let left = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(
             PostgresEventRepository { pool: pool.clone() },
             1,
@@ -762,9 +773,36 @@ mod tests {
             results => panic!("expected one durable winner and one conflict, got {results:?}"),
         };
         let restored = left.load_aggregate("stream").await.unwrap();
-        assert_eq!(restored.aggregate.values, ["seed", winner]);
-        assert_eq!(restored.current_sequence, 2);
-        assert_eq!(restored.current_snapshot, Some(2));
+        let expected: Vec<_> = prefix
+            .iter()
+            .copied()
+            .chain(std::iter::once(winner))
+            .collect();
+        let sequence = expected.len();
+        assert_eq!(restored.aggregate.values, expected);
+        assert_eq!(restored.current_sequence, sequence);
+        assert_eq!(restored.current_snapshot, Some(sequence));
+        let events = PostgresEventRepository { pool }
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=sequence).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            events
+                .into_iter()
+                .map(|event| event.payload)
+                .collect::<Vec<_>>(),
+            expected
+                .into_iter()
+                .map(|value| serde_json::json!({"Recorded": {"value": value}}))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[sqlx::test(migrations = false)]
@@ -805,6 +843,99 @@ mod tests {
                 .await
                 .map(|event| event.unwrap().sequence),
             None
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn stale_version_takes_precedence_over_invalid_snapshot_coverage(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let store =
+            PersistedEventStore::<_, RecordedValues>::new_event_store(PostgresEventRepository {
+                pool: pool.clone(),
+            });
+        let repository = PostgresEventRepository { pool };
+        let framework = CqrsFramework::new(store, vec![], None);
+        framework
+            .execute("stream", "first".to_owned())
+            .await
+            .unwrap();
+        let mut event = repository
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap()
+            .remove(0);
+        event.sequence = 2;
+        let invalid_snapshot = || cqrs_es::persist::SerializedSnapshot {
+            aggregate_id: "stream".to_owned(),
+            aggregate: json!({"values": ["first", "second", "third"]}),
+            current_sequence: 3,
+            current_snapshot: 1,
+        };
+
+        let error = repository
+            .persist_with_snapshot::<RecordedValues>(
+                std::slice::from_ref(&event),
+                Some(invalid_snapshot()),
+            )
+            .await
+            .unwrap_err();
+        let PersistenceError::UnknownError(source) = error else {
+            panic!("expected invalid snapshot coverage, got {error:?}");
+        };
+        assert!(matches!(
+            source.downcast_ref::<event_sorcery::EngineError>(),
+            Some(event_sorcery::EngineError::SnapshotBeyondCurrentVersion {
+                proposed: 3,
+                current: 2
+            })
+        ));
+        let events = repository
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 1);
+        assert!(
+            repository
+                .get_snapshot::<RecordedValues>("stream")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        framework
+            .execute("stream", "winner".to_owned())
+            .await
+            .unwrap();
+        let before = repository
+            .get_events::<RecordedValues>("stream")
+            .await
+            .unwrap();
+        assert_eq!(before[1].payload, json!({"Recorded": {"value": "winner"}}));
+        let error = repository
+            .persist_with_snapshot::<RecordedValues>(
+                std::slice::from_ref(&event),
+                Some(invalid_snapshot()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, PersistenceError::OptimisticLockError),
+            "{error:?}"
+        );
+        assert_eq!(
+            repository
+                .get_events::<RecordedValues>("stream")
+                .await
+                .unwrap(),
+            before
+        );
+        assert!(
+            repository
+                .get_snapshot::<RecordedValues>("stream")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1322,6 +1453,127 @@ mod tests {
                 json!({})
             )]
         );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn snapshot_constraint_failure_keeps_database_identity_and_rolls_back(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        sqlx::query("CREATE UNIQUE INDEX unique_snapshot_payload ON snapshots (payload)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 1);
+        let framework = CqrsFramework::new(store, vec![], None);
+        framework.execute("first", "same".to_owned()).await.unwrap();
+
+        let error = framework
+            .execute("second", "same".to_owned())
+            .await
+            .unwrap_err();
+        let AggregateError::DatabaseConnectionError(source) = error else {
+            panic!("expected the database constraint error: {error:?}");
+        };
+        let database = source
+            .downcast_ref::<sqlx::Error>()
+            .unwrap()
+            .as_database_error()
+            .unwrap();
+        assert_eq!(database.code().as_deref(), Some("23505"));
+        assert_eq!(database.constraint(), Some("unique_snapshot_payload"));
+        let repository = PostgresEventRepository { pool };
+        assert_eq!(
+            repository
+                .get_events::<RecordedValues>("second")
+                .await
+                .unwrap(),
+            []
+        );
+        assert_eq!(
+            repository
+                .get_snapshot::<RecordedValues>("second")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn zero_snapshot_counter_preserves_reload_and_the_next_snapshot(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let store = PersistedEventStore::<_, RecordedValues>::new_snapshot_store(repository, 2);
+        let framework = CqrsFramework::new(store, vec![], None);
+        for value in ["first", "second", "third"] {
+            framework.execute("stream", value.to_owned()).await.unwrap();
+        }
+        sqlx::query(
+            "UPDATE snapshots SET snapshot_version = DEFAULT WHERE aggregate_id = 'stream'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = PostgresEventRepository { pool };
+        let snapshot = repository
+            .get_snapshot::<RecordedValues>("stream")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (snapshot.current_sequence, snapshot.current_snapshot),
+            (2, 0)
+        );
+        assert_eq!(snapshot.aggregate, json!({"values": ["first", "second"]}));
+
+        framework
+            .execute("stream", "fourth".to_owned())
+            .await
+            .unwrap();
+        let updated = repository
+            .get_snapshot::<RecordedValues>("stream")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((updated.current_sequence, updated.current_snapshot), (4, 1));
+        assert_eq!(
+            updated.aggregate,
+            json!({"values": ["first", "second", "third", "fourth"]})
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn append_preserves_application_unique_constraint_identity(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX one_event_per_type ON events (aggregate_type, event_type)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let store = PersistedEventStore::<_, RecordedValues>::new_event_store(repository);
+        let framework = CqrsFramework::new(store, vec![], None);
+        framework
+            .execute("first", "saved".to_string())
+            .await
+            .unwrap();
+        let error = framework
+            .execute("second", "rejected".to_string())
+            .await
+            .unwrap_err();
+        let AggregateError::DatabaseConnectionError(source) = error else {
+            panic!("expected the application constraint to remain a storage error: {error:?}");
+        };
+        let source = source.downcast_ref::<sqlx::Error>().unwrap();
+        let source = source.as_database_error().unwrap();
+        assert_eq!(source.code().as_deref(), Some("23505"));
+        assert_eq!(source.table(), Some("events"));
+        assert_eq!(source.constraint(), Some("one_event_per_type"));
+        let persisted: Vec<String> = sqlx::query_scalar("SELECT aggregate_id FROM events")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(persisted, ["first"]);
     }
 
     #[sqlx::test(migrations = false)]

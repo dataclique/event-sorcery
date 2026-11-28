@@ -22,21 +22,14 @@
 //! [`SCHEMA_VERSION`]: crate::EventSourced::SCHEMA_VERSION
 
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
-use cqrs_es::persist::PersistenceError;
+use cqrs_es::persist::{PersistedEventRepository, PersistedEventStore, PersistenceError};
+use cqrs_es::{AggregateError, CqrsFramework};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::CompactionPolicy;
-use crate::lifecycle::{LifecycleError, Never};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::{DomainEvent, Effect, EventSourced, Nil, StreamIdentity, uneventful};
-
-#[cfg(any(test, feature = "sqlite"))]
-#[path = "sqlite_schema_registry.rs"]
-mod sqlite;
-
-#[cfg(any(test, feature = "sqlite"))]
-pub use sqlite::Reconciler;
 
 /// Singleton aggregate ID for the schema registry.
 pub(crate) const REGISTRY_ID: &str = "schema";
@@ -44,9 +37,12 @@ pub(crate) const REGISTRY_ID: &str = "schema";
 /// Language-neutral aggregate schema metadata used during startup recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaTarget {
-    aggregate_type: String,
-    version: u64,
-    compaction: CompactionPolicy,
+    /// Aggregate namespace used to read the registry and identify stale snapshots.
+    pub aggregate_type: String,
+    /// Current schema version supplied by the entity or binding.
+    pub version: u64,
+    /// Retention policy controlling whether stale snapshots can be removed.
+    pub compaction: CompactionPolicy,
 }
 
 impl SchemaTarget {
@@ -63,7 +59,8 @@ impl SchemaTarget {
         }
     }
 
-    pub(crate) fn reconciliation(
+    /// Compares the declared schema with the replayed registry state.
+    pub fn reconciliation(
         &self,
         registry: Option<&SchemaRegistry>,
     ) -> Result<SchemaReconciliation, ReconcileError> {
@@ -96,11 +93,13 @@ pub struct SchemaRegistry {
 }
 
 impl SchemaRegistry {
-    fn version_of(&self, name: &str) -> Option<u64> {
+    /// Reads the last version durably registered for an aggregate type.
+    pub fn version_of(&self, name: &str) -> Option<u64> {
         self.versions.get(name).copied()
     }
 
-    pub(crate) fn from_payloads(payloads: Vec<String>) -> Result<Option<Self>, ReconcileError> {
+    /// Replays registry event payloads in stream order, without snapshots.
+    pub fn from_payloads(payloads: Vec<String>) -> Result<Option<Self>, ReconcileError> {
         payloads.into_iter().try_fold(None, |state, payload| {
             let event: SchemaRegistryEvent = serde_json::from_str(&payload)?;
             let next = match state {
@@ -219,13 +218,14 @@ impl SchemaReconciliation {
 /// Proves that every positive sequence covered by a snapshot remains available.
 ///
 /// Counts must include only this stream and sequences in `1..=covered_sequence`.
+/// Zero coverage requires zero retained events in that range.
 /// Sparse or compacted histories without this proof require an explicit migration.
 pub fn validate_snapshot_history(
     stream: StreamIdentity,
     covered_sequence: i64,
     retained_events: i64,
 ) -> Result<(), ReconcileError> {
-    if covered_sequence <= 0 || retained_events != covered_sequence {
+    if covered_sequence < 0 || retained_events != covered_sequence {
         return Err(ReconcileError::UnprovenSnapshotHistory {
             stream,
             covered_sequence,
@@ -238,10 +238,16 @@ pub fn validate_snapshot_history(
 /// Errors from schema reconciliation during startup.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
+    /// A materialized view cannot recover from a compactable event stream.
+    #[error("projection startup requires retained history for aggregate '{aggregate_type}'")]
+    ProjectionRequiresRetainedHistory {
+        /// Entity type whose projection needs complete history.
+        aggregate_type: &'static str,
+    },
     /// Snapshot clearing requires proof that its entire covered history is retained.
     #[error(
-        "Cannot clear snapshot for {stream:?}: covered sequence {covered_sequence}, \
-         retained covered events {retained_events}; complete history is unproven. \
+        "Snapshot history for {stream:?} cannot be proven complete: covered sequence \
+         {covered_sequence}, retained covered events {retained_events}. \
          An explicit snapshot-preserving migration is required."
     )]
     UnprovenSnapshotHistory {
@@ -281,13 +287,44 @@ impl From<Never> for ReconcileError {
     }
 }
 
+/// Records reconciled schema versions through the registry's existing aggregate.
+pub struct SchemaRegistryWriter<Repository: PersistedEventRepository> {
+    cqrs: CqrsFramework<
+        Lifecycle<SchemaRegistry>,
+        PersistedEventStore<Repository, Lifecycle<SchemaRegistry>>,
+    >,
+}
+
+impl<Repository: PersistedEventRepository> SchemaRegistryWriter<Repository> {
+    /// Opens the registry's command handler over caller-owned storage.
+    pub fn new(repository: Repository) -> Self {
+        let store = PersistedEventStore::new_event_store(repository);
+        let cqrs = crate::wire::es_cqrs::<SchemaRegistry, _>(store, vec![]);
+
+        Self { cqrs }
+    }
+
+    /// Marks a schema version after its recovery has durably completed.
+    pub async fn record(&self, target: &SchemaTarget) -> Result<(), ReconcileError> {
+        crate::job::with_pending_scope(self.cqrs.execute(
+            REGISTRY_ID,
+            SchemaRegistryCommand::Register {
+                name: target.aggregate_type.clone(),
+                version: target.version,
+            },
+        ))
+        .await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use cqrs_es::Aggregate;
     use cqrs_es::event_sink::EventSink;
     use proptest::prelude::{any, prop_assert_eq, proptest};
     use serde_json::json;
-    use sqlx::SqlitePool;
 
     use super::*;
     use crate::lifecycle::Lifecycle;
@@ -432,216 +469,5 @@ mod tests {
         assert_eq!(registry.version_of("Position"), Some(1));
         assert_eq!(registry.version_of("OffchainOrder"), Some(3));
         assert_eq!(registry.version_of("Unknown"), None);
-    }
-
-    #[tokio::test]
-    async fn reconciler_detects_version_change() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
-
-        let reconciler = Reconciler::new(pool);
-
-        // First run: no stored version -> changed.
-        let outcome = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
-        assert_eq!(outcome, SchemaReconciliation::Changed);
-
-        // Until the version is recorded, every reconcile still reports a change
-        // -- a crash before record_version re-runs the whole recovery.
-        let outcome = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
-        assert_eq!(outcome, SchemaReconciliation::Changed);
-
-        reconciler.record_version::<SchemaRegistry>().await.unwrap();
-
-        // After recording, the version matches -> unchanged.
-        let outcome = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
-        assert_eq!(outcome, SchemaReconciliation::Unchanged);
-    }
-
-    #[tokio::test]
-    async fn load_registry_replays_from_events() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
-
-        let reconciler = Reconciler::new(pool);
-
-        // Initially empty
-        let registry = reconciler.load_registry().await.unwrap();
-        assert!(registry.is_none());
-
-        // Reconcile then record the version into the registry.
-        let _ = reconciler.reconcile::<SchemaRegistry>().await.unwrap();
-        reconciler.record_version::<SchemaRegistry>().await.unwrap();
-
-        // Should have SchemaRegistry at version 1
-        let registry = reconciler.load_registry().await.unwrap().unwrap();
-        assert_eq!(registry.version_of("SchemaRegistry"), Some(1));
-    }
-
-    /// Minimal compactable entity for testing the reconciliation guard.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct CompactableWidget;
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-    enum CompactableEvent {
-        Created,
-    }
-
-    impl cqrs_es::DomainEvent for CompactableEvent {
-        fn event_type(&self) -> String {
-            "Created".to_string()
-        }
-        fn event_version(&self) -> String {
-            "1.0".to_string()
-        }
-    }
-
-    #[async_trait]
-    impl EventSourced for CompactableWidget {
-        type Id = String;
-        type Error = Never;
-        type Command = ();
-        type Event = CompactableEvent;
-        type Materialized = Nil;
-        type Jobs = Nil;
-
-        const PROJECTION: Nil = Nil;
-        const SCHEMA_VERSION: u64 = 2;
-        const SNAPSHOT_SIZE: usize = 1;
-        const AGGREGATE_TYPE: &'static str = "CompactableWidget";
-        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
-
-        fn originate(_event: &Self::Event) -> Option<Self> {
-            Some(Self)
-        }
-
-        fn evolve(_entity: &Self, _event: &Self::Event) -> Result<Option<Self>, Never> {
-            Ok(Some(Self))
-        }
-
-        async fn initialize(_command: Self::Command) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![CompactableEvent::Created]))
-        }
-
-        async fn transition(&self, _command: Self::Command) -> Result<Effect<Self>, Never> {
-            uneventful()
-        }
-    }
-
-    #[tokio::test]
-    async fn reconcile_allows_first_registration_for_compactable_aggregate() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
-
-        let reconciler = Reconciler::new(pool);
-
-        // First reconcile: stored=None, current=2. No prior snapshots
-        // exist, so this should succeed even for compactable entities.
-        let outcome = reconciler.reconcile::<CompactableWidget>().await.unwrap();
-
-        assert_eq!(outcome, SchemaReconciliation::Changed);
-    }
-
-    #[tokio::test]
-    async fn first_registration_preserves_existing_compactable_snapshots() {
-        for policy in [
-            CompactionPolicy::CompactAfterSnapshot,
-            CompactionPolicy::RetainLast { events: 2 },
-        ] {
-            let pool = sqlite_es::testing::create_test_pool().await.unwrap();
-            let store = crate::test_store::<CompactableWidget>(pool.clone());
-            let id = "legacy-widget".to_string();
-            store.send(&id, ()).await.unwrap();
-            let snapshot_sql = "SELECT last_sequence, snapshot_version, payload FROM snapshots \
-                                WHERE aggregate_type = 'CompactableWidget'";
-            let before: (i64, i64, String) =
-                sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
-            assert_eq!((before.0, before.1), (1, 1));
-            let reconciler = Reconciler::new(pool.clone());
-            assert_eq!(reconciler.load_registry().await.unwrap(), None);
-            let target = SchemaTarget::new("CompactableWidget", 2, policy);
-
-            assert_eq!(
-                reconciler.reconcile_target(&target).await.unwrap(),
-                SchemaReconciliation::Changed
-            );
-            reconciler.record_target(&target).await.unwrap();
-
-            let after: (i64, i64, String) =
-                sqlx::query_as(snapshot_sql).fetch_one(&pool).await.unwrap();
-            assert_eq!(after, before);
-            let registry = reconciler.load_registry().await.unwrap().unwrap();
-            assert_eq!(registry.version_of("CompactableWidget"), Some(2));
-            store.load(&id).await.unwrap().unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn reconcile_refuses_schema_changes_for_windowed_compaction() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
-        let reconciler = Reconciler::new(pool);
-        let original = SchemaTarget::new(
-            "WindowedWidget",
-            1,
-            CompactionPolicy::RetainLast { events: 2 },
-        );
-        assert_eq!(
-            reconciler.reconcile_target(&original).await.unwrap(),
-            SchemaReconciliation::Changed
-        );
-        reconciler.record_target(&original).await.unwrap();
-        let changed = SchemaTarget::new(
-            "WindowedWidget",
-            2,
-            CompactionPolicy::RetainLast { events: 2 },
-        );
-
-        let error = reconciler.reconcile_target(&changed).await.unwrap_err();
-        assert!(matches!(
-            error,
-            ReconcileError::CompactedSnapshotClear {
-                aggregate,
-                old_version: Some(1),
-                new_version: 2,
-            } if aggregate == "WindowedWidget"
-        ));
-        let registry = reconciler.load_registry().await.unwrap().unwrap();
-        assert_eq!(registry.version_of("WindowedWidget"), Some(1));
-    }
-
-    #[tokio::test]
-    async fn reconcile_errors_on_version_mismatch_for_compactable_aggregate() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
-
-        let reconciler = Reconciler::new(pool.clone());
-
-        // First registration succeeds (stored=None) and records version 2.
-        let _ = reconciler.reconcile::<CompactableWidget>().await.unwrap();
-        reconciler
-            .record_version::<CompactableWidget>()
-            .await
-            .unwrap();
-
-        // Manually update the stored version to simulate a version
-        // bump (we can't change the const at runtime).
-        sqlx::query(
-            "UPDATE events SET payload = \
-             '{\"VersionUpdated\":{\"name\":\"CompactableWidget\",\"version\":999}}' \
-             WHERE aggregate_type = 'SchemaRegistry' \
-             AND payload LIKE '%CompactableWidget%'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Second reconcile: stored=999, current=2. The entity is
-        // compactable, so reconcile should refuse.
-        let result = reconciler.reconcile::<CompactableWidget>().await;
-
-        assert!(
-            matches!(result, Err(ReconcileError::CompactedSnapshotClear { .. })),
-            "Expected CompactedSnapshotClear error, got {result:?}"
-        );
     }
 }

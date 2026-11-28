@@ -159,7 +159,6 @@ where
             Self::Live(entity) => entity.transition(command).await,
             Self::Failed { error, .. } => {
                 warn!(
-                    target: "cqrs",
                     %error,
                     aggregate_type = Entity::AGGREGATE_TYPE,
                     "Rejecting command because lifecycle is already failed"
@@ -169,7 +168,6 @@ where
         }
         .inspect_err(|domain_error| {
             error!(
-                target: "cqrs",
                 %domain_error,
                 aggregate_type = Entity::AGGREGATE_TYPE,
                 "Command handler returned domain error"
@@ -217,7 +215,6 @@ where
 
             if let Self::Failed { error, .. } = &scratch {
                 error!(
-                    target: "cqrs",
                     %error,
                     aggregate_type = Entity::AGGREGATE_TYPE,
                     "Command produced an event the entity cannot apply"
@@ -234,7 +231,7 @@ where
             Self::Uninitialized => Entity::originate(&event).map_or_else(
                 || {
                     let err = LifecycleError::EventCantOriginate { event };
-                    error!(target: "cqrs", "lifecycle failed during originate: {err}");
+                    error!("lifecycle failed during originate: {err}");
                     Self::Failed {
                         error: err,
                         last_valid_entity: None,
@@ -250,7 +247,7 @@ where
                         entity: Box::new(entity.clone()),
                         event,
                     };
-                    error!(target: "cqrs", "lifecycle failed during evolve: {err}");
+                    error!("lifecycle failed during evolve: {err}");
                     Self::Failed {
                         error: err,
                         last_valid_entity: Some(Box::new(entity)),
@@ -258,7 +255,7 @@ where
                 }
                 Err(domain_err) => {
                     let err = LifecycleError::Apply(domain_err);
-                    error!(target: "cqrs", "lifecycle failed during evolve: {err}");
+                    error!("lifecycle failed during evolve: {err}");
                     Self::Failed {
                         error: err,
                         last_valid_entity: Some(Box::new(entity)),
@@ -274,7 +271,7 @@ where
                     failure: Box::new(error),
                     event,
                 };
-                error!(target: "cqrs", "lifecycle already failed, ignoring event: {err}");
+                error!("lifecycle already failed, ignoring event: {err}");
                 Self::Failed {
                     error: err,
                     last_valid_entity,
@@ -334,7 +331,6 @@ where
     async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Entity>>]) {
         let Ok(typed_id) = aggregate_id.parse::<Entity::Id>() else {
             warn!(
-                target: "cqrs",
                 aggregate_id = aggregate_id,
                 aggregate_type = Entity::AGGREGATE_TYPE,
                 "Failed to parse aggregate ID in reactor bridge"
@@ -352,8 +348,11 @@ where
             // (gated by `IdempotentReactor`) to retry on transient SQLite
             // busy errors. See `docs/cqrs.md`'s "Reactors" section.
             let Some(sequence) = NonZeroUsize::new(envelope.sequence) else {
-                error!(target: "cqrs", aggregate_id, sequence = envelope.sequence,
-                    "Persisted event has an invalid zero sequence; refusing reactor delivery");
+                error!(
+                    aggregate_id,
+                    sequence = envelope.sequence,
+                    "Persisted event has an invalid zero sequence; refusing reactor delivery"
+                );
                 continue;
             };
             let context = ReactorContext {
@@ -361,7 +360,6 @@ where
             };
             if let Err(error) = self.reactor.react_with_context(injected, context).await {
                 error!(
-                    target: "cqrs",
                     ?error,
                     aggregate_id = aggregate_id,
                     aggregate_type = Entity::AGGREGATE_TYPE,
@@ -379,11 +377,11 @@ mod tests {
     use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
     use crate::dependency::{Cons, Dependent, EntityList};
-    use crate::reactor::{IdempotentReactor, RETRY_MAX_ATTEMPTS, RetryOnBusy};
+
     use crate::{CompactionPolicy, EventSourced, Nil, uneventful};
 
     /// Test entity: a simple counter with controllable error behavior.
@@ -691,49 +689,6 @@ mod tests {
         assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 7 })));
     }
 
-    /// Minimal `sqlx::error::DatabaseError` impl reporting the `SQLITE_BUSY`
-    /// extended code, so tests don't need real SQLite lock contention.
-    #[derive(Debug)]
-    struct BusyDatabaseError;
-
-    impl std::fmt::Display for BusyDatabaseError {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "database is locked")
-        }
-    }
-
-    impl std::error::Error for BusyDatabaseError {}
-
-    impl sqlx::error::DatabaseError for BusyDatabaseError {
-        fn message(&self) -> &'static str {
-            "database is locked"
-        }
-
-        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
-            Some(std::borrow::Cow::Borrowed("5"))
-        }
-
-        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-
-        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-
-        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-            self
-        }
-
-        fn kind(&self) -> sqlx::error::ErrorKind {
-            sqlx::error::ErrorKind::Other
-        }
-    }
-
-    fn sqlite_busy_error() -> sqlx::Error {
-        sqlx::Error::Database(Box::new(BusyDatabaseError))
-    }
-
     #[derive(Debug, thiserror::Error)]
     #[error("always fails")]
     struct AlwaysFailError;
@@ -761,50 +716,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug, thiserror::Error)]
-    enum FlakyDispatchError {
-        #[error("busy: {0}")]
-        Busy(#[source] sqlx::Error),
-    }
-
-    /// Test reactor that fails with a busy-classified error a configurable
-    /// number of times before succeeding. Also implements `IdempotentReactor`
-    /// so it can be wrapped in `RetryOnBusy`.
-    struct FlakyIdempotentReactor {
-        remaining_busy_failures: AtomicU32,
-        calls: AtomicU32,
-        applied: AtomicBool,
-    }
-
-    impl Dependent for FlakyIdempotentReactor {
-        type Dependencies = Cons<Counter, Nil>;
-    }
-
-    #[async_trait]
-    impl Reactor for FlakyIdempotentReactor {
-        type Error = FlakyDispatchError;
-
-        async fn react(
-            &self,
-            event: <Self::Dependencies as EntityList>::Event,
-        ) -> Result<(), Self::Error> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-
-            let remaining = self.remaining_busy_failures.load(Ordering::SeqCst);
-            if remaining > 0 {
-                self.remaining_busy_failures
-                    .store(remaining - 1, Ordering::SeqCst);
-                return Err(FlakyDispatchError::Busy(sqlite_busy_error()));
-            }
-
-            let _ = event.into_inner();
-            self.applied.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    impl IdempotentReactor for FlakyIdempotentReactor {}
-
     #[tokio::test]
     async fn dispatch_swallows_reactor_error_without_retry() {
         let reactor = Arc::new(AlwaysFailReactor {
@@ -825,11 +736,44 @@ mod tests {
         assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
     }
 
+    #[derive(Default)]
+    struct DeliveryProbe {
+        deliveries: tokio::sync::Mutex<Vec<(Option<NonZeroUsize>, CounterEvent)>>,
+    }
+
+    impl Dependent for DeliveryProbe {
+        type Dependencies = Cons<Counter, Nil>;
+    }
+
+    #[async_trait]
+    impl Reactor for DeliveryProbe {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Never> {
+            self.react_with_context(event, ReactorContext { sequence: None })
+                .await
+        }
+
+        async fn react_with_context(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+            context: ReactorContext,
+        ) -> Result<(), Never> {
+            let (_, payload) = event.into_inner();
+            self.deliveries
+                .lock()
+                .await
+                .push((context.sequence, payload));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_refuses_zero_sequence_without_discarding_valid_delivery() {
-        let reactor = Arc::new(AlwaysFailReactor {
-            calls: AtomicU32::new(0),
-        });
+        let reactor = Arc::new(DeliveryProbe::default());
         let bridge = ReactorBridge {
             reactor: Arc::clone(&reactor),
         };
@@ -841,71 +785,13 @@ mod tests {
         };
         let valid = EventEnvelope {
             sequence: 1,
+            payload: CounterEvent::Created { initial: 2 },
             ..invalid.clone()
         };
         bridge.dispatch("counter-1", &[invalid, valid]).await;
-        assert_eq!(reactor.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn dispatch_retries_busy_error_via_retry_on_busy_and_succeeds() {
-        let reactor = Arc::new(RetryOnBusy {
-            inner: FlakyIdempotentReactor {
-                remaining_busy_failures: AtomicU32::new(2),
-                calls: AtomicU32::new(0),
-                applied: AtomicBool::new(false),
-            },
-        });
-        let bridge = ReactorBridge {
-            reactor: Arc::clone(&reactor),
-        };
-        let envelope: EventEnvelope<Lifecycle<Counter>> = EventEnvelope {
-            aggregate_id: "counter-1".to_string(),
-            sequence: 1,
-            payload: CounterEvent::Created { initial: 1 },
-            metadata: HashMap::new(),
-        };
-
-        bridge.dispatch("counter-1", &[envelope]).await;
-
-        assert!(reactor.inner.applied.load(Ordering::SeqCst));
-        assert_eq!(reactor.inner.calls.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn dispatch_swallows_retry_on_busy_exhaustion_after_full_schedule() {
-        // Never reaches zero within RETRY_MAX_ATTEMPTS + 1 calls -- exercises
-        // the real production schedule end to end (~4.3s), proving dispatch
-        // still swallows the error once RetryOnBusy exhausts its budget.
-        let reactor = Arc::new(RetryOnBusy {
-            inner: FlakyIdempotentReactor {
-                remaining_busy_failures: AtomicU32::new(u32::MAX),
-                calls: AtomicU32::new(0),
-                applied: AtomicBool::new(false),
-            },
-        });
-        let bridge = ReactorBridge {
-            reactor: Arc::clone(&reactor),
-        };
-        let envelope: EventEnvelope<Lifecycle<Counter>> = EventEnvelope {
-            aggregate_id: "counter-1".to_string(),
-            sequence: 1,
-            payload: CounterEvent::Created { initial: 1 },
-            metadata: HashMap::new(),
-        };
-        let full_schedule = std::time::Duration::from_millis(4_270);
-        let started = tokio::time::Instant::now();
-
-        bridge.dispatch("counter-1", &[envelope]).await;
-
-        // Paused Tokio time advances only through the retry sleeps, so the
-        // elapsed virtual time IS the backoff schedule -- immediate retries
-        // or removed delays fail this exactly.
-        assert_eq!(started.elapsed(), full_schedule);
-        assert!(!reactor.inner.applied.load(Ordering::SeqCst));
         assert_eq!(
-            reactor.inner.calls.load(Ordering::SeqCst),
-            RETRY_MAX_ATTEMPTS + 1
+            *reactor.deliveries.lock().await,
+            [(NonZeroUsize::new(1), CounterEvent::Created { initial: 2 })],
         );
     }
 }

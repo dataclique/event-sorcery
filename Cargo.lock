@@ -410,7 +410,7 @@ dependencies = [
 [[package]]
 name = "cqrs-es"
 version = "0.5.0"
-source = "git+https://github.com/dataclique/cqrs?rev=cb0020add5dcff06f1ece3816fce9e4319004b87#cb0020add5dcff06f1ece3816fce9e4319004b87"
+source = "git+https://github.com/dataclique/cqrs?rev=c2bdadc483f7b54b1820a9a2a265781fe050c298#c2bdadc483f7b54b1820a9a2a265781fe050c298"
 dependencies = [
  "async-trait",
  "serde",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "event-sorcery"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "apalis-core",
  "async-trait",
@@ -631,12 +631,12 @@ dependencies = [
  "chrono",
  "cqrs-es",
  "criterion",
+ "event-sorcery-core",
  "futures-util",
  "indexed-query",
  "proptest",
  "serde",
  "serde_json",
- "sqlite-es",
  "sqlx",
  "thiserror",
  "tokio",
@@ -650,8 +650,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "event-sorcery-core"
+version = "0.6.0"
+dependencies = [
+ "cqrs-es",
+ "indexed-query",
+ "sqlx",
+ "thiserror",
+]
+
+[[package]]
 name = "event-sorcery-ffi"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cbindgen",
  "ciborium",
@@ -660,6 +670,7 @@ dependencies = [
  "getrandom 0.3.4",
  "serde",
  "serde_json",
+ "sqlite-es",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1066,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "indexed-query"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cqrs-es",
  "thiserror",
@@ -1319,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "postgr-es"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "cqrs-es",
@@ -1338,7 +1349,7 @@ dependencies = [
 [[package]]
 name = "postgres-es"
 version = "0.5.0"
-source = "git+https://github.com/dataclique/cqrs?rev=cb0020add5dcff06f1ece3816fce9e4319004b87#cb0020add5dcff06f1ece3816fce9e4319004b87"
+source = "git+https://github.com/dataclique/cqrs?rev=c2bdadc483f7b54b1820a9a2a265781fe050c298#c2bdadc483f7b54b1820a9a2a265781fe050c298"
 dependencies = [
  "cqrs-es",
  "futures",
@@ -1776,16 +1787,24 @@ dependencies = [
 
 [[package]]
 name = "sqlite-es"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
+ "apalis-core",
+ "async-trait",
  "chrono",
  "cqrs-es",
+ "criterion",
+ "event-sorcery",
+ "event-sorcery-core",
+ "futures-util",
  "indexed-query",
  "serde",
  "serde_json",
  "sqlx",
  "thiserror",
  "tokio",
+ "tower-layer",
+ "tower-service",
  "tracing",
 ]
 
@@ -2041,7 +2060,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

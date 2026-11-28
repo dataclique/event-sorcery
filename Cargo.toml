@@ -5,13 +5,14 @@ members = [
   "crates/event-sorcery",
   "crates/event-sorcery-ffi",
   "crates/indexed-query",
+  "crates/core",
 ]
 exclude = ["examples/simple", "examples/complex"]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "0.5.0"
+version = "0.6.0"
 license = "MIT"
 homepage = "https://github.com/dataclique/event-sorcery"
 
@@ -43,14 +44,16 @@ apalis-core = "=1.0.0"
 async-trait = "0.1.89"
 cbindgen = "=0.29.2"
 ciborium = "0.2.2"
-cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87", version = "0.5.0" }
-event-sorcery = { path = "crates/event-sorcery" }
+cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "c2bdadc483f7b54b1820a9a2a265781fe050c298", version = "0.5.0" }
+event-sorcery = { version = "0.6.0", path = "crates/event-sorcery" }
+event-sorcery-core = { version = "0.6.0", path = "crates/core" }
 futures-util = "0.3.34"
 getrandom = "0.3.4"
-indexed-query = { path = "crates/indexed-query" }
+indexed-query = { version = "0.6.0", path = "crates/indexed-query" }
+postgres-es = { git = "https://github.com/dataclique/cqrs", rev = "c2bdadc483f7b54b1820a9a2a265781fe050c298", version = "0.5.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-sqlite-es = { path = "crates/sqlite-es" }
+sqlite-es = { version = "0.6.0", path = "crates/sqlite-es" }
 sqlx = { version = "0.9.0", features = [
   "chrono",
   "runtime-tokio",

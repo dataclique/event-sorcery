@@ -715,14 +715,14 @@ fn delivery_deferral(ctx: &JobContext, delivery_error: &OriginDeliveryError) -> 
     match delivery_error {
         OriginDeliveryError::Transport(_) => {
             warn!(
-                target: "cqrs", ?delivery_error, %job_id,
+                ?delivery_error, %job_id,
                 "settled verdict could not be delivered; deferring"
             );
             ctx.delivery.retry_delay
         }
         OriginDeliveryError::Refused(_) => {
             error!(
-                target: "cqrs", ?delivery_error, %job_id,
+                ?delivery_error, %job_id,
                 "VERDICT REFUSED: the origin entity rejected a settled verdict; \
                  backing off -- operator intervention needed"
             );
@@ -815,7 +815,7 @@ impl<J: Job> StandaloneJob for J {
                         wrapped.origin.deliver(&self.origin_id(), fail).await
                     {
                         error!(
-                            target: "cqrs", ?delivery_error, job_id = %ctx.job_id(),
+                            ?delivery_error, job_id = %ctx.job_id(),
                             "DISPATCH DANGLING: job dead-letters but the origin \
                              entity could not be told; operator intervention needed"
                         );
@@ -1484,90 +1484,5 @@ mod tests {
 
         assert!(matches!(failure, JobFailure::Transient(_)));
         assert!(run.port.delivered.lock().unwrap().is_empty());
-    }
-
-    /// End to end over a real store: dispatch through `Store::send` (the
-    /// `Dispatched` event + job enqueued in one commit), claim like the
-    /// worker does, run the routed execution with the store itself as the
-    /// origin port, and watch the entity settle -- with the guard refusing
-    /// overlap and absorbing duplicate delivery along the way.
-    #[tokio::test]
-    async fn dispatched_job_settles_through_a_real_store() {
-        use crate::job::{WorkerId, plan_claim};
-        use crate::job_store::ClaimOutcome;
-        use crate::{AggregateError, LifecycleError, SqliteBackend, StoreBuilder};
-
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        sqlite_es::MIGRATOR.run(&pool).await.unwrap();
-        let desk_store = StoreBuilder::<Desk, _>::new(pool.clone())
-            .build()
-            .await
-            .unwrap();
-
-        desk_store
-            .send(&7, DeskCommand::Place(place()))
-            .await
-            .unwrap();
-        let desk = desk_store.load(&7).await.unwrap().unwrap();
-        let DispatchedJob::InFlight { job_id } = desk.order else {
-            panic!("expected the job in flight, got {:?}", desk.order);
-        };
-
-        // The guard refuses an overlapping dispatch through the full stack.
-        let refused = desk_store
-            .send(&7, DeskCommand::Place(place()))
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            refused,
-            AggregateError::UserError(LifecycleError::Apply(DeskError::Refused(
-                DispatchRefused::InFlight
-            )))
-        ));
-
-        // Claim exactly as the worker poll does and run the routed execution
-        // with the real store as the origin port.
-        let backend = SqliteBackend::new(pool.clone());
-        let view_id = job_id.to_string();
-        let worker = WorkerId::new("test-worker");
-        let now_ms = chrono::Utc::now().timestamp_millis() + 1_000;
-        let outcome = backend
-            .claim(&view_id, |read| {
-                plan_claim(&view_id, read, &worker, now_ms, 30_000, 50)
-            })
-            .await
-            .unwrap();
-        let ClaimOutcome::Won(won) = outcome else {
-            panic!("expected to win the claim");
-        };
-        let job: PlaceOrder = serde_json::from_value(won.args.clone()).unwrap();
-        let ctx = JobContext {
-            job_id,
-            claim_seq: won.claim_seq,
-            claim_id: won.claim_id,
-            attempt: won.attempt,
-            max_attempts: 5,
-            ..JobContext::default()
-        };
-        let input = JobInput::new((), desk_store.clone());
-
-        let done = StandaloneJob::perform(&job, &ctx, &input).await.unwrap();
-        assert!(matches!(done, JobOutcome::Done(())));
-
-        let settled = desk_store.load(&7).await.unwrap().unwrap();
-        let DispatchedJob::Confirmed(settled_order) = &settled.order else {
-            panic!("expected Confirmed, got {:?}", settled.order);
-        };
-        assert_eq!(settled_order.job_id(), job_id);
-        assert_eq!(settled_order.output(), "filled");
-        assert_eq!(settled_order.attempts(), 1);
-
-        // An at-least-once redelivery of the same verdict is absorbed.
-        desk_store
-            .send(&7, DeskCommand::Settle(confirmed(job_id)))
-            .await
-            .unwrap();
-        let after = desk_store.load(&7).await.unwrap().unwrap();
-        assert_eq!(after.order, settled.order);
     }
 }

@@ -73,6 +73,15 @@ impl ProjectedStoreBackend for PostgresBackend {
     {
         use SchemaReconciliation::{Changed, Unchanged};
 
+        match Entity::COMPACTION_POLICY {
+            CompactionPolicy::Retain => {}
+            CompactionPolicy::CompactAfterSnapshot | CompactionPolicy::RetainLast { .. } => {
+                return Err(ReconcileError::ProjectionRequiresRetainedHistory {
+                    aggregate_type: Entity::AGGREGATE_TYPE,
+                });
+            }
+        }
+
         let (mut recovery, decision) = PostgresRecovery::<Entity>::begin(&self.pool).await?;
         let mode = match decision {
             Changed => ProjectionRecoveryMode::RebuildAll,
@@ -174,9 +183,11 @@ pub(crate) mod tests {
     use futures_util::{TryStreamExt, stream};
     use serde::{Deserialize, Serialize};
     use serde_json::json;
-    use sqlx::PgPool;
+    use sqlx::encode::IsNull;
+    use sqlx::error::BoxDynError;
     use sqlx::migrate::MigrateError;
-    use sqlx::postgres::PgPoolOptions;
+    use sqlx::postgres::{PgArgumentBuffer, PgConnectOptions, PgPoolOptions, PgTypeInfo};
+    use sqlx::{ConnectOptions, Encode, PgPool, Postgres, Type};
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,8 +197,8 @@ pub(crate) mod tests {
 
     use event_sorcery::{
         Column, CompactionPolicy, Cons, Dependent, DomainEvent, Effect, EntityList, EventSourced,
-        Never, Nil, OneOf, PersistenceBackend, Projection, Reactor, ReactorContext, ReconcileError,
-        Store, StoreBuilder, Table,
+        Never, Nil, OneOf, PersistenceBackend, ProjectedStoreBackend, Projection, ProjectionError,
+        Reactor, ReactorContext, ReconcileError, Store, StoreBuilder, Table,
     };
 
     use crate::view_repository::tests::{RegisteredSchemaEvent, RegisteredSchemaView};
@@ -293,13 +304,13 @@ pub(crate) mod tests {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    struct ProjectedNote<const VERSION: u64> {
+    struct ProjectedNote<const VERSION: u64, const COMPACT: bool = false> {
         text: String,
         history: Vec<String>,
     }
 
     #[async_trait]
-    impl<const VERSION: u64> EventSourced for ProjectedNote<VERSION> {
+    impl<const VERSION: u64, const COMPACT: bool> EventSourced for ProjectedNote<VERSION, COMPACT> {
         type Id = String;
         type Command = String;
         type Event = NoteEvent;
@@ -310,7 +321,11 @@ pub(crate) mod tests {
         const AGGREGATE_TYPE: &'static str = "ProjectedNote";
         const SCHEMA_VERSION: u64 = VERSION;
         const SNAPSHOT_SIZE: usize = 2;
-        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
+        const COMPACTION_POLICY: CompactionPolicy = if COMPACT {
+            CompactionPolicy::CompactAfterSnapshot
+        } else {
+            CompactionPolicy::Retain
+        };
         const PROJECTION: Table = Table("note_projection");
 
         fn originate(event: &Self::Event) -> Option<Self> {
@@ -339,7 +354,13 @@ pub(crate) mod tests {
         }
 
         async fn transition(&self, text: String) -> Result<Effect<Self>, Never> {
-            Self::initialize(text).await
+            Ok(Effect::Events(
+                text.lines()
+                    .map(|text| NoteEvent::Written {
+                        text: text.to_string(),
+                    })
+                    .collect(),
+            ))
         }
     }
 
@@ -362,6 +383,291 @@ pub(crate) mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn direct_projected_startup_refuses_a_compactable_entity(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let backend = PostgresBackend { pool: pool.clone() };
+
+        let result = backend
+            .reconcile_projected::<ProjectedNote<1, true>>()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ReconcileError::ProjectionRequiresRetainedHistory { .. })
+        ));
+        let registry: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'SchemaRegistry'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(registry, 0);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn standalone_rebuild_refuses_compaction_without_replacing_the_view(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let backend = PostgresBackend { pool: pool.clone() };
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(backend)
+                .build()
+                .await
+                .unwrap();
+        let id = "projected".to_string();
+        store.send(&id, "before".to_string()).await.unwrap();
+        let before = projection.load(&id).await.unwrap().unwrap();
+        let compactable =
+            Projection::<ProjectedNote<1, true>, PostgresViewBackend>::with_backend(pool);
+
+        let result = compactable.rebuild_all().await;
+
+        assert!(matches!(
+            result,
+            Err(ProjectionError::RequiresRetainedHistory {
+                aggregate_type: "ProjectedNote"
+            })
+        ));
+        assert_eq!(projection.load(&id).await.unwrap(), Some(before));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn standalone_rebuild_refuses_partial_snapshot_history_without_replacing_views(
+        pool: PgPool,
+    ) {
+        let pool = projected_pool(pool).await;
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, _>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let id = "projected".to_owned();
+        let sibling = "sibling".to_owned();
+        store.send(&id, "first".to_owned()).await.unwrap();
+        store.send(&id, "second".to_owned()).await.unwrap();
+        store
+            .send(&sibling, "independent".to_owned())
+            .await
+            .unwrap();
+        let snapshot_query = "SELECT last_sequence, snapshot_version, payload
+                              FROM snapshots WHERE aggregate_type = 'ProjectedNote' AND aggregate_id = $1";
+        let snapshot: (i64, i64, serde_json::Value) = sqlx::query_as(snapshot_query)
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.0, 2);
+        // Simulate importing a stream whose covered prefix was compacted.
+        assert_eq!(sqlx::query("DELETE FROM events WHERE aggregate_type = 'ProjectedNote' AND aggregate_id = $1 AND sequence = 1")
+            .bind(&id).execute(&pool).await.unwrap().rows_affected(), 1);
+        let before = projection.load_all().await.unwrap();
+        let stream = event_sorcery::StreamIdentity::new("ProjectedNote", id.clone());
+        for result in [
+            projection.rebuild(&id).await,
+            projection.rebuild_all().await,
+        ] {
+            assert!(
+                matches!(result, Err(ProjectionError::UnprovenSnapshotHistory(ReconcileError::UnprovenSnapshotHistory {
+                stream: rejected, covered_sequence: 2, retained_events: 1,
+            })) if rejected == stream)
+            );
+        }
+        assert_eq!(projection.load_all().await.unwrap(), before);
+        let after: (i64, i64, serde_json::Value) = sqlx::query_as(snapshot_query)
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, snapshot);
+
+        projection.rebuild(&sibling).await.unwrap();
+        assert_eq!(
+            projection.load(&sibling).await.unwrap().unwrap().history,
+            ["independent"]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn catch_up_refuses_missing_snapshot_covered_events(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let backend = PostgresBackend { pool: pool.clone() };
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, _>::with_backend(backend.clone())
+                .build()
+                .await
+                .unwrap();
+        let id = "projected".to_owned();
+        store.send(&id, "first".to_owned()).await.unwrap();
+        let first_view: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM note_projection")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        store.send(&id, "second".to_owned()).await.unwrap();
+        store.send(&id, "third".to_owned()).await.unwrap();
+        let snapshot_sequence: i64 = sqlx::query_scalar(
+            "SELECT last_sequence FROM snapshots WHERE aggregate_type = 'ProjectedNote'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot_sequence, 2);
+        sqlx::query("UPDATE note_projection SET version = 1, payload = $1")
+            .bind(&first_view)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Simulate imported history missing the event covered by the snapshot but not the view.
+        sqlx::query("DELETE FROM events WHERE aggregate_type = 'ProjectedNote' AND sequence = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = projection.catch_up().await.unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectionError::UnprovenReplayRange {
+                after: 1,
+                covered_through: 2,
+                retained_events: 0,
+                ..
+            }
+        ));
+        let view: (i64, serde_json::Value) =
+            sqlx::query_as("SELECT version, payload FROM note_projection")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(view, (1, first_view));
+
+        sqlx::query("DELETE FROM events WHERE aggregate_type = 'ProjectedNote'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM note_projection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let restarted = StoreBuilder::<ProjectedNote<1>, _>::with_backend(backend)
+            .build()
+            .await;
+        let Err(ReconcileError::Persistence(PersistenceError::UnknownError(source))) = restarted
+        else {
+            panic!("startup must reject missing history for a snapshot-only stream");
+        };
+        assert!(matches!(
+            source.downcast_ref::<ProjectionError<ProjectedNote<1>>>(),
+            Some(ProjectionError::UnprovenReplayRange {
+                after: 0,
+                covered_through: 2,
+                retained_events: 0,
+                ..
+            })
+        ));
+        assert_eq!(projection.load(&id).await.unwrap(), None);
+    }
+
+    struct FilterValueAfterConcurrentUpdate(PgConnectOptions);
+
+    impl Type<Postgres> for FilterValueAfterConcurrentUpdate {
+        fn type_info() -> PgTypeInfo {
+            <str as Type<Postgres>>::type_info()
+        }
+    }
+
+    impl Encode<'_, Postgres> for FilterValueAfterConcurrentUpdate {
+        fn encode_by_ref(&self, buffer: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+            let Self(options) = self;
+            // SQLx binds the filter value immediately before fetching matches.
+            // Use a separate runtime because the test runs on one Tokio thread.
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(async {
+                            timeout(Duration::from_secs(5), async {
+                                let mut connection = options.connect().await?;
+                                sqlx::query("UPDATE note_projection SET payload = '{\"Live\": {\"history\": []}}'")
+                                    .execute(&mut connection)
+                                    .await?;
+                                Ok::<_, sqlx::Error>(())
+                            })
+                            .await??;
+                            Ok::<_, BoxDynError>(())
+                        })
+                }).join().unwrap()
+            })?;
+            <&str as Encode<Postgres>>::encode_by_ref(&"matching", buffer)
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn filter_uses_the_same_snapshot_for_validation_and_matches(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let empty = projection
+            .filter(Column("text_value"), &"matching".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(empty, []);
+
+        let id = "note".to_string();
+        store.send(&id, "matching".to_string()).await.unwrap();
+        let expected = projection.load(&id).await.unwrap().unwrap();
+
+        let result = projection
+            .filter(
+                Column("text_value"),
+                &FilterValueAfterConcurrentUpdate(pool.connect_options().as_ref().clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, [(id, expected)]);
+        let error = projection
+            .filter(Column("text_value"), &"matching".to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectionError::StaleColumn { row_count: 1, .. }
+        ));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn load_all_orders_views_by_id_not_insertion_order(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, _>::with_backend(PostgresBackend { pool })
+                .build()
+                .await
+                .unwrap();
+        for (id, text) in [("z", "last"), ("a", "first")] {
+            store.send(&id.to_owned(), text.to_owned()).await.unwrap();
+        }
+
+        let rows = projection.load_all().await.unwrap();
+        let entries: Vec<_> = rows
+            .into_iter()
+            .map(|(id, note)| (id, note.history))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("a".to_owned(), vec!["first".to_owned()]),
+                ("z".to_owned(), vec!["last".to_owned()])
+            ]
+        );
     }
 
     #[sqlx::test(migrations = false)]
@@ -497,6 +803,68 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(version, 2);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn native_dispatch_catches_up_only_the_delivered_postgres_stream(pool: PgPool) {
+        let pool = projected_pool(pool).await;
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, _>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let delivered_id = "z-delivered".to_owned();
+        let unrelated_id = "a-unrelated".to_owned();
+        store.send(&delivered_id, "first".to_owned()).await.unwrap();
+        store
+            .send(&delivered_id, "second".to_owned())
+            .await
+            .unwrap();
+        store
+            .send(&unrelated_id, "unrelated".to_owned())
+            .await
+            .unwrap();
+        // A distinguishable checkpoint catches accidental replay from sequence zero.
+        sqlx::query("UPDATE note_projection SET version = 1, payload = $1 WHERE view_id = $2")
+            .bind(serde_json::json!({"Live": {"text": "checkpoint", "history": ["checkpoint"]}}))
+            .bind(&delivered_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM note_projection WHERE view_id = $1")
+            .bind(&unrelated_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE note_projection ADD CHECK (view_id <> 'a-unrelated')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        store
+            .send(&delivered_id, "third\nfourth".to_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            projection
+                .load(&delivered_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .history,
+            ["checkpoint", "second", "third", "fourth"]
+        );
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM note_projection WHERE view_id = $1")
+                .bind(&delivered_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 4);
+        assert_eq!(projection.load(&unrelated_id).await.unwrap(), None);
     }
 
     struct PendingProjection {
@@ -700,50 +1068,98 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn exhausted_gap_delivery_preserves_coverage_until_catch_up(pool: PgPool) {
+    async fn rebuilding_at_the_same_checkpoint_fences_an_in_flight_delivery(pool: PgPool) {
+        let control = projected_pool(pool).await;
+        let pool = PgPoolOptions::new()
+            .max_connections(3)
+            .connect_with(control.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let (store, projection) =
+            StoreBuilder::<ProjectedNote<1>, PostgresBackend>::with_backend(PostgresBackend {
+                pool: pool.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let id = "projected".to_string();
+        store.send(&id, "first".to_string()).await.unwrap();
+        sqlx::query("UPDATE note_projection SET payload = $1 WHERE view_id = $2")
+            .bind(json!({"Live": {"text": "stale", "history": ["stale"]}}))
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut recovery = control.begin().await.unwrap();
+        event_sorcery::recover_projection::<ProjectedNote<1>>(
+            &mut crate::projection_recovery::PostgresProjectionRecovery {
+                connection: &mut recovery,
+            },
+            &event_sorcery::ProjectionRecoveryMode::RebuildAll,
+        )
+        .await
+        .unwrap();
+
+        let writing_id = id.clone();
+        let writing = tokio::spawn(async move {
+            store.send(&writing_id, "second".to_string()).await.unwrap();
+        });
+        wait_for_projection_locks(&pool, "RowExclusiveLock", 1).await;
+        recovery.commit().await.unwrap();
+        timeout(Duration::from_secs(10), writing)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let version: i64 =
+            sqlx::query_scalar("SELECT version FROM note_projection WHERE view_id = $1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(
+            projection.load(&id).await.unwrap().unwrap().history,
+            ["first", "second"]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_batch_catches_up_once_when_the_predecessor_delivery_is_late(pool: PgPool) {
         let pool = projected_pool(pool).await;
         let pending = pending_projection(&pool).await;
-        pending
-            .store
-            .send(&"projected".to_string(), "third".to_string())
-            .await
-            .unwrap();
-        assert_eq!(
-            pending
-                .projection
-                .load(&"projected".to_string())
-                .await
-                .unwrap()
-                .unwrap()
-                .history,
-            vec!["first"]
-        );
-        let version: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
+        let id = "projected".to_string();
+        timeout(
+            Duration::from_secs(15),
+            pending.store.send(&id, "third\nfourth".to_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let checkpoint = || {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM note_projection WHERE view_id = 'projected'",
+            )
             .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(version, 1);
+        };
+        assert_eq!(checkpoint().await.unwrap(), 4);
+        assert_eq!(
+            pending.projection.load(&id).await.unwrap().unwrap().history,
+            ["first", "second", "third", "fourth"]
+        );
+
         pending.gate.resume.notify_one();
         timeout(Duration::from_secs(10), pending.writing)
             .await
             .unwrap()
             .unwrap();
-        pending.projection.catch_up().await.unwrap();
+        assert_eq!(checkpoint().await.unwrap(), 4);
         assert_eq!(
-            pending
-                .projection
-                .load(&"projected".to_string())
-                .await
-                .unwrap()
-                .unwrap()
-                .history,
-            vec!["first", "second", "third"]
+            pending.projection.load(&id).await.unwrap().unwrap().history,
+            ["first", "second", "third", "fourth"]
         );
-        let version: i64 = sqlx::query_scalar("SELECT version FROM note_projection")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(version, 3);
     }
 
     async fn seed_projected(pool: &PgPool) {

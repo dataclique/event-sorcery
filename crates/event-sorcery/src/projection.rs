@@ -5,39 +5,27 @@
 //! Database-specific construction and recovery live in the backend integrations.
 
 use async_trait::async_trait;
-use cqrs_es::Aggregate;
-use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
+use cqrs_es::persist::{PersistenceError, ViewRepository};
+use cqrs_es::{Aggregate, EventEnvelope, Query};
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::time::sleep;
+use tokio::time::{Duration, sleep};
 use tracing::{error, trace, warn};
 
 use indexed_query::{IndexedView, Order, Predicate};
 
-use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::reactor::{
     RETRY_BASE_DELAY_MS, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY_MS, Reactor, ReactorContext,
     retry_delays,
 };
-use crate::view_backend::ViewBackend;
-
-/// A materialized view table name.
-///
-/// Used with [`EventSourced::PROJECTION`] to declare that an
-/// entity has a materialized view, and with
-/// [`Projection::with_backend`] to create the projection.
-#[derive(Debug, Clone, Copy)]
-pub struct Table(pub &'static str);
-
-impl std::fmt::Display for Table {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
-    }
-}
+use crate::view_backend::{ViewBackend, ViewUpdateError};
+use crate::{EventSourced, Table};
 
 /// A column name for view table queries.
 ///
@@ -57,11 +45,33 @@ impl std::fmt::Display for Column {
 /// Errors from [`Projection`] query operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectionError<Entity: EventSourced> {
+    /// Replay requires an entity configured to retain its event history.
+    #[error("projection recovery requires retained history for aggregate '{aggregate_type}'")]
+    RequiresRetainedHistory {
+        /// Entity type whose projection cannot be recovered from compactable history.
+        aggregate_type: &'static str,
+    },
+    /// A rebuild needs history covered by a snapshot that cannot be proven complete.
+    #[error("cannot rebuild projection: {0}")]
+    UnprovenSnapshotHistory(#[source] crate::ReconcileError),
+    /// Catch-up cannot prove coverage between the view and the stored snapshot.
     #[error(
-        "operation requires a SQLite-backed projection \
-         created via Projection::sqlite()"
+        "incomplete snapshot-covered replay for {stream:?}: \
+         after {after}, through {covered_through}, retained {retained_events}"
     )]
-    NotSqliteBacked,
+    UnprovenReplayRange {
+        /// Aggregate whose projection could not catch up.
+        stream: crate::StreamIdentity,
+        /// Last event already covered by the decoded view, or zero for replay from scratch.
+        after: u64,
+        /// Last event covered by the aggregate snapshot.
+        covered_through: u64,
+        /// Number of retained events in the required snapshot-covered range.
+        retained_events: u64,
+    },
+    /// This operation requires a projection associated with a native view table.
+    #[error("operation requires a projection backed by a native persistence adapter")]
+    MissingViewTable,
     #[error("column '{column}' does not exist in table '{table}'")]
     ColumnNotFound { column: Column, table: String },
     #[error(
@@ -79,7 +89,7 @@ pub enum ProjectionError<Entity: EventSourced> {
         aggregate_id: String,
         source: serde_json::Error,
     },
-    #[error("sqlite query failed: {0}")]
+    #[error("projection query failed: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("view repository operation failed: {0}")]
     Persistence(#[from] PersistenceError),
@@ -96,7 +106,7 @@ impl<Entity: EventSourced> From<LifecycleError<Entity>> for ProjectionError<Enti
 /// Materialized view of an event-sourced entity.
 ///
 /// Provides [`load`](Self::load) to retrieve a single entity by ID.
-/// SQLite-backed projections also provide [`load_all`](Self::load_all) and
+/// Native projections also provide [`load_all`](Self::load_all) and
 /// [`filter`](Self::filter) for typed column queries.
 /// The backend is explicit in named types: `Projection<Position, Backend>`.
 /// Constructed through the selected native backend during wiring or directly
@@ -156,6 +166,8 @@ where
     }
 
     /// Rebuilds one materialized row from retained history.
+    ///
+    /// Refuses to replace the row if history covered by a snapshot is unproven.
     pub async fn rebuild(&self, id: &Entity::Id) -> Result<(), ProjectionError<Entity>> {
         let (source, _) = self.native_backing()?;
         Backend::recover::<Entity>(
@@ -168,13 +180,15 @@ where
     }
 
     /// Rebuilds all materialized rows from retained history.
+    ///
+    /// Refuses the entire rebuild if any snapshot's covered history is unproven.
     pub async fn rebuild_all(&self) -> Result<(), ProjectionError<Entity>> {
         let (source, _) = self.native_backing()?;
         Backend::recover::<Entity>(source, &crate::ProjectionRecoveryMode::RebuildAll).await
     }
 
     fn native_backing(&self) -> Result<(&Backend::Source, Table), ProjectionError<Entity>> {
-        let table = self.table.ok_or(ProjectionError::NotSqliteBacked)?;
+        let table = self.table.ok_or(ProjectionError::MissingViewTable)?;
         Ok((Backend::source(self.repo.as_ref()), table))
     }
 
@@ -187,7 +201,7 @@ where
                 let id: Entity::Id = match view_id.parse() {
                     Ok(id) => id,
                     Err(error) => {
-                        warn!(target: "cqrs", view_id, ?error, "Failed to parse view ID");
+                        warn!(view_id, ?error, "Failed to parse view ID");
                         return None;
                     }
                 };
@@ -195,7 +209,7 @@ where
                 let lifecycle: Lifecycle<Entity> = match serde_json::from_str(&payload) {
                     Ok(lifecycle) => lifecycle,
                     Err(error) => {
-                        warn!(target: "cqrs", %id, ?error, "Failed to deserialize view payload");
+                        warn!(%id, ?error, "Failed to deserialize view payload");
                         return None;
                     }
                 };
@@ -203,7 +217,7 @@ where
                 if let Lifecycle::Live(entity) = lifecycle {
                     Some((id, entity))
                 } else {
-                    warn!(target: "cqrs", %id, "Skipping non-live aggregate in view");
+                    warn!(%id, "Skipping non-live aggregate in view");
                     None
                 }
             })
@@ -229,7 +243,7 @@ impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
     pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, ProjectionError<Entity>> {
         let view_id = id.to_string();
 
-        trace!(target: "cqrs", %view_id, "Loading view");
+        trace!(%view_id, "Loading view");
 
         match self.repo.load(&view_id).await {
             Ok(Some(lifecycle)) => Ok(lifecycle.into_result()?),
@@ -270,6 +284,94 @@ where
     type Dependencies = Cons<Entity, Nil>;
 }
 
+enum SkippedDelivery {
+    Covered,
+    InvalidCheckpoint(i64),
+    Gap(DeliveryGap),
+}
+
+struct DeliveryGap {
+    covered: usize,
+    sequence: NonZeroUsize,
+}
+
+struct GapWait(Duration);
+
+impl GapWait {
+    fn for_batch() -> Self {
+        let schedule = retry_delays(RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
+        Self(
+            schedule
+                .zip(0..RETRY_MAX_ATTEMPTS)
+                .map(|(delay, _)| delay)
+                .sum(),
+        )
+    }
+
+    fn spend(&mut self, delay: Duration) -> bool {
+        let Self(remaining) = self;
+        let Some(after_sleep) = remaining.checked_sub(delay) else {
+            return false;
+        };
+        *remaining = after_sleep;
+        true
+    }
+}
+
+pub(crate) struct ProjectionQuery<Entity: EventSourced, Backend: ViewBackend> {
+    /// The builder's recovered native projection, shared with the caller.
+    pub(crate) projection: Arc<Projection<Entity, Backend>>,
+}
+
+#[async_trait]
+impl<Entity, Backend> Query<Lifecycle<Entity>> for ProjectionQuery<Entity, Backend>
+where
+    Entity: EventSourced<Materialized = Table> + 'static,
+    Backend: crate::NativeProjectionBackend,
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Entity>>]) {
+        let Ok(id) = aggregate_id.parse::<Entity::Id>() else {
+            warn!(
+                aggregate_id,
+                aggregate_type = Entity::AGGREGATE_TYPE,
+                "Failed to parse aggregate ID in projection query"
+            );
+            return;
+        };
+        let view_id = id.to_string();
+        let mut gap_wait = GapWait::for_batch();
+        for envelope in events {
+            let Some(sequence) = NonZeroUsize::new(envelope.sequence) else {
+                error!(%view_id, sequence = envelope.sequence,
+                    "Persisted event has an invalid zero sequence; refusing projection delivery");
+                continue;
+            };
+            let gap = self
+                .projection
+                .deliver(
+                    &view_id,
+                    &envelope.payload,
+                    self.projection.table.and(Some(sequence)),
+                    &mut gap_wait,
+                )
+                .await;
+            if let Some(DeliveryGap { covered, sequence }) = gap {
+                let mode = crate::ProjectionRecoveryMode::CatchUpOne {
+                    aggregate_id: aggregate_id.to_owned(),
+                };
+                let source = Backend::source(&self.projection.repo);
+                if let Err(error) = Backend::recover::<Entity>(source, &mode).await {
+                    error!(%view_id, covered, sequence = sequence.get(), ?error,
+                        "Projection catch-up failed after a delivery gap");
+                }
+                // Catch-up captures the durable events, including the rest of this batch.
+                return;
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl<Entity, Backend> Reactor for Projection<Entity, Backend>
 where
@@ -295,11 +397,26 @@ where
         let view_id = id.to_string();
         // Only native construction establishes sequence-based checkpoints.
         // Plain custom repositories retain their opaque optimistic versions.
-        let delivery = match self.table {
-            Some(_) => delivery,
-            None => ReactorContext { sequence: None },
-        };
+        let sequence = self.table.and(delivery.sequence);
+        if let Some(DeliveryGap { covered, sequence }) = self
+            .deliver(&view_id, &event, sequence, &mut GapWait::for_batch())
+            .await
+        {
+            error!(%view_id, covered, sequence = sequence.get(),
+                "Projection delivery is out of order; leaving checkpoint for recovery");
+        }
+        Ok(())
+    }
+}
 
+impl<Entity: EventSourced, Backend: ViewBackend> Projection<Entity, Backend> {
+    async fn deliver(
+        &self,
+        view_id: &str,
+        event: &Entity::Event,
+        sequence: Option<NonZeroUsize>,
+        gap_wait: &mut GapWait,
+    ) -> Option<DeliveryGap> {
         // Retry with exponential backoff: 10ms, 20ms, 40ms, ... capped at 1s.
         // 10 retries gives ~4.3s of total retry budget, enough for any
         // realistic burst of concurrent writers on the same aggregate.
@@ -309,13 +426,47 @@ where
 
         let delays = retry_delays(base_delay_ms, max_delay_ms);
         for (attempt, delay) in (0..=max_retries).zip(delays) {
-            let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
-                Ok(Some(pair)) => pair,
-                Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
-                Err(error) if Backend::is_retryable_error(&error) => {
+            let outcome = Backend::try_update(&self.repo, view_id, |stored, context| {
+                if let Some(sequence) = sequence {
+                    let Ok(covered) = usize::try_from(context.version) else {
+                        return ControlFlow::Break(SkippedDelivery::InvalidCheckpoint(
+                            context.version,
+                        ));
+                    };
+                    if sequence.get() <= covered {
+                        return ControlFlow::Break(SkippedDelivery::Covered);
+                    }
+                    if covered.checked_add(1) != Some(sequence.get()) {
+                        return ControlFlow::Break(SkippedDelivery::Gap(DeliveryGap {
+                            covered,
+                            sequence,
+                        }));
+                    }
+                }
+                let mut lifecycle = stored.unwrap_or_default();
+                lifecycle.apply(event.clone());
+                ControlFlow::Continue(lifecycle)
+            })
+            .await;
+
+            use ViewUpdateError::{Load, Write};
+            match outcome {
+                Ok(None | Some(SkippedDelivery::Covered)) => return None,
+                Ok(Some(SkippedDelivery::InvalidCheckpoint(version))) => {
+                    error!(%view_id, version,
+                        "Invalid projection checkpoint; refusing event delivery");
+                    return None;
+                }
+                Ok(Some(SkippedDelivery::Gap(gap))) => {
+                    if attempt < max_retries && gap_wait.spend(delay) {
+                        sleep(delay).await;
+                        continue;
+                    }
+                    return Some(gap);
+                }
+                Err(Load(error)) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
                         warn!(
-                            target: "cqrs",
                             %view_id, attempt = attempt + 1, max_retries, ?delay,
                             "Storage contention loading view, retrying"
                         );
@@ -324,82 +475,52 @@ where
                     }
 
                     error!(
-                        target: "cqrs",
                         %view_id, max_retries,
                         "View load lost: Storage contention conflict persisted after all retries"
                     );
-                    return Ok(());
+                    return None;
                 }
-                Err(error) => {
-                    warn!(target: "cqrs", %view_id, ?error, "Failed to load view for update");
-                    return Ok(());
+                Err(Load(error)) => {
+                    warn!(%view_id, ?error, "Failed to load view for update");
+                    return None;
                 }
-            };
-
-            if let Some(sequence) = delivery.sequence {
-                let Ok(covered) = usize::try_from(context.version) else {
-                    error!(target: "cqrs", %view_id, version = context.version,
-                        "Invalid projection checkpoint; refusing event delivery");
-                    return Ok(());
-                };
-                if sequence.get() <= covered {
-                    return Ok(());
-                }
-                if covered.checked_add(1) != Some(sequence.get()) {
-                    if attempt < max_retries {
-                        sleep(delay).await;
-                        continue;
-                    }
-                    error!(target: "cqrs", %view_id, covered, sequence = sequence.get(),
-                        "Projection delivery is out of order; leaving checkpoint for recovery");
-                    return Ok(());
-                }
-            }
-            lifecycle.apply(event.clone());
-
-            match self.repo.update_view(lifecycle, context).await {
-                Ok(()) => return Ok(()),
-                Err(PersistenceError::OptimisticLockError) if attempt < max_retries => {
+                Err(Write(PersistenceError::OptimisticLockError)) if attempt < max_retries => {
                     warn!(
-                        target: "cqrs",
                         %view_id, attempt = attempt + 1, max_retries, ?delay,
                         "Optimistic lock conflict, retrying view update"
                     );
                     sleep(delay).await;
                 }
-                Err(PersistenceError::OptimisticLockError) => {
+                Err(Write(PersistenceError::OptimisticLockError)) => {
                     error!(
-                        target: "cqrs",
                         %view_id, max_retries,
                         "View update lost: optimistic lock conflict persisted after all retries"
                     );
-                    return Ok(());
+                    return None;
                 }
-                Err(error) if Backend::is_retryable_error(&error) => {
+                Err(Write(error)) if Backend::is_retryable_error(&error) => {
                     if attempt < max_retries {
                         warn!(
-                            target: "cqrs",
                             %view_id, attempt = attempt + 1, max_retries, ?delay,
                             "Storage contention, retrying view update"
                         );
                         sleep(delay).await;
                     } else {
                         error!(
-                            target: "cqrs",
                             %view_id, max_retries,
                             "View update lost: Storage contention conflict persisted after all retries"
                         );
-                        return Ok(());
+                        return None;
                     }
                 }
-                Err(error) => {
-                    warn!(target: "cqrs", %view_id, ?error, "Failed to save view update");
-                    return Ok(());
+                Err(Write(error)) => {
+                    warn!(%view_id, ?error, "Failed to save view update");
+                    return None;
                 }
             }
         }
 
-        Ok(())
+        None
     }
 }
 
@@ -409,7 +530,7 @@ mod tests {
     use cqrs_es::DomainEvent;
     use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
     use serde::{Deserialize, Serialize};
-    use sqlx::SqlitePool;
+
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -417,94 +538,7 @@ mod tests {
     use super::*;
     use crate::Nil;
     use crate::lifecycle::Never;
-    use crate::{
-        CompactionPolicy, Effect, SqliteBackend, SqliteViewBackend, StoreBuilder, uneventful,
-    };
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    struct RecoveryEntity<const ACCEPT_HISTORY: bool>;
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    enum RecoveryEvent {
-        Created,
-    }
-
-    impl DomainEvent for RecoveryEvent {
-        fn event_type(&self) -> String {
-            "RecoveryCreated".to_string()
-        }
-
-        fn event_version(&self) -> String {
-            "1".to_string()
-        }
-    }
-
-    #[async_trait]
-    impl<const ACCEPT_HISTORY: bool> EventSourced for RecoveryEntity<ACCEPT_HISTORY> {
-        type Id = String;
-        type Command = ();
-        type Event = RecoveryEvent;
-        type Error = Never;
-        type Materialized = Table;
-        type Jobs = Nil;
-
-        const AGGREGATE_TYPE: &'static str = "RecoveryEntity";
-        const SCHEMA_VERSION: u64 = if ACCEPT_HISTORY { 1 } else { 2 };
-        const SNAPSHOT_SIZE: usize = 2;
-        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::Retain;
-        const PROJECTION: Table = Table("recovery_projection");
-
-        fn originate(_event: &Self::Event) -> Option<Self> {
-            ACCEPT_HISTORY.then_some(Self)
-        }
-
-        fn evolve(_entity: &Self, _event: &Self::Event) -> Result<Option<Self>, Never> {
-            Ok(None)
-        }
-
-        async fn initialize((): ()) -> Result<Effect<Self>, Never> {
-            Ok(Effect::Events(vec![RecoveryEvent::Created]))
-        }
-
-        async fn transition(&self, (): ()) -> Result<Effect<Self>, Never> {
-            uneventful()
-        }
-    }
-
-    #[tokio::test]
-    async fn catch_up_rejects_history_that_enters_a_failed_lifecycle() {
-        let pool = sqlite_es::testing::create_test_pool().await.unwrap();
-        sqlx::query(
-            "CREATE TABLE recovery_projection (
-                view_id TEXT PRIMARY KEY,
-                version BIGINT NOT NULL,
-                payload JSON NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let (store, _) = StoreBuilder::<RecoveryEntity<true>, SqliteBackend>::new(pool.clone())
-            .build()
-            .await
-            .unwrap();
-        store.send(&"legacy".to_string(), ()).await.unwrap();
-        drop(store);
-        sqlx::query("DELETE FROM recovery_projection")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let projection =
-            Projection::<RecoveryEntity<false>, SqliteViewBackend>::sqlite(pool.clone());
-        let error = projection.catch_up().await.unwrap_err();
-        assert!(matches!(error, ProjectionError::Lifecycle(source)
-            if matches!(*source, LifecycleError::EventCantOriginate { event: RecoveryEvent::Created })));
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM recovery_projection")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(rows, 0);
-    }
+    use crate::{CompactionPolicy, Effect, uneventful};
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct TestEntity {
@@ -827,6 +861,7 @@ mod tests {
         views: RwLock<HashMap<String, (View, i64)>>,
         remaining_busy_failures: AtomicU32,
         remaining_load_busy_failures: AtomicU32,
+        recoveries: AtomicU32,
         _phantom: PhantomData<Agg>,
     }
 
@@ -841,6 +876,7 @@ mod tests {
                 views: RwLock::new(HashMap::new()),
                 remaining_busy_failures: AtomicU32::new(busy_failures),
                 remaining_load_busy_failures: AtomicU32::new(0),
+                recoveries: AtomicU32::new(0),
                 _phantom: PhantomData,
             }
         }
@@ -853,6 +889,7 @@ mod tests {
                 views: RwLock::new(HashMap::new()),
                 remaining_busy_failures: AtomicU32::new(0),
                 remaining_load_busy_failures: AtomicU32::new(load_busy_failures),
+                recoveries: AtomicU32::new(0),
                 _phantom: PhantomData,
             }
         }
@@ -949,7 +986,7 @@ mod tests {
             Agg: cqrs_es::Aggregate + 'static;
 
         fn is_retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
-            crate::is_retryable_sqlite_busy(error)
+            matches!(error.downcast_ref::<PersistenceError>(), Some(PersistenceError::ConnectionError(source)) if matches!(source.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::Database(database)) if database.try_downcast_ref::<TestBusyDatabaseError>().is_some()))
         }
     }
 
@@ -1029,6 +1066,140 @@ mod tests {
             Some(TestEntity {
                 name: "original".to_string(),
             })
+        );
+    }
+
+    impl crate::NativeProjectionBackend for BusyViewBackend {
+        type Source = AtomicU32;
+        type Database = sqlx::Any;
+
+        fn repository<ViewState, AggregateType>(
+            recoveries: Self::Source,
+            _table: Table,
+        ) -> Self::Repo<ViewState, AggregateType>
+        where
+            ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+            AggregateType: Aggregate + 'static,
+        {
+            BusyRepo {
+                recoveries,
+                ..BusyRepo::new(0)
+            }
+        }
+
+        fn source<ViewState, AggregateType>(
+            repository: &Self::Repo<ViewState, AggregateType>,
+        ) -> &Self::Source
+        where
+            ViewState: cqrs_es::View<AggregateType> + Clone + 'static,
+            AggregateType: Aggregate + 'static,
+        {
+            &repository.recoveries
+        }
+
+        async fn rows(
+            _source: &Self::Source,
+            _table: Table,
+        ) -> Result<Vec<(String, String)>, sqlx::Error> {
+            unreachable!("gap recovery does not scan materialized views")
+        }
+
+        async fn filter<Entity, Value>(
+            _source: &Self::Source,
+            _table: Table,
+            _column: Column,
+            _value: &Value,
+        ) -> Result<Vec<(String, String)>, ProjectionError<Entity>>
+        where
+            Entity: EventSourced,
+            for<'query> &'query Value: sqlx::Encode<'query, Self::Database>,
+            Value: sqlx::Type<Self::Database> + Send + Sync,
+        {
+            unreachable!("gap recovery does not filter materialized views")
+        }
+
+        async fn recover<Entity>(
+            recoveries: &Self::Source,
+            mode: &crate::ProjectionRecoveryMode,
+        ) -> Result<(), ProjectionError<Entity>>
+        where
+            Entity: EventSourced<Materialized = Table>,
+        {
+            assert!(
+                matches!(mode, crate::ProjectionRecoveryMode::CatchUpOne { aggregate_id } if aggregate_id == "id-1")
+            );
+            recoveries.fetch_add(1, Ordering::SeqCst);
+            // A storage failure leaves the gap unresolved, so processing another
+            // envelope would request catch-up again.
+            Err(sqlx::Error::PoolClosed.into())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_dispatch_waits_one_budget_and_attempts_recovery_once() {
+        let id = "id-1".to_string();
+        let projection = Arc::new(CounterBusyProjection::with_backend(AtomicU32::new(0)));
+        projection
+            .repo
+            .update_view(
+                Lifecycle::Live(Counter { value: 0 }),
+                ViewContext::new(id.clone(), 0),
+            )
+            .await
+            .unwrap();
+        let query = ProjectionQuery {
+            projection: projection.clone(),
+        };
+        let batch = [3, 4].map(|sequence| EventEnvelope {
+            aggregate_id: id.clone(),
+            sequence,
+            payload: CounterEvent::Incremented,
+            metadata: HashMap::new(),
+        });
+
+        let started_at = tokio::time::Instant::now();
+        query.dispatch(&id, &batch).await;
+
+        assert_eq!(started_at.elapsed(), Duration::from_millis(4_270));
+        assert_eq!(projection.repo.recoveries.load(Ordering::SeqCst), 1);
+        let (_, context) = projection
+            .repo
+            .load_with_context(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.version, 1);
+        assert_eq!(
+            projection.load(&id).await.unwrap(),
+            Some(Counter { value: 0 })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_gap_cannot_restart_the_batch_wait() {
+        let repo: Arc<CounterBusyRepo> =
+            Arc::new(BusyRepo::new(0).with_view("id-1", Lifecycle::Live(Counter { value: 0 })));
+        let projection: CounterBusyProjection = Projection::new(repo);
+        let event = CounterEvent::Incremented;
+        let mut wait = GapWait::for_batch();
+        let initial_time = tokio::time::Instant::now();
+        for sequence in [3, 4] {
+            let gap = projection
+                .deliver(
+                    "id-1",
+                    &event,
+                    Some(sequence.try_into().unwrap()),
+                    &mut wait,
+                )
+                .await
+                .unwrap();
+            assert_eq!(gap.covered, 1);
+            assert_eq!(gap.sequence.get(), sequence);
+            assert_eq!(initial_time.elapsed(), Duration::from_millis(4_270));
+        }
+        assert_eq!(
+            projection.load(&"id-1".to_string()).await.unwrap(),
+            Some(Counter { value: 0 })
         );
     }
 
@@ -1265,371 +1436,5 @@ mod tests {
         async fn transition(&self, _command: ()) -> Result<Effect<Self>, Never> {
             uneventful()
         }
-    }
-
-    async fn setup_catch_up_db() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-
-        sqlx::query(
-            "CREATE TABLE events ( \
-                 aggregate_type TEXT NOT NULL, \
-                 aggregate_id TEXT NOT NULL, \
-                 sequence BIGINT NOT NULL, \
-                 event_type TEXT NOT NULL, \
-                 event_version TEXT NOT NULL, \
-                 payload TEXT NOT NULL, \
-                 metadata TEXT NOT NULL, \
-                 PRIMARY KEY (aggregate_type, aggregate_id, sequence) \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "CREATE TABLE counter_view ( \
-                 view_id TEXT NOT NULL PRIMARY KEY, \
-                 version BIGINT NOT NULL, \
-                 payload TEXT NOT NULL \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Also need schema_registry for Projection::sqlite
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS schema_registry ( \
-                 aggregate_type TEXT NOT NULL PRIMARY KEY, \
-                 version BIGINT NOT NULL \
-             )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        pool
-    }
-
-    async fn insert_event(
-        pool: &SqlitePool,
-        aggregate_id: &str,
-        sequence: i64,
-        event: &CounterEvent,
-    ) {
-        let payload = serde_json::to_string(event).unwrap();
-        let event_type = DomainEvent::event_type(event);
-
-        sqlx::query(
-            "INSERT INTO events \
-             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
-             VALUES (?1, ?2, ?3, ?4, '1.0', ?5, '{}')",
-        )
-        .bind("Counter")
-        .bind(aggregate_id)
-        .bind(sequence)
-        .bind(&event_type)
-        .bind(&payload)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    async fn insert_stale_view(pool: &SqlitePool, view_id: &str, version: i64, counter: &Counter) {
-        let lifecycle = Lifecycle::Live(counter.clone());
-        let payload = serde_json::to_string(&lifecycle).unwrap();
-
-        sqlx::query("INSERT INTO counter_view (view_id, version, payload) VALUES (?1, ?2, ?3)")
-            .bind(view_id)
-            .bind(version)
-            .bind(&payload)
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn catch_up_replays_missed_events() {
-        let pool = setup_catch_up_db().await;
-
-        // Insert 3 events: Created(0), Incremented, Incremented
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
-        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
-        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
-
-        // View is stale at version 1 (only saw Created)
-        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool);
-
-        projection.catch_up().await.unwrap();
-
-        let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 2 }));
-    }
-
-    #[tokio::test]
-    async fn catch_up_skips_up_to_date_views() {
-        let pool = setup_catch_up_db().await;
-
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 5 }).await;
-
-        // View is up to date at version 1
-        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 5 }).await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool);
-
-        projection.catch_up().await.unwrap();
-
-        let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 5 }));
-    }
-
-    #[tokio::test]
-    async fn catch_up_with_no_events_is_noop() {
-        let pool = setup_catch_up_db().await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool);
-
-        projection.catch_up().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn catch_up_is_idempotent() {
-        let pool = setup_catch_up_db().await;
-
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
-        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
-        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
-
-        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool.clone());
-
-        projection.catch_up().await.unwrap();
-        projection.catch_up().await.unwrap();
-
-        let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 2 }));
-
-        // Verify version is correct (should be 3, matching max event sequence)
-        let (version,): (i64,) =
-            sqlx::query_as("SELECT version FROM counter_view WHERE view_id = 'counter-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-
-        assert_eq!(version, 3);
-    }
-
-    #[tokio::test]
-    async fn catch_up_rebuilds_missing_view_row() {
-        let pool = setup_catch_up_db().await;
-
-        // Events exist but no view row (crash before initial view write)
-        insert_event(
-            &pool,
-            "counter-1",
-            1,
-            &CounterEvent::Created { initial: 10 },
-        )
-        .await;
-        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool);
-
-        projection.catch_up().await.unwrap();
-
-        let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 11 }));
-    }
-
-    #[tokio::test]
-    async fn catch_up_tolerates_sequence_gap() {
-        let pool = setup_catch_up_db().await;
-
-        // Insert events with a gap: seq 1 and seq 3 (missing seq 2). A stale
-        // view at version 1 expects 2 missed events (3 - 1) but only 1 exists.
-        // Catch-up must not abort: it replays the available events in sequence
-        // order and advances the view to max_seq.
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
-        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
-
-        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool.clone());
-
-        projection.catch_up().await.unwrap();
-
-        let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 1 }));
-
-        let (version,): (i64,) =
-            sqlx::query_as("SELECT version FROM counter_view WHERE view_id = 'counter-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-
-        assert_eq!(
-            version, 3,
-            "view advances to max event sequence despite the gap"
-        );
-    }
-
-    #[tokio::test]
-    async fn catch_up_tolerates_non_contiguous_global_sequencing() {
-        let pool = setup_catch_up_db().await;
-
-        // Some stores assign sequences from a counter shared across aggregates,
-        // so a single aggregate's sequences are sparse (never 1..N). With no
-        // view row yet, catch-up must build from scratch by replaying every
-        // event in sequence order regardless of the gaps between them.
-        insert_event(
-            &pool,
-            "counter-1",
-            24,
-            &CounterEvent::Created { initial: 0 },
-        )
-        .await;
-        insert_event(&pool, "counter-1", 4559, &CounterEvent::Incremented).await;
-        insert_event(&pool, "counter-1", 4560, &CounterEvent::Incremented).await;
-        insert_event(&pool, "counter-1", 4561, &CounterEvent::Incremented).await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool.clone());
-
-        projection.catch_up().await.unwrap();
-
-        let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 3 }));
-
-        let (version,): (i64,) =
-            sqlx::query_as("SELECT version FROM counter_view WHERE view_id = 'counter-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-
-        assert_eq!(version, 4561);
-    }
-
-    #[tokio::test]
-    async fn catch_up_recovers_from_incompatible_view_payload() {
-        let pool = setup_catch_up_db().await;
-
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
-        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
-        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
-
-        // Pre-Lifecycle wire format: bare entity variant instead of
-        // `{"Live": {...}}`.
-        sqlx::query("INSERT INTO counter_view (view_id, version, payload) VALUES (?1, ?2, ?3)")
-            .bind("counter-1")
-            .bind(1_i64)
-            .bind(r#"{"Completed": {"value": 0}}"#)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let projection = Projection::<Counter, _>::sqlite(pool.clone());
-        projection.catch_up().await.unwrap();
-
-        let payload: String =
-            sqlx::query_scalar("SELECT payload FROM counter_view WHERE view_id = 'counter-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-
-        let lifecycle: Lifecycle<Counter> = serde_json::from_str(&payload).unwrap();
-        assert!(matches!(lifecycle, Lifecycle::Live(Counter { value: 2 })));
-
-        // The version bookmark must advance to max_seq after recovery; a
-        // regression that left it at the stale version would re-replay every
-        // event on each subsequent catch_up and double-apply increments.
-        let version: i64 =
-            sqlx::query_scalar("SELECT version FROM counter_view WHERE view_id = 'counter-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(version, 3);
-    }
-
-    #[tokio::test]
-    async fn catch_up_fails_on_malformed_payload() {
-        let pool = setup_catch_up_db().await;
-
-        // Insert a valid first event, then a malformed payload at seq 2
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
-
-        sqlx::query(
-            "INSERT INTO events \
-             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
-             VALUES (?1, ?2, ?3, ?4, '1.0', ?5, '{}')",
-        )
-        .bind("Counter")
-        .bind("counter-1")
-        .bind(2_i64)
-        .bind("CounterEvent::Incremented")
-        .bind("not valid json {{{")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool);
-
-        let error = projection.catch_up().await.unwrap_err();
-        assert!(
-            matches!(error, ProjectionError::Serde { .. }),
-            "expected Serde error, got: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rebuild_replays_all_events_from_scratch() {
-        let pool = setup_catch_up_db().await;
-
-        // Insert events and a corrupted view (value should be 2, not 99)
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
-        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
-        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
-
-        insert_stale_view(&pool, "counter-1", 3, &Counter { value: 99 }).await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool);
-
-        // catch_up would not fix this because version matches max_seq
-        projection.rebuild(&"counter-1".to_string()).await.unwrap();
-
-        let result = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result, Some(Counter { value: 2 }));
-    }
-
-    #[tokio::test]
-    async fn rebuild_all_replays_all_aggregates() {
-        let pool = setup_catch_up_db().await;
-
-        // Two aggregates with corrupted views
-        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
-        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
-        insert_event(
-            &pool,
-            "counter-2",
-            1,
-            &CounterEvent::Created { initial: 10 },
-        )
-        .await;
-
-        insert_stale_view(&pool, "counter-1", 2, &Counter { value: 99 }).await;
-        insert_stale_view(&pool, "counter-2", 1, &Counter { value: 99 }).await;
-
-        let projection = Projection::<Counter, _>::sqlite(pool);
-
-        projection.rebuild_all().await.unwrap();
-
-        let result1 = projection.load(&"counter-1".to_string()).await.unwrap();
-        assert_eq!(result1, Some(Counter { value: 1 }));
-
-        let result2 = projection.load(&"counter-2".to_string()).await.unwrap();
-        assert_eq!(result2, Some(Counter { value: 10 }));
     }
 }

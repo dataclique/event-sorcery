@@ -203,8 +203,10 @@ visible conversation, treat the change as unjustified and revert it.
 ## Project Overview
 
 `event-sorcery` is an event-sourcing library on top of `cqrs-es`. The Cargo
-workspace has five crates and no application binaries:
+workspace has no application binaries:
 
+- **`crates/core`** (`event-sorcery-core`) — shared persistence contracts
+  without a database driver.
 - **`crates/indexed-query`** — shared indexed-view query contracts, SQL lowering
   and validation errors. Storage adapters retain native encoding and execution.
 
@@ -212,9 +214,8 @@ workspace has five crates and no application binaries:
   repository traits. Standalone; usable wherever a `cqrs-es` backend is needed.
 - **`crates/postgr-es`** — PostgreSQL repositories, migrations, and native
   backend integration for `event-sorcery`.
-- **`crates/event-sorcery`** — higher-level ergonomics on top of `sqlite-es`:
-  the `EventSourced` trait, `Lifecycle` adapter, typed `Store`, projections,
-  schema registry, reactor.
+- **`crates/event-sorcery`** — backend-independent framework: `EventSourced`,
+  typed stores, projections, schema registry, reactors, and durable job policy.
 - **`crates/event-sorcery-ffi`** — C ABI over the shared Rust engine, with a
   generated C header and static library for language bindings.
 
@@ -251,7 +252,7 @@ quickly; duplicating their outputs wastes space and makes cleanup harder.
 
 ### Testing
 
-- `cargo nextest run --workspace` - Run all tests in the five Rust crates
+- `cargo nextest run --workspace` - Run all Rust workspace tests
 - `cargo nextest run --lib` - Run library tests only
 - `cargo nextest run -p event-sorcery` - Run event-sorcery crate tests
 - `cargo nextest run -p sqlite-es` - Run sqlite-es crate tests
@@ -339,11 +340,12 @@ needs a stable on-disk path, point it at `.tmp/<name>` and let the existing
 
 ### Library Layering
 
-`event-sorcery` sits on top of `sqlite-es`, which sits on top of `cqrs-es`. Each
-layer narrows the API the layer above sees. The `Lifecycle` enum is `pub(crate)`
-deliberately — it's an implementation detail of the `EventSourced` ↔ cqrs-es
-bridge and must not leak through any public bound. See the `ViewBackend` GAT in
-`view_backend.rs` for how to express
+`event-sorcery-core` owns shared persistence contracts. The `sqlite-es` and
+`postgr-es` adapters depend on `event-sorcery`, never the reverse. Keep the
+framework's normal and test dependency graphs free of both drivers. The
+`Lifecycle` enum is `pub(crate)` deliberately — it implements the `EventSourced`
+bridge to cqrs-es and must not leak through any public bound. See the
+`ViewBackend` GAT in `view_backend.rs` for how to express
 `(Lifecycle<Entity>, Lifecycle<Entity>)`-shaped repository requirements without
 naming the private type in any public bound.
 
@@ -380,9 +382,9 @@ derived state distinguishable from the authoritative event store.
   `execute_with_metadata()` to emit events through aggregate commands. The
   framework handles persistence, sequence numbers, and consistency
 - **CRITICAL: Single CQRS Framework Instance Per Aggregate**: In any consuming
-  application, each aggregate must have exactly ONE `SqliteCqrs<A>`, constructed
-  once at startup. Never call `sqlite_cqrs()` or `CqrsFramework::new()` per
-  request. Direct construction is fine in test/CLI/migration code
+  application, build exactly one CQRS framework per aggregate at startup. Never
+  construct one per request. Direct construction is fine in test/CLI/migration
+  code
 - **CQRS Aggregate Services Pattern**: Use cqrs-es Services for side-effects in
   `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates

@@ -30,7 +30,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let pool = SqlitePool::connect(":memory:").await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    let (store, projection) = StoreBuilder::<SupportTicket, _>::new(pool.clone())
+    let (store, projection) =
+        StoreBuilder::<SupportTicket, _>::with_backend(sqlite_es::SqliteBackend {
+            pool: pool.clone(),
+        })
         .build()
         .await?;
 
@@ -83,7 +86,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // The worker input bundles the notifier with the origin store the
     // framework delivers verdicts through. A standalone job (ADR-0007) rides
     // the same runtime with a plain input.
-    let runtime = JobRuntime::build(pool.clone()).await?;
+    let runtime = JobRuntime::build(sqlite_es::SqliteBackend { pool: pool.clone() }).await?;
     runtime.enqueue(SweepStaleTickets).await?;
 
     let config = JobWorkerConfig {

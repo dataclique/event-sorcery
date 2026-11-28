@@ -19,9 +19,27 @@ sqlx = { workspace = true, features = [
 ] }
 chrono = "0.4.45"
 tokio = { version = "1.52.3", features = ["rt", "sync"] }
+event-sorcery-core.workspace = true
+futures-util.workspace = true
+event-sorcery.workspace = true
+async-trait.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+apalis-core.workspace = true
+chrono = "0.4.45"
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+event-sorcery = { workspace = true, features = ["test-support"] }
+tokio = { version = "1.52.3", features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+] }
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
+
+[[bench]]
+name = "store"
+harness = false

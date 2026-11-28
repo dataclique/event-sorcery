@@ -80,15 +80,15 @@ shared persistence contracts.
 
 Database-specific SQL and transaction mechanisms MAY differ. Command validation,
 job-event construction, and durable lifecycle decisions MUST remain shared
-library code. Adding a backend MUST preserve existing public constructor
-signatures, backend implementations, migrations, stored data, and behavior.
-Database-specific integrations MUST be opt-in: the default core build and a
-PostgreSQL-only build MUST NOT pull in SQLite repositories, SQLite driver
-dependencies, or SQLite implementation modules. SQLite constructors and
-reexports remain available when the SQLite integration is explicitly enabled.
-Generic modules MUST keep backend implementations in their owning integration
-modules rather than embed SQLite implementations alongside backend-neutral
-interfaces.
+library code. Adding a backend MUST preserve existing backend behavior,
+migrations, and stored data. The Rust 0.6 crate split moves backend-specific
+constructors and types to their owning adapters without compatibility shims. It
+does not change the C ABI.
+
+The framework and shared core MUST NOT depend on database adapters or drivers,
+including in their test builds. Each adapter MUST own its concrete repository
+and startup wiring. Rust applications opt in by selecting an adapter and passing
+its backend to the framework. Neither adapter may pull in the other's driver.
 
 Backend type parameters MUST NOT have implicit database defaults. Named type
 annotations specify the backend; constructors MAY infer it from their inputs or
@@ -330,6 +330,30 @@ values, that repository contract SHOULD be reused directly.
 The engine ships a C-compatible library and a cbindgen-generated header. The
 header is a build artifact and MUST NOT be hand-maintained.
 
+### Deferred backend independence
+
+The Rust 0.6 adapter split leaves the shipped SQLite C ABI unchanged. The
+requirements below apply to the follow-up, not to the Rust 0.6 release.
+
+In [#162](https://github.com/dataclique/event-sorcery/issues/162),
+`event-sorcery-ffi` MUST own the shared ABI contract, wire encoding, and handle
+lifecycle without depending on a concrete adapter or driver. It MUST invoke the
+erased engine facade. For every backend exposed through the C ABI, native Rust
+and C ABI writes MUST use the same repository writer. SQLite is the only adapter
+required for #162.
+
+The code assembling the shipped SQLite binding MUST supply the adapter and own
+its database configuration and connection setup outside the common FFI crate.
+The shipped library MUST still export `es_open` with the same signature, request
+encoding, and behavior. Opening a store MUST use the shared codec and initialize
+the common handle with a SQLite-backed engine facade. The split MUST preserve
+the existing SQLite capabilities, bindings, and persisted formats.
+
+[#124](https://github.com/dataclique/event-sorcery/issues/124) separately tracks
+caller-facing PostgreSQL selection. That work MUST specify which operations
+PostgreSQL supports through the ABI and how callers learn that an operation is
+unsupported.
+
 ### Handles and buffers
 
 The ABI uses an opaque, thread-safe store handle. Inputs remain caller-owned for
@@ -386,7 +410,7 @@ ABI major version 0 has these normative resource limits:
 | Items in one page or list response              |            4,096 |
 | UTF-8 error-detail text                         |            4 KiB |
 | UTF-8 identifier text                           |            4 KiB |
-| Store busy timeout                              | 2,147,483,647 ms |
+| SQLite `es_open` busy timeout                   | 2,147,483,647 ms |
 
 An identifier is any caller-supplied name the store persists or matches on: an
 aggregate type or id, a job id or kind, and a worker name. The busy-timeout
@@ -437,7 +461,8 @@ identities, sizes, limits, and redacted causal categories MAY be reported.
 
 ### Required capabilities
 
-The ABI exposes the existing engine capabilities needed by the binding:
+The shipped SQLite C ABI exposes the existing engine capabilities needed by the
+binding:
 
 - open, close, ABI version, and buffer release;
 - load a stream and read its current version;

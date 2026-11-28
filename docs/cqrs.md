@@ -40,11 +40,11 @@ IDs.
 
 ## CQRS dependency for external backends
 
-This revision uses a temporary `cqrs-es` fix fork for explicit snapshot
-checkpoints, pinned to `cb0020add5dcff06f1ece3816fce9e4319004b87`. Cargo treats
-registry and Git packages as different identities even when both have version
-`0.5.0`. Mixing them gives different `PersistedEventRepository` traits and
-`SerializedEvent` types at the `EventBackend` boundary.
+The 0.6.0 workspace pins a `cqrs-es` fork for explicit snapshot checkpoints and
+transaction-bound PostgreSQL operations. Cargo treats registry and Git packages
+as different identities even when both have version `0.5.0`. Mixing them gives
+different `PersistedEventRepository` traits and `SerializedEvent` types at the
+backend boundary.
 
 An application with a registry-based 0.5.0 backend must align its dependency
 graph in its **root** `Cargo.toml`:
@@ -54,7 +54,7 @@ graph in its **root** `Cargo.toml`:
 cqrs-es = "=0.5.0"
 
 [patch.crates-io]
-cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87" }
+cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "c2bdadc483f7b54b1820a9a2a265781fe050c298" }
 ```
 
 A patch inside a dependency's manifest is ignored by the consuming application.
@@ -215,7 +215,7 @@ aggregates directly:
 
 ```rust
 // Projection is returned by StoreBuilder::build() for Table entities
-let (store, projection) = StoreBuilder::<Position, _>::new(pool)
+let (store, projection) = StoreBuilder::<Position, _>::with_backend(backend)
     .build()
     .await?;
 
@@ -239,6 +239,13 @@ let pending_orders: Vec<OffchainOrder> = projection
 
 ## Wiring: StoreBuilder
 
+Pass the selected adapter to `StoreBuilder::with_backend`. For SQLite, use
+`sqlite_es::SqliteBackend { pool }`; for PostgreSQL, use
+`postgr_es::PostgresBackend { pool }`. Before calling `build()`, apply the
+library migrations for the chosen backend, either through
+`PersistenceBackend::bootstrap_persistence()` or your migration runner. For
+projected entities, also apply the application's projection-table migration.
+
 `StoreBuilder` wires reactors to a `Store` at startup and auto-wires projections
 based on the entity's `Materialized` type. It uses type-level linked lists
 (`Cons`/`Nil`) to ensure all required processors are wired at compile time.
@@ -247,7 +254,7 @@ For **projected entities** (`type Materialized = Table`), `build()` returns
 `(Arc<Store>, Arc<Projection>)`:
 
 ```rust
-let (store, projection) = StoreBuilder::<Position, _>::new(pool)
+let (store, projection) = StoreBuilder::<Position, _>::with_backend(backend)
     .with(rebalancing_trigger)  // wire a reactor
     .build()
     .await?;
@@ -257,15 +264,14 @@ For **non-projected entities** (`type Materialized = Nil`), `build()` returns
 `Arc<Store>`:
 
 ```rust
-let store = StoreBuilder::<OnChainTrade, _>::new(pool)
+let store = StoreBuilder::<OnChainTrade, _>::with_backend(backend)
     .build()
     .await?;
 ```
 
-Projections are created and wired automatically - no manual
-`Projection::sqlite()` or `.with(projection)` calls needed. This eliminates a
-class of bugs where forgetting to wire a projection causes silent data
-staleness.
+Projections are created and wired automatically - no manual projection
+constructor or `.with(projection)` call needed. This eliminates a class of bugs
+where forgetting to wire a projection causes silent data staleness.
 
 The `QueryManifest` pattern in `conductor/manifest.rs` ensures exhaustive wiring
 by destructuring all processors.
@@ -333,9 +339,11 @@ SQLite writes with no side effect (HTTP/RPC call, `Store::send` to another
 aggregate, message-queue publish) that would double-fire on retry:
 
 ```rust
+use sqlite_es::{IdempotentReactor, RetryOnBusy};
+
 impl IdempotentReactor for MyReactor {}
 
-let store = StoreBuilder::<MyEntity, _>::new(pool)
+let store = StoreBuilder::<MyEntity, _>::with_backend(backend)
     .with(Arc::new(RetryOnBusy { inner: my_reactor }))
     // ...
 ```
@@ -345,32 +353,25 @@ end-to-end -- a reactor that orchestrates across aggregates (like
 `RebalancingTrigger` above) must not, unless the downstream command handler is
 independently confirmed idempotent under re-invocation. For a reactor whose
 `react()` has side effects before its write, call `retry_with_backoff` and
-`is_retryable_sqlite_busy` directly around just the write instead, leaving the
-earlier side effects outside the retry boundary and outside `IdempotentReactor`
-entirely. A `react()` that issues two or more separate, non-transactional SQLite
-statements is unsafe to mark too: if the first commits and a later one hits
-`SQLITE_BUSY`, the retry replays the whole `react()`, re-running the
-already-committed statement. A conforming `react()` must be atomic as a whole --
-a single statement, a single transaction, or written so replaying it is safe
-(upserts, not bare inserts).
+`sqlite_es::is_retryable_sqlite_busy` directly around just the write instead,
+leaving the earlier side effects outside the retry boundary and outside
+`IdempotentReactor` entirely. A `react()` that issues two or more separate,
+non-transactional SQLite statements is unsafe to mark too: if the first commits
+and a later one hits `SQLITE_BUSY`, the retry replays the whole `react()`,
+re-running the already-committed statement. A conforming `react()` must be
+atomic as a whole -- a single statement, a single transaction, or written so
+replaying it is safe (upserts, not bare inserts).
 
 A reactor that does neither still swallows a busy error without retry, leaving
 its write outcome unknown, exactly as before this exists -- opting in is a
 per-reactor decision, not a blanket fix.
 
-**Latency tradeoff:** `CqrsFramework::execute_with_metadata` awaits every
-registered reactor's `dispatch()` synchronously before returning to the command
-caller, once per event, so a `RetryOnBusy`-wrapped reactor can block that caller
-for up to the full retry budget (~4.3s, see `RETRY_MAX_ATTEMPTS`/
-`RETRY_BASE_DELAY_MS`/`RETRY_MAX_DELAY_MS`) _per reacted event_ whenever a
-busy/busy-snapshot conflict occurs -- including conflicts caused by an unrelated
-writer committing anywhere in the same database file, not just writes to the
-aggregate the command touched. A single command that emits multiple events
-dispatches the reactor once per event, so the worst-case block for that command
-is the retry budget multiplied by the event count, not a flat ~4.3s. Callers
-with tight request timeouts need a budget larger than the retry schedule. This
-is a real behavioral tradeoff (latency vs. lost updates), not just an
-idempotency question -- weigh it before wrapping a reactor in `RetryOnBusy`.
+**Latency tradeoff:** `CqrsFramework::execute_with_metadata` awaits reactor
+delivery before returning to the command caller. For each event, `RetryOnBusy`
+can add up to 4,270 ms of retry sleeps. That is not a timeout: the caller also
+waits for each reactor attempt, including any wait under SQLite's busy timeout.
+Writes to unrelated streams in the same database file can cause contention, and
+a command that emits multiple events can incur those waits for each event.
 
 ## Jobs Pattern
 
@@ -782,19 +783,39 @@ stores JSONB. Applications own their projection-table migrations. See the
 [PostgreSQL setup guide](../crates/postgr-es/README.md#native-stores) for native
 projected and unprojected builders.
 
-Native framework delivery carries the persisted envelope's aggregate-local
-sequence through `Reactor::react_with_context`. Projection updates skip events
-already covered by recovery or another successful delivery. An ahead-of-next
-sequence retries without applying out of order; exhaustion leaves the checkpoint
-unchanged so `catch_up` can replay the missing history. `Arc` and `RetryOnBusy`
-preserve this context. Existing custom reactors default to their `react` method;
-plain custom `ViewBackend` repositories retain opaque optimistic revisions.
+Native framework delivery uses the persisted envelope's aggregate-local
+sequence. Projection updates skip events already covered by recovery or another
+successful delivery. A gap never applies a live event out of order. The native
+builder's projection shares one gap-wait budget across the committed batch. If
+that wait runs out, live delivery makes one recovery attempt for the affected
+stream instead of retrying each remaining event. It does not repair other
+streams. An explicit `catch_up()` checks all streams for the projection. If live
+recovery fails, delivery logs the failure without undoing the committed command.
+
+Other reactors receive the sequence through `Reactor::react_with_context`. `Arc`
+and `RetryOnBusy` preserve it, and custom reactors default to their `react`
+method. A native projection called directly with a sequence still leaves an
+exhausted gap for explicit recovery. Plain custom `ViewBackend` repositories
+retain opaque optimistic revisions.
 
 Native projection repositories write payload and sequence checkpoints
 atomically, advance ordinary updates by one, and report competing identity
 writes as optimistic conflicts. Direct unsequenced `react` writes must not be
 mixed with native framework delivery because they cannot establish event
 coverage.
+
+**Upgrading existing SQLite projections to Rust 0.6:** Bump each projected
+entity's `SCHEMA_VERSION` before starting the new store, even when its payload
+schema is unchanged. Startup rebuilds the view from retained history before it
+accepts commands. Legacy view revisions may count duplicate deliveries rather
+than represent event checkpoints; carrying those revisions forward can cause new
+events to be skipped. If history is incomplete, recover it before upgrading; do
+not reset the revision by hand.
+
+If replay reaches a failed lifecycle, native projected startup returns an error
+instead of exposing a store with an incomplete projection. It does not record an
+upgraded schema version. Correct the replay or migrate the affected data before
+retrying startup.
 
 ### Lifecycle Serialization in View Payloads
 
@@ -904,20 +925,24 @@ changes.
 
 ## Running Jobs
 
-The worker API below requires a `SqlitePool`. PostgreSQL persistence uses
-`PostgresBackend` and the CQRS repository contract, not an operational
-`EventBackend` for worker execution. Do not use a PostgreSQL pool with
-`JobRuntime::build` or assume its workers can drain PostgreSQL jobs.
+In Rust 0.6, dispatch diagnostics such as `VERDICT REFUSED` use the
+`event_sorcery::dispatch` tracing target. Job-planning diagnostics use
+`event_sorcery::job`. If your log filter enabled only the old `cqrs` target,
+enable warnings and errors for these module targets too.
 
-The worker host uses stable Apalis 1.0. Dispatching a job (see **Jobs Pattern**
-above) only writes a pending row; a worker has to drain it.
-`JobRuntime::build(pool)` wires the durable-jobs runtime over the same database,
-and `build_supervised_worker!` registers one supervised worker per job type --
-entity-kicked jobs get a `JobInput` (their dependencies plus the origin store
-verdicts are delivered through), standalone jobs get their plain input:
+SQLite supports worker execution through `SqliteBackend`. `PostgresBackend` can
+enqueue jobs but does not yet support worker execution.
+
+The worker host uses stable Apalis 1.0. Dispatch commits the origin's
+`Dispatched` event, the job's enqueue event, and the pending queue row in one
+transaction. A worker executes the job later. `JobRuntime::build(backend)` opens
+the job store and recovers its queue projection. `build_supervised_worker!`
+registers one supervised worker per job type -- entity-kicked jobs get a
+`JobInput` (their dependencies plus the origin store verdicts are delivered
+through), standalone jobs get their plain input:
 
 ```rust
-let runtime = JobRuntime::build(pool.clone()).await?;
+let runtime = JobRuntime::build(sqlite_es::SqliteBackend { pool: pool.clone() }).await?;
 
 let monitor = build_supervised_worker!(
     runtime,
@@ -951,8 +976,9 @@ again inside the current execution. The failed-attempt index remains capped at
 implicitly. It must be finite and at least one. The initial delay is capped at
 `cap`; delay scaling and timestamp conversion must fit their supported ranges.
 `Backoff::validate()` checks the configuration, and worker polling rejects an
-invalid configuration with `JobScheduleError` before claiming a job. Worker
-constructors and `build_supervised_worker!` keep their existing signatures.
+invalid configuration with `JobScheduleError` before claiming a job.
+`JobRuntime::build` now takes a backend rather than a SQLite pool.
+`EventStoreBackend::new` and `build_supervised_worker!` keep their call shapes.
 Custom fractional schedules follow `backon` duration rounding rather than the
 former indexed `f64` calculation.
 

@@ -17,9 +17,10 @@ use std::time::{Duration, Instant};
 use sqlx::SqlitePool;
 
 use event_sorcery::{
-    Clock, JobInput, JobRuntime, JobWorkerConfig, StoreBuilder, build_supervised_worker,
-    compact_events, count_aggregates, load_entity,
+    Clock, EventSourced, JobInput, JobRuntime, JobWorkerConfig, StoreBuilder,
+    build_supervised_worker, load_entity,
 };
+use sqlite_es::count_aggregates;
 
 mod audit_log;
 mod inventory;
@@ -46,18 +47,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let audit = Arc::new(AuditLog::new());
 
     // Order is Materialized = Nil -- no projection tuple in the return type.
-    let orders = StoreBuilder::<Order, _>::new(pool.clone())
-        .with(stock_alert.clone())
-        .with(audit.clone())
-        .build()
-        .await?;
+    let orders =
+        StoreBuilder::<Order, _>::with_backend(sqlite_es::SqliteBackend { pool: pool.clone() })
+            .with(stock_alert.clone())
+            .with(audit.clone())
+            .build()
+            .await?;
 
     // Inventory is Materialized = Table -- the auto-wired projection is
     // returned alongside the store, and our custom reactor runs next to it.
-    let (inventory, inventory_projection) = StoreBuilder::<Inventory, _>::new(pool.clone())
-        .with(stock_alert.clone())
-        .build()
-        .await?;
+    let (inventory, inventory_projection) =
+        StoreBuilder::<Inventory, _>::with_backend(sqlite_es::SqliteBackend { pool: pool.clone() })
+            .with(stock_alert.clone())
+            .build()
+            .await?;
 
     let widgets = Sku("widgets".to_string());
     let order_one = OrderId(1);
@@ -91,7 +94,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
     }
 
-    let runtime = JobRuntime::build(pool.clone()).await?;
+    let runtime = JobRuntime::build(sqlite_es::SqliteBackend { pool: pool.clone() }).await?;
     let config = JobWorkerConfig {
         poll_interval: Duration::from_millis(25),
         ..JobWorkerConfig::default()
@@ -150,23 +153,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Standalone helpers -- useful for CLI / migration code that does not
     // hold a long-lived Store. `load_entity` replays from events; for
     // Materialized = Table entities a Projection::load would be cheaper.
-    let order_via_helper = load_entity::<Order>(&pool, &order_one)
-        .await?
-        .ok_or("order missing")?;
+    let order_via_helper =
+        load_entity::<Order>(&sqlite_es::SqliteBackend { pool: pool.clone() }, &order_one)
+            .await?
+            .ok_or("order missing")?;
     println!(
         "load_entity(order_one)       = {{ item: {}, quantity: {}, status: {:?} }}",
         order_via_helper.item, order_via_helper.quantity, order_via_helper.status
     );
 
-    let total_orders = count_aggregates::<Order>(&pool).await?;
-    println!("count_aggregates::<Order>    = {total_orders}");
+    let total_orders = count_aggregates(&pool, Order::AGGREGATE_TYPE).await?;
+    println!("order aggregate count        = {total_orders}");
 
     // Order opts into CompactionPolicy::CompactAfterSnapshot so events
     // covered by a snapshot can be reclaimed. SNAPSHOT_SIZE = 1 means every
     // command wrote a snapshot, so most order events are eligible.
     // Inventory keeps the default Retain because its projection rebuild path
     // reads from the events table.
-    let deleted = compact_events::<Order>(&pool).await?;
+    let deleted =
+        sqlite_es::compact_events(&pool, Order::AGGREGATE_TYPE, Order::COMPACTION_POLICY).await?;
     println!("compact_events(Order)        = {deleted} events reclaimed");
 
     Ok(())

@@ -43,10 +43,29 @@
 //! let query = GenericQuery::new(view_repo);
 //! ```
 
+mod aggregate_ids;
+mod backend;
+mod commit;
+mod compaction;
+mod contention;
 mod cqrs;
+mod engine;
+mod event_page;
 mod event_repository;
+mod job_queue;
+mod native_projection;
+mod native_repository;
+mod projection_queries;
+mod projection_recovery;
+mod reactor;
+mod reconciler;
+mod schema_registry;
+mod snapshot;
 mod sql_query;
+mod startup;
+mod stream_version;
 pub mod testing;
+mod vacuum;
 mod view_repository;
 
 /// The canonical event-store schema (events, snapshots, job queue,
@@ -61,13 +80,34 @@ mod view_repository;
 /// edit them afterwards.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+pub use aggregate_ids::{LoadAllIdsError, count_aggregates, load_all_ids, load_ids_paginated};
+pub use backend::SqliteBackend;
+pub use compaction::compact_events;
+pub use contention::is_retryable_sqlite_busy;
 pub use cqrs::{SqliteCqrs, sqlite_cqrs};
 pub use cqrs_es::persist::ViewContext;
+pub use engine::{Engine, SnapshotWrite};
+pub use event_page::{EventPageReadError, load_events_page, load_events_page_bounded};
 pub use event_repository::{
-    SqliteAggregateError, SqliteEventRepository, insert_serialized_events_batch,
+    SqliteAggregateError, SqliteEventRepository, StoredEventRow, insert_serialized_events_batch,
+    load_event_rows, replay_events,
 };
+pub use job_queue::{SqliteJobError, claim_job, enqueue_job, renew_job};
+pub use native_repository::NativeRepository;
+pub use projection_queries::{SqliteProjectionFilterError, filter_projection, projection_rows};
+pub use projection_recovery::{SqliteProjectionRecovery, recover_projection};
+pub use reactor::{IdempotentReactor, RetryOnBusy};
+pub use reconciler::Reconciler;
+pub use schema_registry::load_schema_registry_payloads;
+pub use snapshot::{
+    StoreSnapshotError, clear_snapshots, discard_snapshot, load_snapshot, store_snapshot,
+    write_snapshot,
+};
+pub use stream_version::committed_stream_version;
+pub use vacuum::{incremental_vacuum, vacuum};
 pub use view_repository::{
-    Cmp, IndexedView, Order, Predicate, SqliteViewError, SqliteViewRepository, Term, Value,
+    Cmp, IndexedView, Order, Predicate, SqliteViewBackend, SqliteViewError, SqliteViewRepository,
+    Term, Value,
 };
 
 #[cfg(test)]
@@ -108,6 +148,7 @@ mod tests {
                     "kind": "migration-probe"
                 }}}),
                 "done",
+                "resolved by operator",
             ),
             (
                 "01ARZ3NDEKTSV4RRFFQ69G5FAX",
@@ -115,30 +156,33 @@ mod tests {
                     "kind": "migration-probe", "reason": "Abandoned"
                 }}}),
                 "dead",
+                "review abandonment",
             ),
         ];
-        for (view_id, payload, _) in &jobs {
+        for (view_id, payload, _, note) in &jobs {
             sqlx::query(
-                "INSERT INTO job_queue_projection (view_id, version, payload, lease_until) \
-                 VALUES (?1, 7, ?2, ?3)",
+                "INSERT INTO job_queue_projection \
+                 (view_id, version, payload, lease_until, operator_note) VALUES (?1, 7, ?2, ?3, ?4)",
             )
             .bind(view_id)
             .bind(payload.to_string())
             .bind(1_700_000_030_000_i64)
+            .bind(note)
             .execute(&pool)
             .await
             .unwrap();
         }
 
         MIGRATOR.run(&pool).await.unwrap();
-        let notes: Vec<String> =
-            sqlx::query_scalar("SELECT operator_note FROM job_queue_projection ORDER BY view_id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(notes, ["retained", "retained"]);
-
-        for (view_id, payload, expected_status) in &jobs {
+        for (view_id, payload, expected_status, expected_note) in &jobs {
+            let note: String = sqlx::query_scalar(
+                "SELECT operator_note FROM job_queue_projection WHERE view_id = ?1",
+            )
+            .bind(view_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(note, *expected_note);
             let (version, stored, lease, kind, status, run_at): (
                 i64,
                 String,

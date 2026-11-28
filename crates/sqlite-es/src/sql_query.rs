@@ -1,6 +1,23 @@
 pub(crate) struct SqlQueryFactory {
     events_table: String,
     snapshots_table: String,
+    event_json: EventJsonColumns,
+}
+
+enum EventJsonColumns {
+    Stored,
+    Text,
+}
+
+impl EventJsonColumns {
+    const fn select(&self) -> &str {
+        match self {
+            Self::Stored => "payload, metadata",
+            // SQLite's JSON affinity can store numeric JSON as INTEGER or REAL.
+            // Text decoding must not depend on the storage class of the value.
+            Self::Text => "CAST(payload AS TEXT) AS payload, CAST(metadata AS TEXT) AS metadata",
+        }
+    }
 }
 
 impl SqlQueryFactory {
@@ -8,6 +25,15 @@ impl SqlQueryFactory {
         Self {
             events_table,
             snapshots_table,
+            event_json: EventJsonColumns::Stored,
+        }
+    }
+
+    pub(crate) fn native_event_rows() -> Self {
+        Self {
+            events_table: "events".to_owned(),
+            snapshots_table: "snapshots".to_owned(),
+            event_json: EventJsonColumns::Text,
         }
     }
 
@@ -23,11 +49,11 @@ impl SqlQueryFactory {
                 sequence,
                 event_type,
                 event_version,
-                payload,
-                metadata
+                {}
              FROM {}
              WHERE aggregate_type = ? AND aggregate_id = ?
              ORDER BY sequence",
+            self.event_json.select(),
             self.events_table
         )
     }
@@ -40,11 +66,11 @@ impl SqlQueryFactory {
                 sequence,
                 event_type,
                 event_version,
-                payload,
-                metadata
+                {}
              FROM {}
              WHERE aggregate_type = ?
              ORDER BY sequence",
+            self.event_json.select(),
             self.events_table
         )
     }
@@ -57,11 +83,11 @@ impl SqlQueryFactory {
                 sequence,
                 event_type,
                 event_version,
-                payload,
-                metadata
+                {}
              FROM {}
              WHERE aggregate_type = ? AND aggregate_id = ? AND sequence > ?
              ORDER BY sequence",
+            self.event_json.select(),
             self.events_table
         )
     }

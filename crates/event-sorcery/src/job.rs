@@ -28,13 +28,14 @@ use std::time::Duration;
 use tracing::error;
 use ulid::Ulid;
 
+use event_sorcery_core::JOB_AGGREGATE_TYPE;
+
 use crate::dependency::Nil;
 use crate::dispatch::DeliveryPolicy;
 use crate::job_store::{ClaimDecision, ClaimRead};
 use crate::lifecycle::Lifecycle;
 use crate::{CompactionPolicy, EventSourced, Table};
 
-const JOB_AGGREGATE_TYPE: &str = "job";
 const JOB_EVENT_VERSION: &str = "1.0";
 
 /// A durable, retryable worker job with no origin entity.
@@ -647,7 +648,11 @@ pub(crate) fn plan_claim(
     let lifecycle: Lifecycle<JobState> = match serde_json::from_str(&read.payload) {
         Ok(lifecycle) => lifecycle,
         Err(error) => {
-            error!(target: "cqrs", job_id, ?error, "job_queue_projection payload undecodable; needs rebuild");
+            error!(
+                job_id,
+                ?error,
+                "job_queue_projection payload undecodable; needs rebuild"
+            );
             return ClaimDecision::Skip;
         }
     };
@@ -689,7 +694,7 @@ pub(crate) fn plan_claim(
 
     let claim_seq = read.version + 1;
     let Ok(claim_seq_usize) = usize::try_from(claim_seq) else {
-        error!(target: "cqrs", job_id, claim_seq, "job claim sequence out of range");
+        error!(job_id, claim_seq, "job claim sequence out of range");
         return ClaimDecision::Skip;
     };
 
@@ -698,11 +703,11 @@ pub(crate) fn plan_claim(
     }
 
     let Some(lease_until_ms) = now_ms.checked_add(lease_ms) else {
-        error!(target: "cqrs", job_id, now_ms, lease_ms, "job lease instant out of range");
+        error!(job_id, now_ms, lease_ms, "job lease instant out of range");
         return ClaimDecision::Skip;
     };
     let Ok(lease_until) = instant_from_millis(lease_until_ms) else {
-        error!(target: "cqrs", job_id, lease_until_ms, "job lease instant out of range");
+        error!(job_id, lease_until_ms, "job lease instant out of range");
         return ClaimDecision::Skip;
     };
     let claim_id = ClaimId::new();
@@ -724,7 +729,7 @@ pub(crate) fn plan_claim(
         claimed.serialized(job_id, claim_seq_usize),
         serde_json::to_string(&Lifecycle::Live(new_state)),
     ) else {
-        error!(target: "cqrs", job_id, "failed to encode Claimed");
+        error!(job_id, "failed to encode Claimed");
         return ClaimDecision::Skip;
     };
 
@@ -753,7 +758,7 @@ fn plan_abandon(job_id: &str, kind: &JobKind, claim_seq_usize: usize) -> ClaimDe
             reason: DeadReason::Abandoned,
         })),
     ) else {
-        error!(target: "cqrs", job_id, "failed to encode Dead{{Abandoned}}");
+        error!(job_id, "failed to encode Dead{{Abandoned}}");
         return ClaimDecision::Skip;
     };
     ClaimDecision::Abandon {
@@ -799,7 +804,11 @@ pub(crate) struct PendingPush {
     pub(crate) delay: Option<Duration>,
 }
 
-/// Encoded pending jobs whose source buffer remains intact until commit.
+/// Receipt for a batch of prepared jobs.
+///
+/// Call [`Self::mark_committed`] only after the transaction that wrote these
+/// jobs commits. On failure, drop the receipt so the original entries remain
+/// eligible for preparation.
 pub struct PreparedPendingJobs {
     requests: Vec<EnqueueRequest>,
     acknowledgements: Vec<Arc<AtomicBool>>,
@@ -834,7 +843,7 @@ impl PreparedPendingJobs {
         std::mem::take(&mut self.requests)
     }
 
-    /// Removes the retained source pushes included in a successful database commit.
+    /// Marks the committed pushes so the next preparation prunes them from the buffer.
     pub fn mark_committed(self) {
         for acknowledgement in self.acknowledgements {
             acknowledgement.store(true, Ordering::Release);
@@ -843,16 +852,15 @@ impl PreparedPendingJobs {
 }
 
 tokio::task_local! {
-    /// Per-command buffer of jobs awaiting flush, cleared by the event
-    /// repository only after its commit transaction succeeds.
+    /// Per-command buffer whose entries are acknowledged only after a successful commit.
     static PENDING_JOBS: RefCell<Vec<PendingBufferEntry>>;
 }
 
 /// Runs `command_execution` with a fresh pending-job scope active, so the
 /// framework's [`buffer`] of a [`crate::Effect::Dispatch`] lands where the
 /// repository's [`prepare_pending`] can prepare it for the event transaction.
-/// [`PreparedPendingJobs::mark_committed`] clears the prepared entries only
-/// after that transaction commits successfully.
+/// After the transaction succeeds, [`PreparedPendingJobs::mark_committed`]
+/// acknowledges only the prepared entries.
 pub(crate) async fn with_pending_scope<Output>(
     command_execution: impl Future<Output = Output>,
 ) -> Output {
@@ -911,13 +919,15 @@ pub(crate) fn prepare_pending() -> Result<PreparedPendingJobs, JobStoreError> {
             acknowledgements,
         })
     });
-    match prepared {
-        Ok(prepared) => prepared,
-        Err(_) => Ok(PreparedPendingJobs {
-            requests: Vec::new(),
-            acknowledgements: Vec::new(),
-        }),
-    }
+    prepared.map_or_else(
+        |_| {
+            Ok(PreparedPendingJobs {
+                requests: Vec::new(),
+                acknowledgements: Vec::new(),
+            })
+        },
+        std::convert::identity,
+    )
 }
 
 /// Drains the per-command pending-job buffer into [`EnqueueRequest`]s for tests

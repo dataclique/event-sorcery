@@ -4,10 +4,11 @@ use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use cqrs_es::{Aggregate, View};
 use sqlx::postgres::PgArguments;
 use sqlx::{Arguments, AssertSqlSafe, PgPool, Postgres, QueryBuilder};
+use std::ops::ControlFlow;
 
 use event_sorcery::{
     Column, EngineError, EventSourced, NativeProjectionBackend, ProjectionError,
-    ProjectionRecoveryMode, Table, ViewBackend, recover_projection,
+    ProjectionRecoveryMode, Table, ViewBackend, ViewUpdateError, recover_projection,
 };
 use indexed_query::{IndexedView, Order, Predicate, ProjectionQueryError, Value};
 
@@ -23,6 +24,76 @@ impl ViewBackend for PostgresViewBackend {
     where
         ViewState: View<AggregateType> + Clone + 'static,
         AggregateType: Aggregate + 'static;
+
+    async fn try_update<ViewState, AggregateType, Skip>(
+        repository: &Self::Repo<ViewState, AggregateType>,
+        view_id: &str,
+        apply: impl FnOnce(Option<ViewState>, &ViewContext) -> ControlFlow<Skip, ViewState> + Send,
+    ) -> Result<Option<Skip>, ViewUpdateError>
+    where
+        ViewState: View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static,
+        Skip: Send,
+    {
+        let table = indexed_query::quote_identifier(&repository.table);
+        let stored: Option<(i64, String)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT version, payload::text FROM {table} WHERE view_id = $1"
+        )))
+        .bind(view_id)
+        .fetch_optional(&repository.pool)
+        .await
+        .map_err(|source| {
+            ViewUpdateError::Load(PersistenceError::ConnectionError(Box::new(source)))
+        })?;
+
+        let (view, context, stored_payload) = match stored {
+            Some((version, payload)) => {
+                validate_stored_version(version).map_err(ViewUpdateError::Load)?;
+                let view = serde_json::from_str::<serde_json::Value>(&payload)
+                    .and_then(serde_json::from_value)
+                    .map_err(|source| ViewUpdateError::Load(source.into()))?;
+                (
+                    Some(view),
+                    ViewContext::new(view_id.to_owned(), version),
+                    Some(payload),
+                )
+            }
+            None => (None, ViewContext::new(view_id.to_owned(), 0), None),
+        };
+        let updated = match apply(view, &context) {
+            ControlFlow::Break(skipped) => return Ok(Some(skipped)),
+            ControlFlow::Continue(updated) => updated,
+        };
+        match stored_payload {
+            Some(payload) => {
+                repository
+                    .compare_update(&table, updated, context, payload)
+                    .await
+            }
+            None => repository.update_view(updated, context).await,
+        }
+        .map_err(ViewUpdateError::Write)?;
+        Ok(None)
+    }
+
+    fn is_retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
+        use PersistenceError::{ConnectionError, UnknownError};
+
+        // CQRS does not expose these boxed errors through Error::source.
+        let sql_error = match error.downcast_ref::<PersistenceError>() {
+            Some(ConnectionError(source) | UnknownError(source)) => {
+                source.downcast_ref::<sqlx::Error>()
+            }
+            Some(_) => None,
+            None => error.downcast_ref::<sqlx::Error>(),
+        };
+        sql_error
+            .and_then(sqlx::Error::as_database_error)
+            .is_some_and(|source| match source.code().as_deref() {
+                Some("55P03" | "40001" | "40P01") => true,
+                Some(_) | None => false,
+            })
+    }
 }
 
 /// PostgreSQL storage for a materialized view and its optimistic version.
@@ -58,6 +129,38 @@ where
             repository,
         }
     }
+
+    async fn compare_update(
+        &self,
+        quoted_table: &str,
+        view: ViewState,
+        context: ViewContext,
+        observed_payload: String,
+    ) -> Result<(), PersistenceError> {
+        let version = next_version(context.version)?;
+        let payload = serde_json::to_value(view)?;
+
+        // Recovery can change the payload without advancing the event checkpoint.
+        // Compare PostgreSQL's original JSONB text without reserializing the view
+        // or letting a collation equate distinct payloads.
+        let result = sqlx::query(AssertSqlSafe(format!(
+            r#"UPDATE {quoted_table}
+               SET payload = $1, version = $2
+               WHERE view_id = $3 AND version = $4 AND payload::text COLLATE "C" = $5"#
+        )))
+        .bind(payload)
+        .bind(version)
+        .bind(context.view_instance_id)
+        .bind(context.version)
+        .bind(observed_payload)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| PersistenceError::ConnectionError(Box::new(source)))?;
+        if result.rows_affected() == 0 {
+            return Err(PersistenceError::OptimisticLockError);
+        }
+        Ok(())
+    }
 }
 
 impl NativeProjectionBackend for PostgresViewBackend {
@@ -91,7 +194,9 @@ impl NativeProjectionBackend for PostgresViewBackend {
     ) -> Result<Vec<(String, String)>, sqlx::Error> {
         let table = indexed_query::quote_identifier(table);
         sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT view_id, payload::text FROM {table}"
+            "SELECT view_id, payload::text
+             FROM {table}
+             ORDER BY view_id ASC"
         )))
         .fetch_all(source)
         .await
@@ -110,13 +215,17 @@ impl NativeProjectionBackend for PostgresViewBackend {
     {
         let quoted_table = indexed_query::quote_identifier(table);
         let Column(column_name) = &column;
+        let mut transaction = source
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await?;
+
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM pg_attribute
              WHERE attrelid = to_regclass($1) AND attname = $2 AND NOT attisdropped)",
         )
         .bind(&quoted_table)
         .bind(column_name)
-        .fetch_one(source)
+        .fetch_one(&mut *transaction)
         .await?;
         if !exists {
             return Err(ProjectionError::ColumnNotFound {
@@ -125,25 +234,34 @@ impl NativeProjectionBackend for PostgresViewBackend {
             });
         }
         let quoted_column = indexed_query::quote_identifier(column_name);
-        let (rows, non_null): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT COUNT(*), COUNT({quoted_column}) FROM {quoted_table}"
+        let has_values: bool = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {quoted_table} WHERE {quoted_column} IS NOT NULL)"
         )))
-        .fetch_one(source)
+        .fetch_one(&mut *transaction)
         .await?;
-        if rows > 0 && non_null == 0 {
-            return Err(ProjectionError::StaleColumn {
-                column,
-                table: table.to_string(),
-                row_count: rows,
-            });
+        if !has_values {
+            let row_count: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {quoted_table}"
+            )))
+            .fetch_one(&mut *transaction)
+            .await?;
+            if row_count > 0 {
+                return Err(ProjectionError::StaleColumn {
+                    column,
+                    table: table.to_string(),
+                    row_count,
+                });
+            }
         }
-        Ok(sqlx::query_as(AssertSqlSafe(format!(
+        let matches = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT view_id, payload::text FROM {quoted_table}
              WHERE {quoted_column} = $1 ORDER BY view_id"
         )))
         .bind(value)
-        .fetch_all(source)
-        .await?)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(matches)
     }
 
     async fn recover<Entity>(
@@ -198,12 +316,8 @@ where
             .load_with_context(view_id)
             .await
             .map_err(adapter_error)?;
-        if let Some((_, context)) = &stored
-            && context.version <= 0
-        {
-            return Err(PersistenceError::UnknownError(Box::new(
-                ProjectionVersionError::StoredNonPositive(context.version),
-            )));
+        if let Some((_, context)) = &stored {
+            validate_stored_version(context.version)?;
         }
         Ok(stored)
     }
@@ -213,21 +327,32 @@ where
         view: ViewState,
         context: ViewContext,
     ) -> Result<(), PersistenceError> {
-        if context.version < 0 {
-            return Err(PersistenceError::UnknownError(Box::new(
-                ProjectionVersionError::Negative(context.version),
-            )));
-        }
-        context.version.checked_add(1).ok_or_else(|| {
-            PersistenceError::UnknownError(Box::new(ProjectionVersionError::Overflow(
-                context.version,
-            )))
-        })?;
+        next_version(context.version)?;
         self.repository
             .update_view(view, context)
             .await
             .map_err(adapter_error)
     }
+}
+
+fn validate_stored_version(version: i64) -> Result<(), PersistenceError> {
+    if version <= 0 {
+        return Err(PersistenceError::UnknownError(Box::new(
+            ProjectionVersionError::StoredNonPositive(version),
+        )));
+    }
+    Ok(())
+}
+
+fn next_version(version: i64) -> Result<i64, PersistenceError> {
+    if version < 0 {
+        return Err(PersistenceError::UnknownError(Box::new(
+            ProjectionVersionError::Negative(version),
+        )));
+    }
+    version.checked_add(1).ok_or_else(|| {
+        PersistenceError::UnknownError(Box::new(ProjectionVersionError::Overflow(version)))
+    })
 }
 
 impl<ViewState, AggregateType> IndexedView<ViewState, AggregateType>
@@ -888,6 +1013,96 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn projection_lock_timeout_is_retryable_without_advancing_the_checkpoint(pool: PgPool) {
+        sqlx::query(
+            "CREATE TABLE schema_projection (view_id TEXT PRIMARY KEY, \
+             version BIGINT NOT NULL, payload JSONB NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let writer = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        sqlx::query("SET lock_timeout = '100ms'")
+            .execute(&writer)
+            .await
+            .unwrap();
+        let repository = PostgresViewRepository::<RegisteredSchemaView, RegisteredSchemaView>::new(
+            writer,
+            "schema_projection",
+        );
+        let view = RegisteredSchemaView {
+            name: "Account".to_string(),
+            schema_version: 10,
+        };
+        repository
+            .update_view(view.clone(), ViewContext::new("schema".to_string(), 0))
+            .await
+            .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE schema_projection IN SHARE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let (_, context) = repository
+            .load_with_context("schema")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.version, 1);
+        let error = repository
+            .update_view(view.clone(), context)
+            .await
+            .unwrap_err();
+
+        let PersistenceError::ConnectionError(source) = &error else {
+            panic!("expected a SQLx lock timeout: {error:?}");
+        };
+        let source = source.downcast_ref::<sqlx::Error>().unwrap();
+        let database = source.as_database_error().unwrap();
+        assert_eq!(database.code().as_deref(), Some("55P03"));
+        assert!(PostgresViewBackend::is_retryable_error(&error));
+
+        let error = PostgresViewBackend::try_update(&repository, "schema", |stored, context| {
+            assert_eq!(context.version, 1);
+            ControlFlow::<(), _>::Continue(stored.unwrap())
+        })
+        .await
+        .unwrap_err();
+        let ViewUpdateError::Write(error) = error else {
+            panic!("expected the live compare-and-write to fail during the write: {error:?}");
+        };
+        let PersistenceError::ConnectionError(source) = &error else {
+            panic!("expected a typed SQLx lock timeout from the live write: {error:?}");
+        };
+        let source = source.downcast_ref::<sqlx::Error>().unwrap();
+        assert_eq!(
+            source.as_database_error().unwrap().code().as_deref(),
+            Some("55P03")
+        );
+        assert!(PostgresViewBackend::is_retryable_error(&error));
+
+        blocker.rollback().await.unwrap();
+        let (_, context) = repository
+            .load_with_context("schema")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.version, 1);
+        repository.update_view(view, context).await.unwrap();
+        let (_, context) = repository
+            .load_with_context("schema")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.version, 2);
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn unrelated_unique_failures_remain_storage_errors(pool: PgPool) {
         sqlx::query(
             "CREATE TABLE schema_projection (view_id TEXT PRIMARY KEY, \
@@ -918,6 +1133,7 @@ pub(crate) mod tests {
             .update_view(view, ViewContext::new("second".to_string(), 0))
             .await
             .unwrap_err();
+        assert!(!PostgresViewBackend::is_retryable_error(&error));
         let PersistenceError::ConnectionError(source) = error else {
             panic!("expected an unrelated uniqueness failure to remain a storage error");
         };

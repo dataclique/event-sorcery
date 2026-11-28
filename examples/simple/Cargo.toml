@@ -12,10 +12,10 @@ async-trait = "0.1.89"
 chrono = { version = "0.4.44", features = ["serde"] }
 cqrs-es = { version = "=0.5.0" }
 event-sorcery = { path = "../../crates/event-sorcery", features = [
-  "sqlite",
   "test-support",
 ] }
 serde = { version = "1.0.228", features = ["derive"] }
+sqlite-es = { version = "0.6.0", path = "../../crates/sqlite-es" }
 sqlx = { version = "0.9.0", features = [
   "sqlite",
   "chrono",
@@ -26,7 +26,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 
 [patch.crates-io]
-cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "cb0020add5dcff06f1ece3816fce9e4319004b87" }
+cqrs-es = { git = "https://github.com/dataclique/cqrs", rev = "c2bdadc483f7b54b1820a9a2a265781fe050c298" }
 
 [lints.rust]
 unsafe_code = "forbid"
