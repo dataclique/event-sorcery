@@ -1581,6 +1581,48 @@ mod tests {
                 won: lease_until_ms,
             }
         };
+        sqlx::raw_sql(
+            "CREATE FUNCTION reject_claim_projection() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF EXISTS (SELECT 1 FROM events WHERE aggregate_type = 'job'
+                            AND aggregate_id = NEW.view_id AND sequence = NEW.version
+                            AND event_type = 'JobClaimed') THEN
+                     RAISE EXCEPTION 'injected projection failure after claim append';
+                 END IF;
+                 RETURN NEW;
+             END;
+             $$;
+             CREATE TRIGGER reject_claim_projection BEFORE UPDATE ON job_queue_projection
+             FOR EACH ROW EXECUTE FUNCTION reject_claim_projection();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let Err(super::PostgresClaimError::Sql(sqlx::Error::Database(error))) =
+            first.claim_job(&job_key, decide).await
+        else {
+            panic!("expected the injected projection write failure");
+        };
+        assert_eq!(
+            error.message(),
+            "injected projection failure after claim append"
+        );
+
+        let unchanged: (i64, Option<i64>, i64) = sqlx::query_as(
+            "SELECT version, lease_until,
+                    (SELECT count(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1)
+             FROM job_queue_projection WHERE view_id = $1",
+        )
+        .bind(&job_key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, (1, None, 1));
+        sqlx::query("DROP TRIGGER reject_claim_projection ON job_queue_projection")
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let (left, right) = timeout(Duration::from_secs(5), async {
             tokio::try_join!(
                 first.claim_job(&job_key, decide),
