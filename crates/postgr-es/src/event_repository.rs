@@ -1675,9 +1675,19 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query(
-            "ALTER TABLE events ADD CONSTRAINT reject_queue_registration
-             CHECK (aggregate_type <> 'SchemaRegistry')",
+        sqlx::raw_sql(
+            "CREATE FUNCTION reject_queue_registration() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF EXISTS (SELECT 1 FROM job_queue_projection WHERE version = 1
+                            AND status = 'pending' AND kind = 'standalone') THEN
+                     RAISE EXCEPTION 'injected registration failure after queue replay';
+                 END IF;
+                 RAISE EXCEPTION 'registration reached before queue replay';
+             END;
+             $$;
+             CREATE TRIGGER reject_queue_registration BEFORE INSERT ON events
+             FOR EACH ROW WHEN (NEW.aggregate_type = 'SchemaRegistry')
+             EXECUTE FUNCTION reject_queue_registration();",
         )
         .execute(&pool)
         .await
@@ -1685,6 +1695,11 @@ mod tests {
 
         let error = recover_job_queue_row(&backend, &job_id).await.unwrap_err();
         assert!(matches!(error, event_sorcery::ReconcileError::Aggregate(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("injected registration failure after queue replay")
+        );
         let counts: (i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM job_queue_projection),
                     (SELECT COUNT(*) FROM events WHERE aggregate_type = 'SchemaRegistry'),
@@ -1696,7 +1711,7 @@ mod tests {
         .unwrap();
         assert_eq!(counts, (0, 0, 1));
 
-        sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_queue_registration")
+        sqlx::query("DROP TRIGGER reject_queue_registration ON events")
             .execute(&pool)
             .await
             .unwrap();
@@ -1733,6 +1748,10 @@ mod tests {
         sqlx::raw_sql(
             "CREATE FUNCTION wait_for_queue_registration() RETURNS trigger LANGUAGE plpgsql AS $$
              BEGIN
+                 IF NOT EXISTS (SELECT 1 FROM job_queue_projection WHERE version = 1
+                                AND status = 'pending' AND kind = 'standalone') THEN
+                     RAISE EXCEPTION 'registration reached before queue replay';
+                 END IF;
                  PERFORM pg_advisory_xact_lock(782341, 9);
                  RETURN NEW;
              END;
