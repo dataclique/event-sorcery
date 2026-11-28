@@ -532,8 +532,9 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use std::collections::HashMap;
-    use std::future::{Future, ready};
+    use std::future::{Future, poll_fn, ready};
     use std::sync::Arc;
+    use std::task::Poll;
     use tokio::sync::RwLock;
 
     use super::*;
@@ -1098,41 +1099,43 @@ mod tests {
             &repository.recoveries
         }
 
-        async fn rows(
+        fn rows(
             _source: &Self::Source,
             _table: Table,
-        ) -> Result<Vec<(String, String)>, sqlx::Error> {
-            unreachable!("gap recovery does not scan materialized views")
+        ) -> impl Future<Output = Result<Vec<(String, String)>, sqlx::Error>> + Send {
+            poll_fn(|_| unreachable!("gap recovery does not scan materialized views"))
         }
 
-        async fn filter<Entity, Value>(
+        fn filter<Entity, Value>(
             _source: &Self::Source,
             _table: Table,
             _column: Column,
             _value: &Value,
-        ) -> Result<Vec<(String, String)>, ProjectionError<Entity>>
+        ) -> impl Future<Output = Result<Vec<(String, String)>, ProjectionError<Entity>>> + Send
         where
             Entity: EventSourced,
             for<'query> &'query Value: sqlx::Encode<'query, Self::Database>,
             Value: sqlx::Type<Self::Database> + Send + Sync,
         {
-            unreachable!("gap recovery does not filter materialized views")
+            poll_fn(|_| unreachable!("gap recovery does not filter materialized views"))
         }
 
-        async fn recover<Entity>(
+        fn recover<Entity>(
             recoveries: &Self::Source,
             mode: &crate::ProjectionRecoveryMode,
-        ) -> Result<(), ProjectionError<Entity>>
+        ) -> impl Future<Output = Result<(), ProjectionError<Entity>>> + Send
         where
             Entity: EventSourced<Materialized = Table>,
         {
-            assert!(
-                matches!(mode, crate::ProjectionRecoveryMode::CatchUpOne { aggregate_id } if aggregate_id == "id-1")
-            );
-            recoveries.fetch_add(1, Ordering::SeqCst);
-            // A storage failure leaves the gap unresolved, so processing another
-            // envelope would request catch-up again.
-            Err(sqlx::Error::PoolClosed.into())
+            poll_fn(move |_| {
+                assert!(
+                    matches!(mode, crate::ProjectionRecoveryMode::CatchUpOne { aggregate_id } if aggregate_id == "id-1")
+                );
+                recoveries.fetch_add(1, Ordering::SeqCst);
+                // A storage failure leaves the gap unresolved, so processing another
+                // envelope would request catch-up again.
+                Poll::Ready(Err(sqlx::Error::PoolClosed.into()))
+            })
         }
     }
 
