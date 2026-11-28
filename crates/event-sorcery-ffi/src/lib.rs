@@ -25,12 +25,13 @@ use url::form_urlencoded;
 #[cfg(test)]
 use event_sorcery::CommitRequest;
 use event_sorcery::{
-    CompactionPolicy, DeadReason, Engine, EngineError, JobClaimHandle, JobClaimResult, JobId,
+    CompactionPolicy, DeadReason, EngineError, JobClaimHandle, JobClaimResult, JobId,
     JobLeaseResult, JobRuntime, JobRuntimeError, JobSeed, JobSettlementResult, JobStoreError,
     OpaqueCommitRequest, OpaqueProposedEvent, OpaqueStoredEvent, ReconcileError,
-    SchemaReconciliation, SchemaTarget, SnapshotWrite, SqliteJobError, StreamIdentity,
-    decode_opaque_payload, encode_opaque_payload,
+    SchemaReconciliation, SchemaTarget, StreamIdentity, decode_opaque_payload,
+    encode_opaque_payload,
 };
+use sqlite_es::{Engine, SnapshotWrite, SqliteBackend, SqliteJobError};
 
 const ABI_MAJOR: u32 = 0;
 const ABI_MINOR: u32 = 5;
@@ -283,7 +284,7 @@ pub unsafe extern "C" fn es_open(
             .block_on(engine.migrate())
             .map_err(AbiError::Migration)?;
         let jobs = runtime
-            .block_on(JobRuntime::build(pool))
+            .block_on(JobRuntime::build(SqliteBackend { pool }))
             .map_err(|error| AbiError::JobRuntime(Box::new(error)))?;
         let store = Arc::new(EsStore {
             state: Mutex::new(StoreState::Open { active_calls: 0 }),
@@ -1107,7 +1108,7 @@ enum SqliteCacheMode {
 struct StoreInner {
     runtime: tokio::runtime::Runtime,
     engine: Engine,
-    jobs: JobRuntime,
+    jobs: JobRuntime<SqliteBackend>,
     claims: Mutex<ClaimRegistry>,
 }
 
@@ -1768,6 +1769,9 @@ impl From<EngineError> for AbiError {
             // permanently refused, so it must not surface as retryable storage.
             EngineError::Schema(ReconcileError::CompactedSnapshotClear { .. }) => {
                 Self::State("compacted snapshot retention cannot be cleared")
+            }
+            EngineError::Schema(ReconcileError::UnprovenSnapshotHistory { .. }) => {
+                Self::State("snapshot history cannot be proven complete")
             }
             other => Self::Engine(other),
         }
@@ -4954,6 +4958,84 @@ mod tests {
             ES_OK
         );
         assert_eq!(reconciliation, 1);
+        assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
+    }
+
+    #[test]
+    fn schema_reconcile_reports_unproven_history_and_preserves_the_snapshot() {
+        let mut store = ptr::null_mut();
+        open_store(&mut store);
+        let stream = StreamIdentity::new("ffi-schema", "one");
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable");
+        };
+        let snapshot = lease.inner.runtime.block_on(async {
+            let engine = &lease.inner.engine;
+            // Import only the event retained after compaction of an older stream.
+            let event = SerializedEvent {
+                aggregate_type: "ffi-schema".to_owned(),
+                aggregate_id: "one".to_owned(),
+                sequence: 2,
+                event_type: "Renamed".to_owned(),
+                event_version: "1.0".to_owned(),
+                payload: serde_json::json!({"name": "one"}),
+                metadata: serde_json::json!({}),
+            };
+            engine
+                .commit(CommitRequest::new(stream.clone(), &[event]))
+                .await
+                .unwrap();
+            let payload = encode_opaque_payload(vec![0, 1, 255]).unwrap();
+            engine
+                .store_snapshot(&stream, SnapshotWrite::new(payload, 2))
+                .await
+                .unwrap();
+            engine.load_snapshot(&stream).await.unwrap().unwrap()
+        });
+        drop(lease);
+
+        let mut error = empty_buffer();
+        let mut recorded = encode_request(&(1_u8, "ffi-schema", 1_u64, 0_u8));
+        let record_request = caller_buffer(&mut recorded);
+        assert_eq!(
+            unsafe { es_schema_record(&raw mut store, &raw const record_request, &raw mut error) },
+            ES_OK
+        );
+        let mut advanced = encode_request(&(1_u8, "ffi-schema", 2_u64, 0_u8));
+        let reconcile_request = caller_buffer(&mut advanced);
+        let mut reconciliation = u8::MAX;
+        assert_eq!(
+            unsafe {
+                es_schema_reconcile(
+                    &raw mut store,
+                    &raw const reconcile_request,
+                    &raw mut reconciliation,
+                    &raw mut error,
+                )
+            },
+            ES_ERR_STATE
+        );
+        assert_eq!(reconciliation, 0);
+        assert_eq!(
+            decode_error(&error),
+            (
+                1,
+                ES_ERR_STATE,
+                Value::Text("snapshot history cannot be proven complete".to_owned()),
+            )
+        );
+        unsafe { es_buf_free(&raw mut error) };
+
+        let Ok(lease) = EsStore::acquire(&raw mut store) else {
+            panic!("open store must be acquirable after refusal");
+        };
+        let after = lease
+            .inner
+            .runtime
+            .block_on(lease.inner.engine.load_snapshot(&stream))
+            .unwrap();
+        assert_eq!(after, Some(snapshot));
+        drop(lease);
         assert_eq!(unsafe { es_close(&raw mut store) }, ES_OK);
     }
 

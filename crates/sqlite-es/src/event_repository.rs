@@ -2,9 +2,10 @@ use cqrs_es::Aggregate;
 use cqrs_es::persist::{
     PersistedEventRepository, PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot,
 };
+use futures_util::TryStreamExt;
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
-use sqlx::{AssertSqlSafe, Pool, Row, Sqlite, SqliteConnection};
+use sqlx::{AssertSqlSafe, FromRow, Pool, Row, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::sql_query::SqlQueryFactory;
 
@@ -368,6 +369,113 @@ impl SqliteEventRepository {
 
         stream
     }
+}
+
+/// A stored event row selected with JSON payload and metadata as text.
+#[derive(FromRow)]
+pub struct StoredEventRow {
+    aggregate_type: String,
+    aggregate_id: String,
+    sequence: i64,
+    event_type: String,
+    event_version: String,
+    payload: String,
+    metadata: String,
+}
+
+impl TryFrom<StoredEventRow> for SerializedEvent {
+    type Error = SqliteAggregateError;
+
+    fn try_from(row: StoredEventRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            aggregate_type: row.aggregate_type,
+            aggregate_id: row.aggregate_id,
+            sequence: usize::try_from(row.sequence)?,
+            event_type: row.event_type,
+            event_version: row.event_version,
+            payload: serde_json::from_str(&row.payload)?,
+            metadata: serde_json::from_str(&row.metadata)?,
+        })
+    }
+}
+
+/// Loads ordered event rows, optionally after an exclusive checkpoint.
+pub async fn load_event_rows<EventRow>(
+    pool: &SqlitePool,
+    aggregate_type: &str,
+    aggregate_id: &str,
+    after_sequence: Option<usize>,
+) -> Result<Vec<EventRow>, SqliteAggregateError>
+where
+    EventRow: for<'row> FromRow<'row, SqliteRow> + Send + Unpin,
+{
+    let mut connection = pool.acquire().await?;
+    let factory = SqlQueryFactory::native_event_rows();
+    let checkpoint = after_sequence.map(i64::try_from).transpose()?;
+    let sql = match checkpoint {
+        None => factory.select_events(),
+        Some(_) => factory.get_last_events(),
+    };
+    let query = sqlx::query_as(AssertSqlSafe(sql))
+        .bind(aggregate_type)
+        .bind(aggregate_id);
+    let query = match checkpoint {
+        None => query,
+        Some(checkpoint) => query.bind(checkpoint),
+    };
+    Ok(query.fetch_all(&mut *connection).await?)
+}
+
+/// Feeds an ordered, incremental replay of one stream or all streams of an aggregate type.
+///
+/// Conversion happens before the transform, which can apply ordered upcasters. The
+/// feed stops on the first error or when its receiver is dropped.
+pub fn replay_events<EventRow>(
+    pool: &SqlitePool,
+    aggregate_type: &'static str,
+    aggregate_id: Option<String>,
+    channel_size: usize,
+    transform: impl Fn(SerializedEvent) -> SerializedEvent + Send + 'static,
+) -> ReplayStream
+where
+    EventRow:
+        for<'row> FromRow<'row, SqliteRow> + Send + Unpin + TryInto<SerializedEvent> + 'static,
+    EventRow::Error: Into<PersistenceError>,
+{
+    let factory = SqlQueryFactory::native_event_rows();
+    let (mut feed, stream) = ReplayStream::new(channel_size);
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let sql = match &aggregate_id {
+            Some(_) => factory.select_events(),
+            None => factory.all_events(),
+        };
+        let query = sqlx::query_as::<_, EventRow>(AssertSqlSafe(sql)).bind(aggregate_type);
+        let query = match aggregate_id {
+            Some(id) => query.bind(id),
+            None => query,
+        };
+        let mut rows = query.fetch(&pool);
+        loop {
+            let event = match rows.try_next().await {
+                Ok(Some(row)) => row.try_into().map_err(Into::into),
+                Ok(None) => return,
+                Err(source) => Err(PersistenceError::ConnectionError(Box::new(source))),
+            };
+            match event {
+                Ok(event) => {
+                    if feed.push(Ok(transform(event))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = feed.push(Err(error)).await;
+                    return;
+                }
+            }
+        }
+    });
+    stream
 }
 
 fn row_to_serialized_event(row: &SqliteRow) -> Result<SerializedEvent, SqliteAggregateError> {

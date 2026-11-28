@@ -65,7 +65,7 @@ mod tests {
 
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let store = StoreBuilder::<Order>::new(pool)
+        let store = StoreBuilder::<Order, _>::with_backend(sqlite_es::SqliteBackend { pool })
             .with(log.clone())
             .build()
             .await
@@ -103,7 +103,7 @@ mod tests {
 
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let store = StoreBuilder::<Order>::new(pool)
+        let store = StoreBuilder::<Order, _>::with_backend(sqlite_es::SqliteBackend { pool })
             .with(Arc::new(spy.clone()))
             .build()
             .await
@@ -141,7 +141,10 @@ mod tests {
 
     /// Simulate the framework delivering the confirmation verdict so `Fill`
     /// is allowed (the worker path is exercised in `main` and store tests).
-    async fn settle_confirmation(store: &event_sorcery::Store<Order>, order: OrderId) {
+    async fn settle_confirmation(
+        store: &event_sorcery::Store<Order, sqlite_es::SqliteBackend>,
+        order: OrderId,
+    ) {
         let placed = store.load(&order).await.unwrap().unwrap();
         let event_sorcery::DispatchedJob::InFlight { job_id } = placed.confirmation else {
             panic!("expected the confirmation in flight");

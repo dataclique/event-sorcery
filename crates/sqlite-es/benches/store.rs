@@ -2,7 +2,7 @@
 //! pure-event commits, dispatch commits (event + transactional enqueue),
 //! entity loads, and standalone enqueues.
 //!
-//! Run with: `cargo bench --features test-support --bench store`
+//! Run with: `cargo bench -p sqlite-es --bench store`
 
 use std::fmt::Debug;
 use std::hint::black_box;
@@ -19,6 +19,8 @@ use event_sorcery::{
     EventSourced, Job, JobContext, JobFailure, JobOutcome, JobRuntime, Label, Never, Nil,
     Reconciliation, StandaloneJob, Store, StoreBuilder, fx, jobs,
 };
+
+use sqlite_es::SqliteBackend;
 
 fn ok<Value, Error: Debug>(result: Result<Value, Error>) -> Value {
     result.unwrap_or_else(|error| panic!("bench setup failed: {error:?}"))
@@ -221,16 +223,21 @@ impl StandaloneJob for BenchSweep {
 }
 
 struct Fixture {
-    store: Arc<Store<BenchEntity>>,
-    jobs: JobRuntime,
+    store: Arc<Store<BenchEntity, SqliteBackend>>,
+    jobs: JobRuntime<SqliteBackend>,
     next_id: AtomicU64,
 }
 
 async fn fixture() -> Fixture {
     let pool = ok(SqlitePool::connect(":memory:").await);
     ok(sqlite_es::MIGRATOR.run(&pool).await);
-    let store = ok(StoreBuilder::<BenchEntity>::new(pool.clone()).build().await);
-    let jobs = ok(JobRuntime::build(pool).await);
+    let store =
+        ok(
+            StoreBuilder::<BenchEntity, _>::with_backend(SqliteBackend { pool: pool.clone() })
+                .build()
+                .await,
+        );
+    let jobs = ok(JobRuntime::build(SqliteBackend { pool }).await);
     Fixture {
         store,
         jobs,

@@ -32,14 +32,15 @@ A job is its own event stream (`aggregate_type = "job"`). `JobState` is an
 [`EventSourced`] aggregate (`JobEvent` = Enqueued / Claimed / Succeeded /
 RetryScheduled / Dead; `JobCommand` = Succeed / RetrySchedule / Kill). The whole
 durable-jobs capability is built from one consumer-supplied **`EventBackend`** —
-a cqrs-es event repository plus two job-shaped primitives, `claim` and `renew`.
-`JobRuntime::build(pool)` wires the job `Store` (cqrs/es) and the
-`job_queue_projection` [`Projection`] via `StoreBuilder`; nothing else is
-required of the consumer.
+a cqrs-es event repository plus `claim`, `renew`, and atomic standalone
+[`enqueue`](#8-command-born-and-standalone-enqueue). The backend also implements
+`ProjectedStoreBackend` so `JobRuntime::build(backend)` opens the job `Store`
+and recovers the `job_queue_projection` [`Projection`]. The caller applies
+migrations first.
 
-The ack rides cqrs-es `execute` (a `JobCommand`); only the **claim** is a
-backend transaction, because its runnable check must read the projection-only
-lease column, which cqrs-es cannot express.
+Acknowledgement runs a `JobCommand` through cqrs-es `execute`. Claiming owns its
+transaction because the runnable check must read the projection-only lease
+column, which cqrs-es cannot express.
 
 ## 2. Keystone decisions (each closes a specific adversarial finding)
 
@@ -186,10 +187,16 @@ idempotency contracts.
 
 ## 9. Worker wiring
 
+Use `build_supervised_worker!` with a configured SQLite backend and the job's
+input. The macro supports jobs that are `Send` but not `Sync`.
+
 ```rust
-let runtime = JobRuntime::build(pool).await?;            // one per process
-let worker = EventStoreBackend::<MyJob>::new(runtime.clone(), "my-worker", cfg, Clock::system());
-WorkerBuilder::new(name).backend(worker).data(Arc::new(input)).build(run::<MyJob>);
+let runtime = JobRuntime::build(backend).await?;
+let monitor = build_supervised_worker!(
+    runtime, JobWorkerConfig::default(), Clock::system(),
+    { MyJob => input }
+);
+monitor.run().await?;
 ```
 
 NO user retry/timeout layer; NO buffering layer outside the ack layer (must

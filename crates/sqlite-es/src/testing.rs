@@ -22,6 +22,76 @@ pub async fn create_test_pool() -> Result<Pool<Sqlite>, sqlx::Error> {
     Ok(pool)
 }
 #[cfg(test)]
+pub(crate) mod snapshot_fixture {
+    use async_trait::async_trait;
+    use cqrs_es::DomainEvent;
+    use serde::{Deserialize, Serialize};
+    use sqlx::SqlitePool;
+
+    use event_sorcery::{CompactionPolicy, Effect, EventSourced, Never, Nil, test_store};
+
+    use crate::SqliteBackend;
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct Invoice<const ORDER: bool>;
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    enum InvoiceEvent {
+        Recorded,
+    }
+
+    impl DomainEvent for InvoiceEvent {
+        fn event_type(&self) -> String {
+            "Recorded".to_owned()
+        }
+
+        fn event_version(&self) -> String {
+            "1".to_owned()
+        }
+    }
+
+    #[async_trait]
+    impl<const ORDER: bool> EventSourced for Invoice<ORDER> {
+        type Id = String;
+        type Error = Never;
+        type Command = ();
+        type Event = InvoiceEvent;
+        type Materialized = Nil;
+        type Jobs = Nil;
+
+        const PROJECTION: Nil = Nil;
+        const SCHEMA_VERSION: u64 = 1;
+        const SNAPSHOT_SIZE: usize = 1_000;
+        const AGGREGATE_TYPE: &'static str = if ORDER { "order" } else { "invoice" };
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
+
+        fn originate(_: &InvoiceEvent) -> Option<Self> {
+            Some(Self)
+        }
+
+        fn evolve(_: &Self, _: &InvoiceEvent) -> Result<Option<Self>, Never> {
+            Ok(Some(Self))
+        }
+
+        async fn initialize((): ()) -> Result<Effect<Self>, Never> {
+            Ok(Effect::Events(vec![InvoiceEvent::Recorded]))
+        }
+
+        async fn transition(&self, (): ()) -> Result<Effect<Self>, Never> {
+            Self::initialize(()).await
+        }
+    }
+
+    pub(crate) async fn record<const ORDER: bool>(pool: &SqlitePool, id: &str, count: usize) {
+        let store = test_store::<Invoice<ORDER>, _>(&SqliteBackend { pool: pool.clone() });
+        let id = id.to_owned();
+        for _ in 0..count {
+            store.send(&id, ()).await.unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     //! Tests for SQLite fixture connection persistence.
 

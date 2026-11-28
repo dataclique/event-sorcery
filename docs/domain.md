@@ -31,6 +31,14 @@ aggregate_id, sequence)`. The library's event store is the
 `events` table in SQLite, accessed through `cqrs-es`'s
 `PersistedEventRepository` trait (implemented by `sqlite-es`).
 
+### Persistence Backend
+
+`PersistenceBackend` supplies a command-aware cqrs-es repository and explicit
+library-storage bootstrap. `Store` and `StoreBuilder` use this capability.
+`EventBackend` adds the durable-worker operations; existing implementations
+receive the persistence capability through a blanket implementation. Entity
+schema reconciliation remains part of store startup.
+
 ### Aggregate
 
 A consistency boundary: a cluster of state that's loaded, mutated, and persisted
@@ -77,13 +85,11 @@ Split into:
 
 ### Projection
 
-A read model derived from events. The library's `Projection<Entity,
-Backend>` is
-a SQLite-backed materialized view: a denormalized table that mirrors live
-aggregate state for fast queries (`load`, `load_all`, `filter`).
+A read model derived from events. `Projection<Entity, Backend>` exposes live
+aggregate state by ID. Native SQLite and PostgreSQL projections also support
+loading all rows and filtering on typed columns.
 
-A projection is fully derived — it can be dropped and rebuilt from the event log
-at any time without data loss.
+Rebuilding a projection requires the event history it derives from.
 
 ### View
 
@@ -93,11 +99,8 @@ with `Projection` directly.
 
 ### View Backend
 
-Pluggable storage for projections. `trait ViewBackend` is a higher-kinded type
-emulation: it supplies, per `(View, Aggregate)` pair, a concrete
-`ViewRepository` implementation. The default `SqliteViewBackend` maps every pair
-to `SqliteViewRepository`. Tests use bespoke in-memory backends. See
-`crates/event-sorcery/src/view_backend.rs`.
+Storage for projections. `ViewBackend` supplies a `ViewRepository` for each view
+and aggregate pair. The caller selects the backend; there is no default.
 
 ### Snapshot
 
@@ -209,10 +212,9 @@ not part of the library's public API and must not appear in any public bound.
 
 ### Store / StoreBuilder
 
-`Store<Entity>` is the typed front door for sending commands.
-`StoreBuilder<Entity>` wires a `Store` together with its projection and reactors
-at startup, using a typed-list encoding (`Cons`/`Nil`) so forgetting a wiring
-step is a compile error.
+`Store<Entity, Backend>` sends commands to typed entity IDs.
+`StoreBuilder<Entity, Backend>` wires the store, its projection when declared,
+and any registered reactors at startup.
 
 ## Naming Conventions
 

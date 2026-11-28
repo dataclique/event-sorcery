@@ -8,7 +8,7 @@ let
       path: type:
       craneLib.filterCargoSources path type
       || pkgs.lib.hasPrefix (toString ./crates/sqlite-es/migrations) path
-      || pkgs.lib.hasPrefix (toString ./crates/event-sorcery/migrations/postgres) path
+      || pkgs.lib.hasPrefix (toString ./crates/postgr-es/migrations) path
       || pkgs.lib.hasPrefix (toString ./.sqlx) path
       || pkgs.lib.hasPrefix (toString ./bindings/haskell/conformance) path;
   };
@@ -43,8 +43,7 @@ let
       platforms = pkgs.lib.platforms.unix;
     };
   };
-  testCargoArgs =
-    "--locked --workspace" + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux " --all-features";
+  testCargoArgs = commonArgs.cargoExtraArgs;
 
   postgresTestArgs = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     nativeCheckInputs = [
@@ -69,6 +68,33 @@ in
       inherit cargoArtifacts;
       cargoExtraArgs = testCargoArgs;
       cargoBuildExtraArgs = "--all-targets";
+      preBuild = ''
+        for package in event-sorcery postgr-es; do
+          echo "Checking backend isolation for $package"
+          cargo check ''${CARGO_PROFILE:+--profile $CARGO_PROFILE} \
+            --locked --offline --package "$package" --lib --no-default-features
+          cargo check ''${CARGO_PROFILE:+--profile $CARGO_PROFILE} \
+            --locked --offline --package "$package" --lib
+        done
+
+        for package in event-sorcery-core event-sorcery sqlite-es postgr-es; do
+          case "$package" in
+            event-sorcery-core|event-sorcery)
+              forbidden='sqlite-es|postgr-es|postgres-es|sqlx-sqlite|sqlx-postgres|libsqlite3-sys'
+              ;;
+            sqlite-es) forbidden='postgr-es|postgres-es|sqlx-postgres' ;;
+            postgr-es) forbidden='sqlite-es|sqlx-sqlite|libsqlite3-sys' ;;
+          esac
+
+          graph="$TMPDIR/$package-dependencies"
+          cargo tree --locked --offline --package "$package" --all-features \
+            --edges normal,dev,build --prefix none --format '{p}' > "$graph"
+          if grep -E "^($forbidden) v" "$graph"; then
+            echo "Unexpected database adapter or driver in $package dependencies" >&2
+            exit 1
+          fi
+        done
+      '';
     }
   );
 
@@ -83,7 +109,7 @@ in
     // {
       inherit cargoArtifacts;
       cargoExtraArgs = testCargoArgs;
-      cargoNextestExtraArgs = "--all-targets";
+      cargoNextestExtraArgs = "--all-targets --no-fail-fast";
       postCheck = ''
         cargo test ''${CARGO_PROFILE:+--profile $CARGO_PROFILE} \
           ${testCargoArgs} --doc

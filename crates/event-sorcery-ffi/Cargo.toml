@@ -16,7 +16,8 @@ event-sorcery.workspace = true
 getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
+sqlite-es.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true

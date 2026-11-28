@@ -22,9 +22,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::error;
 use ulid::Ulid;
+
+use event_sorcery_core::JOB_AGGREGATE_TYPE;
 
 use crate::dependency::Nil;
 use crate::dispatch::DeliveryPolicy;
@@ -32,7 +36,6 @@ use crate::job_store::{ClaimDecision, ClaimRead};
 use crate::lifecycle::Lifecycle;
 use crate::{CompactionPolicy, EventSourced, Table};
 
-const JOB_AGGREGATE_TYPE: &str = "job";
 const JOB_EVENT_VERSION: &str = "1.0";
 
 /// A durable, retryable worker job with no origin entity.
@@ -117,7 +120,7 @@ impl std::str::FromStr for JobId {
     }
 }
 
-/// Durable execution context a worker hands to [`Job::perform`], captured at
+/// Durable execution context a worker hands to [`StandaloneJob::perform`], captured at
 /// claim time; the ack reads it from the task's `parts.ctx`.
 #[derive(Clone, Default)]
 pub struct JobContext {
@@ -173,7 +176,7 @@ impl JobContext {
     }
 }
 
-/// What a [`Job::perform`] reports back to the worker (ADR-0007).
+/// What a [`StandaloneJob::perform`] reports back to the worker (ADR-0007).
 #[derive(Debug)]
 pub enum JobOutcome<Output> {
     /// The job finished; the worker records success and acks it (terminal).
@@ -185,7 +188,7 @@ pub enum JobOutcome<Output> {
     Defer(Duration),
 }
 
-/// How a failed [`Job::perform`] must be treated -- chosen explicitly at every
+/// How a failed [`StandaloneJob::perform`] must be treated -- chosen explicitly at every
 /// failure return (ADR-0008).
 ///
 /// There is deliberately NO `From<Error>` impl: `?` cannot silently classify a
@@ -645,7 +648,11 @@ pub(crate) fn plan_claim(
     let lifecycle: Lifecycle<JobState> = match serde_json::from_str(&read.payload) {
         Ok(lifecycle) => lifecycle,
         Err(error) => {
-            error!(target: "cqrs", job_id, ?error, "job_queue_projection payload undecodable; needs rebuild");
+            error!(
+                job_id,
+                ?error,
+                "job_queue_projection payload undecodable; needs rebuild"
+            );
             return ClaimDecision::Skip;
         }
     };
@@ -687,7 +694,7 @@ pub(crate) fn plan_claim(
 
     let claim_seq = read.version + 1;
     let Ok(claim_seq_usize) = usize::try_from(claim_seq) else {
-        error!(target: "cqrs", job_id, claim_seq, "job claim sequence out of range");
+        error!(job_id, claim_seq, "job claim sequence out of range");
         return ClaimDecision::Skip;
     };
 
@@ -696,11 +703,11 @@ pub(crate) fn plan_claim(
     }
 
     let Some(lease_until_ms) = now_ms.checked_add(lease_ms) else {
-        error!(target: "cqrs", job_id, now_ms, lease_ms, "job lease instant out of range");
+        error!(job_id, now_ms, lease_ms, "job lease instant out of range");
         return ClaimDecision::Skip;
     };
     let Ok(lease_until) = instant_from_millis(lease_until_ms) else {
-        error!(target: "cqrs", job_id, lease_until_ms, "job lease instant out of range");
+        error!(job_id, lease_until_ms, "job lease instant out of range");
         return ClaimDecision::Skip;
     };
     let claim_id = ClaimId::new();
@@ -722,7 +729,7 @@ pub(crate) fn plan_claim(
         claimed.serialized(job_id, claim_seq_usize),
         serde_json::to_string(&Lifecycle::Live(new_state)),
     ) else {
-        error!(target: "cqrs", job_id, "failed to encode Claimed");
+        error!(job_id, "failed to encode Claimed");
         return ClaimDecision::Skip;
     };
 
@@ -751,7 +758,7 @@ fn plan_abandon(job_id: &str, kind: &JobKind, claim_seq_usize: usize) -> ClaimDe
             reason: DeadReason::Abandoned,
         })),
     ) else {
-        error!(target: "cqrs", job_id, "failed to encode Dead{{Abandoned}}");
+        error!(job_id, "failed to encode Dead{{Abandoned}}");
         return ClaimDecision::Skip;
     };
     ClaimDecision::Abandon {
@@ -797,10 +804,19 @@ pub(crate) struct PendingPush {
     pub(crate) delay: Option<Duration>,
 }
 
-/// Encoded pending jobs whose source buffer remains intact until commit.
-pub(crate) struct PreparedPendingJobs {
+/// Receipt for a batch of prepared jobs.
+///
+/// Call [`Self::mark_committed`] only after the transaction that wrote these
+/// jobs commits. On failure, drop the receipt so the original entries remain
+/// eligible for preparation.
+pub struct PreparedPendingJobs {
     requests: Vec<EnqueueRequest>,
-    prepared_count: Option<usize>,
+    acknowledgements: Vec<Arc<AtomicBool>>,
+}
+
+struct PendingBufferEntry {
+    push: PendingPush,
+    committed: Arc<AtomicBool>,
 }
 
 /// Type erasure over a dispatched [`crate::Job`] so the pending buffer can
@@ -827,27 +843,24 @@ impl PreparedPendingJobs {
         std::mem::take(&mut self.requests)
     }
 
-    /// Removes the retained source pushes included in a successful database commit.
-    pub(crate) fn mark_committed(self) {
-        if let Some(prepared_count) = self.prepared_count {
-            PENDING_JOBS.with(|pending| {
-                drop(pending.borrow_mut().drain(..prepared_count));
-            });
+    /// Marks the committed pushes so the next preparation prunes them from the buffer.
+    pub fn mark_committed(self) {
+        for acknowledgement in self.acknowledgements {
+            acknowledgement.store(true, Ordering::Release);
         }
     }
 }
 
 tokio::task_local! {
-    /// Per-command buffer of jobs awaiting flush, cleared by the event
-    /// repository only after its commit transaction succeeds.
-    static PENDING_JOBS: RefCell<Vec<PendingPush>>;
+    /// Per-command buffer whose entries are acknowledged only after a successful commit.
+    static PENDING_JOBS: RefCell<Vec<PendingBufferEntry>>;
 }
 
 /// Runs `command_execution` with a fresh pending-job scope active, so the
 /// framework's [`buffer`] of a [`crate::Effect::Dispatch`] lands where the
 /// repository's [`prepare_pending`] can prepare it for the event transaction.
-/// [`PreparedPendingJobs::mark_committed`] clears the prepared entries only
-/// after that transaction commits successfully.
+/// After the transaction succeeds, [`PreparedPendingJobs::mark_committed`]
+/// acknowledges only the prepared entries.
 pub(crate) async fn with_pending_scope<Output>(
     command_execution: impl Future<Output = Output>,
 ) -> Output {
@@ -862,7 +875,12 @@ pub(crate) async fn with_pending_scope<Output>(
 /// `Dispatched` event is never committed without its enqueue.
 pub(crate) fn buffer(push: PendingPush) -> Result<(), DispatchNotBuffered> {
     PENDING_JOBS
-        .try_with(|pending| pending.borrow_mut().push(push))
+        .try_with(|pending| {
+            pending.borrow_mut().push(PendingBufferEntry {
+                push,
+                committed: Arc::new(AtomicBool::new(false)),
+            });
+        })
         .map_err(|_| DispatchNotBuffered)
 }
 
@@ -878,10 +896,12 @@ pub struct DispatchNotBuffered;
 /// succeeds, leaving the original pushes available after any failure.
 pub(crate) fn prepare_pending() -> Result<PreparedPendingJobs, JobStoreError> {
     let prepared = PENDING_JOBS.try_with(|pending| {
-        let pending = pending.borrow();
+        let mut pending = pending.borrow_mut();
+        pending.retain(|entry| !entry.committed.load(Ordering::Acquire));
         let requests = pending
             .iter()
-            .map(|push| {
+            .map(|entry| {
+                let push = &entry.push;
                 Ok(EnqueueRequest {
                     job_id: push.job_id,
                     kind: push.job.kind(),
@@ -890,19 +910,24 @@ pub(crate) fn prepare_pending() -> Result<PreparedPendingJobs, JobStoreError> {
                 })
             })
             .collect::<Result<Vec<_>, JobStoreError>>()?;
-        Ok::<_, JobStoreError>((requests, pending.len()))
+        let acknowledgements = pending
+            .iter()
+            .map(|entry| Arc::clone(&entry.committed))
+            .collect();
+        Ok::<_, JobStoreError>(PreparedPendingJobs {
+            requests,
+            acknowledgements,
+        })
     });
-    let (requests, prepared_count) = match prepared {
-        Ok(prepared) => {
-            let (requests, prepared_count) = prepared?;
-            (requests, Some(prepared_count))
-        }
-        Err(_) => (Vec::new(), None),
-    };
-    Ok(PreparedPendingJobs {
-        requests,
-        prepared_count,
-    })
+    prepared.map_or_else(
+        |_| {
+            Ok(PreparedPendingJobs {
+                requests: Vec::new(),
+                acknowledgements: Vec::new(),
+            })
+        },
+        std::convert::identity,
+    )
 }
 
 /// Drains the per-command pending-job buffer into [`EnqueueRequest`]s for tests
@@ -1043,6 +1068,54 @@ mod tests {
             assert_eq!(remaining[0].job_id, later_job_id);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn commit_receipt_acknowledges_its_original_scope_inside_another_scope() {
+        with_pending_scope(async {
+            buffer(PendingPush {
+                job_id: JobId::new(),
+                job: Box::new(TestPendingJob),
+                delay: None,
+            })
+            .unwrap();
+            let prepared = prepare_pending().unwrap();
+            let inner_id = JobId::new();
+
+            with_pending_scope(async {
+                buffer(PendingPush {
+                    job_id: inner_id,
+                    job: Box::new(TestPendingJob),
+                    delay: None,
+                })
+                .unwrap();
+                prepared.mark_committed();
+                let remaining = take_pending().unwrap();
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].job_id, inner_id);
+            })
+            .await;
+
+            assert_eq!(take_pending().unwrap().len(), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn commit_receipt_can_complete_after_its_command_scope_ends() {
+        let prepared = with_pending_scope(async {
+            buffer(PendingPush {
+                job_id: JobId::new(),
+                job: Box::new(TestPendingJob),
+                delay: None,
+            })
+            .unwrap();
+            prepare_pending().unwrap()
+        })
+        .await;
+
+        prepared.mark_committed();
+        assert_eq!(take_pending().unwrap().len(), 0);
     }
 
     #[test]

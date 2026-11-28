@@ -1,0 +1,1180 @@
+//! Typed command and opaque binding composition over sqlite-es.
+
+use cqrs_es::persist::{SerializedEvent, SerializedSnapshot};
+use serde_json::Value;
+use sqlx::SqlitePool;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use event_sorcery::{
+    CheckedCommit, ClaimDecision, ClaimOutcome, ClaimRead, CommitRequest, EngineError,
+    LeaseRenewal, OpaqueCommitRequest, OpaqueStoredEvent, SchemaReconciliation, SchemaTarget,
+    StreamIdentity,
+};
+
+use crate::commit::{Commit, commit_atomic};
+use crate::{Reconciler, SqliteJobError, StoredEventRow};
+
+/// Snapshot state stored independently after replaying through a known sequence.
+pub struct SnapshotWrite {
+    aggregate: Value,
+    last_sequence: usize,
+}
+
+impl SnapshotWrite {
+    /// Creates a snapshot write covering events through `last_sequence`.
+    pub fn new(aggregate: Value, last_sequence: usize) -> Self {
+        Self {
+            aggregate,
+            last_sequence,
+        }
+    }
+}
+
+/// Shared serialized SQLite persistence engine.
+#[derive(Clone)]
+pub struct Engine {
+    pool: SqlitePool,
+    reconciler: Arc<Reconciler>,
+}
+
+impl Engine {
+    /// Creates an engine over a SQLite pool.
+    ///
+    /// This constructor does not run migrations. Call [`Self::migrate`] before
+    /// using storage operations when the pool's schema is not initialized.
+    ///
+    /// The schema registry's CQRS framework is built once here and reused by
+    /// every schema call, so one engine never holds more than one framework
+    /// instance for that aggregate.
+    pub fn new(pool: SqlitePool) -> Self {
+        let reconciler = Arc::new(Reconciler::new(pool.clone()));
+
+        Self { pool, reconciler }
+    }
+
+    /// Migrates the engine's existing SQLite schema.
+    pub async fn migrate(&self) -> Result<(), SqliteJobError> {
+        crate::MIGRATOR
+            .run(&self.pool)
+            .await
+            .map_err(|error| SqliteJobError::Sql(error.into()))?;
+        Ok(())
+    }
+
+    /// Runs the existing schema-registry recovery for language-neutral metadata.
+    pub async fn reconcile_schema(
+        &self,
+        target: &SchemaTarget,
+    ) -> Result<SchemaReconciliation, EngineError> {
+        Ok(self.reconciler.reconcile_target(target).await?)
+    }
+
+    /// Records a schema version after its recovery has durably completed.
+    pub async fn record_schema(&self, target: &SchemaTarget) -> Result<(), EngineError> {
+        self.reconciler.record_target(target).await?;
+
+        Ok(())
+    }
+
+    pub async fn claim_job<Decide, Won>(
+        &self,
+        job_id: &str,
+        decide: Decide,
+    ) -> Result<ClaimOutcome<Won>, SqliteJobError>
+    where
+        Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won> + Send,
+        Won: Send,
+    {
+        crate::claim_job(&self.pool, job_id, decide).await
+    }
+
+    pub async fn renew_job(
+        &self,
+        job_id: &str,
+        claim_seq: i64,
+        new_lease_until_ms: i64,
+    ) -> Result<LeaseRenewal, SqliteJobError> {
+        crate::renew_job(&self.pool, job_id, claim_seq, new_lease_until_ms).await
+    }
+
+    pub async fn enqueue_job(
+        &self,
+        event: SerializedEvent,
+        payload: String,
+    ) -> Result<(), SqliteJobError> {
+        crate::enqueue_job(&self.pool, event, payload).await
+    }
+
+    /// Loads one stream, optionally after an exclusive sequence checkpoint.
+    pub async fn load_events(
+        &self,
+        stream: &StreamIdentity,
+        after_sequence: Option<usize>,
+    ) -> Result<Vec<SerializedEvent>, EngineError> {
+        crate::load_event_rows::<StoredEventRow>(
+            &self.pool,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+            after_sequence,
+        )
+        .await?
+        .into_iter()
+        .map(|row| SerializedEvent::try_from(row).map_err(EngineError::from))
+        .collect()
+    }
+
+    /// Loads at most `limit` events from one stream after an optional exclusive
+    /// sequence checkpoint.
+    pub async fn load_events_page(
+        &self,
+        stream: &StreamIdentity,
+        after_sequence: Option<usize>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<SerializedEvent>, EngineError> {
+        crate::load_events_page::<StoredEventRow>(
+            &self.pool,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+            after_sequence,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(|row| SerializedEvent::try_from(row).map_err(EngineError::from))
+        .collect()
+    }
+
+    /// Loads an item- and storage-byte-bounded event page.
+    pub async fn load_events_page_bounded(
+        &self,
+        stream: &StreamIdentity,
+        after_sequence: Option<usize>,
+        item_limit: NonZeroUsize,
+        byte_limit: NonZeroUsize,
+    ) -> Result<Vec<SerializedEvent>, EngineError> {
+        crate::load_events_page_bounded::<StoredEventRow>(
+            &self.pool,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+            after_sequence,
+            item_limit,
+            byte_limit,
+        )
+        .await?
+        .into_iter()
+        .map(|row| SerializedEvent::try_from(row).map_err(EngineError::from))
+        .collect()
+    }
+
+    /// Loads an opaque event page while preserving legacy JSON event semantics.
+    pub async fn load_opaque_events_page_bounded(
+        &self,
+        stream: &StreamIdentity,
+        after_sequence: Option<usize>,
+        item_limit: NonZeroUsize,
+        byte_limit: NonZeroUsize,
+    ) -> Result<Vec<OpaqueStoredEvent>, EngineError> {
+        self.load_events_page_bounded(stream, after_sequence, item_limit, byte_limit)
+            .await?
+            .into_iter()
+            .map(OpaqueStoredEvent::try_from)
+            .collect()
+    }
+
+    /// Reads the current stream version, where zero means the stream holds no
+    /// events and no snapshot covers any.
+    ///
+    /// This is the same oracle [`Engine::commit`] validates against, so a
+    /// compacted stream reports the version its snapshot still covers rather
+    /// than the lower maximum sequence its surviving events show.
+    pub async fn current_version(&self, stream: &StreamIdentity) -> Result<usize, EngineError> {
+        Ok(crate::committed_stream_version(
+            &self.pool,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+        )
+        .await?)
+    }
+
+    /// Loads the current snapshot for one stream when present.
+    pub async fn load_snapshot(
+        &self,
+        stream: &StreamIdentity,
+    ) -> Result<Option<SerializedSnapshot>, EngineError> {
+        Ok(crate::load_snapshot(&self.pool, &stream.aggregate_type, &stream.aggregate_id).await?)
+    }
+
+    /// Writes one snapshot under the same write lock the commit path takes.
+    ///
+    /// The write runs inside a `BEGIN IMMEDIATE` transaction whose guard rolls
+    /// back when it is dropped, so a cancelled caller never returns an open
+    /// write transaction to the pool.
+    pub async fn store_snapshot(
+        &self,
+        stream: &StreamIdentity,
+        snapshot: SnapshotWrite,
+    ) -> Result<usize, EngineError> {
+        Ok(crate::store_snapshot(
+            &self.pool,
+            &stream.aggregate_type,
+            &stream.aggregate_id,
+            snapshot.last_sequence,
+            &snapshot.aggregate,
+        )
+        .await?)
+    }
+
+    pub async fn discard_snapshot(&self, stream: &StreamIdentity) -> Result<(), EngineError> {
+        crate::discard_snapshot(&self.pool, &stream.aggregate_type, &stream.aggregate_id).await?;
+
+        Ok(())
+    }
+
+    /// Atomically persists a validated event, snapshot, and durable-job batch.
+    pub async fn commit(&self, request: CommitRequest<'_>) -> Result<(), EngineError> {
+        commit_serialized(&self.pool, request.check()?).await
+    }
+
+    /// Atomically persists binding-owned payload bytes through the shared writer.
+    pub async fn commit_opaque(&self, request: OpaqueCommitRequest<'_>) -> Result<(), EngineError> {
+        request
+            .write_with(async |commit| commit_serialized(&self.pool, commit).await)
+            .await
+    }
+}
+
+/// Hands validated framework inputs to the shared SQLite writer.
+pub(crate) async fn commit_serialized(
+    pool: &SqlitePool,
+    request: CheckedCommit<'_>,
+) -> Result<(), EngineError> {
+    let (stream, expected_version, events, snapshot, jobs) = request.into_parts();
+    commit_atomic(
+        pool,
+        Commit {
+            aggregate_type: &stream.aggregate_type,
+            aggregate_id: &stream.aggregate_id,
+            expected_version,
+            events,
+            snapshot,
+            jobs,
+        },
+        |snapshot| {
+            let snapshot = snapshot.prepare(events)?;
+            Ok(SerializedSnapshot {
+                aggregate_id: stream.aggregate_id.clone(),
+                aggregate: snapshot.aggregate,
+                current_sequence: snapshot.last_sequence,
+                current_snapshot: snapshot.snapshot_version,
+            })
+        },
+        |job| Ok(job.event()?),
+        |job| Ok(job.queue_payload()?),
+    )
+    .await
+}
+
+impl From<crate::StoreSnapshotError> for EngineError {
+    fn from(error: crate::StoreSnapshotError) -> Self {
+        use crate::StoreSnapshotError::{
+            BeyondCurrentVersion, EmptyStream, Repository, Sql, VersionExhausted,
+        };
+
+        match error {
+            EmptyStream => Self::EmptySnapshotUpdate,
+            BeyondCurrentVersion { proposed, current } => {
+                Self::SnapshotBeyondCurrentVersion { proposed, current }
+            }
+            VersionExhausted => Self::SnapshotVersionExhausted,
+            Sql(source) => Self::Sql(source),
+            Repository(source) => source.into(),
+        }
+    }
+}
+
+impl From<crate::EventPageReadError> for EngineError {
+    fn from(error: crate::EventPageReadError) -> Self {
+        use crate::EventPageReadError::{Integer, Sql, TooLarge};
+
+        match error {
+            Sql(source) => Self::Sql(source),
+            Integer(source) => Self::Integer(source),
+            TooLarge { observed, limit } => Self::EventPageTooLarge { observed, limit },
+        }
+    }
+}
+
+impl From<crate::SqliteAggregateError> for EngineError {
+    fn from(error: crate::SqliteAggregateError) -> Self {
+        match error {
+            crate::SqliteAggregateError::OptimisticLock => Self::OptimisticLock,
+            crate::SqliteAggregateError::Connection(source) => Self::Sql(source),
+            crate::SqliteAggregateError::Deserialization(source) => Self::Json(source),
+            crate::SqliteAggregateError::TryFromInt(source) => Self::Integer(source),
+            crate::SqliteAggregateError::EmptySnapshotUpdate => Self::EmptySnapshotUpdate,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Integration coverage for the serialized engine facade.
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use crate::testing::create_test_pool;
+
+    use super::*;
+    use event_sorcery::{
+        CompactionPolicy, JobClaimResult, JobId, JobRuntime, JobSeed, JobStoreError,
+        ReconcileError, SnapshotUpdate,
+    };
+
+    use crate::SqliteBackend;
+
+    #[tokio::test]
+    async fn migrate_initializes_the_existing_sqlite_schema() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .unwrap();
+        let engine = Engine::new(pool);
+
+        engine.migrate().await.unwrap();
+
+        let stream = StreamIdentity::new("engine-migration-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "engine-migration-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        engine
+            .commit(CommitRequest::new(stream, std::slice::from_ref(&event)))
+            .await
+            .unwrap();
+    }
+
+    fn serialized_event(stream: &StreamIdentity, sequence: usize) -> SerializedEvent {
+        SerializedEvent {
+            aggregate_type: stream.aggregate_type.clone(),
+            aggregate_id: stream.aggregate_id.clone(),
+            sequence,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({ "sequence": sequence }),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    async fn queue_row_count(engine: &Engine, job_id: &JobId) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_queue_projection WHERE view_id = ?1")
+            .bind(job_id.to_string())
+            .fetch_one(&engine.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_reads_stop_at_the_requested_page_size() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-page-test", "one");
+        let events = (1..=3)
+            .map(|sequence| serialized_event(&stream, sequence))
+            .collect::<Vec<_>>();
+        engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await
+            .unwrap();
+
+        let page = engine
+            .load_events_page(&stream, None, NonZeroUsize::new(2).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let page = engine
+            .load_events_page(&stream, Some(1), NonZeroUsize::MIN)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 3);
+        assert_eq!(
+            engine
+                .current_version(&StreamIdentity::new("engine-page-test", "missing"))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_reads_reject_storage_bytes_before_loading_the_page() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-byte-page-test", "one");
+        let event = SerializedEvent {
+            payload: serde_json::Value::String("x".repeat(256)),
+            ..serialized_event(&stream, 1)
+        };
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+
+        let result = engine
+            .load_events_page_bounded(
+                &stream,
+                None,
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(64).unwrap(),
+            )
+            .await;
+
+        let Err(EngineError::EventPageTooLarge { observed, limit }) = result else {
+            panic!("oversized stored page must report its exact accounting");
+        };
+        assert_eq!((observed, limit), (302, 64));
+    }
+
+    #[tokio::test]
+    async fn schema_reconciliation_uses_the_existing_event_sourced_registry() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let target = SchemaTarget::new("engine-schema-test", 1, CompactionPolicy::Retain);
+
+        assert_eq!(
+            engine.reconcile_schema(&target).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        assert_eq!(
+            engine.reconcile_schema(&target).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+
+        engine.record_schema(&target).await.unwrap();
+
+        assert_eq!(
+            engine.reconcile_schema(&target).await.unwrap(),
+            SchemaReconciliation::Unchanged
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_version_change_clears_derived_snapshots() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-schema-snapshot", "one");
+        let version_one = SchemaTarget::new("engine-schema-snapshot", 1, CompactionPolicy::Retain);
+        assert_eq!(
+            engine.reconcile_schema(&version_one).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        engine.record_schema(&version_one).await.unwrap();
+        persist_test_snapshot(&engine, &stream).await;
+
+        let version_two = SchemaTarget::new("engine-schema-snapshot", 2, CompactionPolicy::Retain);
+        let outcome = engine.reconcile_schema(&version_two).await.unwrap();
+
+        assert_eq!(outcome, SchemaReconciliation::Changed);
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn first_registration_clears_zero_coverage_snapshot_without_deleting_events() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-zero-coverage", "one");
+        let target = SchemaTarget::new("engine-zero-coverage", 1, CompactionPolicy::Retain);
+        let events = [serialized_event(&stream, 1)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await
+            .unwrap();
+        engine
+            .store_snapshot(&stream, SnapshotWrite::new(serde_json::json!({}), 0))
+            .await
+            .unwrap();
+        let snapshot = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        assert_eq!(snapshot.current_sequence, 0);
+
+        let outcome = engine.reconcile_schema(&target).await.unwrap();
+
+        assert_eq!(outcome, SchemaReconciliation::Changed);
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), events);
+    }
+
+    #[tokio::test]
+    async fn retained_schema_change_preserves_snapshots_with_incomplete_history() {
+        for (policy, removed_through) in [
+            (CompactionPolicy::RetainLast { events: 1 }, 1),
+            (CompactionPolicy::CompactAfterSnapshot, 2),
+        ] {
+            for registered in [false, true] {
+                let pool = create_test_pool().await.unwrap();
+                let engine = Engine::new(pool.clone());
+                let stream = StreamIdentity::new("engine-retention-transition", "one");
+                let original = SchemaTarget::new("engine-retention-transition", 1, policy);
+                if registered {
+                    engine.record_schema(&original).await.unwrap();
+                }
+                let events = [serialized_event(&stream, 1), serialized_event(&stream, 2)];
+                engine
+                    .commit(
+                        CommitRequest::new(stream.clone(), &events)
+                            .with_snapshot(SnapshotUpdate::new(serde_json::json!({"value": 42}), 1))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let preserved = engine.load_snapshot(&stream).await.unwrap().unwrap();
+                sqlx::query("DELETE FROM events WHERE aggregate_type = ?1 AND sequence <= ?2")
+                    .bind("engine-retention-transition")
+                    .bind(removed_through)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                let remaining = engine.load_events(&stream, None).await.unwrap();
+                let changed =
+                    SchemaTarget::new("engine-retention-transition", 2, CompactionPolicy::Retain);
+
+                let error = engine.reconcile_schema(&changed).await.unwrap_err();
+                assert!(matches!(
+                    error,
+                    EngineError::Schema(ReconcileError::UnprovenSnapshotHistory {
+                        stream: rejected,
+                        covered_sequence: 2,
+                        retained_events,
+                    }) if rejected == stream && retained_events == 2 - removed_through
+                ));
+                assert_eq!(
+                    engine.load_snapshot(&stream).await.unwrap(),
+                    Some(preserved)
+                );
+                assert_eq!(engine.load_events(&stream, None).await.unwrap(), remaining);
+                assert_eq!(
+                    engine.reconcile_schema(&original).await.unwrap(),
+                    if registered {
+                        SchemaReconciliation::Unchanged
+                    } else {
+                        SchemaReconciliation::Changed
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_version_change_preserves_compacted_snapshots_by_refusing_recovery() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-schema-compact", "one");
+        let version_one = SchemaTarget::new("engine-schema-compact", 1, CompactionPolicy::Retain);
+        assert_eq!(
+            engine.reconcile_schema(&version_one).await.unwrap(),
+            SchemaReconciliation::Changed
+        );
+        engine.record_schema(&version_one).await.unwrap();
+        persist_test_snapshot(&engine, &stream).await;
+        let preserved = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        let version_two = SchemaTarget::new(
+            "engine-schema-compact",
+            2,
+            CompactionPolicy::CompactAfterSnapshot,
+        );
+
+        let result = engine.reconcile_schema(&version_two).await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::Schema(
+                ReconcileError::CompactedSnapshotClear { .. }
+            ))
+        ));
+        assert_eq!(
+            engine.load_snapshot(&stream).await.unwrap(),
+            Some(preserved)
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_and_load_use_the_existing_serialized_event_contract() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-test", "one");
+        let event = serialized_event(&stream, 1);
+
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+
+        let loaded = engine.load_events(&stream, None).await.unwrap();
+        assert_eq!(loaded, vec![event]);
+    }
+
+    #[tokio::test]
+    async fn expected_version_rejects_a_gap_without_writing() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-expected-test", "one");
+        let event = serialized_event(&stream, 2);
+
+        let result = engine
+            .commit(
+                CommitRequest::new(stream.clone(), std::slice::from_ref(&event))
+                    .at_expected_version(1),
+            )
+            .await;
+
+        assert!(matches!(result, Err(EngineError::OptimisticLock)));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn noncontiguous_sequence_rejects_without_writing() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-sequence-test", "one");
+        let events = [serialized_event(&stream, 1), serialized_event(&stream, 3)];
+
+        let result = engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await;
+
+        assert!(matches!(result, Err(EngineError::OptimisticLock)));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 0);
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn native_commits_cannot_forge_opaque_payload_provenance() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("engine-reserved-metadata-test", "one");
+        let event = SerializedEvent {
+            metadata: serde_json::json!({
+                "$event-sorcery-engine-owned": "opaque-v1"
+            }),
+            ..serialized_event(&stream, 1)
+        };
+
+        let result = engine
+            .commit(CommitRequest::new(stream, std::slice::from_ref(&event)))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::ReservedMetadata {
+                key: "$event-sorcery-engine-owned"
+            })
+        ));
+        let event_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(event_count, 0);
+    }
+
+    #[tokio::test]
+    async fn load_events_returns_only_sequences_after_the_checkpoint() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-test", "checkpointed");
+        let events = (1..=3)
+            .map(|sequence| serialized_event(&stream, sequence))
+            .collect::<Vec<_>>();
+
+        engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await
+            .unwrap();
+
+        let loaded = engine.load_events(&stream, Some(1)).await.unwrap();
+        assert_eq!(loaded, events[1..]);
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_a_sequence_zero_event_without_a_snapshot() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("compaction-probe", "unsnapshotted");
+        let events = [serialized_event(&stream, 0), serialized_event(&stream, 1)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &events))
+            .await
+            .unwrap();
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), events);
+        assert!(engine.load_snapshot(&stream).await.unwrap().is_none());
+
+        for policy in [
+            CompactionPolicy::CompactAfterSnapshot,
+            CompactionPolicy::RetainLast { events: 0 },
+        ] {
+            let removed = crate::compact_events(&pool, &stream.aggregate_type, policy)
+                .await
+                .unwrap();
+            assert_eq!(removed, 0, "{policy:?}");
+            assert_eq!(engine.load_events(&stream, None).await.unwrap(), events);
+        }
+    }
+
+    #[tokio::test]
+    async fn current_version_reports_the_sequence_a_snapshot_covers_after_compaction() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("engine-compacted-version-test", "one");
+        let persisted = (1..=2)
+            .map(|sequence| serialized_event(&stream, sequence))
+            .collect::<Vec<_>>();
+        engine
+            .commit(
+                CommitRequest::new(stream.clone(), &persisted)
+                    .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 2 }), 1))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        compact_covered_prefix(&pool, &stream).await;
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), vec![]);
+
+        // The events table forgot every sequence, so only the snapshot still
+        // records how far the stream reached. A reader that trusted the events
+        // alone would restart a live aggregate from version zero.
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_a_stale_writer_whose_sequence_a_snapshot_already_covers() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let stream = StreamIdentity::new("engine-compaction-conflict-test", "one");
+        let persisted = [serialized_event(&stream, 1)];
+        engine
+            .commit(
+                CommitRequest::new(stream.clone(), &persisted)
+                    .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 1 }), 1))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        compact_covered_prefix(&pool, &stream).await;
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 1);
+
+        // A writer that loaded before the first commit proposes sequence 1
+        // again. Replay would never reach it behind the snapshot, so accepting
+        // it would lose the update silently.
+        let stale = [serialized_event(&stream, 1)];
+        let result = engine
+            .commit(CommitRequest::new(stream.clone(), &stale).at_expected_version(0))
+            .await;
+
+        assert!(matches!(result, Err(EngineError::OptimisticLock)));
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 1);
+
+        // A writer that loaded the snapshot proposes the sequence after it and
+        // still commits.
+        let next = [serialized_event(&stream, 2)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &next).at_expected_version(1))
+            .await
+            .unwrap();
+
+        assert_eq!(engine.current_version(&stream).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn durable_conflict_precedes_snapshot_validation() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("inventory", "widget");
+        let first = [serialized_event(&stream, 1)];
+        engine
+            .commit(CommitRequest::new(stream.clone(), &first))
+            .await
+            .unwrap();
+
+        let (_, snapshot) = SnapshotUpdate::from_serialized(SerializedSnapshot {
+            aggregate_id: stream.aggregate_id.clone(),
+            aggregate: serde_json::json!({"quantity": 9}),
+            current_sequence: 2,
+            current_snapshot: 1,
+        });
+        let stale = [serialized_event(&stream, 1)];
+        let error = engine
+            .commit(
+                CommitRequest::new(stream.clone(), &stale)
+                    .at_expected_version(0)
+                    .with_snapshot(snapshot)
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, EngineError::OptimisticLock));
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), first);
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    /// Deletes exactly the event prefix the stream's snapshot already covers.
+    async fn compact_covered_prefix(pool: &SqlitePool, stream: &StreamIdentity) {
+        sqlx::query(
+            "DELETE FROM events \
+             WHERE aggregate_type = ?1 \
+               AND aggregate_id = ?2 \
+               AND sequence <= (SELECT last_sequence FROM snapshots \
+                                WHERE aggregate_type = ?1 AND aggregate_id = ?2)",
+        )
+        .bind(&stream.aggregate_type)
+        .bind(&stream.aggregate_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_events_from_multiple_streams_without_writing() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let requested_stream = StreamIdentity::new("engine-test", "requested");
+        let other_stream = StreamIdentity::new("engine-test", "other");
+        let events = [
+            serialized_event(&requested_stream, 1),
+            serialized_event(&other_stream, 1),
+        ];
+
+        let result = engine
+            .commit(CommitRequest::new(requested_stream, &events))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::StreamIdentityMismatch { .. })
+        ));
+        let event_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn snapshot_attachment_requires_persisted_events() {
+        let stream = StreamIdentity::new("engine-test", "empty-snapshot");
+        let request = CommitRequest::new(stream, &[])
+            .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 0 }), 1));
+
+        assert!(matches!(request, Err(EngineError::EmptySnapshotUpdate)));
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_snapshot_identity_mismatch_without_writing() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool.clone());
+        let snapshot_stream = StreamIdentity::new("engine-test", "snapshot");
+        let event_stream = StreamIdentity::new("engine-test", "event");
+        let event = serialized_event(&event_stream, 1);
+        let request = CommitRequest::new(snapshot_stream, std::slice::from_ref(&event))
+            .with_snapshot(SnapshotUpdate::new(serde_json::json!({ "sequence": 1 }), 1))
+            .unwrap();
+
+        let result = engine.commit(request).await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::StreamIdentityMismatch { .. })
+        ));
+        let event_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let snapshot_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM snapshots")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((event_count, snapshot_count), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn job_operations_preserve_the_existing_claim_protocol() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let id = JobId::new();
+        let seed = JobSeed::new(id, "engine-test", serde_json::json!({"value": 42}), 1_000);
+        engine
+            .enqueue_job(seed.event().unwrap(), seed.queue_payload().unwrap())
+            .await
+            .unwrap();
+
+        let jobs = JobRuntime::build(SqliteBackend {
+            pool: engine.pool.clone(),
+        })
+        .await
+        .unwrap();
+        let outcome = jobs
+            .claim_job(id, "engine-test-worker", 1_000, 30_000, 50)
+            .await
+            .unwrap();
+        let JobClaimResult::Claimed(claim) = outcome else {
+            panic!("expected the existing claim decision to win");
+        };
+        assert_eq!(claim.handle.job_id(), id);
+        assert_eq!(claim.payload, serde_json::json!({"value": 42}));
+        let job_id = id.to_string();
+        let job_stream = StreamIdentity::new("job", &job_id);
+        let events = engine.load_events(&job_stream, None).await.unwrap();
+        let claim_seq = i64::try_from(events.last().unwrap().sequence).unwrap();
+        assert_eq!(claim_seq, 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["JobEnqueued", "JobClaimed"]
+        );
+        assert!(matches!(
+            engine.renew_job(&job_id, claim_seq, 60_000).await,
+            Ok(LeaseRenewal::Held)
+        ));
+        assert!(matches!(
+            engine.renew_job(&job_id, claim_seq + 1, 90_000).await,
+            Ok(LeaseRenewal::Lost)
+        ));
+        assert_eq!(engine.load_events(&job_stream, None).await.unwrap(), events);
+    }
+
+    #[tokio::test]
+    async fn language_neutral_job_seed_commits_with_domain_events() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool);
+        let stream = StreamIdentity::new("engine-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "engine-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        let job_id = JobId::new();
+        let request = CommitRequest::new(stream.clone(), std::slice::from_ref(&event)).with_job(
+            JobSeed::new(
+                job_id,
+                "haskell-test",
+                serde_json::json!([0, 1, 255]),
+                1_000,
+            ),
+        );
+
+        engine.commit(request).await.unwrap();
+
+        assert_eq!(engine.load_events(&stream, None).await.unwrap(), [event]);
+        assert_eq!(queue_row_count(&engine, &job_id).await, 1);
+        let job_stream = StreamIdentity::new("job", job_id.to_string());
+        assert_eq!(
+            engine
+                .load_events(&job_stream, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            ["JobEnqueued"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_job_seed_instant_rolls_back_the_domain_event() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool);
+        let stream = StreamIdentity::new("engine-test", "invalid-job-instant");
+        let event = SerializedEvent {
+            aggregate_type: "engine-test".to_string(),
+            aggregate_id: "invalid-job-instant".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        let job_id = JobId::new();
+        let request = CommitRequest::new(stream.clone(), std::slice::from_ref(&event)).with_job(
+            JobSeed::new(job_id, "haskell-test", serde_json::json!([]), i64::MAX),
+        );
+
+        let error = engine.commit(request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            EngineError::JobFlush(JobStoreError::InvalidInstant(i64::MAX))
+        ));
+        assert!(engine.load_events(&stream, None).await.unwrap().is_empty());
+        assert_eq!(queue_row_count(&engine, &job_id).await, 0);
+        let job_stream = StreamIdentity::new("job", job_id.to_string());
+        assert!(
+            engine
+                .load_events(&job_stream, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_operations_use_the_existing_snapshot_table() {
+        let pool = create_test_pool().await.unwrap();
+        let engine = Engine::new(pool);
+        let stream = StreamIdentity::new("engine-snapshot-test", "one");
+        let event = SerializedEvent {
+            aggregate_type: "engine-snapshot-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 1,
+            event_type: "Created".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        engine
+            .commit(CommitRequest::new(stream.clone(), &[event]))
+            .await
+            .unwrap();
+
+        let version = engine
+            .store_snapshot(
+                &stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 42 }), 1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(version, 1);
+        let snapshot = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        assert_eq!(snapshot.current_sequence, 1);
+        assert_eq!(snapshot.current_snapshot, 1);
+        assert_eq!(snapshot.aggregate, serde_json::json!({ "value": 42 }));
+
+        let second_event = SerializedEvent {
+            aggregate_type: "engine-snapshot-test".to_string(),
+            aggregate_id: "one".to_string(),
+            sequence: 2,
+            event_type: "Changed".to_string(),
+            event_version: "1.0".to_string(),
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+        };
+        engine
+            .commit(CommitRequest::new(stream.clone(), &[second_event]))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .store_snapshot(
+                    &stream,
+                    SnapshotWrite::new(serde_json::json!({ "value": 84 }), 2),
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(matches!(
+            engine
+                .store_snapshot(
+                    &stream,
+                    SnapshotWrite::new(serde_json::json!({ "value": 21 }), 1),
+                )
+                .await,
+            Err(EngineError::OptimisticLock)
+        ));
+        let current = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        assert_eq!(current.current_sequence, 2);
+        assert_eq!(current.current_snapshot, 2);
+        assert_eq!(current.aggregate, serde_json::json!({ "value": 84 }));
+
+        engine.discard_snapshot(&stream).await.unwrap();
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_beyond_the_committed_version_keeps_the_stored_snapshot() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-snapshot-ahead-test", "one");
+        let event = serialized_event(&stream, 1);
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+        engine
+            .store_snapshot(
+                &stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 42 }), 1),
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .store_snapshot(
+                &stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 84 }), 2),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EngineError::SnapshotBeyondCurrentVersion {
+                proposed: 2,
+                current: 1
+            })
+        ));
+        let stored = engine.load_snapshot(&stream).await.unwrap().unwrap();
+        assert_eq!(stored.current_sequence, 1);
+        assert_eq!(stored.current_snapshot, 1);
+        assert_eq!(stored.aggregate, serde_json::json!({ "value": 42 }));
+    }
+
+    #[tokio::test]
+    async fn snapshot_of_a_stream_that_committed_nothing_writes_no_row() {
+        let engine = Engine::new(create_test_pool().await.unwrap());
+        let stream = StreamIdentity::new("engine-snapshot-empty-test", "one");
+
+        let result = engine
+            .store_snapshot(
+                &stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 42 }), 0),
+            )
+            .await;
+
+        assert!(matches!(result, Err(EngineError::EmptySnapshotUpdate)));
+        assert_eq!(engine.load_snapshot(&stream).await.unwrap(), None);
+    }
+
+    async fn persist_test_snapshot(engine: &Engine, stream: &StreamIdentity) {
+        let event = serialized_event(stream, 1);
+        engine
+            .commit(CommitRequest::new(
+                stream.clone(),
+                std::slice::from_ref(&event),
+            ))
+            .await
+            .unwrap();
+        engine
+            .store_snapshot(
+                stream,
+                SnapshotWrite::new(serde_json::json!({ "value": 42 }), 1),
+            )
+            .await
+            .unwrap();
+    }
+}

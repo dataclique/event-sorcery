@@ -1,9 +1,68 @@
+//! SQLite materialized-view storage and indexed predicate execution.
+
 use cqrs_es::persist::{PersistenceError, ViewContext, ViewRepository};
 use cqrs_es::{Aggregate, View};
-use sqlx::{AssertSqlSafe, Pool, Row, Sqlite};
+use sqlx::{Arguments, AssertSqlSafe, Pool, Row, Sqlite};
 use std::marker::PhantomData;
+use std::ops::ControlFlow;
+
+pub use indexed_query::{Cmp, IndexedView, Order, Predicate, Term, Value};
+
+use event_sorcery_core::{ViewBackend, ViewUpdateError};
 
 use crate::sql_query::SqlQueryFactory;
+
+/// SQLite repository family for aggregate-state materialized views.
+#[derive(Debug, Clone, Copy)]
+pub struct SqliteViewBackend;
+
+impl ViewBackend for SqliteViewBackend {
+    type Repo<View, Agg>
+        = SqliteViewRepository<View, Agg>
+    where
+        View: cqrs_es::View<Agg> + Clone + 'static,
+        Agg: Aggregate + 'static;
+
+    async fn try_update<ViewState, AggregateType, Skip>(
+        repository: &Self::Repo<ViewState, AggregateType>,
+        view_id: &str,
+        apply: impl FnOnce(Option<ViewState>, &ViewContext) -> ControlFlow<Skip, ViewState> + Send,
+    ) -> Result<Option<Skip>, ViewUpdateError>
+    where
+        ViewState: View<AggregateType> + Clone + 'static,
+        AggregateType: Aggregate + 'static,
+        Skip: Send,
+    {
+        let stored = repository
+            .read_version_and_payload(view_id)
+            .await
+            .map_err(|error| ViewUpdateError::Load(error.into()))?;
+        let (view, version, payload) = match stored {
+            Some((version, payload)) => {
+                let view = serde_json::from_str(&payload).map_err(|error| {
+                    ViewUpdateError::Load(SqliteViewError::Deserialization(error).into())
+                })?;
+                (Some(view), version, Some(payload))
+            }
+            None => (None, 0, None),
+        };
+        let context = ViewContext::new(view_id.to_owned(), version);
+        let view = match apply(view, &context) {
+            ControlFlow::Break(skipped) => return Ok(Some(skipped)),
+            ControlFlow::Continue(view) => view,
+        };
+
+        repository
+            .write_view(view, context, payload.as_deref())
+            .await
+            .map_err(|error| ViewUpdateError::Write(error.into()))?;
+        Ok(None)
+    }
+
+    fn is_retryable_error(error: &(dyn std::error::Error + 'static)) -> bool {
+        crate::is_retryable_sqlite_busy(error)
+    }
+}
 
 /// Errors that can occur during SQLite view repository operations
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +83,10 @@ pub enum SqliteViewError {
     #[error("View deserialization error: {0}")]
     Deserialization(#[source] serde_json::Error),
 
+    /// The stored version cannot be incremented.
+    #[error("view version is exhausted")]
+    VersionExhausted,
+
     /// Integer conversion error (e.g., version number overflow)
     #[error("Integer conversion error: {0}")]
     TryFromInt(#[from] std::num::TryFromIntError),
@@ -37,6 +100,7 @@ impl From<SqliteViewError> for PersistenceError {
             SqliteViewError::Serialization(e) => Self::UnknownError(Box::new(e)),
             SqliteViewError::Deserialization(e) => Self::DeserializationError(Box::new(e)),
             SqliteViewError::TryFromInt(e) => Self::UnknownError(Box::new(e)),
+            SqliteViewError::VersionExhausted => Self::UnknownError(Box::new(err)),
         }
     }
 }
@@ -70,6 +134,17 @@ where
     _phantom: PhantomData<(V, A)>,
 }
 
+impl<ViewState, AggregateType> AsRef<Pool<Sqlite>>
+    for SqliteViewRepository<ViewState, AggregateType>
+where
+    ViewState: View<AggregateType>,
+    AggregateType: Aggregate,
+{
+    fn as_ref(&self) -> &Pool<Sqlite> {
+        &self.pool
+    }
+}
+
 impl<V, A> SqliteViewRepository<V, A>
 where
     V: View<A>,
@@ -88,6 +163,62 @@ where
             view_table,
             _phantom: PhantomData,
         }
+    }
+
+    async fn read_version_and_payload(
+        &self,
+        view_id: &str,
+    ) -> Result<Option<(i64, String)>, SqliteViewError> {
+        let query = SqlQueryFactory::select_view(&self.view_table);
+        let row = sqlx::query(AssertSqlSafe(query))
+            .bind(view_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| Ok((row.try_get("version")?, row.try_get("payload")?)))
+            .transpose()
+    }
+
+    async fn write_view(
+        &self,
+        view: V,
+        context: ViewContext,
+        observed_payload: Option<&str>,
+    ) -> Result<(), SqliteViewError> {
+        let payload = serde_json::to_string(&view).map_err(SqliteViewError::Serialization)?;
+        let new_version = context
+            .version
+            .checked_add(1)
+            .ok_or(SqliteViewError::VersionExhausted)?;
+        let affected = if context.version == 0 && observed_payload.is_none() {
+            let insert = SqlQueryFactory::insert_view(&self.view_table);
+            sqlx::query(AssertSqlSafe(insert))
+                .bind(&context.view_instance_id)
+                .bind(new_version)
+                .bind(&payload)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+        } else {
+            let mut update = SqlQueryFactory::update_view(&self.view_table);
+            if observed_payload.is_some() {
+                update.push_str(" AND CAST(payload AS BLOB) = CAST(? AS BLOB)");
+            }
+            let query = sqlx::query(AssertSqlSafe(update))
+                .bind(new_version)
+                .bind(&payload)
+                .bind(&context.view_instance_id)
+                .bind(context.version);
+            let query = match observed_payload {
+                Some(observed) => query.bind(observed),
+                None => query,
+            };
+            query.execute(&self.pool).await?.rows_affected()
+        };
+        if affected == 0 {
+            return Err(SqliteViewError::OptimisticLock);
+        }
+
+        Ok(())
     }
 }
 
@@ -160,125 +291,9 @@ where
     /// UPDATE affects 0 rows, it means the view was modified concurrently and
     /// an OptimisticLockError is returned.
     async fn update_view(&self, view: V, context: ViewContext) -> Result<(), PersistenceError> {
-        let payload = serde_json::to_string(&view).map_err(SqliteViewError::Serialization)?;
-
-        let new_version = context.version + 1;
-
-        if context.version == 0 {
-            let insert_query = SqlQueryFactory::insert_view(&self.view_table);
-
-            sqlx::query(AssertSqlSafe(insert_query))
-                .bind(&context.view_instance_id)
-                .bind(new_version)
-                .bind(&payload)
-                .execute(&self.pool)
-                .await
-                .map_err(SqliteViewError::Connection)?;
-        } else {
-            let update_query = SqlQueryFactory::update_view(&self.view_table);
-
-            let result = sqlx::query(AssertSqlSafe(update_query))
-                .bind(new_version)
-                .bind(&payload)
-                .bind(&context.view_instance_id)
-                .bind(context.version)
-                .execute(&self.pool)
-                .await
-                .map_err(SqliteViewError::Connection)?;
-
-            if result.rows_affected() == 0 {
-                return Err(SqliteViewError::OptimisticLock.into());
-            }
-        }
-
+        self.write_view(view, context, None).await?;
         Ok(())
     }
-}
-
-/// A predicate scan the load-by-id [`ViewRepository`] cannot express.
-///
-/// Returns the `view_id`s whose columns satisfy a predicate, ordered and
-/// limited -- so a projection can be polled for "all rows matching X" (e.g. the
-/// durable-job runnable poll) without the caller writing SQL.
-pub trait IndexedView<V, A>: ViewRepository<V, A>
-where
-    V: View<A>,
-    A: Aggregate,
-{
-    /// Returns the `view_id`s whose columns satisfy `predicate` (disjunctive
-    /// normal form: an OR of AND-groups), ordered and capped at `limit`.
-    fn find(
-        &self,
-        predicate: &Predicate,
-        order: Option<&Order>,
-        limit: i64,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, PersistenceError>> + Send;
-}
-
-/// A predicate in disjunctive normal form: any of these AND-groups matching is a
-/// match. An empty `any_of` matches nothing.
-pub struct Predicate {
-    /// OR of conjunctions; each inner `Vec` is an AND of [`Term`]s.
-    pub any_of: Vec<Vec<Term>>,
-}
-
-/// One column comparison.
-pub struct Term {
-    /// The column name. MUST be a trusted, code-controlled identifier (a view
-    /// column), never user input -- it is interpolated, not bound.
-    pub column: String,
-    /// The comparison operator.
-    pub cmp: Cmp,
-    /// The bound value; `None` for [`Cmp::IsNull`]/[`Cmp::IsNotNull`].
-    pub value: Option<Value>,
-}
-
-/// Comparison operators for a [`Term`].
-pub enum Cmp {
-    /// `=`
-    Eq,
-    /// `<`
-    Lt,
-    /// `<=`
-    Le,
-    /// `>`
-    Gt,
-    /// `>=`
-    Ge,
-    /// `IS NULL` (no bound value)
-    IsNull,
-    /// `IS NOT NULL` (no bound value)
-    IsNotNull,
-}
-
-impl Cmp {
-    fn sql(&self) -> &'static str {
-        match self {
-            Self::Eq => "=",
-            Self::Lt => "<",
-            Self::Le => "<=",
-            Self::Gt => ">",
-            Self::Ge => ">=",
-            Self::IsNull => "IS NULL",
-            Self::IsNotNull => "IS NOT NULL",
-        }
-    }
-}
-
-/// A bound scalar value.
-pub enum Value {
-    /// An integer column value.
-    Int(i64),
-    /// A text column value.
-    Text(String),
-}
-
-/// Result ordering for [`IndexedView::find`].
-pub struct Order {
-    /// The column to order by (trusted identifier; interpolated).
-    pub column: String,
-    /// Ascending when true, descending otherwise.
-    pub ascending: bool,
 }
 
 impl<V, A> IndexedView<V, A> for SqliteViewRepository<V, A>
@@ -292,51 +307,31 @@ where
         order: Option<&Order>,
         limit: i64,
     ) -> Result<Vec<String>, PersistenceError> {
-        if predicate.any_of.is_empty() {
+        let mut arguments = sqlx::sqlite::SqliteArguments::default();
+        let sql = indexed_query::compile_query(
+            &self.view_table,
+            indexed_query::IdentifierMode::TrustedSql,
+            predicate,
+            order,
+            limit,
+            |value| {
+                match value {
+                    Value::Int(integer) => arguments.add(*integer),
+                    Value::Text(text) => arguments.add(text.as_str()),
+                }
+                .map_err(indexed_query::ProjectionQueryError::Encoding)?;
+                let mut placeholder = String::new();
+                arguments.format_placeholder(&mut placeholder)?;
+                Ok(placeholder)
+            },
+        )
+        .map_err(|source| PersistenceError::UnknownError(Box::new(source)))?;
+        let Some(sql) = sql else {
             return Ok(vec![]);
-        }
-
-        let mut binds: Vec<&Value> = vec![];
-        let groups: Vec<String> = predicate
-            .any_of
-            .iter()
-            .map(|conjunction| {
-                let terms: Vec<String> = conjunction
-                    .iter()
-                    .map(|term| {
-                        term.value.as_ref().map_or_else(
-                            || format!("{} {}", term.column, term.cmp.sql()),
-                            |value| {
-                                binds.push(value);
-                                format!("{} {} ?", term.column, term.cmp.sql())
-                            },
-                        )
-                    })
-                    .collect();
-                format!("({})", terms.join(" AND "))
-            })
-            .collect();
-
-        let order_clause = order.map_or_else(String::new, |order| {
-            let direction = if order.ascending { "ASC" } else { "DESC" };
-            format!(" ORDER BY {} {direction}", order.column)
-        });
-        let sql = format!(
-            "SELECT view_id FROM {} WHERE {}{order_clause} LIMIT ?",
-            self.view_table,
-            groups.join(" OR "),
-        );
-
-        let mut query = sqlx::query_scalar::<_, String>(AssertSqlSafe(sql));
-        for value in binds {
-            query = match value {
-                Value::Int(int) => query.bind(int),
-                Value::Text(text) => query.bind(text),
-            };
-        }
-        query = query.bind(limit);
-
+        };
+        let mut query = sqlx::QueryBuilder::<Sqlite>::with_arguments(sql, arguments);
         query
+            .build_query_scalar::<String>()
             .fetch_all(&self.pool)
             .await
             .map_err(SqliteViewError::Connection)
@@ -350,6 +345,9 @@ mod tests {
     use cqrs_es::{DomainEvent, EventEnvelope};
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
+    use std::time::Duration;
+
+    use indexed_query::ProjectionQueryError;
 
     use super::*;
     use crate::testing::create_test_pool;
@@ -482,6 +480,119 @@ mod tests {
         let loaded_view = result.unwrap();
         assert_eq!(loaded_view.count, 42);
         assert_eq!(loaded_view.values, vec!["foo", "bar"]);
+    }
+
+    #[tokio::test]
+    async fn explicitly_quoted_dotted_names_keep_literal_table_and_column_identity() {
+        let pool = create_test_pool().await.unwrap();
+        sqlx::query(
+            r#"CREATE TABLE "literal.""name_projection" (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL,
+                "metric.""key" BIGINT NOT NULL DEFAULT 7
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool,
+            r#""literal.""name_projection""#.to_string(),
+        );
+        repository
+            .update_view(
+                TestView {
+                    count: 7,
+                    values: vec![],
+                },
+                ViewContext::new("literal".to_string(), 0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repository.load("literal").await.unwrap().unwrap().count, 7);
+        let predicate = Predicate {
+            any_of: vec![vec![Term {
+                column: r#""metric.""key""#.to_string(),
+                cmp: Cmp::Eq,
+                value: Some(Value::Int(7)),
+            }]],
+        };
+        let order = Order {
+            column: r#""metric.""key""#.to_string(),
+            ascending: true,
+        };
+        assert_eq!(
+            repository.find(&predicate, Some(&order), 1).await.unwrap(),
+            vec!["literal".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn qualified_indexed_names_target_the_same_table_as_load_and_update() {
+        let pool = create_test_pool().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE qualified_projection (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool,
+            "main.qualified_projection".to_string(),
+        );
+        repository
+            .update_view(
+                TestView {
+                    count: 7,
+                    values: vec![],
+                },
+                ViewContext::new("qualified".to_string(), 0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.load("qualified").await.unwrap().unwrap().count,
+            7
+        );
+        let predicate = Predicate {
+            any_of: vec![vec![Term {
+                column: "qualified_projection.payload".to_string(),
+                cmp: Cmp::IsNotNull,
+                value: None,
+            }]],
+        };
+        let order = Order {
+            column: "qualified_projection.view_id".to_string(),
+            ascending: true,
+        };
+        assert_eq!(
+            repository.find(&predicate, Some(&order), 1).await.unwrap(),
+            vec!["qualified".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_indexed_limit_fails_before_empty_query_or_storage_access() {
+        let pool = create_test_pool().await.unwrap();
+        pool.close().await;
+        let repository =
+            SqliteViewRepository::<TestView, TestAggregate>::new(pool, "test_view".to_string());
+        let error = repository
+            .find(&Predicate { any_of: vec![] }, None, -1)
+            .await
+            .unwrap_err();
+        let PersistenceError::UnknownError(source) = error else {
+            panic!("expected typed indexed-query validation failure");
+        };
+        assert!(matches!(
+            source.downcast_ref::<ProjectionQueryError>(),
+            Some(ProjectionQueryError::NegativeLimit(-1))
+        ));
     }
 
     #[tokio::test]
@@ -743,6 +854,126 @@ mod tests {
         assert_eq!(loaded_context.version, 2);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_update_rejects_a_rebuild_at_the_same_checkpoint() {
+        let pool = create_test_pool().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = SqliteViewRepository::<TestView, TestAggregate>::new(
+            pool.clone(),
+            "test_view".to_owned(),
+        );
+        repository
+            .update_view(
+                TestView {
+                    count: 0,
+                    values: vec!["stale".to_owned()],
+                },
+                ViewContext::new("one".to_owned(), 0),
+            )
+            .await
+            .unwrap();
+
+        let budget = Duration::from_secs(5);
+        let (loaded, wait_for_load) = tokio::sync::oneshot::channel();
+        let (replaced, wait_for_replacement) = std::sync::mpsc::sync_channel(1);
+        let update = tokio::spawn(async move {
+            SqliteViewBackend::try_update(&repository, "one", move |view, context| {
+                assert_eq!(context.version, 1);
+                let mut view = view.unwrap();
+                assert_eq!(view.values, ["stale"]);
+                loaded.send(()).unwrap();
+                tokio::task::block_in_place(|| wait_for_replacement.recv_timeout(budget)).unwrap();
+                view.values.push("later".to_owned());
+                ControlFlow::<(), _>::Continue(view)
+            })
+            .await
+        });
+        tokio::time::timeout(budget, wait_for_load)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE test_view SET payload = ? WHERE view_id = 'one' AND version = 1")
+            .bind(r#"{"count":1,"values":["rebuilt"]}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        replaced.send(()).unwrap();
+
+        let error = update.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            event_sorcery_core::ViewUpdateError::Write(PersistenceError::OptimisticLockError)
+        ));
+        let repository =
+            SqliteViewRepository::<TestView, TestAggregate>::new(pool, "test_view".to_owned());
+        let (view, context) = repository.load_with_context("one").await.unwrap().unwrap();
+        assert_eq!(context.version, 1);
+        assert_eq!(
+            view,
+            TestView {
+                count: 1,
+                values: vec!["rebuilt".to_owned()]
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_view_version_does_not_overwrite_the_row() {
+        let pool = create_test_pool().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO test_view (view_id, version, payload) VALUES ('one', ?, ?)")
+            .bind(i64::MAX)
+            .bind(r#"{"count":1,"values":["original"]}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let repository =
+            SqliteViewRepository::<TestView, TestAggregate>::new(pool, "test_view".to_owned());
+
+        let error = repository
+            .update_view(
+                TestView::default(),
+                ViewContext::new("one".to_owned(), i64::MAX),
+            )
+            .await
+            .unwrap_err();
+
+        let PersistenceError::UnknownError(source) = error else {
+            panic!("expected version exhaustion, got {error:?}")
+        };
+        assert!(matches!(
+            source.downcast_ref::<SqliteViewError>(),
+            Some(SqliteViewError::VersionExhausted)
+        ));
+        let (view, context) = repository.load_with_context("one").await.unwrap().unwrap();
+        assert_eq!(context.version, i64::MAX);
+        assert_eq!(
+            view,
+            TestView {
+                count: 1,
+                values: vec!["original".to_owned()]
+            }
+        );
+    }
+
     #[tokio::test]
     async fn test_view_serialization_roundtrip() {
         let pool = create_test_pool().await.unwrap();
@@ -822,6 +1053,57 @@ mod tests {
         assert_eq!(loaded1, view1);
         assert_eq!(loaded2, view2);
         assert_eq!(loaded3, view3);
+    }
+
+    #[tokio::test]
+    async fn initial_identity_conflicts_are_retryable_but_other_unique_failures_are_not() {
+        let pool = create_test_pool().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE test_view (
+                view_id TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                payload JSON NOT NULL,
+                unique_count INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.count')) STORED UNIQUE
+            )",
+        ).execute(&pool).await.unwrap();
+        let repo =
+            SqliteViewRepository::<TestView, TestAggregate>::new(pool, "test_view".to_string());
+        let initial = TestView {
+            count: 1,
+            values: vec!["winner".to_string()],
+        };
+        repo.update_view(initial.clone(), ViewContext::new("same".to_string(), 0))
+            .await
+            .unwrap();
+        let rejected = TestView {
+            count: 2,
+            values: vec!["loser".to_string()],
+        };
+        let error = repo
+            .update_view(rejected, ViewContext::new("same".to_string(), 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistenceError::OptimisticLockError));
+        let error = repo
+            .update_view(initial.clone(), ViewContext::new("same".to_string(), 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PersistenceError::OptimisticLockError));
+        let error = repo
+            .update_view(initial.clone(), ViewContext::new("other".to_string(), 0))
+            .await
+            .unwrap_err();
+        let PersistenceError::ConnectionError(source) = error else {
+            panic!("unrelated unique constraints must retain the database error");
+        };
+        let sqlx::Error::Database(source) = source.downcast_ref::<sqlx::Error>().unwrap() else {
+            panic!("connection error must retain its SQLx database source");
+        };
+        assert_eq!(source.kind(), sqlx::error::ErrorKind::UniqueViolation);
+        let (view, context) = repo.load_with_context("same").await.unwrap().unwrap();
+        assert_eq!(view, initial);
+        assert_eq!(context.version, 1);
+        assert_eq!(repo.load("other").await.unwrap(), None);
     }
 
     #[tokio::test]

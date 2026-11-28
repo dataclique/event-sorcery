@@ -2,41 +2,44 @@
 //!
 //! [`JobRuntime`] turns one [`EventBackend`] into the whole durable-jobs
 //! capability -- the job [`Store`] (cqrs/es) and the `job_queue_projection` [`Projection`],
-//! auto-wired by [`StoreBuilder`]. [`EventStoreBackend`] polls that projection
+//! auto-wired by [`StoreBuilder`](crate::StoreBuilder). [`EventStoreBackend`] polls that projection
 //! for runnable jobs, claims each via [`EventBackend::claim`], runs it through an
 //! apalis worker, and durably records the outcome as a [`JobCommand`] fenced on
 //! the claim's [`ClaimId`]. See [ADR-0006](../../adrs/0006-cqrs-native-durable-jobs.md).
 //!
 //! Deployment is single-process, multiple in-process workers, one database.
 
-use std::convert::Infallible;
+use std::future::{Future, ready};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use apalis_core::backend::Backend as ApalisBackend;
+use apalis_core::backend::finalize::Ephemeral;
+use apalis_core::backend::{Backend as ApalisBackend, BackendConfig};
 use apalis_core::error::BoxDynError;
 use apalis_core::task::Task;
-use apalis_core::task::data::Data;
+use apalis_core::task::builder::TaskBuilder;
+use apalis_core::task::data::{Data, MissingDataError};
+use apalis_core::task::from_request::FromRequest;
 use apalis_core::task::task_id::TaskId;
-use apalis_core::task_fn::FromRequest;
 use apalis_core::worker::context::WorkerContext;
+use backon::{BackoffBuilder, ExponentialBuilder};
 use chrono::{DateTime, TimeDelta, Utc};
 use cqrs_es::AggregateError;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use futures_util::{FutureExt, StreamExt};
-use sqlx::SqlitePool;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tower::limit::ConcurrencyLimitLayer;
+use tower::util::MapResponse;
 use tower_layer::{Layer, Stack};
 use tower_service::Service;
 use tracing::{error, warn};
 
-use sqlite_es::{Cmp, Order, Predicate, Term, Value};
+use indexed_query::{Cmp, Order, Predicate, Term, Value};
 
 use crate::dispatch::DeliveryPolicy;
 use crate::job::{
@@ -44,20 +47,38 @@ use crate::job::{
     JobOutcome, JobState, JobStoreError, StandaloneJob, WorkerId, enqueue_request, enqueued_event,
     pending_seed_payload, plan_claim,
 };
-use crate::job_sqlite::SqliteBackend;
 use crate::job_store::{ClaimOutcome, EventBackend, LeaseRenewal};
 use crate::projection::Projection;
-use crate::{LifecycleError, ReconcileError, SendError, Store, StoreBuilder};
+use crate::view_backend::ViewBackend;
+use crate::{
+    LifecycleError, ProjectedStoreBackend, ProjectionError, ReconcileError, SendError, Store,
+};
 
 /// The durable-jobs runtime over one [`EventBackend`].
 ///
 /// Holds the job [`Store`] (cqrs/es) and the `job_queue_projection` [`Projection`], built
 /// once per process. Cheap to clone (the store and projection are `Arc`); one
 /// runtime is shared by every job type's worker.
-pub struct JobRuntime<Backend: EventBackend = SqliteBackend> {
+pub struct JobRuntime<Backend: EventBackend> {
     backend: Backend,
     jobs: Arc<Store<JobState, Backend>>,
-    queue: Arc<Projection<JobState>>,
+    queue: Arc<dyn JobQueueIndex>,
+}
+
+impl<Backend: EventBackend + ProjectedStoreBackend> JobRuntime<Backend> {
+    /// Opens the job store and recovers its queue projection on an already-migrated backend.
+    /// The caller owns migrations.
+    pub async fn build(backend: Backend) -> Result<Self, ReconcileError> {
+        let (jobs, queue) = crate::StoreBuilder::<JobState, _>::with_backend(backend.clone())
+            .build()
+            .await?;
+
+        Ok(Self {
+            backend,
+            jobs,
+            queue,
+        })
+    }
 }
 
 /// A won claim capability used by a worker adapter to renew or settle execution.
@@ -170,6 +191,26 @@ pub enum JobRuntimeError<BackendError> {
     /// The requested lease or claim budget cannot produce a valid claim.
     #[error("invalid job claim policy")]
     InvalidClaimPolicy,
+}
+
+trait JobQueueIndex: Send + Sync {
+    fn find<'query>(
+        &'query self,
+        predicate: &'query Predicate,
+        order: Option<&'query Order>,
+        limit: i64,
+    ) -> BoxFuture<'query, Result<Vec<String>, ProjectionError<JobState>>>;
+}
+
+impl<Backend: ViewBackend> JobQueueIndex for Projection<JobState, Backend> {
+    fn find<'query>(
+        &'query self,
+        predicate: &'query Predicate,
+        order: Option<&'query Order>,
+        limit: i64,
+    ) -> BoxFuture<'query, Result<Vec<String>, ProjectionError<JobState>>> {
+        Box::pin(Self::find(self, predicate, order, limit))
+    }
 }
 
 fn runtime_job_error<BackendError>(error: JobStoreError) -> JobRuntimeError<BackendError> {
@@ -462,35 +503,13 @@ pub enum JobEnqueueError<BackendError> {
     Backend(#[source] BackendError),
 }
 
-impl JobRuntime<SqliteBackend> {
-    /// Wires the SQLite job runtime over `pool`: the job `Store` + `job_queue_projection`
-    /// projection. The canonical schema (events + snapshots + `job_queue_projection`) must
-    /// already be applied -- like [`StoreBuilder`], the consumer owns migrations,
-    /// so this composes with the consumer's own view migrations instead of
-    /// re-running event-sorcery's and conflicting. `pool` MUST satisfy the pool
-    /// contract (WAL, `busy_timeout>=5000ms`, `synchronous=FULL`); see
-    /// [`SqliteBackend`].
-    pub async fn build(pool: SqlitePool) -> Result<Self, ReconcileError> {
-        let backend = SqliteBackend::new(pool);
-        let (jobs, queue) = StoreBuilder::<JobState>::with_backend(backend.clone())
-            .build()
-            .await?;
-        Ok(Self {
-            backend,
-            jobs,
-            queue,
-        })
-    }
-}
-
 /// The event-sourced job backend for a single job type `J` over an
 /// [`EventBackend`].
-pub struct EventStoreBackend<J: StandaloneJob, Backend: EventBackend = SqliteBackend> {
+pub struct EventStoreBackend<J: StandaloneJob, Backend: EventBackend> {
     runtime: JobRuntime<Backend>,
-    worker_id: WorkerId,
     config: JobWorkerConfig,
     clock: Clock,
-    _job: PhantomData<fn() -> J>,
+    tasks: BoxStream<'static, Task<J>>,
 }
 
 impl<J: StandaloneJob, Backend: EventBackend> EventStoreBackend<J, Backend> {
@@ -502,15 +521,29 @@ impl<J: StandaloneJob, Backend: EventBackend> EventStoreBackend<J, Backend> {
         config: JobWorkerConfig,
         clock: Clock,
     ) -> Self {
+        let poller = JobPoller {
+            runtime: runtime.clone(),
+            worker_id: WorkerId::new(worker_name),
+            config: config.clone(),
+            clock: clock.clone(),
+        };
         Self {
             runtime,
-            worker_id: WorkerId::new(worker_name),
             config,
             clock,
-            _job: PhantomData,
+            tasks: poll_jobs::<J, Backend>(poller),
         }
     }
+}
 
+struct JobPoller<Backend: EventBackend> {
+    runtime: JobRuntime<Backend>,
+    worker_id: WorkerId,
+    config: JobWorkerConfig,
+    clock: Clock,
+}
+
+impl<Backend: EventBackend> JobPoller<Backend> {
     /// Claims one candidate through the shared facade claim, reusing this
     /// worker's stable identity rather than minting one per attempt.
     async fn claim_one(
@@ -532,31 +565,27 @@ impl<J: StandaloneJob, Backend: EventBackend> EventStoreBackend<J, Backend> {
 
 /// Decodes a claimed job into an apalis task, or `None` if the stored args no
 /// longer deserialize into `J` (a poison row the worker skips).
-fn build_task<J: StandaloneJob>(
-    claimed: ClaimedJob,
-    config: &JobWorkerConfig,
-) -> Option<Task<J, JobContext, String>> {
+fn build_task<J: StandaloneJob>(claimed: ClaimedJob, config: &JobWorkerConfig) -> Option<Task<J>> {
     let ClaimedJob { handle, payload } = claimed;
     let job_id = handle.job_id;
     let job: J = match serde_json::from_value(payload) {
         Ok(job) => job,
         Err(error) => {
-            error!(target: "cqrs", ?error, %job_id, "claimed job failed to decode; skipping");
+            error!(?error, %job_id, "claimed job failed to decode; skipping");
             return None;
         }
     };
-    let mut task = Task::new_with_ctx(
-        job,
-        JobContext {
+    let task = TaskBuilder::new(job)
+        .data(JobContext {
             job_id,
             claim_seq: handle.claim_seq,
             claim_id: handle.claim_id,
             attempt: handle.attempt,
             max_attempts: config.max_attempts,
             delivery: config.delivery,
-        },
-    );
-    task.parts.task_id = Some(TaskId::new(job_id.to_string()));
+        })
+        .task_id(TaskId::from_string(job_id.to_string()))
+        .build();
     Some(task)
 }
 
@@ -575,33 +604,72 @@ pub async fn run_job<J: StandaloneJob>(
 
 /// Extracts the claim-time [`JobContext`] into the task handler, so `perform`
 /// receives the job's durable identity alongside its input.
-impl<Args: Sync> FromRequest<Task<Args, Self, String>> for JobContext {
-    type Error = Infallible;
+impl<Args> FromRequest<Task<Args>> for JobContext {
+    type Error = MissingDataError;
 
-    async fn from_request(task: &Task<Args, Self, String>) -> Result<Self, Infallible> {
-        Ok(task.parts.ctx.clone())
+    fn from_request(task: &Task<Args>) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(task.data().get_checked::<Self>().cloned())
+    }
+}
+
+/// Owned dependency extraction without requiring the task's job to be `Sync`.
+#[doc(hidden)]
+pub struct JobInput<Input>(pub Arc<Input>);
+
+impl<Args, Input: Send + Sync + 'static> FromRequest<Task<Args>> for JobInput<Input> {
+    type Error = MissingDataError;
+
+    fn from_request(task: &Task<Args>) -> impl Future<Output = Result<Self, Self::Error>> + Send {
+        ready(task.data().get_checked::<Arc<Input>>().cloned().map(Self))
     }
 }
 
 impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBackend<J, Backend> {
-    type Args = J;
-    type IdType = String;
-    type Context = JobContext;
-    type Error = BoxDynError;
-    type Stream = BoxStream<'static, Result<Option<Task<J, JobContext, String>>, BoxDynError>>;
-    type Beat = BoxStream<'static, Result<(), BoxDynError>>;
-    type Layer = Stack<AckLayer<J, Backend>, ConcurrencyLimitLayer>;
+    type Task = Task<J>;
+    type Error = JobScheduleError;
 
-    fn heartbeat(&self, _worker: &WorkerContext) -> Self::Beat {
-        let interval = self.config.poll_interval;
-        stream::unfold((), move |()| async move {
-            sleep(interval).await;
-            Some((Ok(()), ()))
-        })
-        .boxed()
+    fn poll_ready(
+        &mut self,
+        _cx: &mut Context<'_>,
+        _worker: &WorkerContext,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(self.config.backoff.validate())
     }
 
-    fn middleware(&self) -> Self::Layer {
+    fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+        _worker: &WorkerContext,
+    ) -> Poll<Option<Result<Self::Task, Self::Error>>> {
+        if let Err(error) = self.config.backoff.validate() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        self.tasks.poll_next_unpin(cx).map(|task| task.map(Ok))
+    }
+
+    fn poll_close(
+        &mut self,
+        _cx: &mut Context<'_>,
+        _worker: &WorkerContext,
+    ) -> Poll<Result<(), Self::Error>> {
+        self.tasks = stream::empty().boxed();
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<J: StandaloneJob, Backend: EventBackend> BackendConfig for EventStoreBackend<J, Backend> {
+    type Args = J;
+    type Id = String;
+    // Tasks are already decoded; the event store and AckLayer own durability.
+    type Kind = Ephemeral;
+    type Config = JobWorkerConfig;
+    type Layer = Stack<AckLayer<J, Backend>, ConcurrencyLimitLayer>;
+
+    fn config(&self) -> &Self::Config {
+        &self.config
+    }
+
+    fn middleware(&mut self, _worker: &mut WorkerContext) -> Self::Layer {
         Stack::new(
             AckLayer {
                 jobs: self.runtime.jobs.clone(),
@@ -613,58 +681,62 @@ impl<J: StandaloneJob, Backend: EventBackend> ApalisBackend for EventStoreBacken
             ConcurrencyLimitLayer::new(self.config.max_concurrency),
         )
     }
+}
 
-    fn poll(self, _worker: &WorkerContext) -> Self::Stream {
-        stream::unfold(self, |backend| async move {
-            let now_ms = backend.clock.now().timestamp_millis();
-            let predicate = poll_predicate(J::KIND, now_ms);
-            let order = poll_order();
-            let candidates = match backend
-                .runtime
-                .queue
-                .find(&predicate, Some(&order), backend.config.scan_limit)
-                .await
-            {
-                Ok(ids) => ids,
+fn poll_jobs<J: StandaloneJob, Backend: EventBackend>(
+    poller: JobPoller<Backend>,
+) -> BoxStream<'static, Task<J>> {
+    stream::unfold(poller, |backend| async move {
+        let now_ms = backend.clock.now().timestamp_millis();
+        let predicate = poll_predicate(J::KIND, now_ms);
+        let order = poll_order();
+        let candidates = match backend
+            .runtime
+            .queue
+            .find(&predicate, Some(&order), backend.config.scan_limit)
+            .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                warn!(?error, kind = J::KIND, "job poll failed; idling");
+                sleep(backend.config.poll_interval).await;
+                return Some((None, backend));
+            }
+        };
+
+        for view_id in candidates {
+            let job_id = match view_id.parse::<JobId>() {
+                Ok(job_id) => job_id,
                 Err(error) => {
-                    warn!(target: "cqrs", ?error, kind = J::KIND, "job poll failed; idling");
-                    sleep(backend.config.poll_interval).await;
-                    return Some((Ok(None), backend));
+                    error!(
+                        ?error,
+                        view_id, "queue candidate has a malformed id; skipping"
+                    );
+                    continue;
                 }
             };
-
-            for view_id in candidates {
-                let job_id = match view_id.parse::<JobId>() {
-                    Ok(job_id) => job_id,
-                    Err(error) => {
-                        error!(target: "cqrs", ?error, view_id, "queue candidate has a malformed id; skipping");
-                        continue;
-                    }
-                };
-                match backend.claim_one(job_id, now_ms).await {
-                    Ok(JobClaimResult::Claimed(claimed)) => {
-                        if let Some(task) = build_task::<J>(claimed, &backend.config) {
-                            return Some((Ok(Some(task)), backend));
-                        }
-                    }
-                    // An abandoned dead-letter freed the slot; contended/skip move on.
-                    Ok(
-                        JobClaimResult::Abandoned
-                        | JobClaimResult::Contended
-                        | JobClaimResult::Skipped,
-                    ) => {}
-                    Err(error) => {
-                        warn!(target: "cqrs", ?error, "job claim error; idling");
-                        break;
+            match backend.claim_one(job_id, now_ms).await {
+                Ok(JobClaimResult::Claimed(claimed)) => {
+                    if let Some(task) = build_task::<J>(claimed, &backend.config) {
+                        return Some((Some(task), backend));
                     }
                 }
+                // An abandoned dead-letter freed the slot; contended/skip move on.
+                Ok(
+                    JobClaimResult::Abandoned | JobClaimResult::Contended | JobClaimResult::Skipped,
+                ) => {}
+                Err(error) => {
+                    warn!(?error, "job claim error; idling");
+                    break;
+                }
             }
+        }
 
-            sleep(backend.config.poll_interval).await;
-            Some((Ok(None), backend))
-        })
-        .boxed()
-    }
+        sleep(backend.config.poll_interval).await;
+        Some((None, backend))
+    })
+    .filter_map(|task| async move { task })
+    .boxed()
 }
 
 /// Tuning for a job worker. Defaults target a single-host bot with sub-second
@@ -716,8 +788,8 @@ impl Default for JobWorkerConfig {
 pub struct Backoff {
     /// Delay for the first retry.
     pub base: Duration,
-    /// Per-attempt multiplier.
-    pub factor: f64,
+    /// Finite, unitless per-attempt multiplier, at least one.
+    pub factor: f32,
     /// Maximum delay.
     pub cap: Duration,
 }
@@ -733,13 +805,84 @@ impl Default for Backoff {
 }
 
 impl Backoff {
-    fn delay(&self, attempt: u32) -> Duration {
-        let scaled = self.base.as_secs_f64() * self.factor.powf(f64::from(attempt.min(32)));
-        Duration::from_secs_f64(scaled.min(self.cap.as_secs_f64()))
+    const MAX_RETRY_INDEX: u32 = 32;
+
+    /// Checks that delay generation fits the durable scheduling contract.
+    pub fn validate(&self) -> Result<(), JobScheduleError> {
+        if !self.factor.is_finite() || self.factor < 1.0 {
+            return Err(JobScheduleError::InvalidFactor {
+                factor: self.factor,
+            });
+        }
+        let _maximum_delta = TimeDelta::from_std(self.cap)?;
+        let minimum = self.base.min(self.cap);
+        if self.factor <= 1.0 || minimum.is_zero() || minimum == self.cap {
+            return Ok(());
+        }
+
+        let mut delays = self.delays();
+        for _ in 0..Self::MAX_RETRY_INDEX {
+            let current = delays.next().ok_or(JobScheduleError::Exhausted)?;
+            if current >= self.cap {
+                break;
+            }
+            // backon saturates overflow before applying the configured cap.
+            // Check only the multiplications it can actually perform.
+            Duration::try_from_secs_f32(current.as_secs_f32() * self.factor)
+                .map_err(JobScheduleError::BackoffScale)?;
+        }
+        Ok(())
+    }
+
+    fn delay(&self, attempt: u32) -> Result<Duration, JobScheduleError> {
+        self.validate()?;
+        if self.factor <= 1.0 {
+            return Ok(self.base.min(self.cap));
+        }
+        let index = usize::try_from(attempt.min(Self::MAX_RETRY_INDEX))?;
+        self.delays().nth(index).ok_or(JobScheduleError::Exhausted)
+    }
+
+    fn delays(&self) -> impl Iterator<Item = Duration> {
+        ExponentialBuilder::default()
+            .with_min_delay(self.base.min(self.cap))
+            .with_max_delay(self.cap)
+            .with_factor(self.factor)
+            .without_max_times()
+            .build()
     }
 }
 
-/// Injectable wall clock, so tests drive lease/retry timing deterministically.
+/// Configuration or arithmetic failure while preparing a durable job schedule.
+#[derive(Debug, thiserror::Error)]
+pub enum JobScheduleError {
+    /// The configured multiplier cannot define a finite, nondecreasing schedule.
+    #[error("invalid exponential backoff factor: {factor}")]
+    InvalidFactor {
+        /// Configured unitless retry multiplier.
+        factor: f32,
+    },
+    /// Scaling a delay would exceed the supported duration range.
+    #[error("exponential backoff scaling is outside the duration range")]
+    BackoffScale(#[source] std::time::TryFromFloatSecsError),
+    /// A delay cannot be represented by the persisted timestamp arithmetic.
+    #[error("job delay is outside the timestamp duration range")]
+    DelayOutOfRange(#[from] chrono::OutOfRangeError),
+    /// The bounded retry index cannot be represented on this platform.
+    #[error("job retry index is outside the platform range")]
+    RetryIndex(#[from] std::num::TryFromIntError),
+    /// The configured delay iterator ended before the selected retry index.
+    #[error("job retry schedule exhausted before its selected attempt")]
+    Exhausted,
+    /// Adding a valid delay would exceed the timestamp range.
+    #[error("job retry timestamp is outside the supported range")]
+    TimestampOverflow,
+    /// Another recorded failure cannot be represented by the attempt counter.
+    #[error("job failure counter is exhausted")]
+    AttemptOverflow,
+}
+
+/// Injectable timestamp source for job eligibility, lease and retry decisions.
 #[derive(Clone)]
 pub struct Clock(Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>);
 
@@ -824,6 +967,10 @@ fn poll_order() -> Order {
 
 /// Layer that wraps the worker's execution service to durably record each job's
 /// outcome and hold its lease for the duration of the run.
+///
+/// [`AckService`] retains the job's output through settlement. Only its completed
+/// response is mapped to a unit output for Apalis, whose monitor requires `Sync`
+/// responses even though [`StandaloneJob::Output`] requires only `Send`.
 pub struct AckLayer<J: StandaloneJob, Backend: EventBackend> {
     jobs: Arc<Store<JobState, Backend>>,
     backend: Backend,
@@ -833,17 +980,32 @@ pub struct AckLayer<J: StandaloneJob, Backend: EventBackend> {
 }
 
 impl<S, J: StandaloneJob, Backend: EventBackend> Layer<S> for AckLayer<J, Backend> {
-    type Service = AckService<S, J, Backend>;
+    type Service =
+        MapResponse<AckService<S, J, Backend>, fn(JobOutcome<J::Output>) -> JobOutcome<()>>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        AckService {
-            inner,
-            jobs: self.jobs.clone(),
-            backend: self.backend.clone(),
-            config: self.config.clone(),
-            clock: self.clock.clone(),
-            _job: PhantomData,
+        MapResponse::new(
+            AckService {
+                inner,
+                jobs: self.jobs.clone(),
+                backend: self.backend.clone(),
+                config: self.config.clone(),
+                clock: self.clock.clone(),
+                _job: PhantomData,
+            },
+            settled_worker_outcome::<J::Output> as fn(JobOutcome<J::Output>) -> JobOutcome<()>,
+        )
+    }
+}
+
+fn settled_worker_outcome<Output>(outcome: JobOutcome<Output>) -> JobOutcome<()> {
+    use JobOutcome::{Defer, Done};
+    match outcome {
+        Done(output) => {
+            drop(output);
+            Done(())
         }
+        Defer(delay) => Defer(delay),
     }
 }
 
@@ -857,11 +1019,11 @@ pub struct AckService<S, J: StandaloneJob, Backend: EventBackend> {
     _job: PhantomData<fn() -> J>,
 }
 
-impl<S, J, Backend> Service<Task<J, JobContext, String>> for AckService<S, J, Backend>
+impl<S, J, Backend> Service<Task<J>> for AckService<S, J, Backend>
 where
     J: StandaloneJob,
     Backend: EventBackend,
-    S: Service<Task<J, JobContext, String>, Response = JobOutcome<J::Output>>,
+    S: Service<Task<J>, Response = JobOutcome<J::Output>>,
     S::Error: Into<BoxDynError> + Send + Sync + 'static,
     S::Future: Send + 'static,
 {
@@ -873,8 +1035,21 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, task: Task<J, JobContext, String>) -> Self::Future {
-        let ctx = task.parts.ctx.clone();
+    fn call(&mut self, task: Task<J>) -> Self::Future {
+        let ctx = match task.data().get_checked::<JobContext>().cloned() {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                error!(?error, "job task is missing its claim context");
+                return async move { Err(Box::new(error) as BoxDynError) }.boxed();
+            }
+        };
+        if let Err(error) = self.config.backoff.validate() {
+            error!(
+                ?error,
+                "Invalid retry configuration; refusing job execution"
+            );
+            return async move { Err(Box::new(error) as BoxDynError) }.boxed();
+        }
         let jobs = self.jobs.clone();
         let backend = self.backend.clone();
         let config = self.config.clone();
@@ -908,14 +1083,16 @@ where
                 };
             let plan = ack_plan::<J>(&result);
 
-            if lost.load(Ordering::Relaxed) {
-                warn!(target: "cqrs", job_id = %ctx.job_id, "lease lost during execution; re-claimer owns the outcome");
+            let settlement = if lost.load(Ordering::Relaxed) {
+                warn!(job_id = %ctx.job_id, "lease lost during execution; re-claimer owns the outcome");
+                Ok(())
             } else {
-                ack(&jobs, &config, &clock, &ctx, plan).await;
-            }
+                ack(&jobs, &config, &clock, &ctx, plan).await
+            };
 
             cancel.cancel();
             let _ = renew.await;
+            settlement?;
 
             result
         }
@@ -981,13 +1158,13 @@ async fn renew_loop<Backend: EventBackend>(
                 let new_lease = clock.now() + lease_delta(config.lease_duration);
                 match backend.renew(&ctx.job_id.to_string(), ctx.claim_seq, new_lease.timestamp_millis()).await {
                     Ok(LeaseRenewal::Lost) => {
-                        error!(target: "cqrs", job_id = %ctx.job_id, claim_seq = ctx.claim_seq, "lease lost; stopping renewal");
+                        error!(job_id = %ctx.job_id, claim_seq = ctx.claim_seq, "lease lost; stopping renewal");
                         lost.store(true, Ordering::Relaxed);
                         break;
                     }
                     Ok(LeaseRenewal::Held) => {}
                     Err(error) => {
-                        warn!(target: "cqrs", ?error, "lease renewal transient error");
+                        warn!(?error, "lease renewal transient error");
                     }
                 }
             }
@@ -1007,24 +1184,24 @@ async fn ack<Backend: EventBackend>(
     clock: &Clock,
     ctx: &JobContext,
     plan: AckPlan,
-) {
-    let command = ack_command(config, clock, ctx, plan);
+) -> Result<(), JobScheduleError> {
+    let command = ack_command(config, clock, ctx, plan)?;
     let settled = settled_outcome(&command);
 
     loop {
         match classify_settlement(jobs.send(&ctx.job_id, command.clone()).await) {
-            SettlementVerdict::Applied => return,
+            SettlementVerdict::Applied => return Ok(()),
             SettlementVerdict::Fenced => {
                 report_fenced_settlement(ctx.job_id, settled);
-                return;
+                return Ok(());
             }
             SettlementVerdict::Transient(error) => {
-                warn!(target: "cqrs", ?error, job_id = %ctx.job_id, "ack transient error; retrying within lease");
+                warn!(?error, job_id = %ctx.job_id, "ack transient error; retrying within lease");
                 sleep(Duration::from_millis(50)).await;
             }
             SettlementVerdict::Rejected(error) => {
-                error!(target: "cqrs", ?error, job_id = %ctx.job_id, "ack rejected by the job aggregate; giving up");
-                return;
+                error!(?error, job_id = %ctx.job_id, "ack rejected by the job aggregate; giving up");
+                return Ok(());
             }
         }
     }
@@ -1080,10 +1257,10 @@ fn settled_outcome(command: &JobCommand) -> SettledOutcome {
 fn report_fenced_settlement(job_id: JobId, settled: SettledOutcome) {
     match settled {
         SettledOutcome::Succeeded => {
-            error!(target: "cqrs", %job_id, "DOUBLE-EXECUTION RISK: job succeeded but a re-claimer owns the outcome");
+            error!(%job_id, "DOUBLE-EXECUTION RISK: job succeeded but a re-claimer owns the outcome");
         }
         SettledOutcome::Unsuccessful => {
-            warn!(target: "cqrs", %job_id, "settlement fenced; a re-claimer owns the outcome");
+            warn!(%job_id, "settlement fenced; a re-claimer owns the outcome");
         }
     }
 }
@@ -1093,43 +1270,54 @@ fn ack_command(
     clock: &Clock,
     ctx: &JobContext,
     plan: AckPlan,
-) -> JobCommand {
+) -> Result<JobCommand, JobScheduleError> {
     let error_text = match plan {
         AckPlan::Succeeded => {
-            return JobCommand::Succeed {
+            return Ok(JobCommand::Succeed {
                 claim_id: ctx.claim_id.clone(),
-            };
+            });
         }
         AckPlan::Deferred(delay) => {
-            return JobCommand::Reschedule {
+            return Ok(JobCommand::Reschedule {
                 claim_id: ctx.claim_id.clone(),
-                run_at: clock.now() + lease_delta(delay),
-            };
+                run_at: schedule_time(clock, delay)?,
+            });
         }
         AckPlan::Rejected(error_text) => {
-            return JobCommand::Kill {
+            return Ok(JobCommand::Kill {
                 claim_id: ctx.claim_id.clone(),
                 reason: DeadReason::Rejected,
                 error: error_text,
-            };
+            });
         }
         AckPlan::Failed(error_text) => error_text,
     };
-    let failed = ctx.attempt + 1;
+    let failed = ctx
+        .attempt
+        .checked_add(1)
+        .ok_or(JobScheduleError::AttemptOverflow)?;
     if failed >= config.max_attempts {
-        return JobCommand::Kill {
+        return Ok(JobCommand::Kill {
             claim_id: ctx.claim_id.clone(),
             reason: DeadReason::RetriesExhausted,
             error: error_text,
-        };
+        });
     }
-    let run_at = clock.now() + lease_delta(config.backoff.delay(ctx.attempt));
-    JobCommand::RetrySchedule {
+    let run_at = schedule_time(clock, config.backoff.delay(ctx.attempt)?)?;
+    Ok(JobCommand::RetrySchedule {
         claim_id: ctx.claim_id.clone(),
         run_at,
         attempt: failed,
         error: error_text,
-    }
+    })
+}
+
+fn schedule_time(clock: &Clock, delay: Duration) -> Result<DateTime<Utc>, JobScheduleError> {
+    let delta = TimeDelta::from_std(delay)?;
+    clock
+        .now()
+        .checked_add_signed(delta)
+        .ok_or(JobScheduleError::TimestampOverflow)
 }
 
 fn lease_delta(duration: Duration) -> TimeDelta {
@@ -1144,12 +1332,12 @@ fn lease_millis(duration: Duration) -> i64 {
 /// per job type over a shared [`JobRuntime`].
 ///
 /// Each entry is `JobType => input_expr`, where `input_expr` builds that job's
-/// [`Job::Input`] dependency bundle. The macro builds an [`EventStoreBackend`]
+/// [`StandaloneJob::Input`] dependency bundle. The macro builds an [`EventStoreBackend`]
 /// per job (named `"{WORKER_NAME}-{index}"`, supervised/restartable) and returns
 /// the `Monitor`; call `.run().await` to start processing.
 ///
 /// ```ignore
-/// let runtime = JobRuntime::build(pool).await?;
+/// let runtime = JobRuntime::build(backend).await?;
 /// let monitor = build_supervised_worker!(runtime, JobWorkerConfig::default(), Clock::system(), {
 ///     SendEmail => email_client.clone(),
 ///     ChargeCard => billing_client.clone(),
@@ -1175,7 +1363,7 @@ macro_rules! build_supervised_worker {
                         <$job as $crate::StandaloneJob>::WORKER_NAME,
                         index
                     );
-                    let backend = $crate::EventStoreBackend::<$job>::new(
+                    let backend = $crate::EventStoreBackend::<$job, _>::new(
                         ::std::clone::Clone::clone(&runtime),
                         &name,
                         ::std::clone::Clone::clone(&config),
@@ -1184,7 +1372,11 @@ macro_rules! build_supervised_worker {
                     $crate::__worker::WorkerBuilder::new(name)
                         .backend(backend)
                         .data(::std::clone::Clone::clone(&input))
-                        .build($crate::run_job::<$job>)
+                        .build(|job, context, input: $crate::__worker::JobInput<
+                            <$job as $crate::StandaloneJob>::Input,
+                        >| {
+                            $crate::run_job(job, context, $crate::__worker::Data::new(input.0))
+                        })
                 })
             };
         )+
@@ -1195,395 +1387,112 @@ macro_rules! build_supervised_worker {
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
-    use sqlite_es::insert_serialized_events_batch;
-    use sqlite_es::testing::create_test_pool;
-    use sqlx::SqlitePool;
-
-    use crate::job::{
-        EnqueueRequest, JobEvent, JobKind, Label, WonClaim, enqueued_event, pending_seed_payload,
-    };
 
     use super::*;
+    use crate::job::Label;
 
-    #[derive(Serialize, Deserialize)]
-    struct TestJob {
-        n: u32,
-    }
-
-    impl StandaloneJob for TestJob {
-        type Input = ();
-        type Output = ();
-        type Error = std::convert::Infallible;
-
-        const WORKER_NAME: &'static str = "test-worker";
-        const KIND: &'static str = "test-job";
-        const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
-
-        fn label(&self) -> Label {
-            Label::new(format!("test:{}", self.n))
-        }
-
-        async fn perform(
-            &self,
-            _ctx: &JobContext,
-            _input: &(),
-        ) -> Result<JobOutcome<()>, JobFailure<std::convert::Infallible>> {
-            Ok(JobOutcome::Done(()))
+    #[test]
+    fn invalid_backoff_configuration_is_rejected() {
+        for factor in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 0.5] {
+            let backoff = Backoff {
+                factor,
+                ..Backoff::default()
+            };
+            let error = backoff.validate().unwrap_err();
+            assert!(matches!(error, JobScheduleError::InvalidFactor { .. }));
         }
     }
 
-    fn from_millis(millis: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp_millis(millis).expect("valid timestamp")
-    }
-
-    /// Seeds a job exactly as the enqueue flush does: the `Enqueued` event at
-    /// sequence 1 plus the seed `job_queue_projection` row (version 1, pending, no lease).
-    async fn enqueue(pool: &SqlitePool, run_at_ms: i64) -> JobId {
-        let request = EnqueueRequest {
-            job_id: JobId::new(),
-            kind: JobKind::new(TestJob::KIND),
-            payload: serde_json::to_value(TestJob { n: 1 }).unwrap(),
-            run_at_ms,
+    #[test]
+    fn durable_backoff_preserves_the_bounded_index_and_cap() {
+        let backoff = Backoff {
+            base: Duration::from_secs(1),
+            factor: 2.0,
+            cap: Duration::from_secs(34_359_738_360),
         };
-        let event = enqueued_event(&request).unwrap();
-        let payload = pending_seed_payload(&request).unwrap();
-        let mut connection = pool.acquire().await.unwrap();
-        insert_serialized_events_batch(&mut connection, "events", std::slice::from_ref(&event))
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO job_queue_projection (view_id, version, payload, lease_until) VALUES (?1, 1, ?2, NULL)",
-        )
-        .bind(request.job_id.to_string())
-        .bind(&payload)
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        request.job_id
+        for (attempt, seconds) in [
+            (0, 1),
+            (1, 2),
+            (32, 4_294_967_296),
+            (33, 4_294_967_296),
+            (u32::MAX, 4_294_967_296),
+        ] {
+            assert_eq!(
+                backoff.delay(attempt).unwrap(),
+                Duration::from_secs(seconds)
+            );
+        }
+        let custom = Backoff {
+            base: Duration::from_secs(2),
+            factor: 1.5,
+            cap: Duration::from_secs(6),
+        };
+        for (attempt, millis) in [(0, 2_000), (1, 3_000), (2, 4_500), (3, 6_000), (32, 6_000)] {
+            assert_eq!(
+                custom.delay(attempt).unwrap(),
+                Duration::from_millis(millis)
+            );
+        }
     }
 
-    async fn claim(
-        backend: &SqliteBackend,
-        job_id: &JobId,
-        worker: &str,
-        now_ms: i64,
-        max_claims: u32,
-    ) -> ClaimOutcome<WonClaim> {
-        let worker = WorkerId::new(worker);
-        let view_id = job_id.to_string();
-        backend
-            .claim(&view_id, |read| {
-                plan_claim(&view_id, read, &worker, now_ms, 30_000, max_claims)
-            })
-            .await
-            .unwrap()
+    #[test]
+    fn durable_backoff_allows_scaling_that_reaches_the_cap_without_overflow() {
+        let backoff = Backoff {
+            base: Duration::from_nanos(1),
+            factor: 1e20,
+            cap: Duration::from_secs(1),
+        };
+        backoff.validate().unwrap();
+        assert_eq!(backoff.delay(0).unwrap(), Duration::from_nanos(1));
+        assert_eq!(backoff.delay(1).unwrap(), Duration::from_secs(1));
+        assert_eq!(backoff.delay(32).unwrap(), Duration::from_secs(1));
     }
 
-    async fn event_types(pool: &SqlitePool, job_id: &JobId) -> Vec<String> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT event_type FROM events WHERE aggregate_type = 'job' AND aggregate_id = ?1 \
-             ORDER BY sequence",
-        )
-        .bind(job_id.to_string())
-        .fetch_all(pool)
-        .await
-        .unwrap()
+    #[test]
+    fn a_unit_backoff_factor_preserves_the_exact_delay() {
+        let base = Duration::from_millis(65_536_003);
+        let backoff = Backoff {
+            base,
+            factor: 1.0,
+            cap: Duration::from_hours(24),
+        };
+        for attempt in [0, 1, 32, u32::MAX] {
+            assert_eq!(backoff.delay(attempt).unwrap(), base);
+        }
     }
 
-    async fn queue_status(pool: &SqlitePool, job_id: &JobId) -> Option<String> {
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT status FROM job_queue_projection WHERE view_id = ?1",
-        )
-        .bind(job_id.to_string())
-        .fetch_optional(pool)
-        .await
-        .unwrap()
-        .flatten()
-    }
-
-    #[tokio::test]
-    async fn claim_appends_claimed_and_marks_the_row() {
-        let pool = create_test_pool().await.unwrap();
-        let backend = SqliteBackend::new(pool.clone());
-        let job_id = enqueue(&pool, 1000).await;
-
-        let outcome = claim(&backend, &job_id, "w1", 1000, 50).await;
-
+    #[test]
+    fn durable_backoff_validates_ranges_and_normalizes_the_initial_cap() {
+        let unrepresentable = Backoff {
+            cap: Duration::MAX,
+            ..Backoff::default()
+        };
         assert!(matches!(
-            outcome,
-            ClaimOutcome::Won(WonClaim { claim_seq: 2, .. })
+            unrepresentable.validate().unwrap_err(),
+            JobScheduleError::DelayOutOfRange(_)
         ));
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed"]
-        );
-        assert_eq!(
-            queue_status(&pool, &job_id).await.as_deref(),
-            Some("claimed")
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_facade_polls_claims_renews_and_acknowledges_the_job_stream() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = enqueue(&pool, 1_000).await;
-
-        let candidates = runtime.poll_jobs(TestJob::KIND, 1_000, 10).await.unwrap();
-        assert_eq!(candidates, vec![job_id.to_string()]);
-
-        let JobClaimResult::Claimed(claim) = runtime
-            .claim_job(job_id, "ffi-worker", 1_000, 30_000, 50)
-            .await
-            .unwrap()
-        else {
-            panic!("expected the facade to win the claim");
+        let overflow = Backoff {
+            base: Duration::from_nanos(1),
+            factor: f32::MAX,
+            cap: Duration::from_secs(2),
         };
-        assert_eq!(claim.handle.job_id(), job_id);
-        assert_eq!(claim.handle.attempt(), 0);
-        assert!(claim.handle.is_first_execution());
-        assert_eq!(claim.payload, serde_json::json!({ "n": 1 }));
-
-        assert_eq!(
-            runtime.renew_job(&claim.handle, 60_000).await.unwrap(),
-            JobLeaseResult::Held
-        );
-        assert_eq!(
-            runtime.acknowledge_job(claim.handle).await.unwrap(),
-            JobSettlementResult::Applied
-        );
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed", "JobSucceeded"]
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_facade_enqueues_an_erased_payload_through_the_job_stream() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = JobId::new();
-
-        runtime
-            .enqueue_job_payload(
-                job_id,
-                TestJob::KIND.to_string(),
-                serde_json::json!([0, 1, 255]),
-                1_000,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
-        assert_eq!(
-            runtime.poll_jobs(TestJob::KIND, 1_000, 10).await.unwrap(),
-            [job_id.to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_facade_rejects_an_out_of_range_enqueue_instant() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = JobId::new();
-
-        let error = runtime
-            .enqueue_job_payload(
-                job_id,
-                TestJob::KIND.to_string(),
-                serde_json::json!({ "n": 1 }),
-                i64::MAX,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, JobRuntimeError::InvalidInstant(i64::MAX)));
-        assert!(event_types(&pool, &job_id).await.is_empty());
-        assert!(
-            runtime
-                .poll_jobs(TestJob::KIND, i64::MAX, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_facade_rejects_a_lease_instant_outside_chronos_range() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = enqueue(&pool, 1_000).await;
-
-        // The sum stays inside i64 but far outside chrono's range, so only the
-        // representability check catches it.
-        let error = runtime
-            .claim_job(job_id, "ffi-worker", i64::MAX - 1, 1, 50)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, JobRuntimeError::InvalidClaimPolicy));
-        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
-        // The candidate is untouched and still runnable, which is exactly why
-        // reporting this as an ordinary skip would strand the caller.
-        assert_eq!(
-            runtime.poll_jobs(TestJob::KIND, 1_000, 10).await.unwrap(),
-            [job_id.to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_facade_reports_a_refused_settlement_as_terminal() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = enqueue(&pool, 1_000).await;
-
-        let JobClaimResult::Claimed(claimed) = runtime
-            .claim_job(job_id, "ffi-worker", 1_000, 30_000, 50)
-            .await
-            .unwrap()
-        else {
-            panic!("expected the facade to win the claim");
-        };
-
-        // A stray `Enqueued` on an already-claimed stream is an event the job
-        // entity cannot evolve, so replay lands the lifecycle in `Failed` and
-        // the aggregate refuses every later command.
-        let stray = JobEvent::Enqueued {
-            kind: JobKind::new(TestJob::KIND),
-            payload: serde_json::json!({ "n": 1 }),
-            run_at: from_millis(1_000),
-        }
-        .serialized(&job_id.to_string(), 3)
-        .unwrap();
-        let mut connection = pool.acquire().await.unwrap();
-        insert_serialized_events_batch(&mut connection, "events", std::slice::from_ref(&stray))
-            .await
-            .unwrap();
-        drop(connection);
-
-        let error = runtime.acknowledge_job(claimed.handle).await.unwrap_err();
-
         assert!(matches!(
-            error,
-            JobRuntimeError::SettlementRefused { job_id: refused, .. } if refused == job_id
+            overflow.validate().unwrap_err(),
+            JobScheduleError::BackoffScale(_)
         ));
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed", "JobEnqueued"]
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_facade_retries_defers_and_dead_letters_through_job_commands() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = enqueue(&pool, 1_000).await;
-
-        let JobClaimResult::Claimed(first) = runtime
-            .claim_job(job_id, "ffi-worker", 1_000, 30_000, 50)
-            .await
-            .unwrap()
-        else {
-            panic!("expected first claim");
+        let capped = Backoff {
+            base: Duration::from_secs(5),
+            cap: Duration::from_secs(1),
+            ..Backoff::default()
         };
-        assert_eq!(
-            runtime
-                .retry_job(first.handle, 2_000, "transient".to_string())
-                .await
-                .unwrap(),
-            JobSettlementResult::Applied
-        );
-
-        let JobClaimResult::Claimed(second) = runtime
-            .claim_job(job_id, "ffi-worker", 2_000, 30_000, 50)
-            .await
-            .unwrap()
-        else {
-            panic!("expected retry claim");
+        assert_eq!(capped.delay(0).unwrap(), Duration::from_secs(1));
+        assert_eq!(capped.delay(1).unwrap(), Duration::from_secs(1));
+        let zero = Backoff {
+            base: Duration::ZERO,
+            factor: f32::MAX,
+            cap: Duration::from_secs(1),
         };
-        assert_eq!(second.handle.attempt(), 1);
-        assert_eq!(
-            runtime.defer_job(second.handle, 3_000).await.unwrap(),
-            JobSettlementResult::Applied
-        );
-
-        let JobClaimResult::Claimed(third) = runtime
-            .claim_job(job_id, "ffi-worker", 3_000, 30_000, 50)
-            .await
-            .unwrap()
-        else {
-            panic!("expected deferred claim");
-        };
-        assert_eq!(third.handle.attempt(), 1);
-        assert_eq!(
-            runtime
-                .dead_letter_job(third.handle, DeadReason::Rejected, "terminal".to_string())
-                .await
-                .unwrap(),
-            JobSettlementResult::Applied
-        );
-
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            [
-                "JobEnqueued",
-                "JobClaimed",
-                "JobRetryScheduled",
-                "JobClaimed",
-                "JobRescheduled",
-                "JobClaimed",
-                "JobDead",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn perform_receives_the_claimed_jobs_identity() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
-        let now_ms = Utc::now().timestamp_millis() + 1_000;
-
-        let outcome = runtime
-            .claim_job(job_id, "w1", now_ms, 30_000, 50)
-            .await
-            .unwrap();
-        let JobClaimResult::Claimed(claimed) = outcome else {
-            panic!("expected to win the claim");
-        };
-        let task =
-            build_task::<TestJob>(claimed, &JobWorkerConfig::default()).expect("payload decodes");
-
-        // The context the handler extracts carries the claimed job's durable
-        // identity: the stable job id and a zero attempt on the first run.
-        let ctx = JobContext::from_request(&task).await.unwrap();
-        assert_eq!(ctx.job_id(), job_id);
-        assert_eq!(ctx.attempt(), 0);
-
-        // A failed attempt bumps the durable attempt count, and the re-claimed
-        // task's context reports it.
-        ack(
-            &runtime.jobs,
-            &JobWorkerConfig::default(),
-            &Clock::system(),
-            &ctx,
-            AckPlan::Failed("boom".to_string()),
-        )
-        .await;
-
-        let retry_ms = now_ms + 3_600_000;
-        let JobClaimResult::Claimed(reclaimed) = runtime
-            .claim_job(job_id, "w2", retry_ms, 30_000, 50)
-            .await
-            .unwrap()
-        else {
-            panic!("expected to win the retry claim");
-        };
-        let retry_task =
-            build_task::<TestJob>(reclaimed, &JobWorkerConfig::default()).expect("payload decodes");
-        let retry_ctx = JobContext::from_request(&retry_task).await.unwrap();
-        assert_eq!(retry_ctx.job_id(), job_id);
-        assert_eq!(retry_ctx.attempt(), 1);
+        assert_eq!(zero.delay(u32::MAX).unwrap(), Duration::ZERO);
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -1606,12 +1515,13 @@ mod tests {
             Label::new("fallible")
         }
 
-        async fn perform(
+        fn perform(
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<JobOutcome<()>, JobFailure<TestPerformError>> {
-            Err(JobFailure::Terminal(TestPerformError))
+        ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<TestPerformError>>> + Send
+        {
+            ready(Err(JobFailure::Terminal(TestPerformError)))
         }
     }
 
@@ -1639,484 +1549,5 @@ mod tests {
             ack_plan::<FallibleJob>(&unclassified),
             AckPlan::Failed(_)
         ));
-    }
-
-    #[tokio::test]
-    async fn terminal_failure_dead_letters_without_retries() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let backend = SqliteBackend::new(pool.clone());
-        let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
-        let now_ms = Utc::now().timestamp_millis() + 1_000;
-
-        let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
-            panic!("expected to win the claim");
-        };
-        let ctx = JobContext {
-            job_id,
-            claim_seq: won.claim_seq,
-            claim_id: won.claim_id,
-            attempt: won.attempt,
-            max_attempts: 5,
-            ..JobContext::default()
-        };
-
-        // A terminal failure on the FIRST attempt (max_attempts = 5) must kill
-        // the job immediately instead of scheduling a retry.
-        ack(
-            &runtime.jobs,
-            &JobWorkerConfig::default(),
-            &Clock::system(),
-            &ctx,
-            AckPlan::Rejected("external system said no".to_string()),
-        )
-        .await;
-
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed", "JobDead"]
-        );
-        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("dead"));
-
-        let payload: String =
-            sqlx::query_scalar("SELECT payload FROM job_queue_projection WHERE view_id = ?1")
-                .bind(job_id.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        let state: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(state["Live"]["Dead"]["reason"], "Rejected");
-    }
-
-    #[tokio::test]
-    async fn standalone_enqueue_seeds_a_claimable_pending_job() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-
-        let job_id = runtime.enqueue(TestJob { n: 7 }).await.unwrap();
-
-        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
-        assert_eq!(
-            queue_status(&pool, &job_id).await.as_deref(),
-            Some("pending")
-        );
-
-        // A standalone-enqueued job is claimable like any handler-pushed one.
-        let backend = SqliteBackend::new(pool.clone());
-        let now_ms = Utc::now().timestamp_millis() + 1_000;
-        let outcome = claim(&backend, &job_id, "w1", now_ms, 50).await;
-        assert!(matches!(outcome, ClaimOutcome::Won(_)));
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed"]
-        );
-    }
-
-    #[tokio::test]
-    async fn job_queue_rebuilds_from_the_job_event_stream() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = runtime.enqueue(TestJob { n: 7 }).await.unwrap();
-
-        sqlx::query(
-            r"
-            DELETE FROM job_queue_projection
-            WHERE view_id = ?1
-            ",
-        )
-        .bind(job_id.to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(queue_status(&pool, &job_id).await, None);
-
-        let _rebuilt = JobRuntime::build(pool.clone()).await.unwrap();
-
-        assert_eq!(event_types(&pool, &job_id).await, ["JobEnqueued"]);
-        assert_eq!(
-            queue_status(&pool, &job_id).await.as_deref(),
-            Some("pending")
-        );
-    }
-
-    #[tokio::test]
-    async fn standalone_enqueue_with_delay_is_not_runnable_until_run_at() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-
-        let job_id = runtime
-            .enqueue_with_delay(TestJob { n: 1 }, std::time::Duration::from_hours(1))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            queue_status(&pool, &job_id).await.as_deref(),
-            Some("pending")
-        );
-
-        // run_at is an hour out, so a poll at "now" finds nothing runnable.
-        let projection = Projection::<JobState>::sqlite(pool.clone());
-        let now_ms = Utc::now().timestamp_millis();
-        let found = projection
-            .find(
-                &poll_predicate(TestJob::KIND, now_ms),
-                Some(&poll_order()),
-                16,
-            )
-            .await
-            .unwrap();
-        assert!(
-            found.is_empty(),
-            "a delayed standalone enqueue must not be runnable before its run_at"
-        );
-    }
-
-    #[tokio::test]
-    async fn enqueue_rejects_a_reused_job_id() {
-        let pool = create_test_pool().await.unwrap();
-        let backend = SqliteBackend::new(pool.clone());
-
-        let request = EnqueueRequest {
-            job_id: JobId::new(),
-            kind: JobKind::new(TestJob::KIND),
-            payload: serde_json::to_value(TestJob { n: 1 }).unwrap(),
-            run_at_ms: 1000,
-        };
-        let payload = pending_seed_payload(&request).unwrap();
-
-        backend
-            .enqueue(enqueued_event(&request).unwrap(), payload.clone())
-            .await
-            .unwrap();
-        let error = backend
-            .enqueue(enqueued_event(&request).unwrap(), payload)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            crate::job_sqlite::SqliteJobError::DuplicateEnqueue { job_id } if job_id == request.job_id.to_string()
-        ));
-    }
-
-    #[tokio::test]
-    async fn deferred_job_reschedules_to_pending_and_resets_the_claim_budget() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let backend = SqliteBackend::new(pool.clone());
-
-        let job_id = runtime.enqueue(TestJob { n: 1 }).await.unwrap();
-        let now_ms = Utc::now().timestamp_millis() + 1_000;
-
-        let ClaimOutcome::Won(won) = claim(&backend, &job_id, "w1", now_ms, 50).await else {
-            panic!("expected to win the claim");
-        };
-        let ctx = JobContext {
-            job_id,
-            claim_seq: won.claim_seq,
-            claim_id: won.claim_id,
-            attempt: won.attempt,
-            max_attempts: 5,
-            ..JobContext::default()
-        };
-
-        ack(
-            &runtime.jobs,
-            &JobWorkerConfig::default(),
-            &Clock::system(),
-            &ctx,
-            AckPlan::Deferred(Duration::from_hours(1)),
-        )
-        .await;
-
-        // A defer records Rescheduled (not Succeeded) and returns the row to pending.
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed", "JobRescheduled"]
-        );
-        assert_eq!(
-            queue_status(&pool, &job_id).await.as_deref(),
-            Some("pending")
-        );
-
-        // The claim budget reset to 0 so a poller may defer indefinitely.
-        let payload: String =
-            sqlx::query_scalar("SELECT payload FROM job_queue_projection WHERE view_id = ?1")
-                .bind(job_id.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        let state: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(state["Live"]["Pending"]["claims"], 0);
-
-        // run_at is an hour out, so the deferred job is not runnable yet.
-        let projection = Projection::<JobState>::sqlite(pool.clone());
-        let found = projection
-            .find(
-                &poll_predicate(TestJob::KIND, Utc::now().timestamp_millis()),
-                Some(&poll_order()),
-                16,
-            )
-            .await
-            .unwrap();
-        assert!(
-            found.is_empty(),
-            "a deferred job must not be runnable before its new run_at"
-        );
-    }
-
-    #[tokio::test]
-    async fn second_sequential_claim_is_not_runnable() {
-        let pool = create_test_pool().await.unwrap();
-        let backend = SqliteBackend::new(pool.clone());
-        let job_id = enqueue(&pool, 1000).await;
-
-        let first = claim(&backend, &job_id, "w1", 1000, 50).await;
-        let second = claim(&backend, &job_id, "w2", 1000, 50).await;
-
-        assert!(matches!(first, ClaimOutcome::Won(_)));
-        assert!(matches!(second, ClaimOutcome::Skip));
-        let claimed = event_types(&pool, &job_id)
-            .await
-            .iter()
-            .filter(|event| *event == "JobClaimed")
-            .count();
-        assert_eq!(claimed, 1);
-    }
-
-    #[tokio::test]
-    async fn claimed_job_is_not_runnable_before_its_lease_expires() {
-        let pool = create_test_pool().await.unwrap();
-        let backend = SqliteBackend::new(pool.clone());
-        let job_id = enqueue(&pool, 1000).await;
-        claim(&backend, &job_id, "w1", 1000, 50).await;
-
-        let projection = Projection::<JobState>::sqlite(pool.clone());
-        let found = projection
-            .find(
-                &poll_predicate(TestJob::KIND, 1000 + 5_000),
-                Some(&poll_order()),
-                16,
-            )
-            .await
-            .unwrap();
-        assert!(found.is_empty());
-    }
-
-    #[tokio::test]
-    async fn expired_lease_is_reclaimable_without_counting_an_attempt() {
-        let pool = create_test_pool().await.unwrap();
-        let backend = SqliteBackend::new(pool.clone());
-        let job_id = enqueue(&pool, 1000).await;
-        claim(&backend, &job_id, "w1", 1000, 50).await;
-
-        let later = 1000 + 31_000;
-        let outcome = claim(&backend, &job_id, "w2", later, 50).await;
-
-        assert!(matches!(
-            outcome,
-            ClaimOutcome::Won(WonClaim {
-                claim_seq: 3,
-                attempt: 0,
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn ack_retry_then_kill_via_commands() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = enqueue(&pool, 1000).await;
-
-        let ClaimOutcome::Won(won) = claim(&runtime.backend, &job_id, "w1", 1000, 50).await else {
-            panic!("expected claim");
-        };
-        runtime
-            .jobs
-            .send(
-                &job_id,
-                JobCommand::RetrySchedule {
-                    claim_id: won.claim_id,
-                    run_at: from_millis(2000),
-                    attempt: 1,
-                    error: "boom".to_string(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed", "JobRetryScheduled"]
-        );
-        assert_eq!(
-            queue_status(&pool, &job_id).await.as_deref(),
-            Some("pending")
-        );
-
-        // Re-claim the now-pending job and kill it.
-        let ClaimOutcome::Won(won) = claim(&runtime.backend, &job_id, "w1", 2000, 50).await else {
-            panic!("expected re-claim");
-        };
-        runtime
-            .jobs
-            .send(
-                &job_id,
-                JobCommand::Kill {
-                    claim_id: won.claim_id,
-                    reason: DeadReason::RetriesExhausted,
-                    error: "boom".to_string(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            [
-                "JobEnqueued",
-                "JobClaimed",
-                "JobRetryScheduled",
-                "JobClaimed",
-                "JobDead"
-            ]
-        );
-        // Terminal rows are retained (status 'dead'), not deleted.
-        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("dead"));
-    }
-
-    #[tokio::test]
-    async fn ack_is_fenced_when_a_reclaimer_holds_the_job() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = enqueue(&pool, 1000).await;
-
-        // w1 claims.
-        let ClaimOutcome::Won(stale) = claim(&runtime.backend, &job_id, "w1", 1000, 50).await
-        else {
-            panic!("expected claim");
-        };
-        // The lease expires and w2 re-claims, minting a new claim_id.
-        let ClaimOutcome::Won(_) = claim(&runtime.backend, &job_id, "w2", 1000 + 31_000, 50).await
-        else {
-            panic!("expected re-claim");
-        };
-
-        // w1's ack carries its stale claim_id -> fenced, no event written.
-        let fenced = runtime
-            .jobs
-            .send(
-                &job_id,
-                JobCommand::Succeed {
-                    claim_id: stale.claim_id,
-                },
-            )
-            .await;
-        assert!(matches!(
-            fenced,
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                JobError::Fenced
-            )))
-        ));
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed", "JobClaimed"]
-        );
-    }
-
-    #[tokio::test]
-    async fn facade_settlement_is_fenced_when_a_reclaimer_holds_the_job() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = enqueue(&pool, 1_000).await;
-
-        let outcome = runtime
-            .claim_job(job_id, "w1", 1_000, 30_000, 50)
-            .await
-            .unwrap();
-        let JobClaimResult::Claimed(stale) = outcome else {
-            panic!("expected the first claim to win");
-        };
-        let JobClaimResult::Claimed(_) = runtime
-            .claim_job(job_id, "w2", 1_000 + 31_000, 30_000, 50)
-            .await
-            .unwrap()
-        else {
-            panic!("expected the expired lease to be re-claimable");
-        };
-
-        assert_eq!(
-            runtime.acknowledge_job(stale.handle).await.unwrap(),
-            JobSettlementResult::Fenced
-        );
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed", "JobClaimed"]
-        );
-    }
-
-    #[tokio::test]
-    async fn the_native_worker_adapter_claims_through_the_shared_facade() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool.clone()).await.unwrap();
-        let job_id = enqueue(&pool, 1_000).await;
-        let worker = EventStoreBackend::<TestJob>::new(
-            runtime,
-            "native-worker",
-            JobWorkerConfig::default(),
-            Clock::system(),
-        );
-
-        let outcome = worker.claim_one(job_id, 1_000).await.unwrap();
-
-        let JobClaimResult::Claimed(claimed) = outcome else {
-            panic!("expected the native adapter to win the claim");
-        };
-
-        assert_eq!(claimed.handle.job_id(), job_id);
-        assert_eq!(claimed.handle.attempt(), 0);
-        assert_eq!(
-            event_types(&pool, &job_id).await,
-            ["JobEnqueued", "JobClaimed"]
-        );
-    }
-
-    #[tokio::test]
-    async fn claim_budget_dead_letters_a_crash_loop() {
-        let pool = create_test_pool().await.unwrap();
-        let backend = SqliteBackend::new(pool.clone());
-        let job_id = enqueue(&pool, 1000).await;
-
-        // max_claims = 2: claim twice (advancing past each lease), the third
-        // claim exhausts the budget and dead-letters as abandoned.
-        let mut now = 1000;
-        for _ in 0..2 {
-            let outcome = claim(&backend, &job_id, "w1", now, 2).await;
-            assert!(matches!(outcome, ClaimOutcome::Won(_)));
-            now += 31_000;
-        }
-
-        let outcome = claim(&backend, &job_id, "w1", now, 2).await;
-        assert!(matches!(outcome, ClaimOutcome::Abandoned));
-        assert_eq!(queue_status(&pool, &job_id).await.as_deref(), Some("dead"));
-        assert!(
-            event_types(&pool, &job_id)
-                .await
-                .contains(&"JobDead".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn build_supervised_worker_wires_a_monitor() {
-        let pool = create_test_pool().await.unwrap();
-        let runtime = JobRuntime::build(pool).await.unwrap();
-        // Build (but do not run) a supervised monitor: this type-checks the whole
-        // worker wiring -- EventStoreBackend + its claim/ack middleware +
-        // WorkerBuilder + run_job + Monitor::register's bounds all line up.
-        let _monitor = crate::build_supervised_worker!(
-            runtime,
-            JobWorkerConfig::default(),
-            Clock::system(),
-            { TestJob => () }
-        );
     }
 }
