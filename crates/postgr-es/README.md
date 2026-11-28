@@ -164,12 +164,27 @@ leaves that column unset. The deadline recorded in a claim event is audit data,
 not a lease that replay can restore. A failed or cancelled recovery does not
 publish a partial queue or advance the schema registry.
 
+### Job ownership
+
+`PostgresBackend` implements `EventBackend`. A claim locks the job's queue row,
+reads its current lease, and lets the library decide whether to claim, skip, or
+abandon the job. The claim event, queue version, and lease commit in one
+transaction. An abandoned job records a terminal event and clears the lease. The
+claim budget is separate from the job's failure-attempt counter.
+
+Renewal changes only the lease, in Unix milliseconds. It requires a claimed row
+whose version matches the claim event sequence. Once a reclaim or settlement
+advances the row, the old sequence cannot renew it. A lease past its deadline is
+eligible for reclaim; the deadline alone does not change the sequence that
+fences renewal.
+
 ## Migrations
 
 Use `PostgresBackend::bootstrap_persistence` to apply the library migrations
-from a pool. It closes its migration connection on drop, so failure or
-cancellation cannot return a connection holding the migration advisory lock to
-the pool.
+from a pool. Bootstrap failures return `PostgresBackendError::Migration`, which
+retains the underlying SQLx migration error. Bootstrap closes its migration
+connection on drop, so failure or cancellation cannot return a connection
+holding the migration advisory lock to the pool.
 
 Apply the complete migration set from this crate's `migrations/` directory, as
 well as your application's migrations. If one application migrator includes both

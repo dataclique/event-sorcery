@@ -22,6 +22,37 @@ use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
 use crate::reactor::Reactor;
 
+/// Runs the library claim planner for adapter conformance tests.
+///
+/// Times are Unix milliseconds for `now_ms` and a duration for `lease_ms`.
+/// A winning decision carries its event sequence, not the private job state.
+pub fn plan_test_claim(
+    job_id: &str,
+    read: Option<crate::ClaimRead>,
+    now_ms: i64,
+    lease_ms: i64,
+    max_claims: u32,
+) -> crate::ClaimDecision<i64> {
+    use crate::ClaimDecision::{Abandon, Claim, Skip};
+
+    let worker = crate::job::WorkerId::new("conformance");
+    match crate::job::plan_claim(job_id, read, &worker, now_ms, lease_ms, max_claims) {
+        Claim {
+            event,
+            payload,
+            lease_until_ms,
+            won,
+        } => Claim {
+            event,
+            payload,
+            lease_until_ms,
+            won: won.claim_seq,
+        },
+        Abandon { event, payload } => Abandon { event, payload },
+        Skip => Skip,
+    }
+}
+
 /// Failures from the job queue conformance helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveredJobQueryError {
