@@ -2247,6 +2247,79 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn recovered_success_rejects_renewal_even_at_the_current_version(pool: PgPool) {
+        use event_sorcery::ClaimOutcome::Won;
+        use event_sorcery::LeaseRenewal::Lost;
+
+        MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let backend = PostgresBackend { pool: pool.clone() };
+        let job_id = JobId::new();
+        let job_key = job_id.to_string();
+        let run_at = 1_700_000_000_000_i64;
+        let lease_ms = 1_000;
+        repository
+            .enqueue(JobSeed::new(job_id, "standalone", json!({}), run_at))
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_job_queue_row(&backend, &job_id).await.unwrap(),
+            Some(json!({"Pending": {"kind": "standalone", "payload": {},
+                "run_at": run_at, "attempt": 0, "claims": 0}}))
+        );
+        let Won(claim_sequence) = repository
+            .claim_job(&job_key, |read| {
+                plan_test_claim(&job_key, read, run_at, lease_ms, 2)
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected the pending job to be claimed");
+        };
+        assert_eq!(claim_sequence, 2);
+
+        // Seed the committed success for native replay; worker settlement is tested separately.
+        let success = SerializedEvent {
+            aggregate_id: job_key.clone(),
+            sequence: 3,
+            aggregate_type: "job".to_owned(),
+            event_type: "JobSucceeded".to_owned(),
+            event_version: "1.0".to_owned(),
+            payload: json!("Succeeded"),
+            metadata: json!({}),
+        };
+        let mut transaction = pool.begin().await.unwrap();
+        repository
+            .official()
+            .append_serialized_events_in(&mut transaction, "job", &[success])
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            recover_job_queue_row(&backend, &job_id).await.unwrap(),
+            Some(json!({"Done": {"kind": "standalone"}}))
+        );
+
+        for sequence in [claim_sequence, 3] {
+            assert!(matches!(
+                repository
+                    .renew_job(&job_key, sequence, run_at + 2 * lease_ms)
+                    .await
+                    .unwrap(),
+                Lost
+            ));
+        }
+        let row: (i64, String, Option<i64>) = sqlx::query_as(
+            "SELECT version, status, lease_until FROM job_queue_projection WHERE view_id = $1",
+        )
+        .bind(&job_key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (3, "done".to_owned(), Some(run_at + lease_ms)));
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn queue_recovery_rolls_back_when_schema_registration_fails(pool: PgPool) {
         MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
