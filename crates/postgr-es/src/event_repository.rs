@@ -7,8 +7,8 @@ use cqrs_es::persist::{
 use serde_json::Value;
 
 use event_sorcery::{
-    ClaimDecision, ClaimOutcome, ClaimRead, CommitRequest, EngineError, JobSeed, SnapshotUpdate,
-    StreamIdentity, validate_expected_version,
+    ClaimDecision, ClaimOutcome, ClaimRead, CommitRequest, EngineError, JobSeed, LeaseRenewal,
+    SnapshotUpdate, StreamIdentity, validate_expected_version,
 };
 
 /// Pool-backed PostgreSQL repository for the CQRS persistence contract.
@@ -167,6 +167,28 @@ impl PostgresEventRepository {
         }
         transaction.commit().await?;
         Ok(outcome)
+    }
+
+    pub(crate) async fn renew_job(
+        &self,
+        job_id: &str,
+        claim_seq: i64,
+        new_lease_until_ms: i64,
+    ) -> Result<LeaseRenewal, sqlx::Error> {
+        let updated = sqlx::query(
+            "UPDATE job_queue_projection SET lease_until = $3
+             WHERE view_id = $1 AND version = $2 AND status = 'claimed'",
+        )
+        .bind(job_id)
+        .bind(claim_seq)
+        .bind(new_lease_until_ms)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() == 0 {
+            Ok(LeaseRenewal::Lost)
+        } else {
+            Ok(LeaseRenewal::Held)
+        }
     }
 
     /// Atomically persists a standalone job's event and queue seed.
@@ -1734,6 +1756,16 @@ mod tests {
             _ => None,
         };
         assert_eq!(winner, Some(lease_until_ms));
+        let renewed_deadline = lease_until_ms + 10_000;
+        use event_sorcery::LeaseRenewal::{Held, Lost};
+        assert!(matches!(
+            first.renew_job(job_key, 2, renewed_deadline).await.unwrap(),
+            Held
+        ));
+        assert!(matches!(
+            second.renew_job(job_key, 1, lease_until_ms).await.unwrap(),
+            Lost
+        ));
         let row: (i64, String, i64) = sqlx::query_as(
             "SELECT version, status, lease_until FROM job_queue_projection WHERE view_id = $1",
         )
@@ -1741,7 +1773,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(row, (2, "claimed".to_owned(), lease_until_ms));
+        assert_eq!(row, (2, "claimed".to_owned(), renewed_deadline));
         let claims: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT sequence, (payload #>> '{Claimed,lease_until}')::BIGINT FROM events
              WHERE aggregate_type = 'job' AND aggregate_id = $1 AND event_type = 'JobClaimed'",
