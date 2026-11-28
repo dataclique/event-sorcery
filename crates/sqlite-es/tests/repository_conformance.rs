@@ -32,7 +32,7 @@ mod tests {
     fn creating_native_replay_futures_does_not_start_background_io() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let pool = runtime.block_on(create_test_pool()).unwrap();
-        let backend = SqliteBackend::new(pool.clone());
+        let backend = SqliteBackend { pool: pool.clone() };
         let repository = backend.event_repo(CompactionPolicy::Retain);
 
         drop(repository.stream_events::<TestAggregate>("unpolled"));
