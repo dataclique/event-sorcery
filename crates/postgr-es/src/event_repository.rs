@@ -1437,6 +1437,87 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn queue_replays_a_claim_without_recreating_its_lease(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let job_id = JobId::new();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let backend = PostgresBackend { pool: pool.clone() };
+        let run_at = 1_700_000_000_000_i64;
+        let audit_deadline = run_at + 10_000;
+        let renewed_deadline = run_at + 20_000;
+        let payload = json!({"value": "first"});
+        repository
+            .enqueue(JobSeed::new(job_id, "standalone", payload.clone(), run_at))
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_job_queue_row(&backend, &job_id).await.unwrap(),
+            Some(json!({"Pending": {
+                "kind": "standalone", "payload": payload,
+                "run_at": run_at, "attempt": 0, "claims": 0
+            }}))
+        );
+
+        let claim = SerializedEvent {
+            aggregate_id: job_id.to_string(),
+            sequence: 2,
+            aggregate_type: "job".to_string(),
+            event_type: "JobClaimed".to_string(),
+            event_version: "1.0".to_string(),
+            payload: json!({"Claimed": {
+                "worker": "worker:01HF7YAT000000000000000001",
+                "claim_id": "01HF7YAT000000000000000002",
+                "lease_until": audit_deadline
+            }}),
+            metadata: json!({}),
+        };
+        let mut transaction = pool.begin().await.unwrap();
+        repository
+            .official()
+            .append_serialized_events_in(&mut transaction, "job", &[claim])
+            .await
+            .unwrap();
+        let updated = sqlx::query(
+            "UPDATE job_queue_projection SET lease_until = $2 WHERE view_id = $1 AND version = 1",
+        )
+        .bind(job_id.to_string())
+        .bind(renewed_deadline)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+        transaction.commit().await.unwrap();
+
+        let claimed = json!({"Claimed": {
+            "kind": "standalone", "payload": payload, "run_at": run_at,
+            "worker": "worker:01HF7YAT000000000000000001",
+            "claim_id": "01HF7YAT000000000000000002", "attempt": 0, "claims": 1
+        }});
+        for lease in [Some(renewed_deadline), Some(renewed_deadline), None] {
+            if lease.is_none() {
+                let deleted = sqlx::query("DELETE FROM job_queue_projection WHERE view_id = $1")
+                    .bind(job_id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(deleted.rows_affected(), 1);
+            }
+            assert_eq!(
+                recover_job_queue_row(&backend, &job_id).await.unwrap(),
+                Some(claimed.clone())
+            );
+            let row: (i64, Option<i64>) = sqlx::query_as(
+                "SELECT version, lease_until FROM job_queue_projection WHERE view_id = $1",
+            )
+            .bind(job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row, (2, lease));
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn standalone_enqueue_preserves_first_event_and_queue_row_on_duplicate(pool: PgPool) {
         MIGRATOR.run(&pool).await.unwrap();
         let job_id = JobId::new();
