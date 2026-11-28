@@ -1648,6 +1648,112 @@ mod tests {
 
         verify_claim_cancellation(&pool, &first.pool, &job_key, decide).await;
         verify_competing_claims(&pool, &first, &second, &job_key, lease_until_ms, decide).await;
+        verify_stale_projection_claim(&first, run_at, decide).await;
+    }
+
+    async fn verify_stale_projection_claim(
+        repository: &PostgresEventRepository,
+        run_at: i64,
+        decide: impl Fn(&str, Option<event_sorcery::ClaimRead>) -> event_sorcery::ClaimDecision<i64>
+        + Sync,
+    ) {
+        use event_sorcery::ClaimDecision::Claim;
+
+        let job_id = JobId::new();
+        let job_key = job_id.to_string();
+        repository
+            .enqueue(JobSeed::new(job_id, "standalone", json!({}), run_at))
+            .await
+            .unwrap();
+
+        let wrong_key = JobId::new().to_string();
+        let wrong_stream = repository
+            .claim_job(&job_key, |read| decide(&wrong_key, read))
+            .await;
+        assert!(matches!(
+            wrong_stream,
+            Err(super::PostgresClaimError::InvalidEvent)
+        ));
+        let skipped_sequence = repository
+            .claim_job(&job_key, |read| {
+                let Claim {
+                    mut event,
+                    payload,
+                    lease_until_ms,
+                    won,
+                } = decide(&job_key, read)
+                else {
+                    panic!("expected pending job to be claimable")
+                };
+                event.sequence = 3;
+                Claim {
+                    event,
+                    payload,
+                    lease_until_ms,
+                    won,
+                }
+            })
+            .await;
+        assert!(matches!(
+            skipped_sequence,
+            Err(super::PostgresClaimError::InvalidEvent)
+        ));
+
+        // The authoritative stream can be ahead of the queue until replay catches up.
+        let mut transaction = repository.pool.begin().await.unwrap();
+        let Claim { event, .. } = decide(
+            &job_key,
+            Some(event_sorcery::ClaimRead {
+                version: 1,
+                payload: sqlx::query_scalar(
+                    "SELECT payload::text FROM job_queue_projection WHERE view_id = $1",
+                )
+                .bind(&job_key)
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap(),
+                lease_until_ms: None,
+            }),
+        ) else {
+            panic!("expected a claim fixture")
+        };
+        repository
+            .official()
+            .append_serialized_events_in(&mut transaction, "job", &[event])
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        let result = repository
+            .claim_job(&job_key, |read| decide(&job_key, read))
+            .await
+            .unwrap();
+        assert!(matches!(result, event_sorcery::ClaimOutcome::Contended));
+        let row: (i64, Option<i64>) = sqlx::query_as(
+            "SELECT version, lease_until FROM job_queue_projection WHERE view_id = $1",
+        )
+        .bind(&job_key)
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (1, None));
+        let sequences: Vec<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1
+             ORDER BY sequence",
+        )
+        .bind(&job_key)
+        .fetch_all(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(sequences, [1, 2]);
+        let stray_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1",
+        )
+        .bind(wrong_key)
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(stray_events, 0);
     }
 
     async fn verify_claim_cancellation(
