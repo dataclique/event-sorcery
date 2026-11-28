@@ -233,20 +233,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::testing::create_test_pool;
+    use crate::testing::{create_test_pool, snapshot_fixture::record};
 
     async fn seed_events(pool: &SqlitePool) {
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
-                                 event_version, payload, metadata)
-             VALUES ('invoice', 'one', 1, 'Issued', '1', '{}', '{}'),
-                    ('invoice', 'one', 2, 'Adjusted', '1', '{}', '{}'),
-                    ('invoice', 'one', 3, 'Adjusted', '1', '{}', '{}'),
-                    ('invoice', 'two', 1, 'Issued', '1', '{}', '{}')",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
+        record::<false>(pool, "one", 3).await;
+        record::<false>(pool, "two", 1).await;
     }
 
     async fn stored(
@@ -380,7 +371,7 @@ mod tests {
                 id,
                 coverage,
                 9,
-                &json!({"id": id}),
+                &json!({"Live": null}),
             )
             .await
             .unwrap();
@@ -415,14 +406,21 @@ mod tests {
             9
         );
 
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
-                                 event_version, payload, metadata)
-             VALUES ('invoice', 'two', 2, 'Adjusted', '1', '{}', '{}')",
+        // Remove the deliberately ahead-of-stream fixture before appending its missing event.
+        discard_snapshot(&pool, "invoice", "two").await.unwrap();
+        record::<false>(&pool, "two", 1).await;
+        let mut connection = pool.acquire().await.unwrap();
+        write_snapshot(
+            &mut connection,
+            "invoice",
+            "two",
+            2,
+            9,
+            &json!({"Live": null}),
         )
-        .execute(&pool)
         .await
         .unwrap();
+        drop(connection);
         let mut inspected = Vec::new();
         clear_snapshots::<ClearError>(&pool, "invoice", |id, covered, retained| {
             inspected.push((id, covered, retained));

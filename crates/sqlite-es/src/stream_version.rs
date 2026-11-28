@@ -49,22 +49,16 @@ mod tests {
     use event_sorcery_core::CompactionPolicy;
 
     use super::*;
-    use crate::{compact_events, testing::create_test_pool, write_snapshot};
+    use crate::testing::{create_test_pool, snapshot_fixture::record};
+    use crate::{compact_events, store_snapshot, write_snapshot};
 
     #[tokio::test]
     async fn version_is_scoped_to_both_parts_of_the_stream_key() {
         let pool = create_test_pool().await.unwrap();
+        record::<false>(&pool, "one", 3).await;
+        record::<false>(&pool, "other", 41).await;
+        record::<true>(&pool, "one", 72).await;
         let mut connection = pool.acquire().await.unwrap();
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
-                                 event_version, payload, metadata)
-             VALUES ('invoice', 'one', 3, 'Issued', '1', '{}', '{}'),
-                    ('invoice', 'other', 41, 'Issued', '1', '{}', '{}'),
-                    ('order', 'one', 72, 'Placed', '1', '{}', '{}')",
-        )
-        .execute(&mut *connection)
-        .await
-        .unwrap();
         write_snapshot(&mut connection, "order", "other", 89, 103, &json!({}))
             .await
             .unwrap();
@@ -88,20 +82,10 @@ mod tests {
     #[tokio::test]
     async fn compacted_prefix_and_retained_tail_both_contribute_to_the_version() {
         let pool = create_test_pool().await.unwrap();
-        let mut connection = pool.acquire().await.unwrap();
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
-                                 event_version, payload, metadata)
-             VALUES ('invoice', 'one', 1, 'Issued', '1', '{}', '{}'),
-                    ('invoice', 'one', 2, 'Adjusted', '1', '{}', '{}')",
-        )
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        write_snapshot(&mut connection, "invoice", "one", 2, 11, &json!({}))
+        record::<false>(&pool, "one", 2).await;
+        store_snapshot(&pool, "invoice", "one", 2, &json!({"Live": null}))
             .await
             .unwrap();
-        drop(connection);
 
         assert_eq!(
             compact_events(&pool, "invoice", CompactionPolicy::CompactAfterSnapshot)
@@ -116,14 +100,9 @@ mod tests {
                 .unwrap(),
             2,
         );
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type,
-                                 event_version, payload, metadata)
-             VALUES ('invoice', 'one', 3, 'Adjusted', '1', '{}', '{}')",
-        )
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
+        transaction.rollback().await.unwrap();
+        record::<false>(&pool, "one", 1).await;
+        let mut transaction = pool.begin().await.unwrap();
         assert_eq!(
             committed_stream_version(&mut *transaction, "invoice", "one")
                 .await
@@ -137,7 +116,7 @@ mod tests {
             committed_stream_version(&mut *connection, "invoice", "one")
                 .await
                 .unwrap(),
-            2,
+            3,
         );
     }
 }
