@@ -164,8 +164,8 @@ pub use schema_registry::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use testing::{
-    ReactorHarness, SpyReactor, TestHarness, TestResult, TestStore, buffer_pending_job,
-    find_recovered_jobs, recover_job_queue_row, replay, with_pending_jobs,
+    ReactorHarness, RecoveredJobQueryError, SpyReactor, TestHarness, TestResult, TestStore,
+    buffer_pending_job, find_recovered_jobs, recover_job_queue_row, replay, with_pending_jobs,
 };
 pub use view_backend::{NativeProjectionBackend, ViewBackend, ViewUpdateError};
 #[cfg(any(test, feature = "test-support"))]

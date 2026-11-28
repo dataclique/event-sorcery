@@ -22,19 +22,36 @@ use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
 use crate::reactor::Reactor;
 
+/// Failures from the job queue conformance helpers.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveredJobQueryError {
+    /// Native startup could not recover or register the queue projection.
+    #[error(transparent)]
+    Reconcile(#[from] crate::ReconcileError),
+    /// Reading the recovered projection failed; the source retains the original error.
+    #[error("reading the recovered job queue failed: {0}")]
+    Projection(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The recovered job state could not be serialized for an assertion.
+    #[error(transparent)]
+    Serialize(#[from] serde_json::Error),
+}
+
+impl From<crate::ProjectionError<crate::job::JobState>> for RecoveredJobQueryError {
+    fn from(source: crate::ProjectionError<crate::job::JobState>) -> Self {
+        Self::Projection(Box::new(source))
+    }
+}
+
 /// Recovers the canonical job queue and reads one row through the typed projection.
 /// The serialized state is for adapter conformance assertions, not a public job model.
 pub async fn recover_job_queue_row(
     backend: &impl crate::ProjectedStoreBackend,
     job_id: &crate::JobId,
-) -> Result<Option<serde_json::Value>, crate::ReconcileError> {
+) -> Result<Option<serde_json::Value>, RecoveredJobQueryError> {
     let projection = backend
         .reconcile_projected::<crate::job::JobState>()
         .await?;
-    let state = projection
-        .load(job_id)
-        .await
-        .map_err(|source| cqrs_es::persist::PersistenceError::UnknownError(Box::new(source)))?;
+    let state = projection.load(job_id).await?;
 
     Ok(state.map(serde_json::to_value).transpose()?)
 }
@@ -43,14 +60,11 @@ pub async fn recover_job_queue_row(
 pub async fn find_recovered_jobs(
     backend: &impl crate::ProjectedStoreBackend,
     predicate: &indexed_query::Predicate,
-) -> Result<Vec<String>, crate::ReconcileError> {
+) -> Result<Vec<String>, RecoveredJobQueryError> {
     let projection = backend
         .reconcile_projected::<crate::job::JobState>()
         .await?;
-    projection
-        .find(predicate, None, 10)
-        .await
-        .map_err(|source| cqrs_es::persist::PersistenceError::UnknownError(Box::new(source)).into())
+    Ok(projection.find(predicate, None, 10).await?)
 }
 
 struct EncodedTestJob {

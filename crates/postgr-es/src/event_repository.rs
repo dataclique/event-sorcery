@@ -1735,7 +1735,12 @@ mod tests {
         .unwrap();
 
         let error = recover_job_queue_row(&backend, &job_id).await.unwrap_err();
-        assert!(matches!(error, event_sorcery::ReconcileError::Aggregate(_)));
+        assert!(matches!(
+            error,
+            event_sorcery::RecoveredJobQueryError::Reconcile(
+                event_sorcery::ReconcileError::Aggregate(_)
+            )
+        ));
         assert!(
             error
                 .to_string()
