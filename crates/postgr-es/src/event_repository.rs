@@ -7,7 +7,8 @@ use cqrs_es::persist::{
 use serde_json::Value;
 
 use event_sorcery::{
-    CommitRequest, EngineError, JobSeed, SnapshotUpdate, StreamIdentity, validate_expected_version,
+    ClaimDecision, ClaimOutcome, ClaimRead, CommitRequest, EngineError, JobSeed, SnapshotUpdate,
+    StreamIdentity, validate_expected_version,
 };
 
 /// Pool-backed PostgreSQL repository for the CQRS persistence contract.
@@ -89,6 +90,83 @@ impl PostgresEventRepository {
     pub(crate) fn official(&self) -> postgres_es::PostgresEventRepository {
         let repository = postgres_es::PostgresEventRepository::new(self.pool.clone());
         repository.with_tables_and_snapshot_counter("events", "snapshots", "snapshot_version")
+    }
+
+    pub(crate) async fn claim_job<Decide, Won>(
+        &self,
+        job_id: &str,
+        decide: Decide,
+    ) -> Result<ClaimOutcome<Won>, PostgresClaimError>
+    where
+        Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won> + Send,
+        Won: Send,
+    {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, (i64, String, Option<i64>)>(
+            "SELECT version, payload::text, lease_until
+             FROM job_queue_projection WHERE view_id = $1 FOR UPDATE",
+        )
+        .bind(job_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|(version, payload, lease_until_ms)| ClaimRead {
+            version,
+            payload,
+            lease_until_ms,
+        });
+        let previous_version = row.as_ref().map(|row| row.version);
+        let (event, payload, lease, outcome) = match decide(row) {
+            ClaimDecision::Skip => {
+                transaction.rollback().await?;
+                return Ok(ClaimOutcome::Skip);
+            }
+            ClaimDecision::Claim {
+                event,
+                payload,
+                lease_until_ms,
+                won,
+            } => (event, payload, Some(lease_until_ms), ClaimOutcome::Won(won)),
+            ClaimDecision::Abandon { event, payload } => {
+                (event, payload, None, ClaimOutcome::Abandoned)
+            }
+        };
+        let sequence = i64::try_from(event.sequence)?;
+        if event.aggregate_type != "job"
+            || event.aggregate_id != job_id
+            || previous_version.and_then(|version| version.checked_add(1)) != Some(sequence)
+        {
+            return Err(PostgresClaimError::InvalidEvent);
+        }
+
+        let append = self
+            .official()
+            .append_serialized_events_in(&mut transaction, "job", std::slice::from_ref(&event))
+            .await;
+        match append {
+            Ok(_) => {}
+            Err(error) => match adapter_error(error.into()) {
+                PersistenceError::OptimisticLockError => {
+                    transaction.rollback().await?;
+                    return Ok(ClaimOutcome::Contended);
+                }
+                other => return Err(other.into()),
+            },
+        }
+        let updated = sqlx::query(
+            "UPDATE job_queue_projection SET version = $2, payload = $3::jsonb, lease_until = $4
+             WHERE view_id = $1",
+        )
+        .bind(job_id)
+        .bind(sequence)
+        .bind(payload)
+        .bind(lease)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(PostgresClaimError::ProjectionCount);
+        }
+        transaction.commit().await?;
+        Ok(outcome)
     }
 
     /// Atomically persists a standalone job's event and queue seed.
@@ -215,6 +293,20 @@ impl PostgresEventRepository {
         transaction.commit().await.map_err(write_error)?;
         Ok(())
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PostgresClaimError {
+    #[error("claim event must target the next sequence of the locked job stream")]
+    InvalidEvent,
+    #[error("claim must update exactly one projection row")]
+    ProjectionCount,
+    #[error(transparent)]
+    Sql(#[from] sqlx::Error),
+    #[error(transparent)]
+    Sequence(#[from] std::num::TryFromIntError),
+    #[error(transparent)]
+    Append(#[from] PersistenceError),
 }
 
 pub(crate) fn adapter_error(error: PersistenceError) -> PersistenceError {
@@ -1436,6 +1528,91 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((checkpoint, lease), (1, None));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn competing_claims_commit_one_event_and_lease(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let job_id = JobId::new();
+        let job_key = job_id.to_string();
+        let run_at = 1_700_000_000_000_i64;
+        let lease_until_ms = run_at + 10_000;
+        PostgresEventRepository { pool: pool.clone() }
+            .enqueue(JobSeed::new(job_id, "standalone", json!({}), run_at))
+            .await
+            .unwrap();
+
+        let options = pool.connect_options();
+        let (first_pool, second_pool) = tokio::try_join!(
+            PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with((*options).clone()),
+            PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with((*options).clone()),
+        )
+        .unwrap();
+        let first = PostgresEventRepository { pool: first_pool };
+        let second = PostgresEventRepository { pool: second_pool };
+        let decide = |read: Option<event_sorcery::ClaimRead>| {
+            let read = read.unwrap();
+            if read.lease_until_ms.is_some() {
+                return event_sorcery::ClaimDecision::Skip;
+            }
+            assert_eq!(read.version, 1);
+            let worker = "worker:01HF7YAT000000000000000001";
+            let claim_id = "01HF7YAT000000000000000002";
+            event_sorcery::ClaimDecision::Claim {
+                event: SerializedEvent {
+                    aggregate_id: job_key.clone(),
+                    sequence: 2,
+                    aggregate_type: "job".to_owned(),
+                    event_type: "JobClaimed".to_owned(),
+                    event_version: "1.0".to_owned(),
+                    payload: json!({"Claimed": {"worker": worker, "claim_id": claim_id,
+                        "lease_until": lease_until_ms}}),
+                    metadata: json!({}),
+                },
+                payload: json!({"Live": {"Claimed": {"kind": "standalone", "payload": {},
+                    "worker": worker, "claim_id": claim_id, "run_at": run_at,
+                    "attempt": 0, "claims": 1}}})
+                .to_string(),
+                lease_until_ms,
+                won: lease_until_ms,
+            }
+        };
+        let (left, right) = timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                first.claim_job(&job_key, decide),
+                second.claim_job(&job_key, decide)
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        use event_sorcery::ClaimOutcome::{Skip, Won};
+        let winner = match (left, right) {
+            (Won(deadline), Skip) | (Skip, Won(deadline)) => Some(deadline),
+            _ => None,
+        };
+        assert_eq!(winner, Some(lease_until_ms));
+        let row: (i64, String, i64) = sqlx::query_as(
+            "SELECT version, status, lease_until FROM job_queue_projection WHERE view_id = $1",
+        )
+        .bind(&job_key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (2, "claimed".to_owned(), lease_until_ms));
+        let claims: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT sequence, (payload #>> '{Claimed,lease_until}')::BIGINT FROM events
+             WHERE aggregate_type = 'job' AND aggregate_id = $1 AND event_type = 'JobClaimed'",
+        )
+        .bind(&job_key)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(claims, vec![(2, lease_until_ms)]);
     }
 
     #[sqlx::test(migrations = false)]
