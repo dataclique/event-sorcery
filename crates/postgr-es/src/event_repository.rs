@@ -1544,6 +1544,116 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn queue_reconstructs_retried_deferred_and_terminal_jobs(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let backend = PostgresBackend { pool: pool.clone() };
+        let run_at = 1_700_000_000_000_i64;
+        let retry_at = run_at + 30_000;
+        let defer_at = retry_at + 60_000;
+        let retry = json!({"RetryScheduled": {
+            "run_at": retry_at, "attempt": 1, "error": "temporary"
+        }});
+        let mut jobs = Vec::new();
+        for (outcomes, expected) in [
+            (
+                vec![("JobRetryScheduled", retry.clone())],
+                json!({"Pending": {
+                    "kind": "standalone", "payload": {"value": "original"},
+                    "run_at": retry_at, "attempt": 1, "claims": 1
+                }}),
+            ),
+            (
+                vec![
+                    ("JobRetryScheduled", retry),
+                    (
+                        "JobRescheduled",
+                        json!({"Rescheduled": {"run_at": defer_at}}),
+                    ),
+                ],
+                json!({"Pending": {
+                    "kind": "standalone", "payload": {"value": "original"},
+                    "run_at": defer_at, "attempt": 1, "claims": 0
+                }}),
+            ),
+            (
+                vec![("JobSucceeded", json!("Succeeded"))],
+                json!({"Done": {"kind": "standalone"}}),
+            ),
+            (
+                vec![(
+                    "JobDead",
+                    json!({"Dead": {"reason": "Rejected", "error": "terminal"}}),
+                )],
+                json!({"Dead": {"kind": "standalone", "reason": "Rejected"}}),
+            ),
+        ] {
+            let job_id = JobId::new();
+            repository
+                .enqueue(JobSeed::new(
+                    job_id,
+                    "standalone",
+                    json!({"value": "original"}),
+                    run_at,
+                ))
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            for (index, (event_type, payload)) in outcomes.into_iter().enumerate() {
+                let sequence = 2 + 2 * index;
+                let claim = json!({"Claimed": {
+                    "worker": "worker:01HF7YAT000000000000000001",
+                    "claim_id": format!("01HF7YAT00000000000000000{}", index + 2),
+                    "lease_until": defer_at + 10_000
+                }});
+                for (sequence, event_type, payload) in [
+                    (sequence, "JobClaimed", claim),
+                    (sequence + 1, event_type, payload),
+                ] {
+                    events.push(SerializedEvent {
+                        aggregate_id: job_id.to_string(),
+                        sequence,
+                        aggregate_type: "job".to_string(),
+                        event_type: event_type.to_string(),
+                        event_version: "1.0".to_string(),
+                        payload,
+                        metadata: json!({}),
+                    });
+                }
+            }
+            let checkpoint = i64::try_from(events.len()).unwrap() + 1;
+            let mut transaction = pool.begin().await.unwrap();
+            repository
+                .official()
+                .append_serialized_events_in(&mut transaction, "job", &events)
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap();
+            jobs.push((job_id, checkpoint, expected));
+        }
+
+        let deleted = sqlx::query("DELETE FROM job_queue_projection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 4);
+        for (job_id, checkpoint, expected) in jobs {
+            assert_eq!(
+                recover_job_queue_row(&backend, &job_id).await.unwrap(),
+                Some(expected)
+            );
+            let row: (i64, Option<i64>) = sqlx::query_as(
+                "SELECT version, lease_until FROM job_queue_projection WHERE view_id = $1",
+            )
+            .bind(job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row, (checkpoint, None));
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn standalone_enqueue_preserves_first_event_and_queue_row_on_duplicate(pool: PgPool) {
         MIGRATOR.run(&pool).await.unwrap();
         let job_id = JobId::new();
