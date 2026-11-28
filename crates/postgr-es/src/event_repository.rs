@@ -270,8 +270,10 @@ mod tests {
 
     use event_sorcery::{
         CompactionPolicy, Effect, EventSourced, JobId, JobSeed, Never, Nil, PersistenceBackend,
-        StoreBuilder, buffer_pending_job, with_pending_jobs,
+        StoreBuilder, buffer_pending_job, find_recovered_jobs, recover_job_queue_row,
+        with_pending_jobs,
     };
+    use indexed_query::{Cmp, Predicate, Term, Value as IndexedValue};
 
     use super::{MIGRATOR, PostgresEventRepository};
     use crate::PostgresBackend;
@@ -1390,6 +1392,486 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(counts, (0, 0));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn queue_recovers_a_missing_pending_job_without_workers(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let job_id = JobId::new();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let backend = PostgresBackend { pool: pool.clone() };
+        repository
+            .enqueue(JobSeed::new(
+                job_id,
+                "standalone",
+                json!({"value": "first"}),
+                1_700_000_000_000,
+            ))
+            .await
+            .unwrap();
+
+        let deleted = sqlx::query("DELETE FROM job_queue_projection WHERE view_id = $1")
+            .bind(job_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+
+        let pending = json!({"Pending": {
+            "kind": "standalone", "payload": {"value": "first"},
+            "run_at": 1_700_000_000_000_i64, "attempt": 0, "claims": 0
+        }});
+        for _ in 0..2 {
+            assert_eq!(
+                recover_job_queue_row(&backend, &job_id).await.unwrap(),
+                Some(pending.clone())
+            );
+        }
+
+        let (checkpoint, lease): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT version, lease_until FROM job_queue_projection WHERE view_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((checkpoint, lease), (1, None));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn queue_replays_a_claim_without_recreating_its_lease(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let job_id = JobId::new();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let backend = PostgresBackend { pool: pool.clone() };
+        let run_at = 1_700_000_000_000_i64;
+        let audit_deadline = run_at + 10_000;
+        let renewed_deadline = run_at + 20_000;
+        let payload = json!({"value": "first"});
+        repository
+            .enqueue(JobSeed::new(job_id, "standalone", payload.clone(), run_at))
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_job_queue_row(&backend, &job_id).await.unwrap(),
+            Some(json!({"Pending": {
+                "kind": "standalone", "payload": payload,
+                "run_at": run_at, "attempt": 0, "claims": 0
+            }}))
+        );
+
+        let claim = SerializedEvent {
+            aggregate_id: job_id.to_string(),
+            sequence: 2,
+            aggregate_type: "job".to_string(),
+            event_type: "JobClaimed".to_string(),
+            event_version: "1.0".to_string(),
+            payload: json!({"Claimed": {
+                "worker": "worker:01HF7YAT000000000000000001",
+                "claim_id": "01HF7YAT000000000000000002",
+                "lease_until": audit_deadline
+            }}),
+            metadata: json!({}),
+        };
+        let mut transaction = pool.begin().await.unwrap();
+        repository
+            .official()
+            .append_serialized_events_in(&mut transaction, "job", std::slice::from_ref(&claim))
+            .await
+            .unwrap();
+        let updated = sqlx::query(
+            "UPDATE job_queue_projection SET lease_until = $2 WHERE view_id = $1 AND version = 1",
+        )
+        .bind(job_id.to_string())
+        .bind(renewed_deadline)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        assert_eq!(updated.rows_affected(), 1);
+        transaction.commit().await.unwrap();
+
+        let claimed = json!({"Claimed": {
+            "kind": "standalone", "payload": payload, "run_at": run_at,
+            "worker": "worker:01HF7YAT000000000000000001",
+            "claim_id": "01HF7YAT000000000000000002", "attempt": 0, "claims": 1
+        }});
+        for lease in [Some(renewed_deadline), Some(renewed_deadline), None] {
+            if lease.is_none() {
+                let deleted = sqlx::query("DELETE FROM job_queue_projection WHERE view_id = $1")
+                    .bind(job_id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(deleted.rows_affected(), 1);
+            }
+            assert_eq!(
+                recover_job_queue_row(&backend, &job_id).await.unwrap(),
+                Some(claimed.clone())
+            );
+            let row: (i64, Option<i64>) = sqlx::query_as(
+                "SELECT version, lease_until FROM job_queue_projection WHERE view_id = $1",
+            )
+            .bind(job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row, (2, lease));
+        }
+
+        // Each decoy differs from the match in exactly one queried column.
+        for (schedule, is_claimed, lease) in [
+            (run_at, false, None),
+            (run_at + 1, true, None),
+            (run_at, true, Some(renewed_deadline)),
+        ] {
+            let decoy = JobId::new();
+            repository
+                .enqueue(JobSeed::new(decoy, "standalone", payload.clone(), schedule))
+                .await
+                .unwrap();
+            if is_claimed {
+                let mut transaction = pool.begin().await.unwrap();
+                let decoy_claim = SerializedEvent {
+                    aggregate_id: decoy.to_string(),
+                    ..claim.clone()
+                };
+                repository
+                    .official()
+                    .append_serialized_events_in(&mut transaction, "job", &[decoy_claim])
+                    .await
+                    .unwrap();
+                transaction.commit().await.unwrap();
+                recover_job_queue_row(&backend, &decoy)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            if let Some(deadline) = lease {
+                let updated = sqlx::query(
+                    "UPDATE job_queue_projection SET lease_until = $2 WHERE view_id = $1",
+                )
+                .bind(decoy.to_string())
+                .bind(deadline)
+                .execute(&pool)
+                .await
+                .unwrap();
+                assert_eq!(updated.rows_affected(), 1);
+            }
+        }
+
+        let predicate = Predicate {
+            any_of: vec![vec![
+                Term {
+                    column: "status".to_string(),
+                    cmp: Cmp::Eq,
+                    value: Some(IndexedValue::Text("claimed".to_string())),
+                },
+                Term {
+                    column: "run_at".to_string(),
+                    cmp: Cmp::Eq,
+                    value: Some(IndexedValue::Int(run_at)),
+                },
+                Term {
+                    column: "lease_until".to_string(),
+                    cmp: Cmp::IsNull,
+                    value: None,
+                },
+            ]],
+        };
+        assert_eq!(
+            find_recovered_jobs(&backend, &predicate).await.unwrap(),
+            [job_id.to_string()]
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn queue_reconstructs_retried_deferred_and_terminal_jobs(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let backend = PostgresBackend { pool: pool.clone() };
+        let run_at = 1_700_000_000_000_i64;
+        let retry_at = run_at + 30_000;
+        let defer_at = retry_at + 60_000;
+        let retry = json!({"RetryScheduled": {
+            "run_at": retry_at, "attempt": 1, "error": "temporary"
+        }});
+        let mut jobs = Vec::new();
+        for (outcomes, expected) in [
+            (
+                vec![("JobRetryScheduled", retry.clone())],
+                json!({"Pending": {
+                    "kind": "standalone", "payload": {"value": "original"},
+                    "run_at": retry_at, "attempt": 1, "claims": 1
+                }}),
+            ),
+            (
+                vec![
+                    ("JobRetryScheduled", retry),
+                    (
+                        "JobRescheduled",
+                        json!({"Rescheduled": {"run_at": defer_at}}),
+                    ),
+                ],
+                json!({"Pending": {
+                    "kind": "standalone", "payload": {"value": "original"},
+                    "run_at": defer_at, "attempt": 1, "claims": 0
+                }}),
+            ),
+            (
+                vec![("JobSucceeded", json!("Succeeded"))],
+                json!({"Done": {"kind": "standalone"}}),
+            ),
+            (
+                vec![(
+                    "JobDead",
+                    json!({"Dead": {"reason": "Rejected", "error": "terminal"}}),
+                )],
+                json!({"Dead": {"kind": "standalone", "reason": "Rejected"}}),
+            ),
+        ] {
+            let job_id = JobId::new();
+            repository
+                .enqueue(JobSeed::new(
+                    job_id,
+                    "standalone",
+                    json!({"value": "original"}),
+                    run_at,
+                ))
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            for (index, (event_type, payload)) in outcomes.into_iter().enumerate() {
+                let sequence = 2 + 2 * index;
+                let claim = json!({"Claimed": {
+                    "worker": "worker:01HF7YAT000000000000000001",
+                    "claim_id": format!("01HF7YAT00000000000000000{}", index + 2),
+                    "lease_until": defer_at + 10_000
+                }});
+                for (sequence, event_type, payload) in [
+                    (sequence, "JobClaimed", claim),
+                    (sequence + 1, event_type, payload),
+                ] {
+                    events.push(SerializedEvent {
+                        aggregate_id: job_id.to_string(),
+                        sequence,
+                        aggregate_type: "job".to_string(),
+                        event_type: event_type.to_string(),
+                        event_version: "1.0".to_string(),
+                        payload,
+                        metadata: json!({}),
+                    });
+                }
+            }
+            let checkpoint = i64::try_from(events.len()).unwrap() + 1;
+            let mut transaction = pool.begin().await.unwrap();
+            repository
+                .official()
+                .append_serialized_events_in(&mut transaction, "job", &events)
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap();
+            jobs.push((job_id, checkpoint, expected));
+        }
+
+        let deleted = sqlx::query("DELETE FROM job_queue_projection")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 4);
+        for (job_id, checkpoint, expected) in jobs {
+            assert_eq!(
+                recover_job_queue_row(&backend, &job_id).await.unwrap(),
+                Some(expected)
+            );
+            let row: (i64, Option<i64>) = sqlx::query_as(
+                "SELECT version, lease_until FROM job_queue_projection WHERE view_id = $1",
+            )
+            .bind(job_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row, (checkpoint, None));
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn queue_recovery_rolls_back_when_schema_registration_fails(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let backend = PostgresBackend { pool: pool.clone() };
+        let job_id = JobId::new();
+        let run_at = 1_700_000_000_000_i64;
+        repository
+            .enqueue(JobSeed::new(
+                job_id,
+                "standalone",
+                json!({"value": 1}),
+                run_at,
+            ))
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM job_queue_projection WHERE view_id = $1")
+            .bind(job_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE FUNCTION reject_queue_registration() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF EXISTS (SELECT 1 FROM job_queue_projection WHERE version = 1
+                            AND status = 'pending' AND kind = 'standalone') THEN
+                     RAISE EXCEPTION 'injected registration failure after queue replay';
+                 END IF;
+                 RAISE EXCEPTION 'registration reached before queue replay';
+             END;
+             $$;
+             CREATE TRIGGER reject_queue_registration BEFORE INSERT ON events
+             FOR EACH ROW WHEN (NEW.aggregate_type = 'SchemaRegistry')
+             EXECUTE FUNCTION reject_queue_registration();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = recover_job_queue_row(&backend, &job_id).await.unwrap_err();
+        assert!(matches!(
+            error,
+            event_sorcery::RecoveredJobQueryError::Reconcile(
+                event_sorcery::ReconcileError::Aggregate(_)
+            )
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("injected registration failure after queue replay")
+        );
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM job_queue_projection),
+                    (SELECT COUNT(*) FROM events WHERE aggregate_type = 'SchemaRegistry'),
+                    (SELECT COUNT(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1)",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0, 1));
+
+        sqlx::query("DROP TRIGGER reject_queue_registration ON events")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_job_queue_row(&backend, &job_id).await.unwrap(),
+            Some(json!({"Pending": {
+                "kind": "standalone", "payload": {"value": 1},
+                "run_at": run_at, "attempt": 0, "claims": 0
+            }}))
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn cancelling_queue_recovery_before_registration_rolls_back_replay(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let job_id = JobId::new();
+        PostgresEventRepository { pool: pool.clone() }
+            .enqueue(JobSeed::new(
+                job_id,
+                "standalone",
+                json!({"value": 1}),
+                1_700_000_000_000,
+            ))
+            .await
+            .unwrap();
+        let deleted = sqlx::query("DELETE FROM job_queue_projection WHERE view_id = $1")
+            .bind(job_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+
+        // Registration follows replay. Block its insert without locking out replay reads.
+        sqlx::raw_sql(
+            "CREATE FUNCTION wait_for_queue_registration() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF NOT EXISTS (SELECT 1 FROM job_queue_projection WHERE version = 1
+                                AND status = 'pending' AND kind = 'standalone') THEN
+                     RAISE EXCEPTION 'registration reached before queue replay';
+                 END IF;
+                 PERFORM pg_advisory_xact_lock(782341, 9);
+                 RETURN NEW;
+             END;
+             $$;
+             CREATE TRIGGER wait_for_queue_registration BEFORE INSERT ON events
+             FOR EACH ROW WHEN (NEW.aggregate_type = 'SchemaRegistry')
+             EXECUTE FUNCTION wait_for_queue_registration();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let singleton = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let recovery_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&singleton)
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(782341, 9)")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let backend = PostgresBackend { pool: singleton };
+        let recovering = backend.pool.clone();
+        let recovery = tokio::spawn(async move {
+            recover_job_queue_row(&PostgresBackend { pool: recovering }, &job_id).await
+        });
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks
+                     WHERE pid = $1 AND locktype = 'advisory' AND NOT granted
+                       AND classid = 782341 AND objid = 9 AND objsubid = 2)",
+                )
+                .bind(recovery_pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovery must reach registration after writing the queue row");
+        recovery.abort();
+        assert!(recovery.await.unwrap_err().is_cancelled());
+        blocker.rollback().await.unwrap();
+
+        let counts: (i64, i64, i64) = timeout(
+            Duration::from_secs(5),
+            sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM job_queue_projection),
+                        (SELECT COUNT(*) FROM events WHERE aggregate_type = 'SchemaRegistry'),
+                        (SELECT COUNT(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1)",
+            )
+            .bind(job_id.to_string())
+            .fetch_one(&backend.pool),
+        )
+        .await
+        .expect("cancellation must release the recovery connection")
+        .unwrap();
+        assert_eq!(counts, (0, 0, 1));
+        assert_eq!(
+            recover_job_queue_row(&backend, &job_id).await.unwrap(),
+            Some(json!({"Pending": {
+                "kind": "standalone", "payload": {"value": 1},
+                "run_at": 1_700_000_000_000_i64, "attempt": 0, "claims": 0
+            }}))
+        );
     }
 
     #[sqlx::test(migrations = false)]

@@ -6,8 +6,8 @@ I/O delegate to that adapter. This crate adds atomic job writes, native store
 startup and projection recovery, and indexed view queries. Entity definitions
 and shared schema and snapshot policy remain in `event-sorcery`.
 
-PostgreSQL can persist job events and queue rows, but this adapter does not yet
-run workers or recover the job queue at startup.
+PostgreSQL supports atomic job enqueue. The adapter exposes neither worker
+startup nor a public job-queue recovery entry point.
 
 ## Public API
 
@@ -109,6 +109,60 @@ carries the persisted sequence so an event already included by recovery is not
 applied again. Out-of-order delivery retries without advancing past missing
 history; `catch_up` repairs a remaining lag. Use framework delivery rather than
 mixing direct, unsequenced `Reactor::react` calls into a native projection.
+
+## Standalone durable enqueue
+
+`PostgresEventRepository::enqueue` is the low-level entry point for an already
+encoded job that has no application command transaction to join. Apply the
+library migrations first. The repository commits the enqueue event and initial
+queue row in one transaction.
+
+The routing key identifies which job implementation should handle the payload.
+For a Rust `StandaloneJob`, it must match that implementation's `KIND` (for
+example, `"send-email"`). It is persisted in job history and used by workers to
+select jobs. It is not the job instance's `JobId` or a worker name. This erased
+entry point cannot check that the payload matches the job implementation or that
+a worker is registered for the key.
+
+```rust
+use cqrs_es::persist::PersistenceError;
+use sqlx::PgPool;
+
+use event_sorcery::{JobId, JobSeed, StandaloneJob};
+use postgr_es::PostgresEventRepository;
+
+async fn enqueue_job<Job: StandaloneJob>(
+    pool: PgPool,
+    job_id: JobId,
+    job: Job,
+    run_at_ms: i64,
+) -> Result<(), PersistenceError> {
+    let payload = serde_json::to_value(job)?;
+    PostgresEventRepository { pool }
+        .enqueue(JobSeed::new(job_id, Job::KIND, payload, run_at_ms))
+        .await
+}
+```
+
+`run_at_ms` is the scheduled Unix timestamp in milliseconds. Supply a fresh job
+identity for a new enqueue; reusing an existing identity returns a persistence
+error rather than creating another job. Enqueue records durable intent; it does
+not execute the job's external effects.
+
+### Queue recovery contract
+
+The `job` event stream is authoritative; `job_queue_projection` is derived
+state. The adapter's PostgreSQL conformance tests exercise the library-owned job
+fold through native projection recovery and indexed reads, without starting a
+worker. The tests use the same indexed `find` contract as other native
+projections: they locate a recovered job by `status`, `run_at` (Unix
+milliseconds), and whether `lease_until` is unset.
+
+Recovery restores the lifecycle and the scheduled time of pending or claimed
+jobs. Catch-up leaves an existing lease column intact; recreating a missing row
+leaves that column unset. The deadline recorded in a claim event is audit data,
+not a lease that replay can restore. A failed or cancelled recovery does not
+publish a partial queue or advance the schema registry.
 
 ## Migrations
 
