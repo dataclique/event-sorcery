@@ -97,6 +97,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+
+        let registry_before = sqlite_es::load_schema_registry_payloads(&pool)
+            .await
+            .unwrap();
+        let restarted = StoreBuilder::<RecoveryEntity<false>, _>::with_backend(SqliteBackend {
+            pool: pool.clone(),
+        })
+        .build()
+        .await;
+        let Err(ReconcileError::Persistence(cqrs_es::persist::PersistenceError::UnknownError(
+            source,
+        ))) = restarted
+        else {
+            panic!("startup must refuse the failed lifecycle");
+        };
+        assert!(
+            matches!(source.downcast_ref::<ProjectionError<RecoveryEntity<false>>>(), Some(ProjectionError::Lifecycle(source))
+            if matches!(source.as_ref(), LifecycleError::EventCantOriginate { event: RecoveryEvent::Created }))
+        );
+        assert_eq!(
+            sqlite_es::load_schema_registry_payloads(&pool)
+                .await
+                .unwrap(),
+            registry_before
+        );
+        assert_eq!(projection.load_all().await.unwrap(), []);
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

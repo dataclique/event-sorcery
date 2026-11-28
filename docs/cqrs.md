@@ -812,6 +812,11 @@ than represent event checkpoints; carrying those revisions forward can cause new
 events to be skipped. If history is incomplete, recover it before upgrading; do
 not reset the revision by hand.
 
+If replay reaches a failed lifecycle, native projected startup returns an error
+instead of exposing a store with an incomplete projection. It does not record an
+upgraded schema version. Correct the replay or migrate the affected data before
+retrying startup.
+
 ### Lifecycle Serialization in View Payloads
 
 All our aggregates use `Lifecycle<Entity>` (where `Entity: EventSourced`) as
