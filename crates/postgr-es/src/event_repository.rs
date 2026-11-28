@@ -384,8 +384,8 @@ mod tests {
 
     use event_sorcery::{
         CompactionPolicy, Effect, EventSourced, JobId, JobSeed, Never, Nil, PersistenceBackend,
-        StoreBuilder, buffer_pending_job, find_recovered_jobs, recover_job_queue_row,
-        with_pending_jobs,
+        StoreBuilder, buffer_pending_job, find_recovered_jobs, plan_test_claim,
+        recover_job_queue_row, with_pending_jobs,
     };
     use indexed_query::{Cmp, Predicate, Term, Value as IndexedValue};
 
@@ -1889,6 +1889,105 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(claims, vec![(2, lease_until_ms)]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn expired_claims_are_reclaimed_then_abandoned_at_the_claim_budget(pool: PgPool) {
+        use event_sorcery::ClaimOutcome::{Abandoned, Skip, Won};
+        use event_sorcery::LeaseRenewal::{Held, Lost};
+
+        MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let job_id = JobId::new();
+        let job_key = job_id.to_string();
+        let run_at = 1_700_000_000_000;
+        let lease_ms = 1_000;
+        let max_claims = 2;
+        repository
+            .enqueue(JobSeed::new(job_id, "standalone", json!({}), run_at))
+            .await
+            .unwrap();
+
+        let claim_at = |now_ms| {
+            let job_key = job_key.as_str();
+            repository.claim_job(job_key, move |read| {
+                plan_test_claim(job_key, read, now_ms, lease_ms, max_claims)
+            })
+        };
+        assert!(matches!(claim_at(run_at).await.unwrap(), Won(2)));
+        let first_deadline = run_at + 2 * lease_ms;
+        assert!(matches!(
+            repository
+                .renew_job(&job_key, 2, first_deadline)
+                .await
+                .unwrap(),
+            Held
+        ));
+        // The original event deadline has elapsed, but the renewed lease has not.
+        assert!(matches!(claim_at(first_deadline).await.unwrap(), Skip));
+        let reclaim_at = first_deadline + 1;
+        assert!(matches!(claim_at(reclaim_at).await.unwrap(), Won(3)));
+        let second_deadline = reclaim_at + lease_ms;
+        assert!(matches!(
+            repository
+                .renew_job(&job_key, 2, second_deadline + 1)
+                .await
+                .unwrap(),
+            Lost
+        ));
+        assert!(matches!(claim_at(second_deadline).await.unwrap(), Skip));
+        assert!(matches!(
+            claim_at(second_deadline + 1).await.unwrap(),
+            Abandoned
+        ));
+
+        for sequence in [3, 4] {
+            assert!(matches!(
+                repository
+                    .renew_job(&job_key, sequence, second_deadline + 2)
+                    .await
+                    .unwrap(),
+                Lost
+            ));
+        }
+        let terminal: (i64, String, Option<i64>, Value) = sqlx::query_as(
+            "SELECT version, status, lease_until, payload FROM job_queue_projection
+             WHERE view_id = $1",
+        )
+        .bind(&job_key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            terminal,
+            (
+                4,
+                "dead".to_owned(),
+                None,
+                json!({"Live": {"Dead": {"kind": "standalone", "reason": "Abandoned"}}})
+            )
+        );
+        let events: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT sequence, event_type FROM events
+             WHERE aggregate_type = 'job' AND aggregate_id = $1 ORDER BY sequence",
+        )
+        .bind(&job_key)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let observed: Vec<_> = events
+            .iter()
+            .map(|(seq, name)| (*seq, name.as_str()))
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                (1, "JobEnqueued"),
+                (2, "JobClaimed"),
+                (3, "JobClaimed"),
+                (4, "JobDead")
+            ]
+        );
     }
 
     #[sqlx::test(migrations = false)]
