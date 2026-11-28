@@ -96,7 +96,7 @@ impl PostgresEventRepository {
         &self,
         job_id: &str,
         decide: Decide,
-    ) -> Result<ClaimOutcome<Won>, PostgresClaimError>
+    ) -> Result<ClaimOutcome<Won>, PostgresBackendError>
     where
         Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won> + Send,
         Won: Send,
@@ -135,7 +135,7 @@ impl PostgresEventRepository {
             || event.aggregate_id != job_id
             || previous_version.and_then(|version| version.checked_add(1)) != Some(sequence)
         {
-            return Err(PostgresClaimError::InvalidEvent);
+            return Err(PostgresBackendError::InvalidEvent);
         }
 
         let append = self
@@ -163,7 +163,7 @@ impl PostgresEventRepository {
         .execute(&mut *transaction)
         .await?;
         if updated.rows_affected() != 1 {
-            return Err(PostgresClaimError::ProjectionCount);
+            return Err(PostgresBackendError::ProjectionCount);
         }
         transaction.commit().await?;
         Ok(outcome)
@@ -340,18 +340,27 @@ async fn append_and_seed_job(
     Ok(())
 }
 
+/// Failure from PostgreSQL backend bootstrap or durable job operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PostgresClaimError {
+pub enum PostgresBackendError {
+    /// The claim decision did not identify the next event in the locked stream.
     #[error("claim event must target the next sequence of the locked job stream")]
     InvalidEvent,
+    /// PostgreSQL did not update the locked queue row.
     #[error("claim must update exactly one projection row")]
     ProjectionCount,
-    #[error(transparent)]
+    /// Acquiring the migration connection or applying the schema failed.
+    #[error("PostgreSQL bootstrap failed: {0}")]
+    Migration(#[from] sqlx::migrate::MigrateError),
+    /// A direct job queue SQL operation failed.
+    #[error("PostgreSQL job queue operation failed: {0}")]
     Sql(#[from] sqlx::Error),
-    #[error(transparent)]
+    /// The claim event sequence exceeded the supported database range.
+    #[error("job sequence out of range: {0}")]
     Sequence(#[from] std::num::TryFromIntError),
-    #[error(transparent)]
-    Append(#[from] PersistenceError),
+    /// Persisting the job event or the initial queue row failed.
+    #[error("PostgreSQL job persistence failed: {0}")]
+    Persistence(#[from] PersistenceError),
 }
 
 pub(crate) fn adapter_error(error: PersistenceError) -> PersistenceError {
@@ -406,8 +415,8 @@ mod tests {
     use tokio::time::timeout;
 
     use event_sorcery::{
-        CompactionPolicy, Effect, EventSourced, JobId, JobSeed, Never, Nil, PersistenceBackend,
-        StoreBuilder, buffer_pending_job, find_recovered_jobs, plan_test_claim,
+        CompactionPolicy, Effect, EventBackend, EventSourced, JobId, JobSeed, Never, Nil,
+        PersistenceBackend, StoreBuilder, buffer_pending_job, find_recovered_jobs, plan_test_claim,
         recover_job_queue_row, with_pending_jobs,
     };
     use indexed_query::{Cmp, Predicate, Term, Value as IndexedValue};
@@ -1532,6 +1541,38 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn postgres_backend_enqueues_claims_and_renews(pool: PgPool) {
+        let backend = PostgresBackend { pool };
+        backend.bootstrap_persistence().await.unwrap();
+        let job_id = JobId::new();
+        let job_key = job_id.to_string();
+        let run_at = 1_700_000_000_000;
+        let seed = JobSeed::new(job_id, "standalone", json!({}), run_at);
+        backend
+            .enqueue(seed.event().unwrap(), seed.queue_payload().unwrap())
+            .await
+            .unwrap();
+
+        let claim = backend
+            .claim(&job_key, |read| {
+                plan_test_claim(&job_key, read, run_at, 1_000, 2)
+            })
+            .await
+            .unwrap();
+        let event_sorcery::ClaimOutcome::Won(sequence) = claim else {
+            panic!("expected the job enqueued through EventBackend to be claimable");
+        };
+        assert_eq!(sequence, 2);
+        assert!(matches!(
+            backend
+                .renew(&job_key, sequence, run_at + 2_000)
+                .await
+                .unwrap(),
+            event_sorcery::LeaseRenewal::Held
+        ));
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn encoded_enqueue_commits_event_and_seed_together(pool: PgPool) {
         MIGRATOR.run(&pool).await.unwrap();
         let repository = PostgresEventRepository { pool: pool.clone() };
@@ -1696,7 +1737,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let Err(super::PostgresClaimError::Sql(sqlx::Error::Database(error))) = first
+        let Err(super::PostgresBackendError::Sql(sqlx::Error::Database(error))) = first
             .claim_job(&job_key, |read| decide(&job_key, read))
             .await
         else {
@@ -1746,7 +1787,7 @@ mod tests {
             .await;
         assert!(matches!(
             claim,
-            Err(super::PostgresClaimError::ProjectionCount)
+            Err(super::PostgresBackendError::ProjectionCount)
         ));
         assert_unclaimed(pool, job_key).await;
     }
@@ -1785,7 +1826,7 @@ mod tests {
             .await;
         assert!(matches!(
             wrong_stream,
-            Err(super::PostgresClaimError::InvalidEvent)
+            Err(super::PostgresBackendError::InvalidEvent)
         ));
         let skipped_sequence = repository
             .claim_job(&job_key, |read| {
@@ -1809,7 +1850,7 @@ mod tests {
             .await;
         assert!(matches!(
             skipped_sequence,
-            Err(super::PostgresClaimError::InvalidEvent)
+            Err(super::PostgresBackendError::InvalidEvent)
         ));
 
         // The authoritative stream can be ahead of the queue until replay catches up.

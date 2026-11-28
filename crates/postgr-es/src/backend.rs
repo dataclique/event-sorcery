@@ -9,13 +9,13 @@ use sqlx::PgPool;
 use sqlx::migrate::MigrateError;
 
 use event_sorcery::{
-    CompactionPolicy, EventSourced, Nil, PersistenceBackend, ProjectedStoreBackend, Projection,
-    ProjectionError, ProjectionRecoveryMode, ReconcileError, SchemaReconciliation, Table,
-    UnmaterializedStoreBackend, guard_snapshot,
+    ClaimDecision, ClaimOutcome, ClaimRead, CompactionPolicy, EventBackend, EventSourced,
+    LeaseRenewal, Nil, ProjectedStoreBackend, Projection, ProjectionError, ProjectionRecoveryMode,
+    ReconcileError, SchemaReconciliation, Table, UnmaterializedStoreBackend, guard_snapshot,
 };
 
 use crate::recovery::PostgresRecovery;
-use crate::{MIGRATOR, PostgresEventRepository, PostgresViewBackend};
+use crate::{MIGRATOR, PostgresBackendError, PostgresEventRepository, PostgresViewBackend};
 
 /// Native persistence capability over an application-provisioned pool.
 #[derive(Clone)]
@@ -30,11 +30,11 @@ pub struct PostgresStoreRepository {
     compaction_policy: CompactionPolicy,
 }
 
-impl PersistenceBackend for PostgresBackend {
-    type PersistenceRepo = PostgresStoreRepository;
-    type BootstrapError = sqlx::Error;
+impl EventBackend for PostgresBackend {
+    type EventRepo = PostgresStoreRepository;
+    type Error = PostgresBackendError;
 
-    fn persistence_repo(&self, policy: CompactionPolicy) -> Self::PersistenceRepo {
+    fn event_repo(&self, policy: CompactionPolicy) -> Self::EventRepo {
         PostgresStoreRepository {
             repository: PostgresEventRepository {
                 pool: self.pool.clone(),
@@ -43,13 +43,51 @@ impl PersistenceBackend for PostgresBackend {
         }
     }
 
-    async fn bootstrap_persistence(&self) -> Result<(), Self::BootstrapError> {
-        let mut connection = self.pool.acquire().await.map_err(MigrateError::from)?;
+    async fn migrate(&self) -> Result<(), Self::Error> {
+        let mut connection = match self.pool.acquire().await {
+            Ok(connection) => connection,
+            Err(error) => return Err(MigrateError::from(error).into()),
+        };
         connection.close_on_drop();
-        MIGRATOR
-            .run_direct(None, &mut *connection, false)
-            .await
-            .map_err(sqlx::Error::from)
+        MIGRATOR.run_direct(None, &mut *connection, false).await?;
+        Ok(())
+    }
+
+    async fn claim<Decide, Won>(
+        &self,
+        job_id: &str,
+        decide: Decide,
+    ) -> Result<ClaimOutcome<Won>, Self::Error>
+    where
+        Decide: FnOnce(Option<ClaimRead>) -> ClaimDecision<Won> + Send,
+        Won: Send,
+    {
+        PostgresEventRepository {
+            pool: self.pool.clone(),
+        }
+        .claim_job(job_id, decide)
+        .await
+    }
+
+    async fn renew(
+        &self,
+        job_id: &str,
+        claim_seq: i64,
+        new_lease_until_ms: i64,
+    ) -> Result<LeaseRenewal, Self::Error> {
+        Ok(PostgresEventRepository {
+            pool: self.pool.clone(),
+        }
+        .renew_job(job_id, claim_seq, new_lease_until_ms)
+        .await?)
+    }
+
+    async fn enqueue(&self, event: SerializedEvent, payload: String) -> Result<(), Self::Error> {
+        Ok(PostgresEventRepository {
+            pool: self.pool.clone(),
+        }
+        .enqueue_encoded(event, payload)
+        .await?)
     }
 }
 
@@ -202,7 +240,7 @@ pub(crate) mod tests {
     };
 
     use crate::view_repository::tests::{RegisteredSchemaEvent, RegisteredSchemaView};
-    use crate::{MIGRATOR, PostgresBackend, PostgresViewBackend};
+    use crate::{MIGRATOR, PostgresBackend, PostgresBackendError, PostgresViewBackend};
 
     async fn command_events(aggregate_id: &str, versions: &[u64]) -> Vec<SerializedEvent> {
         let memory = MemStore::<RegisteredSchemaView>::default();
@@ -1596,11 +1634,11 @@ pub(crate) mod tests {
         pool.close().await;
 
         let error = backend.bootstrap_persistence().await.unwrap_err();
-        let sqlx::Error::Migrate(source) = error else {
+        let PostgresBackendError::Migration(source) = error else {
             panic!("expected a migration error from the closed pool");
         };
         assert!(matches!(
-            *source,
+            source,
             MigrateError::Execute(sqlx::Error::PoolClosed)
         ));
     }
@@ -1625,10 +1663,10 @@ pub(crate) mod tests {
 
         let backend = PostgresBackend { pool: pool.clone() };
         let error = backend.bootstrap_persistence().await.unwrap_err();
-        let sqlx::Error::Migrate(error) = error else {
+        let PostgresBackendError::Migration(error) = error else {
             panic!("expected bootstrap to preserve its migration error");
         };
-        let MigrateError::ExecuteMigration(source, version) = *error else {
+        let MigrateError::ExecuteMigration(source, version) = error else {
             panic!("expected the bootstrap migration to fail");
         };
         assert_eq!(version, MIGRATOR.iter().next().unwrap().version);
