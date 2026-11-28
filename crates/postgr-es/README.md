@@ -112,28 +112,34 @@ mixing direct, unsequenced `Reactor::react` calls into a native projection.
 
 ## Standalone durable enqueue
 
-Use `PostgresEventRepository::enqueue` when a job has no application command
-transaction to join. Apply the library migrations first. The repository commits
-its canonical enqueue event and initial queue row in one transaction:
+`PostgresEventRepository::enqueue` is the low-level entry point for an already
+encoded job that has no application command transaction to join. Apply the
+library migrations first. The repository commits the enqueue event and initial
+queue row in one transaction.
+
+The routing key identifies which job implementation should handle the payload.
+For a Rust `StandaloneJob`, it must match that implementation's `KIND` (for
+example, `"send-email"`). It is persisted in job history and used by workers to
+select jobs. It is not the job instance's `JobId` or a worker name. This erased
+entry point cannot check that the payload matches the job implementation or that
+a worker is registered for the key.
 
 ```rust
 use cqrs_es::persist::PersistenceError;
-use serde_json::Value;
 use sqlx::PgPool;
 
-use event_sorcery::{JobId, JobSeed};
+use event_sorcery::{JobId, JobSeed, StandaloneJob};
 use postgr_es::PostgresEventRepository;
 
-async fn enqueue_job(
+async fn enqueue_job<Job: StandaloneJob>(
     pool: PgPool,
     job_id: JobId,
-    kind: String,
-    payload: Value,
+    job: Job,
     run_at_ms: i64,
 ) -> Result<(), PersistenceError> {
-    let repository = PostgresEventRepository { pool };
-    repository
-        .enqueue(JobSeed::new(job_id, kind, payload, run_at_ms))
+    let payload = serde_json::to_value(job)?;
+    PostgresEventRepository { pool }
+        .enqueue(JobSeed::new(job_id, Job::KIND, payload, run_at_ms))
         .await
 }
 ```
