@@ -17,6 +17,7 @@ def main [installer: path, work: path] {
             {reason: 'compiler-artifact', package_id: $package}
             {reason: 'build-script-executed', package_id: 'other-package', out_dir: '/unused'}
             {reason: 'build-script-executed', package_id: $package, out_dir: $generated}
+            {reason: 'build-script-executed', package_id: $package, out_dir: $generated}
         ]
         | each { to json --raw }
         | prepend ['procedural macro output' '123' '"scalar"' '[]' 'null']
