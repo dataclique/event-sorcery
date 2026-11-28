@@ -270,8 +270,10 @@ mod tests {
 
     use event_sorcery::{
         CompactionPolicy, Effect, EventSourced, JobId, JobSeed, Never, Nil, PersistenceBackend,
-        StoreBuilder, buffer_pending_job, recover_job_queue_row, with_pending_jobs,
+        StoreBuilder, buffer_pending_job, find_recovered_jobs, recover_job_queue_row,
+        with_pending_jobs,
     };
+    use indexed_query::{Cmp, Predicate, Term, Value as IndexedValue};
 
     use super::{MIGRATOR, PostgresEventRepository};
     use crate::PostgresBackend;
@@ -1515,6 +1517,30 @@ mod tests {
             .unwrap();
             assert_eq!(row, (2, lease));
         }
+
+        let predicate = Predicate {
+            any_of: vec![vec![
+                Term {
+                    column: "status".to_string(),
+                    cmp: Cmp::Eq,
+                    value: Some(IndexedValue::Text("claimed".to_string())),
+                },
+                Term {
+                    column: "run_at".to_string(),
+                    cmp: Cmp::Eq,
+                    value: Some(IndexedValue::Int(run_at)),
+                },
+                Term {
+                    column: "lease_until".to_string(),
+                    cmp: Cmp::IsNull,
+                    value: None,
+                },
+            ]],
+        };
+        assert_eq!(
+            find_recovered_jobs(&backend, &predicate).await.unwrap(),
+            [job_id.to_string()]
+        );
     }
 
     #[sqlx::test(migrations = false)]

@@ -39,6 +39,20 @@ pub async fn recover_job_queue_row(
     Ok(state.map(serde_json::to_value).transpose()?)
 }
 
+/// Finds job IDs through the canonical queue's indexed projection after recovery.
+pub async fn find_recovered_jobs(
+    backend: &impl crate::ProjectedStoreBackend,
+    predicate: &indexed_query::Predicate,
+) -> Result<Vec<String>, crate::ReconcileError> {
+    let projection = backend
+        .reconcile_projected::<crate::job::JobState>()
+        .await?;
+    projection
+        .find(predicate, None, 10)
+        .await
+        .map_err(|source| cqrs_es::persist::PersistenceError::UnknownError(Box::new(source)).into())
+}
+
 struct EncodedTestJob {
     kind: crate::job::JobKind,
     payload: serde_json::Value,
