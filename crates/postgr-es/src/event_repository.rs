@@ -1554,7 +1554,7 @@ mod tests {
         .unwrap();
         let first = PostgresEventRepository { pool: first_pool };
         let second = PostgresEventRepository { pool: second_pool };
-        let decide = |read: Option<event_sorcery::ClaimRead>| {
+        let decide = move |job_key: &str, read: Option<event_sorcery::ClaimRead>| {
             let read = read.unwrap();
             if read.lease_until_ms.is_some() {
                 return event_sorcery::ClaimDecision::Skip;
@@ -1564,7 +1564,7 @@ mod tests {
             let claim_id = "01HF7YAT000000000000000002";
             event_sorcery::ClaimDecision::Claim {
                 event: SerializedEvent {
-                    aggregate_id: job_key.clone(),
+                    aggregate_id: job_key.to_owned(),
                     sequence: 2,
                     aggregate_type: "job".to_owned(),
                     event_type: "JobClaimed".to_owned(),
@@ -1598,8 +1598,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let Err(super::PostgresClaimError::Sql(sqlx::Error::Database(error))) =
-            first.claim_job(&job_key, decide).await
+        let Err(super::PostgresClaimError::Sql(sqlx::Error::Database(error))) = first
+            .claim_job(&job_key, |read| decide(&job_key, read))
+            .await
         else {
             panic!("expected the injected projection write failure");
         };
@@ -1623,10 +1624,105 @@ mod tests {
             .await
             .unwrap();
 
+        verify_claim_cancellation(&pool, &first.pool, &job_key, decide).await;
+        verify_competing_claims(&pool, &first, &second, &job_key, lease_until_ms, decide).await;
+    }
+
+    async fn verify_claim_cancellation(
+        pool: &PgPool,
+        writer_pool: &PgPool,
+        job_key: &str,
+        decide: impl FnOnce(&str, Option<event_sorcery::ClaimRead>) -> event_sorcery::ClaimDecision<i64>
+        + Send
+        + 'static,
+    ) {
+        sqlx::raw_sql(
+            "CREATE FUNCTION block_claim_projection() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF NOT EXISTS (SELECT 1 FROM events WHERE aggregate_type = 'job'
+                                AND aggregate_id = NEW.view_id AND sequence = NEW.version
+                                AND event_type = 'JobClaimed') THEN
+                     RAISE EXCEPTION 'claim must append before updating its projection';
+                 END IF;
+                 PERFORM pg_advisory_xact_lock(782341, 10);
+                 RETURN NEW;
+             END;
+             $$;
+             CREATE TRIGGER block_claim_projection BEFORE UPDATE ON job_queue_projection
+             FOR EACH ROW EXECUTE FUNCTION block_claim_projection();",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(writer_pool)
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(782341, 10)")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let writer = PostgresEventRepository {
+            pool: writer_pool.clone(),
+        };
+        let writer_job_key = job_key.to_owned();
+        let pending = tokio::spawn(async move {
+            writer
+                .claim_job(&writer_job_key, |read| decide(&writer_job_key, read))
+                .await
+        });
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks
+                     WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)",
+                )
+                .bind(writer_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        pending.abort();
+        assert!(matches!(pending.await, Err(error) if error.is_cancelled()));
+        blocker.rollback().await.unwrap();
+
+        let unchanged: (i64, Option<i64>, i64) = timeout(Duration::from_secs(5),
+            sqlx::query_as(
+                "SELECT version, lease_until,
+                        (SELECT count(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1)
+                 FROM job_queue_projection WHERE view_id = $1",
+            )
+            .bind(job_key)
+            .fetch_one(writer_pool),
+        ).await.unwrap().unwrap();
+        assert_eq!(unchanged, (1, None, 1));
+        sqlx::query("DROP TRIGGER block_claim_projection ON job_queue_projection")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn verify_competing_claims(
+        pool: &PgPool,
+        first: &PostgresEventRepository,
+        second: &PostgresEventRepository,
+        job_key: &str,
+        lease_until_ms: i64,
+        decide: impl Fn(&str, Option<event_sorcery::ClaimRead>) -> event_sorcery::ClaimDecision<i64>
+        + Sync,
+    ) {
         let (left, right) = timeout(Duration::from_secs(5), async {
             tokio::try_join!(
-                first.claim_job(&job_key, decide),
-                second.claim_job(&job_key, decide)
+                first.claim_job(job_key, |read| decide(job_key, read)),
+                second.claim_job(job_key, |read| decide(job_key, read))
             )
         })
         .await
@@ -1641,8 +1737,8 @@ mod tests {
         let row: (i64, String, i64) = sqlx::query_as(
             "SELECT version, status, lease_until FROM job_queue_projection WHERE view_id = $1",
         )
-        .bind(&job_key)
-        .fetch_one(&pool)
+        .bind(job_key)
+        .fetch_one(pool)
         .await
         .unwrap();
         assert_eq!(row, (2, "claimed".to_owned(), lease_until_ms));
@@ -1650,8 +1746,8 @@ mod tests {
             "SELECT sequence, (payload #>> '{Claimed,lease_until}')::BIGINT FROM events
              WHERE aggregate_type = 'job' AND aggregate_id = $1 AND event_type = 'JobClaimed'",
         )
-        .bind(&job_key)
-        .fetch_all(&pool)
+        .bind(job_key)
+        .fetch_all(pool)
         .await
         .unwrap();
         assert_eq!(claims, vec![(2, lease_until_ms)]);
