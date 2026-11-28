@@ -1476,7 +1476,7 @@ mod tests {
         let mut transaction = pool.begin().await.unwrap();
         repository
             .official()
-            .append_serialized_events_in(&mut transaction, "job", &[claim])
+            .append_serialized_events_in(&mut transaction, "job", std::slice::from_ref(&claim))
             .await
             .unwrap();
         let updated = sqlx::query(
@@ -1516,6 +1516,47 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(row, (2, lease));
+        }
+
+        // Each decoy differs from the match in exactly one queried column.
+        for (schedule, is_claimed, lease) in [
+            (run_at, false, None),
+            (run_at + 1, true, None),
+            (run_at, true, Some(renewed_deadline)),
+        ] {
+            let decoy = JobId::new();
+            repository
+                .enqueue(JobSeed::new(decoy, "standalone", payload.clone(), schedule))
+                .await
+                .unwrap();
+            if is_claimed {
+                let mut transaction = pool.begin().await.unwrap();
+                let decoy_claim = SerializedEvent {
+                    aggregate_id: decoy.to_string(),
+                    ..claim.clone()
+                };
+                repository
+                    .official()
+                    .append_serialized_events_in(&mut transaction, "job", &[decoy_claim])
+                    .await
+                    .unwrap();
+                transaction.commit().await.unwrap();
+                recover_job_queue_row(&backend, &decoy)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            if let Some(deadline) = lease {
+                let updated = sqlx::query(
+                    "UPDATE job_queue_projection SET lease_until = $2 WHERE view_id = $1",
+                )
+                .bind(decoy.to_string())
+                .bind(deadline)
+                .execute(&pool)
+                .await
+                .unwrap();
+                assert_eq!(updated.rows_affected(), 1);
+            }
         }
 
         let predicate = Predicate {
