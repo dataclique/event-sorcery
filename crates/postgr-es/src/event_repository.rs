@@ -270,7 +270,7 @@ mod tests {
 
     use event_sorcery::{
         CompactionPolicy, Effect, EventSourced, JobId, JobSeed, Never, Nil, PersistenceBackend,
-        StoreBuilder, buffer_pending_job, with_pending_jobs,
+        StoreBuilder, buffer_pending_job, recover_job_queue_row, with_pending_jobs,
     };
 
     use super::{MIGRATOR, PostgresEventRepository};
@@ -1390,6 +1390,50 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(counts, (0, 0));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn queue_recovers_a_missing_pending_job_without_workers(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let job_id = JobId::new();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let backend = PostgresBackend { pool: pool.clone() };
+        repository
+            .enqueue(JobSeed::new(
+                job_id,
+                "standalone",
+                json!({"value": "first"}),
+                1_700_000_000_000,
+            ))
+            .await
+            .unwrap();
+
+        let deleted = sqlx::query("DELETE FROM job_queue_projection WHERE view_id = $1")
+            .bind(job_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+
+        let pending = json!({"Pending": {
+            "kind": "standalone", "payload": {"value": "first"},
+            "run_at": 1_700_000_000_000_i64, "attempt": 0, "claims": 0
+        }});
+        for _ in 0..2 {
+            assert_eq!(
+                recover_job_queue_row(&backend, &job_id).await.unwrap(),
+                Some(pending.clone())
+            );
+        }
+
+        let (checkpoint, lease): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT version, lease_until FROM job_queue_projection WHERE view_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((checkpoint, lease), (1, None));
     }
 
     #[sqlx::test(migrations = false)]

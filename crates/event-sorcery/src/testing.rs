@@ -22,6 +22,23 @@ use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
 use crate::reactor::Reactor;
 
+/// Recovers the canonical job queue and reads one row through the typed projection.
+/// The serialized state is for adapter conformance assertions, not a public job model.
+pub async fn recover_job_queue_row(
+    backend: &impl crate::ProjectedStoreBackend,
+    job_id: &crate::JobId,
+) -> Result<Option<serde_json::Value>, crate::ReconcileError> {
+    let projection = backend
+        .reconcile_projected::<crate::job::JobState>()
+        .await?;
+    let state = projection
+        .load(job_id)
+        .await
+        .map_err(|source| cqrs_es::persist::PersistenceError::UnknownError(Box::new(source)))?;
+
+    Ok(state.map(serde_json::to_value).transpose()?)
+}
+
 struct EncodedTestJob {
     kind: crate::job::JobKind,
     payload: serde_json::Value,
