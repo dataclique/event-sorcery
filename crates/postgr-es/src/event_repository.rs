@@ -1643,16 +1643,8 @@ mod tests {
             "injected projection failure after claim append"
         );
 
-        let unchanged: (i64, Option<i64>, i64) = sqlx::query_as(
-            "SELECT version, lease_until,
-                    (SELECT count(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1)
-             FROM job_queue_projection WHERE view_id = $1",
-        )
-        .bind(&job_key)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(unchanged, (1, None, 1));
+        assert_unclaimed(&pool, &job_key).await;
+        verify_suppressed_claim_update(&pool, &first, &job_key, decide).await;
         sqlx::query("DROP TRIGGER reject_claim_projection ON job_queue_projection")
             .execute(&pool)
             .await
@@ -1661,6 +1653,51 @@ mod tests {
         verify_claim_cancellation(&pool, &first.pool, &job_key, decide).await;
         verify_competing_claims(&pool, &first, &second, &job_key, lease_until_ms, decide).await;
         verify_stale_projection_claim(&first, run_at, decide).await;
+    }
+
+    async fn verify_suppressed_claim_update(
+        pool: &PgPool,
+        writer: &PostgresEventRepository,
+        job_key: &str,
+        decide: impl FnOnce(&str, Option<event_sorcery::ClaimRead>) -> event_sorcery::ClaimDecision<i64>
+        + Send,
+    ) {
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION reject_claim_projection() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF NOT EXISTS (SELECT 1 FROM events WHERE aggregate_type = 'job'
+                                AND aggregate_id = NEW.view_id AND sequence = NEW.version
+                                AND event_type = 'JobClaimed') THEN
+                     RAISE EXCEPTION 'claim must append before updating its projection';
+                 END IF;
+                 RETURN NULL;
+             END;
+             $$",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let claim = writer
+            .claim_job(job_key, |read| decide(job_key, read))
+            .await;
+        assert!(matches!(
+            claim,
+            Err(super::PostgresClaimError::ProjectionCount)
+        ));
+        assert_unclaimed(pool, job_key).await;
+    }
+
+    async fn assert_unclaimed(pool: &PgPool, job_key: &str) {
+        let unchanged: (i64, Option<i64>, i64) = sqlx::query_as(
+            "SELECT version, lease_until,
+                    (SELECT count(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1)
+             FROM job_queue_projection WHERE view_id = $1",
+        )
+        .bind(job_key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, (1, None, 1));
     }
 
     async fn verify_stale_projection_claim(
@@ -1834,20 +1871,12 @@ mod tests {
         assert!(matches!(pending.await, Err(error) if error.is_cancelled()));
         blocker.rollback().await.unwrap();
 
-        let unchanged: (i64, Option<i64>, i64) = timeout(Duration::from_secs(5),
-            sqlx::query_as(
-                "SELECT version, lease_until,
-                        (SELECT count(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1)
-                 FROM job_queue_projection WHERE view_id = $1",
-            )
-            .bind(job_key)
-            .fetch_one(writer_pool),
-        ).await.unwrap().unwrap();
-        assert_eq!(unchanged, (1, None, 1));
-        sqlx::query("DROP TRIGGER block_claim_projection ON job_queue_projection")
-            .execute(pool)
-            .await
-            .unwrap();
+        timeout(
+            Duration::from_secs(5),
+            assert_unclaimed(writer_pool, job_key),
+        )
+        .await
+        .unwrap();
     }
 
     async fn verify_competing_claims(
@@ -1859,21 +1888,14 @@ mod tests {
         decide: impl Fn(&str, Option<event_sorcery::ClaimRead>) -> event_sorcery::ClaimDecision<i64>
         + Sync,
     ) {
-        let (left, right) = timeout(Duration::from_secs(5), async {
-            tokio::try_join!(
-                first.claim_job(job_key, |read| decide(job_key, read)),
-                second.claim_job(job_key, |read| decide(job_key, read))
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
+        let (left, right) = run_overlapping_claims(pool, first, second, job_key, decide).await;
         use event_sorcery::ClaimOutcome::{Skip, Won};
-        let winner = match (left, right) {
-            (Won(deadline), Skip) | (Skip, Won(deadline)) => Some(deadline),
-            _ => None,
-        };
-        assert_eq!(winner, Some(lease_until_ms));
+        assert!(matches!(left, Won(deadline) if deadline == lease_until_ms));
+        assert!(matches!(right, Skip));
+        sqlx::query("DROP TRIGGER block_claim_projection ON job_queue_projection")
+            .execute(pool)
+            .await
+            .unwrap();
         let renewed_deadline = lease_until_ms + 10_000;
         use event_sorcery::LeaseRenewal::{Held, Lost};
         assert!(matches!(
@@ -1901,6 +1923,77 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(claims, vec![(2, lease_until_ms)]);
+    }
+
+    async fn run_overlapping_claims(
+        pool: &PgPool,
+        first: &PostgresEventRepository,
+        second: &PostgresEventRepository,
+        job_key: &str,
+        decide: impl Fn(&str, Option<event_sorcery::ClaimRead>) -> event_sorcery::ClaimDecision<i64>
+        + Sync,
+    ) -> (
+        event_sorcery::ClaimOutcome<i64>,
+        event_sorcery::ClaimOutcome<i64>,
+    ) {
+        let (first_pid, second_pid): (i32, i32) = tokio::try_join!(
+            sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&first.pool),
+            sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&second.pool),
+        )
+        .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(782341, 10)")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let (left, right, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                first.claim_job(job_key, |read| decide(job_key, read)),
+                async {
+                    wait_for_blocker(
+                        pool,
+                        first_pid,
+                        blocker_pid,
+                        "%UPDATE job_queue_projection%",
+                    )
+                    .await;
+                    second
+                        .claim_job(job_key, |read| decide(job_key, read))
+                        .await
+                },
+                async {
+                    wait_for_blocker(pool, second_pid, first_pid, "%FOR UPDATE").await;
+                    blocker.rollback().await.unwrap();
+                },
+            )
+        })
+        .await
+        .expect("first claim must hold the row lock while the second waits");
+        (left.unwrap(), right.unwrap())
+    }
+
+    async fn wait_for_blocker(pool: &PgPool, waiting_pid: i32, blocking_pid: i32, statement: &str) {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                 WHERE pid = $1 AND query LIKE $3 AND $2 = ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(waiting_pid)
+            .bind(blocking_pid)
+            .bind(statement)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if blocked {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[sqlx::test(migrations = false)]
