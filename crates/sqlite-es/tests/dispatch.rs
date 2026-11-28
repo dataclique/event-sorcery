@@ -4,7 +4,11 @@
 mod tests {
     use apalis_core::worker::event::Event;
     use serde::{Deserialize, Serialize};
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        future::{Future, ready},
+        sync::Arc,
+        time::Duration,
+    };
     use tokio::{sync::Notify, time::timeout};
 
     use event_sorcery::*;
@@ -130,20 +134,22 @@ mod tests {
             self.origin
         }
 
-        async fn submit(
+        fn submit(
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<JobOutcome<String>, JobFailure<OrderRejected>> {
-            Ok(JobOutcome::Done("filled".to_string()))
+        ) -> impl Future<Output = Result<JobOutcome<String>, JobFailure<OrderRejected>>> + Send
+        {
+            ready(Ok(JobOutcome::Done("filled".to_string())))
         }
 
-        async fn reconcile(
+        fn reconcile(
             &self,
             _ctx: &JobContext,
             _input: &(),
-        ) -> Result<Reconciliation<String>, JobFailure<OrderRejected>> {
-            Ok(Reconciliation::Settled("reconciled".to_string()))
+        ) -> impl Future<Output = Result<Reconciliation<String>, JobFailure<OrderRejected>>> + Send
+        {
+            ready(Ok(Reconciliation::Settled("reconciled".to_string())))
         }
     }
 
