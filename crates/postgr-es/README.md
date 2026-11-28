@@ -143,6 +143,19 @@ identity for a new enqueue; reusing an existing identity returns a persistence
 error rather than creating another job. Enqueue records durable intent; it does
 not execute the job's external effects.
 
+### Queue recovery contract
+
+The `job` event stream is authoritative; `job_queue_projection` is derived
+state. The adapter's PostgreSQL conformance tests exercise the library-owned job
+fold through native projection recovery and indexed reads, without starting a
+worker. This does not add a public job-queue startup API.
+
+Recovery restores the lifecycle and the scheduled time of pending or claimed
+jobs. Catch-up leaves an existing lease column intact; recreating a missing row
+leaves that column unset. The deadline recorded in a claim event is audit data,
+not a lease that replay can restore. A failed or cancelled recovery does not
+publish a partial queue or advance the schema registry.
+
 ## Migrations
 
 Use `PostgresBackend::bootstrap_persistence` to apply the library migrations
