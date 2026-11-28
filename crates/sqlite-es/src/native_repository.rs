@@ -1,7 +1,9 @@
 //! SQLite storage adapter for native command repositories.
 
+use std::future::{Future, poll_fn};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::task::Poll;
 
 use cqrs_es::Aggregate;
 use cqrs_es::persist::{
@@ -151,17 +153,21 @@ impl PersistedEventRepository for NativeRepository {
         .await
     }
 
-    async fn stream_events<AggregateType: Aggregate>(
+    fn stream_events<AggregateType: Aggregate>(
         &self,
         aggregate_id: &str,
-    ) -> Result<ReplayStream, PersistenceError> {
-        Ok(self.replay::<AggregateType>(Some(aggregate_id.to_owned())))
+    ) -> impl Future<Output = Result<ReplayStream, PersistenceError>> + Send {
+        poll_fn(move |_| {
+            Poll::Ready(Ok(
+                self.replay::<AggregateType>(Some(aggregate_id.to_owned()))
+            ))
+        })
     }
 
-    async fn stream_all_events<AggregateType: Aggregate>(
+    fn stream_all_events<AggregateType: Aggregate>(
         &self,
-    ) -> Result<ReplayStream, PersistenceError> {
-        Ok(self.replay::<AggregateType>(None))
+    ) -> impl Future<Output = Result<ReplayStream, PersistenceError>> + Send {
+        poll_fn(move |_| Poll::Ready(Ok(self.replay::<AggregateType>(None))))
     }
 }
 

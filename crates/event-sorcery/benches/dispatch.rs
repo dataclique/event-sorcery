@@ -4,6 +4,7 @@
 //! Run with: `cargo bench --features test-support --bench dispatch`
 
 use std::fmt::Debug;
+use std::future::{Future, ready};
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -126,20 +127,20 @@ impl Job for BenchJob {
         self.origin
     }
 
-    async fn submit(
+    fn submit(
         &self,
         _ctx: &JobContext,
         _input: &(),
-    ) -> Result<JobOutcome<u64>, JobFailure<Never>> {
-        Ok(JobOutcome::Done(self.amount))
+    ) -> impl Future<Output = Result<JobOutcome<u64>, JobFailure<Never>>> + Send {
+        ready(Ok(JobOutcome::Done(self.amount)))
     }
 
-    async fn reconcile(
+    fn reconcile(
         &self,
         _ctx: &JobContext,
         _input: &(),
-    ) -> Result<Reconciliation<u64>, JobFailure<Never>> {
-        Ok(Reconciliation::Settled(self.amount))
+    ) -> impl Future<Output = Result<Reconciliation<u64>, JobFailure<Never>>> + Send {
+        ready(Ok(Reconciliation::Settled(self.amount)))
     }
 }
 

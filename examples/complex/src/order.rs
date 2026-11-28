@@ -14,7 +14,9 @@
 //! miss compacted aggregates.
 
 use std::fmt::{self, Display};
+use std::future::{Future, poll_fn, ready};
 use std::str::FromStr;
+use std::task::Poll;
 
 use async_trait::async_trait;
 use cqrs_es::DomainEvent;
@@ -171,26 +173,28 @@ impl Job for SendOrderConfirmation {
         self.order
     }
 
-    async fn submit(
+    fn submit(
         &self,
         _ctx: &JobContext,
         _input: &Confirmer,
-    ) -> Result<JobOutcome<()>, JobFailure<Never>> {
-        println!(
-            "  [worker] sent confirmation for {} x{}",
-            self.item, self.quantity
-        );
-        Ok(JobOutcome::Done(()))
+    ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<Never>>> + Send {
+        poll_fn(move |_| {
+            println!(
+                "  [worker] sent confirmation for {} x{}",
+                self.item, self.quantity
+            );
+            Poll::Ready(Ok(JobOutcome::Done(())))
+        })
     }
 
-    async fn reconcile(
+    fn reconcile(
         &self,
         _ctx: &JobContext,
         _input: &Confirmer,
-    ) -> Result<Reconciliation<()>, JobFailure<Never>> {
+    ) -> impl Future<Output = Result<Reconciliation<()>, JobFailure<Never>>> + Send {
         // A duplicate confirmation email is tolerable; treat an unknown fate
         // as settled.
-        Ok(Reconciliation::Settled(()))
+        ready(Ok(Reconciliation::Settled(())))
     }
 }
 

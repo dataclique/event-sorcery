@@ -120,9 +120,19 @@ pub enum LifecycleError<Entity: EventSourced> {
 /// `Serialize`/`Deserialize` for cqrs-es compatibility.
 /// Use as `type Error = Never` on entities where neither
 /// command handling nor event application can fail.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[error("never")]
-pub enum Never {}
+pub use infallible_error::Never;
+
+#[allow(clippy::empty_enums)]
+mod infallible_error {
+    //! Serde's generated empty helper enum needs the same lint scope as `Never`.
+
+    use serde::{Deserialize, Serialize};
+
+    /// An uninhabited error that supports the CQRS serialization contract.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+    #[error("never")]
+    pub enum Never {}
+}
 
 /// Bridges [`EventSourced`] to cqrs-es `Aggregate`.
 ///

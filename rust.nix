@@ -131,13 +131,15 @@ in
       pname = "event-sorcery-ffi";
       inherit cargoArtifacts;
       cargoExtraArgs = "--locked --package event-sorcery-ffi";
+      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.nushell ];
       postInstall = ''
-        mkdir -p $out/include
-        cp target/release/build/event-sorcery-ffi-*/out/event_sorcery.h $out/include/event_sorcery.h
+        nu ${./nix/install-ffi-header.nu} \
+          "$cargoBuildLog" "$(cargo pkgid --package event-sorcery-ffi)" "$out"
       '';
       doInstallCheck = true;
       installCheckPhase = ''
         runHook preInstallCheck
+        nu ${./nix/install-ffi-header.test.nu} ${./nix/install-ffi-header.nu} "$TMPDIR/ffi-header-tests"
         test -s $out/lib/libevent_sorcery_ffi.a
         test -s $out/include/event_sorcery.h
         runHook postInstallCheck

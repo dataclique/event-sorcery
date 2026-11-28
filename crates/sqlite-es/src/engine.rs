@@ -1018,15 +1018,15 @@ mod tests {
             error,
             EngineError::JobFlush(JobStoreError::InvalidInstant(i64::MAX))
         ));
-        assert!(engine.load_events(&stream, None).await.unwrap().is_empty());
+        assert_eq!(
+            engine.load_events(&stream, None).await.unwrap(),
+            Vec::<SerializedEvent>::new()
+        );
         assert_eq!(queue_row_count(&engine, &job_id).await, 0);
         let job_stream = StreamIdentity::new("job", job_id.to_string());
-        assert!(
-            engine
-                .load_events(&job_stream, None)
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            engine.load_events(&job_stream, None).await.unwrap(),
+            Vec::<SerializedEvent>::new()
         );
     }
 

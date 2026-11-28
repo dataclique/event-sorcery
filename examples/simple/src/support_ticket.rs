@@ -10,7 +10,9 @@
 //! system makes the eager-fact bug unrepresentable.
 
 use std::fmt::{self, Display};
+use std::future::{Future, poll_fn, ready};
 use std::str::FromStr;
+use std::task::Poll;
 
 use async_trait::async_trait;
 use cqrs_es::DomainEvent;
@@ -179,26 +181,28 @@ impl Job for NotifyClosed {
         self.ticket
     }
 
-    async fn submit(
+    fn submit(
         &self,
         _ctx: &JobContext,
         _input: &Notifier,
-    ) -> Result<JobOutcome<()>, JobFailure<Never>> {
-        println!(
-            "  [worker] notified customer that '{}' was closed",
-            self.subject
-        );
-        Ok(JobOutcome::Done(()))
+    ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<Never>>> + Send {
+        poll_fn(move |_| {
+            println!(
+                "  [worker] notified customer that '{}' was closed",
+                self.subject
+            );
+            Poll::Ready(Ok(JobOutcome::Done(())))
+        })
     }
 
-    async fn reconcile(
+    fn reconcile(
         &self,
         _ctx: &JobContext,
         _input: &Notifier,
-    ) -> Result<Reconciliation<()>, JobFailure<Never>> {
+    ) -> impl Future<Output = Result<Reconciliation<()>, JobFailure<Never>>> + Send {
         // A duplicate notification is tolerable; treat an unknown fate as
         // settled rather than double-checking an email provider.
-        Ok(Reconciliation::Settled(()))
+        ready(Ok(Reconciliation::Settled(())))
     }
 }
 
@@ -221,13 +225,15 @@ impl StandaloneJob for SweepStaleTickets {
         Label::new("sweep-stale-tickets")
     }
 
-    async fn perform(
+    fn perform(
         &self,
         _ctx: &JobContext,
         _input: &(),
-    ) -> Result<JobOutcome<()>, JobFailure<Never>> {
-        println!("  [worker] swept stale tickets");
-        Ok(JobOutcome::Done(()))
+    ) -> impl Future<Output = Result<JobOutcome<()>, JobFailure<Never>>> + Send {
+        poll_fn(|_| {
+            println!("  [worker] swept stale tickets");
+            Poll::Ready(Ok(JobOutcome::Done(())))
+        })
     }
 }
 

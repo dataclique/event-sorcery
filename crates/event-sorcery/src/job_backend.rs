@@ -1408,7 +1408,7 @@ mod tests {
         let backoff = Backoff {
             base: Duration::from_secs(1),
             factor: 2.0,
-            cap: Duration::from_secs(34_359_738_360),
+            cap: Duration::from_mins(572_662_306),
         };
         for (attempt, seconds) in [
             (0, 1),

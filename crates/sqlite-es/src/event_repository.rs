@@ -6,6 +6,8 @@ use futures_util::TryStreamExt;
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{AssertSqlSafe, FromRow, Pool, Row, Sqlite, SqliteConnection, SqlitePool};
+use std::future::{Future, poll_fn};
+use std::task::Poll;
 
 use crate::sql_query::SqlQueryFactory;
 
@@ -135,15 +137,17 @@ impl PersistedEventRepository for SqliteEventRepository {
         Ok(())
     }
 
-    async fn stream_events<A: Aggregate>(
+    fn stream_events<A: Aggregate>(
         &self,
         aggregate_id: &str,
-    ) -> Result<ReplayStream, PersistenceError> {
-        Ok(self.stream_events_impl::<A>(Some(aggregate_id)))
+    ) -> impl Future<Output = Result<ReplayStream, PersistenceError>> + Send {
+        poll_fn(move |_| Poll::Ready(Ok(self.stream_events_impl::<A>(Some(aggregate_id)))))
     }
 
-    async fn stream_all_events<A: Aggregate>(&self) -> Result<ReplayStream, PersistenceError> {
-        Ok(self.stream_events_impl::<A>(None))
+    fn stream_all_events<A: Aggregate>(
+        &self,
+    ) -> impl Future<Output = Result<ReplayStream, PersistenceError>> + Send {
+        poll_fn(move |_| Poll::Ready(Ok(self.stream_events_impl::<A>(None))))
     }
 }
 
@@ -584,9 +588,22 @@ mod tests {
     use cqrs_es::{AggregateContext, CqrsFramework, DomainEvent, EventStore};
     use serde::{Deserialize, Serialize};
     use std::fmt::{self, Display};
+    use std::future::ready;
 
     use super::*;
     use crate::testing::create_test_pool;
+
+    #[test]
+    fn creating_replay_futures_does_not_start_background_io() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let pool = runtime.block_on(create_test_pool()).unwrap();
+        let repository = SqliteEventRepository::new(pool.clone());
+
+        drop(repository.stream_events::<TestAggregate>("unpolled"));
+        drop(repository.stream_all_events::<TestAggregate>());
+
+        runtime.block_on(pool.close());
+    }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     struct TestAggregate {
@@ -630,13 +647,13 @@ mod tests {
         type Error = TestError;
         type Services = ();
 
-        async fn handle(
+        fn handle(
             &mut self,
             _command: Self::Command,
             _services: &Self::Services,
             _sink: &EventSink<Self>,
-        ) -> Result<(), Self::Error> {
-            Ok(())
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            ready(Ok(()))
         }
 
         fn apply(&mut self, event: Self::Event) {
