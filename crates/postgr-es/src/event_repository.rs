@@ -1654,6 +1654,62 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn queue_recovery_rolls_back_when_schema_registration_fails(pool: PgPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        let repository = PostgresEventRepository { pool: pool.clone() };
+        let backend = PostgresBackend { pool: pool.clone() };
+        let job_id = JobId::new();
+        let run_at = 1_700_000_000_000_i64;
+        repository
+            .enqueue(JobSeed::new(
+                job_id,
+                "standalone",
+                json!({"value": 1}),
+                run_at,
+            ))
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM job_queue_projection WHERE view_id = $1")
+            .bind(job_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE events ADD CONSTRAINT reject_queue_registration
+             CHECK (aggregate_type <> 'SchemaRegistry')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = recover_job_queue_row(&backend, &job_id).await.unwrap_err();
+        assert!(matches!(error, event_sorcery::ReconcileError::Aggregate(_)));
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM job_queue_projection),
+                    (SELECT COUNT(*) FROM events WHERE aggregate_type = 'SchemaRegistry'),
+                    (SELECT COUNT(*) FROM events WHERE aggregate_type = 'job' AND aggregate_id = $1)",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0, 1));
+
+        sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_queue_registration")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_job_queue_row(&backend, &job_id).await.unwrap(),
+            Some(json!({"Pending": {
+                "kind": "standalone", "payload": {"value": 1},
+                "run_at": run_at, "attempt": 0, "claims": 0
+            }}))
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn standalone_enqueue_preserves_first_event_and_queue_row_on_duplicate(pool: PgPool) {
         MIGRATOR.run(&pool).await.unwrap();
         let job_id = JobId::new();
